@@ -1,0 +1,15 @@
+id = 'zed-surrealql'
+name = 'SurrealQL'
+version = '0.1.0'
+schema_version = 1
+description = 'SurrealQL language support'
+authors = ['Chiru B <chiru@foretag.co>']
+repository = 'https://github.com/ForetagInc/surreal-language-server'
+
+[language_servers.surreal-language-server]
+name = 'Surreal Language Server'
+language = 'Surreal Query Language'
+
+[grammars.surrealql]
+repository = 'https://github.com/ForetagInc/tree-sitter-surrealql'
+commit = '30b40797c54ffab2d6ea14bea6748d65e56357ea'
