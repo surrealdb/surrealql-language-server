@@ -1,6 +1,6 @@
 use tower_lsp::{LspService, Server};
 
-use surreal_language_server::backend::Backend;
+use surrealql_language_server::backend::Backend;
 
 #[tokio::main]
 async fn main() {

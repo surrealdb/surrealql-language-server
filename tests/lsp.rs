@@ -1,10 +1,10 @@
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 
-use surreal_language_server::config::{AuthContext, ServerSettings};
-use surreal_language_server::semantic::analyzer::analyze_document;
-use surreal_language_server::semantic::model::is_record_type_context;
-use surreal_language_server::semantic::type_expr::TypeExpr;
-use surreal_language_server::semantic::types::{
+use surrealql_language_server::config::{AuthContext, ServerSettings};
+use surrealql_language_server::semantic::analyzer::analyze_document;
+use surrealql_language_server::semantic::model::is_record_type_context;
+use surrealql_language_server::semantic::type_expr::TypeExpr;
+use surrealql_language_server::semantic::types::{
     DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, MergedSemanticModel, PermissionMode,
     PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
 };
@@ -238,7 +238,7 @@ fn hover_for_js_function_shows_javascript_badge() {
         fields: Vec::new(),
         functions: vec![FunctionDef {
             name: "fn::slugify".to_string(),
-            params: vec![surreal_language_server::semantic::types::FunctionParam {
+            params: vec![surrealql_language_server::semantic::types::FunctionParam {
                 name: "$text".to_string(),
                 type_expr: Some(TypeExpr::Scalar("string".to_string())),
             }],
@@ -293,7 +293,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
         fields: Vec::new(),
         functions: vec![FunctionDef {
             name: "fn::double".to_string(),
-            params: vec![surreal_language_server::semantic::types::FunctionParam {
+            params: vec![surrealql_language_server::semantic::types::FunctionParam {
                 name: "$n".to_string(),
                 type_expr: Some(TypeExpr::Scalar("number".to_string())),
             }],
