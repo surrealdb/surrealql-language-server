@@ -390,7 +390,11 @@ fn extract_function(
     });
 }
 
-fn detect_function_language(children: &[Node<'_>], _source: &str, _node: Node<'_>) -> FunctionLanguage {
+fn detect_function_language(
+    children: &[Node<'_>],
+    _source: &str,
+    _node: Node<'_>,
+) -> FunctionLanguage {
     // A DEFINE FUNCTION is JavaScript if its body block contains any scripting_function node.
     let has_scripting_fn = children
         .iter()

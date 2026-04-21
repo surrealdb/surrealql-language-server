@@ -1092,7 +1092,11 @@ fn scripting_function_in_define_event() {
             THEN function() { return { ok: true }; };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
-    assert!(analysis.syntax_diagnostics.is_empty(), "got: {:?}", analysis.syntax_diagnostics);
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "got: {:?}",
+        analysis.syntax_diagnostics
+    );
 }
 
 #[test]
@@ -1102,7 +1106,11 @@ fn scripting_function_in_define_api() {
         DEFINE API '/test' FOR get THEN function() { return { status: 200 }; };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
-    assert!(analysis.syntax_diagnostics.is_empty(), "got: {:?}", analysis.syntax_diagnostics);
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "got: {:?}",
+        analysis.syntax_diagnostics
+    );
 }
 
 #[test]
@@ -1115,7 +1123,11 @@ fn scripting_function_nested_braces_in_event() {
         };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
-    assert!(analysis.syntax_diagnostics.is_empty(), "got: {:?}", analysis.syntax_diagnostics);
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "got: {:?}",
+        analysis.syntax_diagnostics
+    );
 }
 
 #[test]
@@ -1125,5 +1137,9 @@ fn scripting_function_as_value_in_create() {
         CREATE person SET scores = function() { return [1, 2, 3].map(v => v * 10); };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
-    assert!(analysis.syntax_diagnostics.is_empty(), "got: {:?}", analysis.syntax_diagnostics);
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "got: {:?}",
+        analysis.syntax_diagnostics
+    );
 }

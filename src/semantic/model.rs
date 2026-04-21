@@ -1013,7 +1013,12 @@ fn format_function_hover(function: &FunctionDef) -> String {
     if !function.called_functions.is_empty() {
         sections.push(list_section("Calls", function.called_functions.clone()));
     }
-    hover_block(function_signature(function), function.comment.clone(), metadata, sections)
+    hover_block(
+        function_signature(function),
+        function.comment.clone(),
+        metadata,
+        sections,
+    )
 }
 
 fn format_builtin_function_hover(function: &BuiltinFunction, token: &str) -> String {
