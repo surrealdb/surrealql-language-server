@@ -16,8 +16,8 @@ use crate::grammar::{
 use crate::semantic::text::compact_preview;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
-    AccessDef, AccessResult, DocumentAnalysis, EventDef, FieldDef, FunctionDef, IndexDef,
-    LiveMetadataSnapshot, MergedSemanticModel, ParamDef, PermissionMode, PermissionRule,
+    AccessDef, AccessResult, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
+    IndexDef, LiveMetadataSnapshot, MergedSemanticModel, ParamDef, PermissionMode, PermissionRule,
     QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
 };
 
@@ -1004,16 +1004,16 @@ fn format_table_hover(
 }
 
 fn format_function_hover(function: &FunctionDef) -> String {
+    let mut metadata = vec![format!("Source: {}", origin_label(function.origin))];
+    match function.language {
+        FunctionLanguage::JavaScript => metadata.push("Language: JavaScript".to_string()),
+        FunctionLanguage::SurrealQL => {}
+    }
     let mut sections = Vec::new();
     if !function.called_functions.is_empty() {
         sections.push(list_section("Calls", function.called_functions.clone()));
     }
-    hover_block(
-        function_signature(function),
-        function.comment.clone(),
-        vec![format!("Source: {}", origin_label(function.origin))],
-        sections,
-    )
+    hover_block(function_signature(function), function.comment.clone(), metadata, sections)
 }
 
 fn format_builtin_function_hover(function: &BuiltinFunction, token: &str) -> String {
@@ -1089,7 +1089,11 @@ fn function_signature(function: &FunctionDef) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{}({params})", function.name)
+    let base = format!("{}({params})", function.name);
+    match &function.return_type {
+        Some(ret) => format!("{base} -> {ret}"),
+        None => base,
+    }
 }
 
 fn table_permission_posture(permissions: &[PermissionRule]) -> &'static str {
@@ -1749,6 +1753,8 @@ mod tests {
             FunctionDef {
                 name: "fn::remote".to_string(),
                 params: Vec::new(),
+                return_type: None,
+                language: crate::semantic::types::FunctionLanguage::SurrealQL,
                 comment: None,
                 permissions: Vec::new(),
                 origin: SymbolOrigin::Remote,

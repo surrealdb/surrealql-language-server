@@ -1,37 +1,23 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+    push:
+    pull_request:
 
 jobs:
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check out tree-sitter grammar
-        run: git clone --depth 1 https://github.com/ForetagInc/tree-sitter-surrealql ../tree-sitter-surrealql
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Run tests
-        run: cargo test --workspace
-
-  zed-extension:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
-      - name: Check extension assets
-        run: |
-          test -f extensions/zed-surrealql/extension.toml
-          test -f extensions/zed-surrealql/grammars/surrealql.wasm
-          test -f extensions/zed-surrealql/languages/surql/config.toml
-      - name: Build Zed extension
-        run: cargo check --manifest-path extensions/zed-surrealql/Cargo.toml --target wasm32-wasip2
+    rust:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Check out tree-sitter grammar
+              run: git clone --depth 1 https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
+            - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.94.0
+                  components: rustfmt
+            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+              name: Cache Rust Artifacts
+            - name: Check formatting
+              run: cargo fmt --check
+            - name: Run tests
+              run: cargo test

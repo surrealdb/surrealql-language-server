@@ -23,11 +23,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}", parser_c.display());
     println!("cargo:rerun-if-changed={}", grammar_js.display());
 
-    cc::Build::new()
-        .file(&parser_c)
-        .include(&header_dir)
-        .warnings(false)
-        .compile("tree-sitter-surrealql");
+    let scanner_c = grammar_dir.join("src/scanner.c");
+    let mut build = cc::Build::new();
+    build.file(&parser_c).include(&header_dir).warnings(false);
+    if scanner_c.exists() {
+        println!("cargo:rerun-if-changed={}", scanner_c.display());
+        build.file(&scanner_c);
+    }
+    build.compile("tree-sitter-surrealql");
 
     let grammar_source = fs::read_to_string(&grammar_js).expect("failed to read grammar.js");
     let keywords = extract_keywords(&grammar_source);
@@ -39,7 +42,7 @@ fn main() {
 fn grammar_dir(manifest_dir: &Path) -> PathBuf {
     let configured = env::var_os("TREE_SITTER_SURREALQL_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("../../../tree-sitter-surrealql"));
+        .unwrap_or_else(|| manifest_dir.join("../surrealql-tree-sitter"));
 
     if configured.is_absolute() {
         configured

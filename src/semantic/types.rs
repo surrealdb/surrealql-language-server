@@ -100,6 +100,13 @@ pub struct IndexDef {
     pub location: Location,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FunctionLanguage {
+    #[default]
+    SurrealQL,
+    JavaScript,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionParam {
     pub name: String,
@@ -110,6 +117,8 @@ pub struct FunctionParam {
 pub struct FunctionDef {
     pub name: String,
     pub params: Vec<FunctionParam>,
+    pub return_type: Option<TypeExpr>,
+    pub language: FunctionLanguage,
     pub comment: Option<String>,
     pub permissions: Vec<PermissionRule>,
     pub origin: SymbolOrigin,

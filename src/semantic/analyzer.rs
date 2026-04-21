@@ -7,9 +7,9 @@ use crate::grammar::language;
 use crate::semantic::text::{byte_range_to_lsp, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
-    AccessDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionParam, IndexDef,
-    InferenceFact, ParamDef, PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin,
-    SymbolReference, TableDef,
+    AccessDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage, FunctionParam,
+    IndexDef, InferenceFact, ParamDef, PermissionMode, PermissionRule, QueryAction, QueryFact,
+    SymbolOrigin, SymbolReference, TableDef,
 };
 
 const TRANSPARENT_NODES: &[&str] = &[
@@ -329,16 +329,27 @@ fn extract_function(
         .find(|child| child.kind() == "param_list")
         .map(|child| parse_function_params(*child, source))
         .unwrap_or_default();
+
+    let return_type = children
+        .iter()
+        .find(|child| child.kind() == "type" || child.kind() == "return_type_clause")
+        .and_then(|child| text_of(source, *child))
+        .map(|text| TypeExpr::parse(text.trim_start_matches("->").trim()));
+
+    let language = detect_function_language(&children, source, node);
+
     let permissions = children
         .iter()
         .copied()
         .filter(|child| child.kind() == "permissions_basic_clause")
         .map(|child| parse_permission_rule(child, source, origin, uri))
         .collect::<Vec<_>>();
+
     let body_node = children
         .iter()
         .find(|child| child.kind() == "block")
         .copied();
+
     let called_functions = body_node
         .map(|body| collect_called_functions(body, source))
         .unwrap_or_default();
@@ -364,6 +375,8 @@ fn extract_function(
     analysis.functions.push(FunctionDef {
         name,
         params,
+        return_type,
+        language,
         comment: extract_comment(node, source),
         permissions,
         origin,
@@ -375,6 +388,19 @@ fn extract_function(
             .map(|body| byte_range_to_lsp(source, body.start_byte(), body.end_byte())),
         called_functions,
     });
+}
+
+fn detect_function_language(children: &[Node<'_>], _source: &str, _node: Node<'_>) -> FunctionLanguage {
+    // A DEFINE FUNCTION is JavaScript if its body block contains any scripting_function node.
+    let has_scripting_fn = children
+        .iter()
+        .find(|child| child.kind() == "block")
+        .is_some_and(|block| !descendants_of_kind(*block, "scripting_function").is_empty());
+    if has_scripting_fn {
+        FunctionLanguage::JavaScript
+    } else {
+        FunctionLanguage::SurrealQL
+    }
 }
 
 fn extract_index(
@@ -1132,7 +1158,7 @@ mod tests {
         -- Person records
         DEFINE TABLE person SCHEMAFULL PERMISSIONS FOR select WHERE $auth.roles CONTAINS 'viewer';
         DEFINE FIELD email ON TABLE person TYPE string;
-        DEFINE FUNCTION fn::greet($name: string) COMMENT "Greets" { RETURN $name; } PERMISSIONS FULL;
+        DEFINE FUNCTION fn::greet($name: string) { RETURN $name; } COMMENT "Greets" PERMISSIONS FULL;
         CREATE person CONTENT { email: "a@b.com", active: true };
         "#;
 
