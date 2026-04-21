@@ -40,20 +40,24 @@ jobs:
                 include:
                     - os: ubuntu-latest
                       target: x86_64-unknown-linux-gnu
-                      artifact: surreal-language-server
-                      asset: surreal-language-server-linux-amd64
+                      artifact: surrealql-language-server
+                      asset: surrealql-language-server-linux-amd64
+                      bin_dir: target/x86_64-unknown-linux-gnu/release
                     - os: ubuntu-24.04-arm
                       target: aarch64-unknown-linux-gnu
-                      artifact: surreal-language-server
-                      asset: surreal-language-server-linux-arm64
+                      artifact: surrealql-language-server
+                      asset: surrealql-language-server-linux-arm64
+                      bin_dir: target/aarch64-unknown-linux-gnu/release
                     - os: macos-latest
                       target: aarch64-apple-darwin
-                      artifact: surreal-language-server
-                      asset: surreal-language-server-macos-arm64
+                      artifact: surrealql-language-server
+                      asset: surrealql-language-server-macos-arm64
+                      bin_dir: target/aarch64-apple-darwin/release
                     - os: windows-latest
                       target: x86_64-pc-windows-msvc
-                      artifact: surreal-language-server.exe
-                      asset: surreal-language-server-windows-amd64.exe
+                      artifact: surrealql-language-server.exe
+                      asset: surrealql-language-server-windows-amd64.exe
+                      bin_dir: target/x86_64-pc-windows-msvc/release
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -69,7 +73,7 @@ jobs:
               run: cargo build --release --target ${{ matrix.target }}
             - name: Rename artifact
               shell: bash
-              run: cp target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.asset }}
+              run: cp ${{ matrix.bin_dir }}/${{ matrix.artifact }} ${{ matrix.asset }}
             - name: Upload release asset
               uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
               with:
