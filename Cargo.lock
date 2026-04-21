@@ -3870,7 +3870,7 @@ dependencies = [
 
 [[package]]
 name = "surrealql-language-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cc",
  "pretty_assertions",
