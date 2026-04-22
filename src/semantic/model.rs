@@ -70,6 +70,43 @@ impl MergedSemanticModel {
         tables
     }
 
+    /// Returns *only* table-name completion items (no keywords, functions,
+    /// fields, params, etc). Use when the cursor is positioned in a slot
+    /// that syntactically only accepts a table name (e.g. right after
+    /// `SELECT * FROM `, `INSERT INTO `, `UPDATE `).
+    pub fn table_completion_items(
+        &self,
+        prefix: &str,
+        active_context: Option<&AuthContext>,
+    ) -> Vec<CompletionItem> {
+        self.table_names_by_priority()
+            .into_iter()
+            .filter(|table| prefix.is_empty() || table.name.starts_with(prefix))
+            .map(|table| CompletionItem {
+                label: table.name.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some(format!(
+                    "{} schema, source: {}",
+                    table
+                        .schema_mode
+                        .clone()
+                        .unwrap_or_else(|| "inferred".to_string()),
+                    origin_label(table.origin)
+                )),
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format_table_hover(table, self, active_context),
+                })),
+                sort_text: Some(format!(
+                    "0-{}-{}",
+                    symbol_priority(table.origin),
+                    table.name
+                )),
+                ..CompletionItem::default()
+            })
+            .collect()
+    }
+
     pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
         let mut fields = self
             .fields

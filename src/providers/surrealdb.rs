@@ -32,7 +32,7 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
         .endpoint
         .clone()
         .ok_or_else(|| "missing SurrealDB endpoint".to_string())?;
-    let db = connect(endpoint)
+    let db = connect(endpoint.clone())
         .await
         .map_err(|error| format!("failed to connect to SurrealDB: {error}"))?;
 
