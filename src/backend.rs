@@ -812,22 +812,16 @@ impl LanguageServer for Backend {
 }
 
 fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
-    if let Some(folders) = &params.workspace_folders {
-        let resolved = folders
-            .iter()
-            .filter_map(|folder| folder.uri.to_file_path().map(|p| p.into_owned()))
-            .collect::<Vec<_>>();
-        if !resolved.is_empty() {
-            return resolved;
-        }
-    }
-
     params
-        .root_uri
+        .workspace_folders
         .as_ref()
-        .and_then(|uri| uri.to_file_path().map(|p| p.into_owned()))
-        .into_iter()
-        .collect()
+        .map(|folders| {
+            folders
+                .iter()
+                .filter_map(|folder| folder.uri.to_file_path().map(|p| p.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Skip files larger than this — pathological generated SurrealQL dumps would
