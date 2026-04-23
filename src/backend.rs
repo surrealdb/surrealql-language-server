@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer};
 use walkdir::WalkDir;
 
 use crate::config::ServerSettings;
@@ -26,14 +26,29 @@ pub struct Backend {
     state: Arc<RwLock<BackendState>>,
 }
 
+/// All shared state lives behind [`Arc`]: cloning a snapshot for an LSP
+/// request handler is now a handful of pointer-bumps instead of a deep clone
+/// of the entire workspace model (which previously copied every table /
+/// field / function definition for every hover / completion).
 #[derive(Debug, Default)]
 struct BackendState {
-    settings: ServerSettings,
+    settings: Arc<ServerSettings>,
     workspace_folders: Vec<PathBuf>,
-    saved_workspace: WorkspaceIndex,
-    open_documents: HashMap<Url, DocumentAnalysis>,
-    live_metadata: LiveMetadataSnapshot,
-    model: MergedSemanticModel,
+    saved_workspace: Arc<WorkspaceIndex>,
+    open_documents: HashMap<Uri, Arc<DocumentAnalysis>>,
+    live_metadata: Arc<LiveMetadataSnapshot>,
+    model: Arc<MergedSemanticModel>,
+    /// Fingerprint of the last successful workspace walk. When the new
+    /// fingerprint matches, `apply_settings` skips the walk entirely — this
+    /// is the common path for `didChangeConfiguration` events that don't
+    /// touch the folder set.
+    last_walked: Option<Vec<PathBuf>>,
+}
+
+fn workspace_signature(folders: &[PathBuf]) -> Vec<PathBuf> {
+    let mut signature = folders.to_vec();
+    signature.sort();
+    signature
 }
 
 impl Backend {
@@ -45,38 +60,20 @@ impl Backend {
     }
 
     async fn initialize_state(&self, params: &InitializeParams) {
-        // Apply settings + workspace folders synchronously so subsequent requests
-        // see the configured connection / folders straight away.
-        let settings = ServerSettings::from_sources(params.initialization_options.as_ref(), None);
+        // Stash settings + workspace folders synchronously so subsequent requests
+        // see the configured connection / folders straight away. The heavy
+        // workspace walk + SurrealDB fetch is deferred to `initialized →
+        // apply_settings`, where it runs exactly once with the
+        // client-supplied configuration merged in.
+        let settings = Arc::new(ServerSettings::from_sources(
+            params.initialization_options.as_ref(),
+            None,
+        ));
         let workspace_folders = resolve_workspace_folders(params);
-        {
-            let mut state = self.state.write().await;
-            state.settings = settings.clone();
-            state.workspace_folders = workspace_folders.clone();
-        }
 
-        // Defer the heavy `load_workspace_documents` walk and the SurrealDB
-        // metadata fetch to a background task so `initialize` can respond
-        // immediately. Otherwise large workspaces (or unreachable SurrealDB
-        // endpoints) keep clients in a "starting" state forever.
-        let state = Arc::clone(&self.state);
-        let folders = workspace_folders;
-        let settings_for_bg = settings;
-        tokio::spawn(async move {
-            let folders_for_walk = folders.clone();
-            let saved_workspace = tokio::task::spawn_blocking(move || {
-                load_workspace_documents(&folders_for_walk)
-            })
-            .await
-            .unwrap_or_default();
-            let live_metadata = SurrealDbProvider::fetch_snapshot(&settings_for_bg).await;
-            let model = MergedSemanticModel::build(&saved_workspace, &live_metadata);
-
-            let mut s = state.write().await;
-            s.saved_workspace = saved_workspace;
-            s.live_metadata = live_metadata;
-            s.model = model;
-        });
+        let mut state = self.state.write().await;
+        state.settings = settings;
+        state.workspace_folders = workspace_folders;
     }
 
     async fn reload_from_client_configuration(&self) {
@@ -92,7 +89,7 @@ impl Backend {
 
         let current_settings = {
             let state = self.state.read().await;
-            state.settings.clone()
+            (*state.settings).clone()
         };
         let settings = ServerSettings::from_sources(None, configuration.as_ref())
             .merge_with_env_if_missing(current_settings);
@@ -102,10 +99,10 @@ impl Backend {
 
     async fn apply_settings(&self, settings: ServerSettings) {
         // Persist settings synchronously so subsequent requests see them immediately.
-        let workspace_folders = {
+        let (workspace_folders, last_walked) = {
             let mut state = self.state.write().await;
-            state.settings = settings.clone();
-            state.workspace_folders.clone()
+            state.settings = Arc::new(settings.clone());
+            (state.workspace_folders.clone(), state.last_walked.clone())
         };
 
         // Defer the heavy `load_workspace_documents` walk and the SurrealDB
@@ -118,31 +115,51 @@ impl Backend {
         let folders = workspace_folders;
         let settings_for_bg = settings;
         tokio::spawn(async move {
-            let folders_for_walk = folders.clone();
-            let saved_workspace = tokio::task::spawn_blocking(move || {
-                load_workspace_documents(&folders_for_walk)
-            })
-            .await
-            .unwrap_or_default();
-            let live_metadata = SurrealDbProvider::fetch_snapshot(&settings_for_bg).await;
+            // Skip the walk entirely if every workspace folder is unchanged
+            // since the last successful walk — this is the common case for
+            // `didChangeConfiguration` and avoids redundant tree-sitter
+            // parsing of every .surql file in large repos.
+            let folder_signature = workspace_signature(&folders);
+            let need_walk = last_walked
+                .as_ref()
+                .map(|previous| previous != &folder_signature)
+                .unwrap_or(true);
+
+            let saved_workspace = if need_walk {
+                let folders_for_walk = folders.clone();
+                let walked = tokio::task::spawn_blocking(move || {
+                    load_workspace_documents(&folders_for_walk)
+                })
+                .await
+                .unwrap_or_default();
+                Arc::new(walked)
+            } else {
+                let s = state.read().await;
+                Arc::clone(&s.saved_workspace)
+            };
+
+            let live_metadata = Arc::new(SurrealDbProvider::fetch_snapshot(&settings_for_bg).await);
             let open_documents = {
                 let s = state.read().await;
                 s.open_documents.clone()
             };
             let workspace = merged_workspace(&saved_workspace, &open_documents);
-            let model = MergedSemanticModel::build(&workspace, &live_metadata);
+            let model = Arc::new(MergedSemanticModel::build(&workspace, &live_metadata));
 
             let (uris, model_for_diag, settings_for_diag, open_for_diag, saved_for_diag) = {
                 let mut s = state.write().await;
-                s.saved_workspace = saved_workspace;
-                s.live_metadata = live_metadata;
-                s.model = model;
+                s.saved_workspace = Arc::clone(&saved_workspace);
+                s.live_metadata = Arc::clone(&live_metadata);
+                s.model = Arc::clone(&model);
+                if need_walk {
+                    s.last_walked = Some(folder_signature);
+                }
                 (
                     s.open_documents.keys().cloned().collect::<Vec<_>>(),
-                    s.model.clone(),
-                    s.settings.clone(),
+                    Arc::clone(&s.model),
+                    Arc::clone(&s.settings),
                     s.open_documents.clone(),
-                    s.saved_workspace.clone(),
+                    Arc::clone(&s.saved_workspace),
                 )
             };
 
@@ -164,20 +181,20 @@ impl Backend {
         });
     }
 
-    async fn upsert_open_document(&self, uri: Url, text: String) {
+    async fn upsert_open_document(&self, uri: Uri, text: String) {
         let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) else {
             return;
         };
         {
             let mut state = self.state.write().await;
-            state.open_documents.insert(uri.clone(), analysis);
+            state.open_documents.insert(uri.clone(), Arc::new(analysis));
         }
         self.recompute_model().await;
         self.publish_diagnostics_for_uri(&uri).await;
     }
 
-    async fn sync_saved_document_from_disk(&self, uri: &Url) {
-        let Some(path) = uri.to_file_path().ok() else {
+    async fn sync_saved_document_from_disk(&self, uri: &Uri) {
+        let Some(path) = uri.to_file_path() else {
             return;
         };
         let Some(text) = fs::read_to_string(path).ok() else {
@@ -187,10 +204,9 @@ impl Backend {
             return;
         };
         let mut state = self.state.write().await;
-        state
-            .saved_workspace
-            .documents
-            .insert(uri.clone(), analysis);
+        let mut workspace = (*state.saved_workspace).clone();
+        workspace.documents.insert(uri.clone(), Arc::new(analysis));
+        state.saved_workspace = Arc::new(workspace);
     }
 
     async fn recompute_model(&self) {
@@ -198,11 +214,11 @@ impl Backend {
             let state = self.state.read().await;
             (
                 merged_workspace(&state.saved_workspace, &state.open_documents),
-                state.live_metadata.clone(),
+                Arc::clone(&state.live_metadata),
             )
         };
 
-        let model = MergedSemanticModel::build(&workspace, &live_metadata);
+        let model = Arc::new(MergedSemanticModel::build(&workspace, &live_metadata));
         let mut state = self.state.write().await;
         state.model = model;
     }
@@ -210,9 +226,9 @@ impl Backend {
     async fn refresh_remote_metadata_if_needed(&self) {
         let settings = {
             let state = self.state.read().await;
-            state.settings.clone()
+            Arc::clone(&state.settings)
         };
-        let live_metadata = SurrealDbProvider::fetch_snapshot(&settings).await;
+        let live_metadata = Arc::new(SurrealDbProvider::fetch_snapshot(&settings).await);
         {
             let mut state = self.state.write().await;
             state.live_metadata = live_metadata;
@@ -220,7 +236,7 @@ impl Backend {
         self.recompute_model().await;
     }
 
-    async fn publish_diagnostics_for_uri(&self, uri: &Url) {
+    async fn publish_diagnostics_for_uri(&self, uri: &Uri) {
         let (analysis, model, settings) = {
             let state = self.state.read().await;
             let analysis = state
@@ -228,7 +244,7 @@ impl Backend {
                 .get(uri)
                 .cloned()
                 .or_else(|| state.saved_workspace.documents.get(uri).cloned());
-            (analysis, state.model.clone(), state.settings.clone())
+            (analysis, Arc::clone(&state.model), Arc::clone(&state.settings))
         };
 
         if let Some(analysis) = analysis {
@@ -240,25 +256,24 @@ impl Backend {
         }
     }
 
-    async fn clear_diagnostics(&self, uri: Url) {
+    async fn clear_diagnostics(&self, uri: Uri) {
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn snapshot_for_uri(
         &self,
-        uri: &Url,
-    ) -> Option<(DocumentAnalysis, MergedSemanticModel, ServerSettings)> {
+        uri: &Uri,
+    ) -> Option<(Arc<DocumentAnalysis>, Arc<MergedSemanticModel>, Arc<ServerSettings>)> {
         let state = self.state.read().await;
         let analysis = state
             .open_documents
             .get(uri)
             .cloned()
             .or_else(|| state.saved_workspace.documents.get(uri).cloned())?;
-        Some((analysis, state.model.clone(), state.settings.clone()))
+        Some((analysis, Arc::clone(&state.model), Arc::clone(&state.settings)))
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         self.initialize_state(&params).await;
@@ -309,6 +324,7 @@ impl LanguageServer for Backend {
                 }),
                 ..ServerCapabilities::default()
             },
+            ..Default::default()
         })
     }
 
@@ -375,12 +391,14 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             for removed in params.event.removed {
-                if let Ok(path) = removed.uri.to_file_path() {
+                if let Some(path) = removed.uri.to_file_path() {
+                    let path = path.into_owned();
                     state.workspace_folders.retain(|folder| folder != &path);
                 }
             }
             for added in params.event.added {
-                if let Ok(path) = added.uri.to_file_path() {
+                if let Some(path) = added.uri.to_file_path() {
+                    let path = path.into_owned();
                     if !state.workspace_folders.contains(&path) {
                         state.workspace_folders.push(path);
                     }
@@ -390,7 +408,7 @@ impl LanguageServer for Backend {
 
         let settings = {
             let state = self.state.read().await;
-            state.settings.clone()
+            (*state.settings).clone()
         };
         self.apply_settings(settings).await;
     }
@@ -767,9 +785,9 @@ impl LanguageServer for Backend {
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
-    ) -> Result<Option<Vec<SymbolInformation>>> {
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
         let state = self.state.read().await;
-        Ok(Some(state.model.workspace_symbol_items(&params.query)))
+        Ok(Some(state.model.workspace_symbol_items(&params.query).into()))
     }
 }
 
@@ -777,7 +795,7 @@ fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
     if let Some(folders) = &params.workspace_folders {
         let resolved = folders
             .iter()
-            .filter_map(|folder| folder.uri.to_file_path().ok())
+            .filter_map(|folder| folder.uri.to_file_path().map(|p| p.into_owned()))
             .collect::<Vec<_>>();
         if !resolved.is_empty() {
             return resolved;
@@ -787,14 +805,21 @@ fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
     params
         .root_uri
         .as_ref()
-        .and_then(|uri| uri.to_file_path().ok())
+        .and_then(|uri| uri.to_file_path().map(|p| p.into_owned()))
         .into_iter()
         .collect()
 }
 
+/// Skip files larger than this — pathological generated SurrealQL dumps would
+/// otherwise blow up parser memory at startup.
+const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+/// Hard cap on the total number of `.surql` / `.surrealql` files we ingest.
+const MAX_WORKSPACE_FILES: usize = 5000;
+
 fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
-    let mut index = WorkspaceIndex::default();
-    for folder in workspace_folders {
+    // First pass: gather candidate file paths sequentially (cheap, IO-bound).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    'outer: for folder in workspace_folders {
         for entry in WalkDir::new(folder)
             .into_iter()
             .filter_entry(|entry| should_descend(entry.path()))
@@ -808,23 +833,66 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
             ) {
                 continue;
             }
-            let Some(uri) = Url::from_file_path(path).ok() else {
+            if entry
+                .metadata()
+                .map(|meta| meta.len() > MAX_FILE_SIZE_BYTES)
+                .unwrap_or(false)
+            {
                 continue;
-            };
-            let Some(text) = fs::read_to_string(path).ok() else {
-                continue;
-            };
-            if let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) {
-                index.documents.insert(uri, analysis);
+            }
+            candidates.push(path.to_path_buf());
+            if candidates.len() >= MAX_WORKSPACE_FILES {
+                break 'outer;
             }
         }
     }
+
+    // Second pass: parse files in parallel — tree-sitter parsing is CPU-bound
+    // and trivially parallelisable per-file. We're already inside a
+    // spawn_blocking, so std::thread::scope is the cheapest way to fan out.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(2)
+        .max(1);
+    let chunk_size = candidates.len().div_ceil(worker_count).max(1);
+    let mut index = WorkspaceIndex::default();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for chunk in candidates.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            handles.push(scope.spawn(move || -> Vec<(Uri, Arc<DocumentAnalysis>)> {
+                let mut local = Vec::with_capacity(chunk.len());
+                for path in chunk {
+                    let Some(uri) = Uri::from_file_path(&path) else {
+                        continue;
+                    };
+                    let Some(text) = fs::read_to_string(&path).ok() else {
+                        continue;
+                    };
+                    if let Some(analysis) =
+                        analyze_document(uri.clone(), &text, SymbolOrigin::Local)
+                    {
+                        local.push((uri, Arc::new(analysis)));
+                    }
+                }
+                local
+            }));
+        }
+        for handle in handles {
+            if let Ok(results) = handle.join() {
+                for (uri, analysis) in results {
+                    index.documents.insert(uri, analysis);
+                }
+            }
+        }
+    });
+
     index
 }
 
 fn should_descend(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        !matches!(name, ".git" | "target" | "node_modules")
+        !matches!(name, ".git" | "target" | "node_modules" | ".idea" | ".gradle")
     } else {
         true
     }
@@ -832,11 +900,11 @@ fn should_descend(path: &Path) -> bool {
 
 fn merged_workspace(
     saved_workspace: &WorkspaceIndex,
-    open_documents: &HashMap<Url, DocumentAnalysis>,
+    open_documents: &HashMap<Uri, Arc<DocumentAnalysis>>,
 ) -> WorkspaceIndex {
     let mut workspace = saved_workspace.clone();
     for (uri, analysis) in open_documents {
-        workspace.documents.insert(uri.clone(), analysis.clone());
+        workspace.documents.insert(uri.clone(), Arc::clone(analysis));
     }
     workspace
 }

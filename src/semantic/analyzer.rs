@@ -1,5 +1,5 @@
-use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, DocumentSymbol, Location, SymbolKind, Url,
+use tower_lsp_server::ls_types::{
+    Diagnostic, DiagnosticSeverity, DocumentSymbol, Location, SymbolKind, Uri,
 };
 use tree_sitter::{Node, Parser};
 
@@ -20,7 +20,7 @@ const TRANSPARENT_NODES: &[&str] = &[
     "primary_statement",
 ];
 
-pub fn analyze_document(uri: Url, text: &str, origin: SymbolOrigin) -> Option<DocumentAnalysis> {
+pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<DocumentAnalysis> {
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
     let tree = parser.parse(text, None)?;
@@ -55,7 +55,7 @@ pub fn collect_syntax_diagnostics(source: &str, node: Node<'_>) -> Vec<Diagnosti
 fn collect_statements(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -112,7 +112,7 @@ fn collect_statements(
 fn extract_table(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -161,7 +161,7 @@ fn extract_table(
 fn extract_field(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -254,7 +254,7 @@ fn extract_field(
 fn extract_event(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -311,7 +311,7 @@ fn extract_event(
 fn extract_function(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -410,7 +410,7 @@ fn detect_function_language(
 fn extract_index(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -471,7 +471,7 @@ fn extract_index(
 fn extract_param(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -507,7 +507,7 @@ fn extract_param(
 fn extract_access(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -536,7 +536,7 @@ fn extract_access(
 fn extract_query_fact(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     action: QueryAction,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -591,7 +591,7 @@ fn extract_query_fact(
 fn infer_fields_from_statement(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     action: QueryAction,
     targets: &[String],
     touched_fields: &[String],
@@ -678,7 +678,7 @@ fn inferred_field(
     table: &str,
     field: &str,
     type_expr: Option<TypeExpr>,
-    uri: &Url,
+    uri: &Uri,
     source: &str,
     node: Node<'_>,
     action: QueryAction,
@@ -706,7 +706,7 @@ fn inferred_field(
 fn collect_function_references(
     node: Node<'_>,
     source: &str,
-    uri: &Url,
+    uri: &Uri,
     analysis: &mut DocumentAnalysis,
 ) {
     for reference in descendants_of_kind(node, "custom_function_name") {
@@ -736,7 +736,7 @@ fn collect_called_functions(node: Node<'_>, source: &str) -> Vec<String> {
 
 fn infer_record_types_from_table(
     _table: &TableDef,
-    _uri: &Url,
+    _uri: &Uri,
     _source: &str,
     _node: Node<'_>,
 ) -> Vec<TableDef> {
@@ -776,7 +776,7 @@ fn parse_permission_rule(
     node: Node<'_>,
     source: &str,
     origin: SymbolOrigin,
-    uri: &Url,
+    uri: &Uri,
 ) -> PermissionRule {
     let children = direct_named_children(node);
     let mut actions = Vec::new();
@@ -991,7 +991,7 @@ fn definition_symbol(name: &str, kind: SymbolKind, source: &str, node: Node<'_>)
     }
 }
 
-fn statement_symbol(node: Node<'_>, source: &str, uri: &Url) -> Option<DocumentSymbol> {
+fn statement_symbol(node: Node<'_>, source: &str, uri: &Uri) -> Option<DocumentSymbol> {
     let preview = node
         .utf8_text(source.as_bytes())
         .ok()
@@ -1004,7 +1004,7 @@ fn statement_symbol(node: Node<'_>, source: &str, uri: &Url) -> Option<DocumentS
 fn upsert_inferred_table(
     analysis: &mut DocumentAnalysis,
     inferred: TableDef,
-    source_uri: &Url,
+    source_uri: &Uri,
     source: &str,
     source_node: Node<'_>,
 ) {
@@ -1038,7 +1038,7 @@ fn upsert_inferred_table(
     analysis.tables.push(inferred);
 }
 
-fn location(uri: &Url, source: &str, node: Node<'_>) -> Location {
+fn location(uri: &Uri, source: &str, node: Node<'_>) -> Location {
     Location::new(
         uri.clone(),
         byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
@@ -1149,7 +1149,9 @@ fn action_label(action: QueryAction) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::Url;
+    use std::str::FromStr;
+
+    use tower_lsp_server::ls_types::Uri;
 
     use crate::semantic::types::SymbolOrigin;
 
@@ -1157,7 +1159,7 @@ mod tests {
 
     #[test]
     fn indexes_define_statements_and_queries() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let text = r#"
         -- Person records
         DEFINE TABLE person SCHEMAFULL PERMISSIONS FOR select WHERE $auth.roles CONTAINS 'viewer';
@@ -1184,7 +1186,7 @@ mod tests {
 
     #[test]
     fn accepts_define_field_block_default_and_assert() {
-        let uri = Url::parse("file:///workspace/calendar.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/calendar.surql").expect("valid uri");
         let text = r#"
         DEFINE FIELD OVERWRITE organization ON calendar
             TYPE option<record<organization>>
@@ -1217,7 +1219,7 @@ mod tests {
 
     #[test]
     fn extracts_indexes_events_and_table_permissions() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let text = r#"
         DEFINE TABLE person PERMISSIONS FOR select FULL, create WHERE $auth.roles CONTAINS 'admin';
         DEFINE EVENT audit_person ON TABLE person WHEN $before != $after THEN (CREATE event CONTENT { table: 'person' });
@@ -1239,7 +1241,7 @@ mod tests {
 
     #[test]
     fn accepts_hnsw_index_variants() {
-        let uri = Url::parse("file:///workspace/vector.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/vector.surql").expect("valid uri");
         let text = r#"
         DEFINE INDEX embeddings_hnsw ON TABLE embedding FIELDS vector HNSW DIMENSION 1536 DIST COSINE EFC 200 M 16;
         "#;
