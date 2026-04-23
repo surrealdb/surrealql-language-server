@@ -70,6 +70,64 @@ impl MergedSemanticModel {
         tables
     }
 
+    /// Returns *only* column (field) completion items for the given target
+    /// tables. Use when the cursor is positioned in a slot that syntactically
+    /// only accepts a column name (e.g. between `SELECT` and `FROM`, after
+    /// `UPDATE tbl SET `, or after a `tbl.` qualifier).
+    ///
+    /// Mirrors the field branch of [`Self::completion_items`] but emits no
+    /// keywords / functions / params / namespaces.
+    pub fn column_completion_items(
+        &self,
+        prefix: &str,
+        tables: &[String],
+        multi_table_context: bool,
+        _active_context: Option<&AuthContext>,
+    ) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        for table_name in tables {
+            for field in self.fields_for_table(table_name) {
+                let qualified_label = format!("{}.{}", field.table, field.name);
+                let matches_prefix = prefix.is_empty()
+                    || field.name.starts_with(prefix)
+                    || (multi_table_context && qualified_label.starts_with(prefix));
+                if !matches_prefix {
+                    continue;
+                }
+
+                let label = if multi_table_context {
+                    qualified_label.clone()
+                } else {
+                    field.name.clone()
+                };
+                let insert_text = if multi_table_context {
+                    qualified_label
+                } else {
+                    field.name.clone()
+                };
+                let mut detail = vec![format!("table: {}", field.table)];
+                if let Some(type_expr) = &field.type_expr {
+                    detail.push(format!("type: {type_expr}"));
+                }
+                detail.push(format!("source: {}", origin_label(field.origin)));
+
+                items.push(CompletionItem {
+                    label,
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(detail.join(" | ")),
+                    insert_text: Some(insert_text),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format_field_hover(field),
+                    })),
+                    sort_text: Some(format!("0-fld-{}-{}", field.table, field.name)),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+        items
+    }
+
     /// Returns *only* table-name completion items (no keywords, functions,
     /// fields, params, etc). Use when the cursor is positioned in a slot
     /// that syntactically only accepts a table name (e.g. right after
@@ -386,12 +444,11 @@ impl MergedSemanticModel {
                             kind: MarkupKind::Markdown,
                             value: format_field_hover(field),
                         })),
-                        sort_text: Some(format!(
-                            "0f-{}-{}-{}",
-                            symbol_priority(field.origin),
-                            field.table,
-                            field.name
-                        )),
+                        // `0-fld-...` sorts above `1-` user functions, `2-`
+                        // builtin functions, and unsorted keywords so that
+                        // in loose contexts (WHERE / ORDER BY / GROUP BY)
+                        // the relevant column names surface first.
+                        sort_text: Some(format!("0-fld-{}-{}", field.table, field.name)),
                         ..CompletionItem::default()
                     });
                 }
@@ -1302,7 +1359,7 @@ fn action_label(action: QueryAction) -> &'static str {
     }
 }
 
-fn field_completion_tables(
+pub(crate) fn field_completion_tables(
     statement_fact: Option<&QueryFact>,
     qualifier: Option<&str>,
 ) -> Vec<String> {
@@ -1784,6 +1841,148 @@ mod tests {
                     .unwrap_or_default()
                     .contains("table: person")
         }));
+    }
+
+    #[test]
+    fn column_completion_items_returns_only_fields() {
+        use tower_lsp::lsp_types::CompletionItemKind;
+
+        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let mut model = MergedSemanticModel::default();
+        // Tables and functions should NOT leak into the column-only output.
+        model.tables.insert(
+            "person".to_string(),
+            TableDef {
+                name: "person".to_string(),
+                schema_mode: Some("schemafull".to_string()),
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+            },
+        );
+        model.functions.insert(
+            "fn::greet".to_string(),
+            FunctionDef {
+                name: "fn::greet".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                language: crate::semantic::types::FunctionLanguage::SurrealQL,
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+                selection_range: Range::default(),
+                body_range: None,
+                called_functions: Vec::new(),
+            },
+        );
+        for field_name in ["email", "name"] {
+            model.fields.insert(
+                ("person".to_string(), field_name.to_string()),
+                crate::semantic::types::FieldDef {
+                    table: "person".to_string(),
+                    name: field_name.to_string(),
+                    type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                        "string".to_string(),
+                    )),
+                    comment: None,
+                    permissions: Vec::new(),
+                    origin: SymbolOrigin::Local,
+                    explicit: true,
+                    inference: None,
+                    location: Location::new(uri.clone(), Range::default()),
+                },
+            );
+        }
+
+        let items =
+            model.column_completion_items("", &["person".to_string()], false, None);
+        assert_eq!(items.len(), 2, "expected exactly the two fields");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind == Some(CompletionItemKind::FIELD)),
+            "all items must be FIELD; got {:?}",
+            items.iter().map(|i| (i.label.clone(), i.kind)).collect::<Vec<_>>()
+        );
+        let labels: Vec<_> = items.iter().map(|item| item.label.clone()).collect();
+        assert!(labels.contains(&"email".to_string()));
+        assert!(labels.contains(&"name".to_string()));
+        // No table / function leakage.
+        assert!(!labels.iter().any(|l| l == "person" || l == "fn::greet"));
+    }
+
+    #[test]
+    fn field_sort_text_puts_fields_above_functions_in_loose_mode() {
+        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let mut model = MergedSemanticModel::default();
+        model.fields.insert(
+            ("person".to_string(), "email".to_string()),
+            crate::semantic::types::FieldDef {
+                table: "person".to_string(),
+                name: "email".to_string(),
+                type_expr: None,
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+            },
+        );
+        model.functions.insert(
+            "fn::greet".to_string(),
+            FunctionDef {
+                name: "fn::greet".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                language: crate::semantic::types::FunctionLanguage::SurrealQL,
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri, Range::default()),
+                selection_range: Range::default(),
+                body_range: None,
+                called_functions: Vec::new(),
+            },
+        );
+
+        let statement_fact = crate::semantic::types::QueryFact {
+            action: QueryAction::Select,
+            target_tables: vec!["person".to_string()],
+            touched_fields: Vec::new(),
+            dynamic: false,
+            location: Location::new(
+                Url::parse("file:///workspace/schema.surql").expect("valid uri"),
+                Range::default(),
+            ),
+            source_preview: "SELECT email FROM person".to_string(),
+        };
+        let items = model.completion_items("", false, None, Some(&statement_fact), None);
+
+        let field_sort = items
+            .iter()
+            .find(|item| item.label == "email")
+            .and_then(|item| item.sort_text.clone())
+            .expect("field item must have sort_text");
+        let function_sort = items
+            .iter()
+            .find(|item| item.label == "fn::greet")
+            .and_then(|item| item.sort_text.clone())
+            .expect("function item must have sort_text");
+        assert!(
+            field_sort < function_sort,
+            "field sort_text `{field_sort}` must sort before function sort_text `{function_sort}`"
+        );
+        assert!(field_sort.starts_with("0-fld-"));
+        assert!(function_sort.starts_with("1-"));
     }
 
     #[test]

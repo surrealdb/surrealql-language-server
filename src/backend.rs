@@ -13,7 +13,7 @@ use crate::config::ServerSettings;
 use crate::grammar::{BuiltinFunction, builtin_function};
 use crate::providers::surrealdb::SurrealDbProvider;
 use crate::semantic::analyzer::analyze_document;
-use crate::semantic::model::is_record_type_context;
+use crate::semantic::model::{field_completion_tables, is_record_type_context};
 use crate::semantic::text::{token_at, token_prefix, word_range};
 use crate::semantic::types::{
     DocumentAnalysis, LiveMetadataSnapshot, MergedSemanticModel, QueryFact, SymbolOrigin,
@@ -421,8 +421,50 @@ impl LanguageServer for Backend {
 
         let statement_fact = active_query_fact(&analysis, position);
         let qualifier = completion_table_qualifier(&analysis.text, position);
+        let trimmed_prefix = prefix.trim_matches(|ch: char| ch == ':');
+
+        // Decide whether the cursor is in a column-name slot. A `tbl.`
+        // qualifier is always treated as a strict slot (the only legal
+        // continuations are field names of `tbl`).
+        let column_slot = if qualifier.is_some() {
+            Some(ColumnSlot::Strict { allow_star: false })
+        } else if record_type_context {
+            None
+        } else {
+            column_completion_context(&analysis.text, position)
+        };
+
+        if let Some(ColumnSlot::Strict { allow_star }) = column_slot {
+            let field_tables = field_completion_tables(statement_fact, qualifier.as_deref());
+            if !field_tables.is_empty() {
+                let multi_table_context = qualifier.is_none() && field_tables.len() > 1;
+                let mut items = model.column_completion_items(
+                    trimmed_prefix,
+                    &field_tables,
+                    multi_table_context,
+                    settings.active_auth_context(),
+                );
+                if allow_star && (trimmed_prefix.is_empty() || "*".starts_with(trimmed_prefix)) {
+                    items.insert(
+                        0,
+                        CompletionItem {
+                            label: "*".to_string(),
+                            kind: Some(CompletionItemKind::OPERATOR),
+                            detail: Some("All columns".to_string()),
+                            insert_text: Some("*".to_string()),
+                            sort_text: Some("0-aaa-star".to_string()),
+                            ..CompletionItem::default()
+                        },
+                    );
+                }
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+            // No identifiable target table — fall through to the generic
+            // completion below so the dropdown isn't empty.
+        }
+
         let items = model.completion_items(
-            prefix.trim_matches(|ch: char| ch == ':'),
+            trimmed_prefix,
             record_type_context,
             settings.active_auth_context(),
             statement_fact,
@@ -870,6 +912,94 @@ fn is_table_name_context(source: &str, position: Position) -> bool {
 
 fn is_table_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '`'
+}
+
+/// Classification of a column-name slot near the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnSlot {
+    /// The cursor is in a position that *only* accepts column names —
+    /// `SELECT ... |, FROM tbl`, `UPDATE tbl SET |`, or after a `tbl.`
+    /// qualifier. Suggestions should be column-only. The contained flag
+    /// is true when emitting a leading `*` is appropriate (SELECT only).
+    Strict { allow_star: bool },
+    /// The cursor is in an expression position where columns are useful
+    /// but other things (functions, $vars, literals) are also legal —
+    /// `WHERE | / AND | / OR |`, `ORDER BY |`, `GROUP BY |`. Columns
+    /// should be surfaced at the top of the dropdown but the rest of the
+    /// generic completions should still appear.
+    Loose,
+}
+
+/// Returns the column-completion classification for the cursor. Returns
+/// `None` when the cursor is not in any column-name slot we recognise.
+///
+/// Strategy: walk backwards from the cursor over the partial identifier,
+/// then over any `<ident> <ws>* (= <expr>)? <ws>* ,` runs (so multi-column
+/// SELECT/SET lists still detect the leading `SELECT`/`SET`), and then
+/// inspect the previous keyword token.
+///
+/// The algorithm intentionally avoids a full SurrealQL parse — it covers
+/// the common, syntactically-unambiguous cases listed below and degrades
+/// to `None` for anything unfamiliar (sub-queries, parenthesised
+/// expressions, ON clauses, etc.).
+fn column_completion_context(source: &str, position: Position) -> Option<ColumnSlot> {
+    let offset = crate::semantic::text::position_to_offset(source, position);
+    let before = source.get(..offset)?;
+    let chars: Vec<char> = before.chars().collect();
+    let mut i = chars.len();
+
+    // Strip the partial identifier currently being typed at the cursor.
+    while i > 0 && is_table_ident_char(chars[i - 1]) {
+        i -= 1;
+    }
+    // Walk backwards over repeated `<ws>* (= ... ,)? <ws>* <ident-or-expr>`
+    // segments so that:
+    //   `SELECT a, b, |`            still resolves to SELECT
+    //   `UPDATE t SET a = 1, b = 2, |`  still resolves to SET
+    // For SET we can't safely parse the RHS expression — instead we just
+    // skip backwards across non-comma chars until we hit a comma or the
+    // closest column-context keyword.
+    loop {
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || chars[i - 1] != ',' {
+            break;
+        }
+        i -= 1;
+        // Skip the segment between the previous comma and this comma:
+        // walk back over identifier characters, '=' assignment, simple
+        // value tokens, and whitespace until we hit either a comma or a
+        // keyword boundary. Stop at quotes / parens / braces to stay safe.
+        while i > 0 {
+            let c = chars[i - 1];
+            if c == ',' {
+                break;
+            }
+            if matches!(c, '\'' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | ';') {
+                return None;
+            }
+            i -= 1;
+        }
+    }
+    // Skip whitespace, then read the previous identifier token.
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    let keyword_end = i;
+    while i > 0 && is_table_ident_char(chars[i - 1]) {
+        i -= 1;
+    }
+    if i == keyword_end {
+        return None;
+    }
+    let keyword: String = chars[i..keyword_end].iter().collect::<String>().to_ascii_uppercase();
+    match keyword.as_str() {
+        "SELECT" => Some(ColumnSlot::Strict { allow_star: true }),
+        "SET" => Some(ColumnSlot::Strict { allow_star: false }),
+        "WHERE" | "AND" | "OR" | "BY" => Some(ColumnSlot::Loose),
+        _ => None,
+    }
 }
 
 fn completion_prefix(source: &str, position: Position, record_type_context: bool) -> String {
