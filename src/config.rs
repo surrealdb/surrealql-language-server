@@ -58,7 +58,10 @@ impl MetadataSettings {
 
     /// Returns true when the language server should fetch schema from a remote SurrealDB.
     pub fn db_enabled(&self) -> bool {
-        matches!(self.mode.as_str(), "both" | "workspace+db" | "db" | "remote")
+        matches!(
+            self.mode.as_str(),
+            "both" | "workspace+db" | "db" | "remote"
+        )
     }
 }
 

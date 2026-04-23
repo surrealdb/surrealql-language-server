@@ -24,9 +24,6 @@ cc = '1.2.56'
 [dev-dependencies]
 pretty_assertions = '1.4.1'
 
-# Aggressively optimise the release binary: smaller download for the JetBrains
-# plugin and slightly faster startup. `panic = "abort"` removes the unwinding
-# tables; `lto` + `codegen-units = 1` enable cross-crate inlining.
 [profile.release]
 lto = 'fat'
 codegen-units = 1

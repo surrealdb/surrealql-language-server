@@ -115,10 +115,7 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
 /// `http[s]://host:port/sql` URL that SurrealDB exposes for raw SQL requests.
 fn sql_endpoint_url(endpoint: &str) -> Result<String, String> {
     let trimmed = endpoint.trim().trim_end_matches('/');
-    let (scheme_idx, path_idx) = trimmed
-        .find("://")
-        .map(|i| (i, i + 3))
-        .unwrap_or((0, 0));
+    let (scheme_idx, path_idx) = trimmed.find("://").map(|i| (i, i + 3)).unwrap_or((0, 0));
 
     let scheme = if path_idx == 0 {
         "http"

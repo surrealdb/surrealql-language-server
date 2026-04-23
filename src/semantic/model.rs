@@ -1472,7 +1472,9 @@ mod tests {
             document_symbols: Vec::new(),
         };
         let mut workspace = WorkspaceIndex::default();
-        workspace.documents.insert(analysis.uri.clone(), Arc::new(analysis));
+        workspace
+            .documents
+            .insert(analysis.uri.clone(), Arc::new(analysis));
         let model = MergedSemanticModel::build(&workspace, &Default::default());
         assert_eq!(model.tables["person"].schema_mode, explicit.schema_mode);
     }
@@ -1738,7 +1740,9 @@ mod tests {
             document_symbols: Vec::new(),
         };
         let mut workspace = WorkspaceIndex::default();
-        workspace.documents.insert(analysis.uri.clone(), Arc::new(analysis));
+        workspace
+            .documents
+            .insert(analysis.uri.clone(), Arc::new(analysis));
         let model = MergedSemanticModel::build(&workspace, &Default::default());
         let hover = model
             .hover_markdown_for_token("person", None)
@@ -1907,15 +1911,17 @@ mod tests {
             );
         }
 
-        let items =
-            model.column_completion_items("", &["person".to_string()], false, None);
+        let items = model.column_completion_items("", &["person".to_string()], false, None);
         assert_eq!(items.len(), 2, "expected exactly the two fields");
         assert!(
             items
                 .iter()
                 .all(|item| item.kind == Some(CompletionItemKind::FIELD)),
             "all items must be FIELD; got {:?}",
-            items.iter().map(|i| (i.label.clone(), i.kind)).collect::<Vec<_>>()
+            items
+                .iter()
+                .map(|i| (i.label.clone(), i.kind))
+                .collect::<Vec<_>>()
         );
         let labels: Vec<_> = items.iter().map(|item| item.label.clone()).collect();
         assert!(labels.contains(&"email".to_string()));

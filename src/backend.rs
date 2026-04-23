@@ -250,7 +250,11 @@ impl Backend {
                 .get(uri)
                 .cloned()
                 .or_else(|| state.saved_workspace.documents.get(uri).cloned());
-            (analysis, Arc::clone(&state.model), Arc::clone(&state.settings))
+            (
+                analysis,
+                Arc::clone(&state.model),
+                Arc::clone(&state.settings),
+            )
         };
 
         if let Some(analysis) = analysis {
@@ -269,14 +273,22 @@ impl Backend {
     async fn snapshot_for_uri(
         &self,
         uri: &Uri,
-    ) -> Option<(Arc<DocumentAnalysis>, Arc<MergedSemanticModel>, Arc<ServerSettings>)> {
+    ) -> Option<(
+        Arc<DocumentAnalysis>,
+        Arc<MergedSemanticModel>,
+        Arc<ServerSettings>,
+    )> {
         let state = self.state.read().await;
         let analysis = state
             .open_documents
             .get(uri)
             .cloned()
             .or_else(|| state.saved_workspace.documents.get(uri).cloned())?;
-        Some((analysis, Arc::clone(&state.model), Arc::clone(&state.settings)))
+        Some((
+            analysis,
+            Arc::clone(&state.model),
+            Arc::clone(&state.settings),
+        ))
     }
 }
 
@@ -793,7 +805,9 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         let state = self.state.read().await;
-        Ok(Some(state.model.workspace_symbol_items(&params.query).into()))
+        Ok(Some(
+            state.model.workspace_symbol_items(&params.query).into(),
+        ))
     }
 }
 
@@ -898,7 +912,10 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
 
 fn should_descend(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        !matches!(name, ".git" | "target" | "node_modules" | ".idea" | ".gradle")
+        !matches!(
+            name,
+            ".git" | "target" | "node_modules" | ".idea" | ".gradle"
+        )
     } else {
         true
     }
@@ -910,7 +927,9 @@ fn merged_workspace(
 ) -> WorkspaceIndex {
     let mut workspace = saved_workspace.clone();
     for (uri, analysis) in open_documents {
-        workspace.documents.insert(uri.clone(), Arc::clone(analysis));
+        workspace
+            .documents
+            .insert(uri.clone(), Arc::clone(analysis));
     }
     workspace
 }
@@ -1067,7 +1086,10 @@ fn column_completion_context(source: &str, position: Position) -> Option<ColumnS
     if i == keyword_end {
         return None;
     }
-    let keyword: String = chars[i..keyword_end].iter().collect::<String>().to_ascii_uppercase();
+    let keyword: String = chars[i..keyword_end]
+        .iter()
+        .collect::<String>()
+        .to_ascii_uppercase();
     match keyword.as_str() {
         "SELECT" => Some(ColumnSlot::Strict { allow_star: true }),
         "SET" => Some(ColumnSlot::Strict { allow_star: false }),

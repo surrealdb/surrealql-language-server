@@ -12,7 +12,9 @@ use surrealql_language_server::semantic::types::{
 };
 
 fn uri(path: &str) -> Uri {
-    format!("file:///workspace/{path}").parse().expect("valid uri")
+    format!("file:///workspace/{path}")
+        .parse()
+        .expect("valid uri")
 }
 
 fn empty_range() -> Range {
