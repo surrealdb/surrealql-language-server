@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tower_lsp::lsp_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Url};
+use tower_lsp_server::ls_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Uri};
 
 use crate::semantic::type_expr::TypeExpr;
 
@@ -167,7 +168,7 @@ pub struct SymbolReference {
 
 #[derive(Debug, Clone)]
 pub struct DocumentAnalysis {
-    pub uri: Url,
+    pub uri: Uri,
     pub text: String,
     pub tables: Vec<TableDef>,
     pub events: Vec<EventDef>,
@@ -182,14 +183,17 @@ pub struct DocumentAnalysis {
     pub document_symbols: Vec<DocumentSymbol>,
 }
 
+/// Documents are shared via [`Arc`] so that cloning a [`WorkspaceIndex`]
+/// across the background task / read-snapshot boundary is O(documents) pointer
+/// copies instead of O(total source bytes) string clones.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceIndex {
-    pub documents: HashMap<Url, DocumentAnalysis>,
+    pub documents: HashMap<Uri, Arc<DocumentAnalysis>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LiveMetadataSnapshot {
-    pub documents: HashMap<Url, DocumentAnalysis>,
+    pub documents: HashMap<Uri, Arc<DocumentAnalysis>>,
     pub errors: Vec<String>,
 }
 
@@ -205,5 +209,5 @@ pub struct MergedSemanticModel {
     pub function_references: HashMap<String, Vec<Location>>,
     pub function_callers: HashMap<String, Vec<String>>,
     pub workspace_symbols: Vec<DocumentSymbol>,
-    pub query_facts: HashMap<Url, Vec<QueryFact>>,
+    pub query_facts: HashMap<Uri, Vec<QueryFact>>,
 }

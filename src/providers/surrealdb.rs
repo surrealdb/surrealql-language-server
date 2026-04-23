@@ -1,26 +1,45 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde_json::Value as JsonValue;
 use surrealdb::engine::any::connect;
 use surrealdb::opt::auth::{Database, Root};
 use surrealdb::types::Value as SurrealValue;
-use tower_lsp::lsp_types::Url;
+use tokio::time::timeout;
+use tower_lsp_server::ls_types::Uri;
 
 use crate::config::ServerSettings;
 use crate::semantic::analyzer::analyze_document;
 use crate::semantic::types::{LiveMetadataSnapshot, SymbolOrigin};
 
+/// Hard ceiling on the total INFO-FOR-DB + INFO-FOR-TABLE walk so that a
+/// degenerate database (thousands of tables) or an unreachable endpoint still
+/// can't pin the cold-start task forever.
+const TOTAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct SurrealDbProvider;
 
 impl SurrealDbProvider {
     pub async fn fetch_snapshot(settings: &ServerSettings) -> LiveMetadataSnapshot {
-        if !settings.metadata.enable_live_metadata || !settings.connection.is_configured() {
+        if !settings.metadata.enable_live_metadata
+            || !settings.metadata.db_enabled()
+            || !settings.connection.is_configured()
+        {
             return LiveMetadataSnapshot::default();
         }
 
-        match fetch_snapshot_inner(settings).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => LiveMetadataSnapshot {
+        match timeout(TOTAL_FETCH_TIMEOUT, fetch_snapshot_inner(settings)).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => LiveMetadataSnapshot {
                 documents: Default::default(),
                 errors: vec![error],
+            },
+            Err(_) => LiveMetadataSnapshot {
+                documents: Default::default(),
+                errors: vec![format!(
+                    "SurrealDB metadata fetch exceeded {}s timeout",
+                    TOTAL_FETCH_TIMEOUT.as_secs()
+                )],
             },
         }
     }
@@ -32,6 +51,7 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
         .endpoint
         .clone()
         .ok_or_else(|| "missing SurrealDB endpoint".to_string())?;
+
     let db = connect(endpoint)
         .await
         .map_err(|error| format!("failed to connect to SurrealDB: {error}"))?;
@@ -117,10 +137,11 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
     }
 
     for (index, define) in define_strings.into_iter().enumerate() {
-        let uri = Url::parse(&format!("surrealdb:///metadata/{}.surql", index))
+        let uri = format!("surrealdb:///metadata/{}.surql", index)
+            .parse::<Uri>()
             .map_err(|error| format!("failed to build metadata uri: {error}"))?;
         if let Some(analysis) = analyze_document(uri.clone(), &define, SymbolOrigin::Remote) {
-            snapshot.documents.insert(uri, analysis);
+            snapshot.documents.insert(uri, Arc::new(analysis));
         }
     }
 

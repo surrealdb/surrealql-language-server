@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer};
 use walkdir::WalkDir;
 
 use crate::config::ServerSettings;
 use crate::grammar::{BuiltinFunction, builtin_function};
 use crate::providers::surrealdb::SurrealDbProvider;
 use crate::semantic::analyzer::analyze_document;
-use crate::semantic::model::is_record_type_context;
+use crate::semantic::model::{field_completion_tables, is_record_type_context};
 use crate::semantic::text::{token_at, token_prefix, word_range};
 use crate::semantic::types::{
     DocumentAnalysis, LiveMetadataSnapshot, MergedSemanticModel, QueryFact, SymbolOrigin,
@@ -22,40 +23,57 @@ use crate::semantic::types::{
 #[derive(Debug)]
 pub struct Backend {
     client: Client,
-    state: RwLock<BackendState>,
+    state: Arc<RwLock<BackendState>>,
 }
 
+/// All shared state lives behind [`Arc`]: cloning a snapshot for an LSP
+/// request handler is now a handful of pointer-bumps instead of a deep clone
+/// of the entire workspace model (which previously copied every table /
+/// field / function definition for every hover / completion).
 #[derive(Debug, Default)]
 struct BackendState {
-    settings: ServerSettings,
+    settings: Arc<ServerSettings>,
     workspace_folders: Vec<PathBuf>,
-    saved_workspace: WorkspaceIndex,
-    open_documents: HashMap<Url, DocumentAnalysis>,
-    live_metadata: LiveMetadataSnapshot,
-    model: MergedSemanticModel,
+    saved_workspace: Arc<WorkspaceIndex>,
+    open_documents: HashMap<Uri, Arc<DocumentAnalysis>>,
+    live_metadata: Arc<LiveMetadataSnapshot>,
+    model: Arc<MergedSemanticModel>,
+    /// Fingerprint of the last successful workspace walk. When the new
+    /// fingerprint matches, `apply_settings` skips the walk entirely — this
+    /// is the common path for `didChangeConfiguration` events that don't
+    /// touch the folder set.
+    last_walked: Option<Vec<PathBuf>>,
+}
+
+fn workspace_signature(folders: &[PathBuf]) -> Vec<PathBuf> {
+    let mut signature = folders.to_vec();
+    signature.sort();
+    signature
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            state: RwLock::new(BackendState::default()),
+            state: Arc::new(RwLock::new(BackendState::default())),
         }
     }
 
     async fn initialize_state(&self, params: &InitializeParams) {
-        let settings = ServerSettings::from_sources(params.initialization_options.as_ref(), None);
+        // Stash settings + workspace folders synchronously so subsequent requests
+        // see the configured connection / folders straight away. The heavy
+        // workspace walk + SurrealDB fetch is deferred to `initialized →
+        // apply_settings`, where it runs exactly once with the
+        // client-supplied configuration merged in.
+        let settings = Arc::new(ServerSettings::from_sources(
+            params.initialization_options.as_ref(),
+            None,
+        ));
         let workspace_folders = resolve_workspace_folders(params);
-        let saved_workspace = load_workspace_documents(&workspace_folders);
-        let live_metadata = SurrealDbProvider::fetch_snapshot(&settings).await;
-        let model = MergedSemanticModel::build(&saved_workspace, &live_metadata);
 
         let mut state = self.state.write().await;
         state.settings = settings;
         state.workspace_folders = workspace_folders;
-        state.saved_workspace = saved_workspace;
-        state.live_metadata = live_metadata;
-        state.model = model;
     }
 
     async fn reload_from_client_configuration(&self) {
@@ -71,53 +89,118 @@ impl Backend {
 
         let current_settings = {
             let state = self.state.read().await;
-            state.settings.clone()
+            (*state.settings).clone()
         };
         let settings = ServerSettings::from_sources(None, configuration.as_ref())
             .merge_with_env_if_missing(current_settings);
-
         self.apply_settings(settings).await;
     }
 
     async fn apply_settings(&self, settings: ServerSettings) {
-        let workspace_folders = {
-            let state = self.state.read().await;
-            state.workspace_folders.clone()
-        };
-        let saved_workspace = load_workspace_documents(&workspace_folders);
-        let live_metadata = SurrealDbProvider::fetch_snapshot(&settings).await;
-        let open_documents = {
-            let state = self.state.read().await;
-            state.open_documents.clone()
-        };
-        let workspace = merged_workspace(&saved_workspace, &open_documents);
-        let model = MergedSemanticModel::build(&workspace, &live_metadata);
-
-        {
+        // Persist settings synchronously so subsequent requests see them immediately.
+        let (workspace_folders, last_walked) = {
             let mut state = self.state.write().await;
-            state.settings = settings;
-            state.saved_workspace = saved_workspace;
-            state.live_metadata = live_metadata;
-            state.model = model;
-        }
+            state.settings = Arc::new(settings.clone());
+            (state.workspace_folders.clone(), state.last_walked.clone())
+        };
 
-        self.publish_open_document_diagnostics().await;
+        // Defer the heavy `load_workspace_documents` walk and the SurrealDB
+        // metadata fetch to a background task so notification handlers
+        // (initialized, didChangeConfiguration, didChangeWorkspaceFolders)
+        // return immediately. Otherwise tower-lsp serialises subsequent
+        // requests behind the blocking walk and LSP4IJ kills the server.
+        let state = Arc::clone(&self.state);
+        let client = self.client.clone();
+        let folders = workspace_folders;
+        let settings_for_bg = settings;
+        tokio::spawn(async move {
+            // Skip the walk entirely if every workspace folder is unchanged
+            // since the last successful walk — this is the common case for
+            // `didChangeConfiguration` and avoids redundant tree-sitter
+            // parsing of every .surql file in large repos.
+            let folder_signature = workspace_signature(&folders);
+            let need_walk = last_walked
+                .as_ref()
+                .map(|previous| previous != &folder_signature)
+                .unwrap_or(true);
+
+            let saved_workspace = if settings_for_bg.metadata.filesystem_enabled() {
+                if need_walk {
+                    let folders_for_walk = folders.clone();
+                    let walked = tokio::task::spawn_blocking(move || {
+                        load_workspace_documents(&folders_for_walk)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    Arc::new(walked)
+                } else {
+                    let s = state.read().await;
+                    Arc::clone(&s.saved_workspace)
+                }
+            } else {
+                // Filesystem inference is disabled. Clear the walk cache so that
+                // re-enabling it later will trigger a fresh walk.
+                state.write().await.last_walked = None;
+                Arc::new(WorkspaceIndex::default())
+            };
+
+            let live_metadata = Arc::new(SurrealDbProvider::fetch_snapshot(&settings_for_bg).await);
+            let open_documents = {
+                let s = state.read().await;
+                s.open_documents.clone()
+            };
+            let workspace = merged_workspace(&saved_workspace, &open_documents);
+            let model = Arc::new(MergedSemanticModel::build(&workspace, &live_metadata));
+
+            let (uris, model_for_diag, settings_for_diag, open_for_diag, saved_for_diag) = {
+                let mut s = state.write().await;
+                s.saved_workspace = Arc::clone(&saved_workspace);
+                s.live_metadata = Arc::clone(&live_metadata);
+                s.model = Arc::clone(&model);
+                if need_walk {
+                    s.last_walked = Some(folder_signature);
+                }
+                (
+                    s.open_documents.keys().cloned().collect::<Vec<_>>(),
+                    Arc::clone(&s.model),
+                    Arc::clone(&s.settings),
+                    s.open_documents.clone(),
+                    Arc::clone(&s.saved_workspace),
+                )
+            };
+
+            // Inline the equivalent of publish_open_document_diagnostics
+            // (we don't have `&self` here, but `client` + `state` snapshots
+            // are sufficient).
+            for uri in uris {
+                let analysis = open_for_diag
+                    .get(&uri)
+                    .cloned()
+                    .or_else(|| saved_for_diag.documents.get(&uri).cloned());
+                if let Some(analysis) = analysis {
+                    let mut diagnostics = analysis.syntax_diagnostics.clone();
+                    diagnostics
+                        .extend(model_for_diag.semantic_diagnostics(&analysis, &settings_for_diag));
+                    client.publish_diagnostics(uri, diagnostics, None).await;
+                }
+            }
+        });
     }
 
-    async fn upsert_open_document(&self, uri: Url, text: String) {
+    async fn upsert_open_document(&self, uri: Uri, text: String) {
         let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) else {
             return;
         };
         {
             let mut state = self.state.write().await;
-            state.open_documents.insert(uri.clone(), analysis);
+            state.open_documents.insert(uri.clone(), Arc::new(analysis));
         }
         self.recompute_model().await;
         self.publish_diagnostics_for_uri(&uri).await;
     }
 
-    async fn sync_saved_document_from_disk(&self, uri: &Url) {
-        let Some(path) = uri.to_file_path().ok() else {
+    async fn sync_saved_document_from_disk(&self, uri: &Uri) {
+        let Some(path) = uri.to_file_path() else {
             return;
         };
         let Some(text) = fs::read_to_string(path).ok() else {
@@ -127,10 +210,9 @@ impl Backend {
             return;
         };
         let mut state = self.state.write().await;
-        state
-            .saved_workspace
-            .documents
-            .insert(uri.clone(), analysis);
+        let mut workspace = (*state.saved_workspace).clone();
+        workspace.documents.insert(uri.clone(), Arc::new(analysis));
+        state.saved_workspace = Arc::new(workspace);
     }
 
     async fn recompute_model(&self) {
@@ -138,11 +220,11 @@ impl Backend {
             let state = self.state.read().await;
             (
                 merged_workspace(&state.saved_workspace, &state.open_documents),
-                state.live_metadata.clone(),
+                Arc::clone(&state.live_metadata),
             )
         };
 
-        let model = MergedSemanticModel::build(&workspace, &live_metadata);
+        let model = Arc::new(MergedSemanticModel::build(&workspace, &live_metadata));
         let mut state = self.state.write().await;
         state.model = model;
     }
@@ -150,9 +232,9 @@ impl Backend {
     async fn refresh_remote_metadata_if_needed(&self) {
         let settings = {
             let state = self.state.read().await;
-            state.settings.clone()
+            Arc::clone(&state.settings)
         };
-        let live_metadata = SurrealDbProvider::fetch_snapshot(&settings).await;
+        let live_metadata = Arc::new(SurrealDbProvider::fetch_snapshot(&settings).await);
         {
             let mut state = self.state.write().await;
             state.live_metadata = live_metadata;
@@ -160,7 +242,7 @@ impl Backend {
         self.recompute_model().await;
     }
 
-    async fn publish_diagnostics_for_uri(&self, uri: &Url) {
+    async fn publish_diagnostics_for_uri(&self, uri: &Uri) {
         let (analysis, model, settings) = {
             let state = self.state.read().await;
             let analysis = state
@@ -168,7 +250,11 @@ impl Backend {
                 .get(uri)
                 .cloned()
                 .or_else(|| state.saved_workspace.documents.get(uri).cloned());
-            (analysis, state.model.clone(), state.settings.clone())
+            (
+                analysis,
+                Arc::clone(&state.model),
+                Arc::clone(&state.settings),
+            )
         };
 
         if let Some(analysis) = analysis {
@@ -180,35 +266,32 @@ impl Backend {
         }
     }
 
-    async fn publish_open_document_diagnostics(&self) {
-        let uris = {
-            let state = self.state.read().await;
-            state.open_documents.keys().cloned().collect::<Vec<_>>()
-        };
-        for uri in uris {
-            self.publish_diagnostics_for_uri(&uri).await;
-        }
-    }
-
-    async fn clear_diagnostics(&self, uri: Url) {
+    async fn clear_diagnostics(&self, uri: Uri) {
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn snapshot_for_uri(
         &self,
-        uri: &Url,
-    ) -> Option<(DocumentAnalysis, MergedSemanticModel, ServerSettings)> {
+        uri: &Uri,
+    ) -> Option<(
+        Arc<DocumentAnalysis>,
+        Arc<MergedSemanticModel>,
+        Arc<ServerSettings>,
+    )> {
         let state = self.state.read().await;
         let analysis = state
             .open_documents
             .get(uri)
             .cloned()
             .or_else(|| state.saved_workspace.documents.get(uri).cloned())?;
-        Some((analysis, state.model.clone(), state.settings.clone()))
+        Some((
+            analysis,
+            Arc::clone(&state.model),
+            Arc::clone(&state.settings),
+        ))
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         self.initialize_state(&params).await;
@@ -259,6 +342,7 @@ impl LanguageServer for Backend {
                 }),
                 ..ServerCapabilities::default()
             },
+            ..Default::default()
         })
     }
 
@@ -325,12 +409,14 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             for removed in params.event.removed {
-                if let Ok(path) = removed.uri.to_file_path() {
+                if let Some(path) = removed.uri.to_file_path() {
+                    let path = path.into_owned();
                     state.workspace_folders.retain(|folder| folder != &path);
                 }
             }
             for added in params.event.added {
-                if let Ok(path) = added.uri.to_file_path() {
+                if let Some(path) = added.uri.to_file_path() {
+                    let path = path.into_owned();
                     if !state.workspace_folders.contains(&path) {
                         state.workspace_folders.push(path);
                     }
@@ -340,7 +426,7 @@ impl LanguageServer for Backend {
 
         let settings = {
             let state = self.state.read().await;
-            state.settings.clone()
+            (*state.settings).clone()
         };
         self.apply_settings(settings).await;
     }
@@ -348,16 +434,73 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let Some((analysis, model, settings)) = self.snapshot_for_uri(&uri).await else {
+        let snap = self.snapshot_for_uri(&uri).await;
+        let Some((analysis, model, settings)) = snap else {
             return Ok(None);
         };
 
         let record_type_context = is_record_type_context(&analysis.text, position);
         let prefix = completion_prefix(&analysis.text, position, record_type_context);
+
+        // When the cursor sits in a slot that only accepts a table name
+        // (e.g. `SELECT * FROM |`, `INSERT INTO |`, `UPDATE |`), restrict
+        // suggestions to known tables — otherwise the dropdown is flooded
+        // with keywords/functions/fields/params the user can't legally use
+        // there.
+        if !record_type_context && is_table_name_context(&analysis.text, position) {
+            let items = model.table_completion_items(
+                prefix.trim_matches(|ch: char| ch == ':'),
+                settings.active_auth_context(),
+            );
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+
         let statement_fact = active_query_fact(&analysis, position);
         let qualifier = completion_table_qualifier(&analysis.text, position);
+        let trimmed_prefix = prefix.trim_matches(|ch: char| ch == ':');
+
+        // Decide whether the cursor is in a column-name slot. A `tbl.`
+        // qualifier is always treated as a strict slot (the only legal
+        // continuations are field names of `tbl`).
+        let column_slot = if qualifier.is_some() {
+            Some(ColumnSlot::Strict { allow_star: false })
+        } else if record_type_context {
+            None
+        } else {
+            column_completion_context(&analysis.text, position)
+        };
+
+        if let Some(ColumnSlot::Strict { allow_star }) = column_slot {
+            let field_tables = field_completion_tables(statement_fact, qualifier.as_deref());
+            if !field_tables.is_empty() {
+                let multi_table_context = qualifier.is_none() && field_tables.len() > 1;
+                let mut items = model.column_completion_items(
+                    trimmed_prefix,
+                    &field_tables,
+                    multi_table_context,
+                    settings.active_auth_context(),
+                );
+                if allow_star && (trimmed_prefix.is_empty() || "*".starts_with(trimmed_prefix)) {
+                    items.insert(
+                        0,
+                        CompletionItem {
+                            label: "*".to_string(),
+                            kind: Some(CompletionItemKind::OPERATOR),
+                            detail: Some("All columns".to_string()),
+                            insert_text: Some("*".to_string()),
+                            sort_text: Some("0-aaa-star".to_string()),
+                            ..CompletionItem::default()
+                        },
+                    );
+                }
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+            // No identifiable target table — fall through to the generic
+            // completion below so the dropdown isn't empty.
+        }
+
         let items = model.completion_items(
-            prefix.trim_matches(|ch: char| ch == ':'),
+            trimmed_prefix,
             record_type_context,
             settings.active_auth_context(),
             statement_fact,
@@ -660,9 +803,11 @@ impl LanguageServer for Backend {
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
-    ) -> Result<Option<Vec<SymbolInformation>>> {
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
         let state = self.state.read().await;
-        Ok(Some(state.model.workspace_symbol_items(&params.query)))
+        Ok(Some(
+            state.model.workspace_symbol_items(&params.query).into(),
+        ))
     }
 }
 
@@ -670,7 +815,7 @@ fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
     if let Some(folders) = &params.workspace_folders {
         let resolved = folders
             .iter()
-            .filter_map(|folder| folder.uri.to_file_path().ok())
+            .filter_map(|folder| folder.uri.to_file_path().map(|p| p.into_owned()))
             .collect::<Vec<_>>();
         if !resolved.is_empty() {
             return resolved;
@@ -680,14 +825,21 @@ fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
     params
         .root_uri
         .as_ref()
-        .and_then(|uri| uri.to_file_path().ok())
+        .and_then(|uri| uri.to_file_path().map(|p| p.into_owned()))
         .into_iter()
         .collect()
 }
 
+/// Skip files larger than this — pathological generated SurrealQL dumps would
+/// otherwise blow up parser memory at startup.
+const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+/// Hard cap on the total number of `.surql` / `.surrealql` files we ingest.
+const MAX_WORKSPACE_FILES: usize = 5000;
+
 fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
-    let mut index = WorkspaceIndex::default();
-    for folder in workspace_folders {
+    // First pass: gather candidate file paths sequentially (cheap, IO-bound).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    'outer: for folder in workspace_folders {
         for entry in WalkDir::new(folder)
             .into_iter()
             .filter_entry(|entry| should_descend(entry.path()))
@@ -701,23 +853,69 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
             ) {
                 continue;
             }
-            let Some(uri) = Url::from_file_path(path).ok() else {
+            if entry
+                .metadata()
+                .map(|meta| meta.len() > MAX_FILE_SIZE_BYTES)
+                .unwrap_or(false)
+            {
                 continue;
-            };
-            let Some(text) = fs::read_to_string(path).ok() else {
-                continue;
-            };
-            if let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) {
-                index.documents.insert(uri, analysis);
+            }
+            candidates.push(path.to_path_buf());
+            if candidates.len() >= MAX_WORKSPACE_FILES {
+                break 'outer;
             }
         }
     }
+
+    // Second pass: parse files in parallel — tree-sitter parsing is CPU-bound
+    // and trivially parallelisable per-file. We're already inside a
+    // spawn_blocking, so std::thread::scope is the cheapest way to fan out.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(2)
+        .max(1);
+    let chunk_size = candidates.len().div_ceil(worker_count).max(1);
+    let mut index = WorkspaceIndex::default();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for chunk in candidates.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            handles.push(scope.spawn(move || -> Vec<(Uri, Arc<DocumentAnalysis>)> {
+                let mut local = Vec::with_capacity(chunk.len());
+                for path in chunk {
+                    let Some(uri) = Uri::from_file_path(&path) else {
+                        continue;
+                    };
+                    let Some(text) = fs::read_to_string(&path).ok() else {
+                        continue;
+                    };
+                    if let Some(analysis) =
+                        analyze_document(uri.clone(), &text, SymbolOrigin::Local)
+                    {
+                        local.push((uri, Arc::new(analysis)));
+                    }
+                }
+                local
+            }));
+        }
+        for handle in handles {
+            if let Ok(results) = handle.join() {
+                for (uri, analysis) in results {
+                    index.documents.insert(uri, analysis);
+                }
+            }
+        }
+    });
+
     index
 }
 
 fn should_descend(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        !matches!(name, ".git" | "target" | "node_modules")
+        !matches!(
+            name,
+            ".git" | "target" | "node_modules" | ".idea" | ".gradle"
+        )
     } else {
         true
     }
@@ -725,11 +923,13 @@ fn should_descend(path: &Path) -> bool {
 
 fn merged_workspace(
     saved_workspace: &WorkspaceIndex,
-    open_documents: &HashMap<Url, DocumentAnalysis>,
+    open_documents: &HashMap<Uri, Arc<DocumentAnalysis>>,
 ) -> WorkspaceIndex {
     let mut workspace = saved_workspace.clone();
     for (uri, analysis) in open_documents {
-        workspace.documents.insert(uri.clone(), analysis.clone());
+        workspace
+            .documents
+            .insert(uri.clone(), Arc::clone(analysis));
     }
     workspace
 }
@@ -744,6 +944,157 @@ fn call_hierarchy_item(function: &crate::semantic::types::FunctionDef) -> CallHi
         range: function.location.range,
         selection_range: function.selection_range,
         data: None,
+    }
+}
+
+/// Returns true when the cursor is positioned in a SurrealQL slot that
+/// only syntactically accepts a table name. Currently detects:
+///
+///   * `SELECT ... FROM |`               (single or comma-separated tables)
+///   * `INSERT INTO |`
+///   * `UPDATE |`
+///   * `DELETE FROM |`
+///
+/// The check walks backwards from the cursor over (a) the partial
+/// identifier being typed, then (b) any sequence of comma-separated
+/// identifiers (so `FROM a, b, |` still resolves to `FROM`), and inspects
+/// the keyword token immediately preceding that span.
+fn is_table_name_context(source: &str, position: Position) -> bool {
+    let offset = crate::semantic::text::position_to_offset(source, position);
+    let Some(before) = source.get(..offset) else {
+        return false;
+    };
+    let chars: Vec<char> = before.chars().collect();
+    let mut i = chars.len();
+
+    // Strip the partial identifier currently being typed at the cursor.
+    while i > 0 && is_table_ident_char(chars[i - 1]) {
+        i -= 1;
+    }
+    // Walk backwards over `<ws>* (, <ws>* <ident> <ws>*)*` so multi-table
+    // forms like `FROM tbl1, tbl2, |` still detect FROM.
+    loop {
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || chars[i - 1] != ',' {
+            break;
+        }
+        i -= 1;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && is_table_ident_char(chars[i - 1]) {
+            i -= 1;
+        }
+    }
+    // Read the previous identifier (the candidate keyword).
+    let keyword_end = i;
+    while i > 0 && is_table_ident_char(chars[i - 1]) {
+        i -= 1;
+    }
+    if i == keyword_end {
+        return false;
+    }
+    let keyword: String = chars[i..keyword_end].iter().collect();
+    matches!(
+        keyword.to_ascii_uppercase().as_str(),
+        "FROM" | "INTO" | "UPDATE"
+    )
+}
+
+fn is_table_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '`'
+}
+
+/// Classification of a column-name slot near the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnSlot {
+    /// The cursor is in a position that *only* accepts column names —
+    /// `SELECT ... |, FROM tbl`, `UPDATE tbl SET |`, or after a `tbl.`
+    /// qualifier. Suggestions should be column-only. The contained flag
+    /// is true when emitting a leading `*` is appropriate (SELECT only).
+    Strict { allow_star: bool },
+    /// The cursor is in an expression position where columns are useful
+    /// but other things (functions, $vars, literals) are also legal —
+    /// `WHERE | / AND | / OR |`, `ORDER BY |`, `GROUP BY |`. Columns
+    /// should be surfaced at the top of the dropdown but the rest of the
+    /// generic completions should still appear.
+    Loose,
+}
+
+/// Returns the column-completion classification for the cursor. Returns
+/// `None` when the cursor is not in any column-name slot we recognise.
+///
+/// Strategy: walk backwards from the cursor over the partial identifier,
+/// then over any `<ident> <ws>* (= <expr>)? <ws>* ,` runs (so multi-column
+/// SELECT/SET lists still detect the leading `SELECT`/`SET`), and then
+/// inspect the previous keyword token.
+///
+/// The algorithm intentionally avoids a full SurrealQL parse — it covers
+/// the common, syntactically-unambiguous cases listed below and degrades
+/// to `None` for anything unfamiliar (sub-queries, parenthesised
+/// expressions, ON clauses, etc.).
+fn column_completion_context(source: &str, position: Position) -> Option<ColumnSlot> {
+    let offset = crate::semantic::text::position_to_offset(source, position);
+    let before = source.get(..offset)?;
+    let chars: Vec<char> = before.chars().collect();
+    let mut i = chars.len();
+
+    // Strip the partial identifier currently being typed at the cursor.
+    while i > 0 && is_table_ident_char(chars[i - 1]) {
+        i -= 1;
+    }
+    // Walk backwards over repeated `<ws>* (= ... ,)? <ws>* <ident-or-expr>`
+    // segments so that:
+    //   `SELECT a, b, |`            still resolves to SELECT
+    //   `UPDATE t SET a = 1, b = 2, |`  still resolves to SET
+    // For SET we can't safely parse the RHS expression — instead we just
+    // skip backwards across non-comma chars until we hit a comma or the
+    // closest column-context keyword.
+    loop {
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || chars[i - 1] != ',' {
+            break;
+        }
+        i -= 1;
+        // Skip the segment between the previous comma and this comma:
+        // walk back over identifier characters, '=' assignment, simple
+        // value tokens, and whitespace until we hit either a comma or a
+        // keyword boundary. Stop at quotes / parens / braces to stay safe.
+        while i > 0 {
+            let c = chars[i - 1];
+            if c == ',' {
+                break;
+            }
+            if matches!(c, '\'' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | ';') {
+                return None;
+            }
+            i -= 1;
+        }
+    }
+    // Skip whitespace, then read the previous identifier token.
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    let keyword_end = i;
+    while i > 0 && is_table_ident_char(chars[i - 1]) {
+        i -= 1;
+    }
+    if i == keyword_end {
+        return None;
+    }
+    let keyword: String = chars[i..keyword_end]
+        .iter()
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match keyword.as_str() {
+        "SELECT" => Some(ColumnSlot::Strict { allow_star: true }),
+        "SET" => Some(ColumnSlot::Strict { allow_star: false }),
+        "WHERE" | "AND" | "OR" | "BY" => Some(ColumnSlot::Loose),
+        _ => None,
     }
 }
 
@@ -887,6 +1238,14 @@ impl SettingsMergeExt for ServerSettings {
         }
         if self.auth_contexts.is_empty() {
             self.auth_contexts = fallback.auth_contexts;
+        }
+        // `workspace/configuration` responses rarely include `metadata.mode`; when they
+        // don't, the field defaults to "workspace+db". Preserve the value from the
+        // initialization_options (stored in `fallback`) so that settings like
+        // "db" survive the post-`initialized` reload cycle.
+        let default_mode = crate::config::MetadataSettings::default().mode;
+        if self.metadata.mode == default_mode && fallback.metadata.mode != default_mode {
+            self.metadata.mode = fallback.metadata.mode;
         }
         self
     }

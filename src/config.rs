@@ -47,6 +47,24 @@ pub struct MetadataSettings {
     pub refresh_on_save: bool,
 }
 
+impl MetadataSettings {
+    /// Returns true when the language server should scan local `.surql` workspace files.
+    pub fn filesystem_enabled(&self) -> bool {
+        matches!(
+            self.mode.as_str(),
+            "both" | "workspace+db" | "filesystem" | "workspace"
+        )
+    }
+
+    /// Returns true when the language server should fetch schema from a remote SurrealDB.
+    pub fn db_enabled(&self) -> bool {
+        matches!(
+            self.mode.as_str(),
+            "both" | "workspace+db" | "db" | "remote"
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisSettings {

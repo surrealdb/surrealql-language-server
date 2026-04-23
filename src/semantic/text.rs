@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range};
 
 pub fn compact_preview(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -76,19 +76,32 @@ pub fn token_prefix(source: &str, position: Position) -> Option<String> {
     }
 
     let chars: Vec<(usize, char)> = source.char_indices().collect();
-    let mut index = chars.partition_point(|(byte, _)| *byte < offset);
-    if index > 0 && index == chars.len() {
-        index -= 1;
+    let cursor_index = chars.partition_point(|(byte, _)| *byte < offset);
+
+    // If the character immediately before the cursor is not a token char
+    // (i.e., the cursor is in whitespace, after a punctuation mark, or at
+    // the very start of the document), the user is starting a fresh token —
+    // the prefix is empty. Returning the trailing keyword token here would
+    // make `completion_items` filter every table/function/keyword whose name
+    // doesn't start with that previous keyword.
+    let Some((_, prev_char)) = cursor_index
+        .checked_sub(1)
+        .and_then(|index| chars.get(index))
+    else {
+        return Some(String::new());
+    };
+    if !is_token_char(*prev_char) {
+        return Some(String::new());
     }
 
-    let mut start = index;
+    let mut start = cursor_index - 1;
     while start > 0 && is_token_char(chars[start - 1].1) {
         start -= 1;
     }
 
-    let start_byte = chars.get(start).map(|(byte, _)| *byte).unwrap_or(0);
+    let start_byte = chars[start].0;
     let end_byte = chars
-        .get(index)
+        .get(cursor_index)
         .map(|(byte, _)| *byte)
         .unwrap_or(source.len());
     source.get(start_byte..end_byte).map(ToOwned::to_owned)

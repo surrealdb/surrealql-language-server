@@ -1,4 +1,6 @@
-use tower_lsp::lsp_types::{Location, Position, Range, Url};
+use std::sync::Arc;
+
+use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use surrealql_language_server::config::{AuthContext, ServerSettings};
 use surrealql_language_server::semantic::analyzer::analyze_document;
@@ -9,8 +11,10 @@ use surrealql_language_server::semantic::types::{
     PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
 };
 
-fn uri(path: &str) -> Url {
-    Url::parse(&format!("file:///workspace/{path}")).expect("valid uri")
+fn uri(path: &str) -> Uri {
+    format!("file:///workspace/{path}")
+        .parse()
+        .expect("valid uri")
 }
 
 fn empty_range() -> Range {
@@ -24,7 +28,7 @@ fn empty_location(path: &str) -> Location {
 fn workspace_from(analyses: Vec<DocumentAnalysis>) -> WorkspaceIndex {
     let mut ws = WorkspaceIndex::default();
     for a in analyses {
-        ws.documents.insert(a.uri.clone(), a);
+        ws.documents.insert(a.uri.clone(), Arc::new(a));
     }
     ws
 }
@@ -261,7 +265,7 @@ fn hover_for_js_function_shows_javascript_badge() {
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
     };
-    ws.documents.insert(u, analysis);
+    ws.documents.insert(u, Arc::new(analysis));
     let model = MergedSemanticModel::build(&ws, &Default::default());
     let hover = model
         .hover_markdown_for_token("fn::slugify", None)
@@ -316,7 +320,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
     };
-    ws.documents.insert(u, analysis);
+    ws.documents.insert(u, Arc::new(analysis));
     let model = MergedSemanticModel::build(&ws, &Default::default());
     let hover = model
         .hover_markdown_for_token("fn::double", None)
@@ -338,7 +342,7 @@ fn hover_for_table_shows_schema_and_permissions() {
     let mut ws = WorkspaceIndex::default();
     ws.documents.insert(
         u.clone(),
-        DocumentAnalysis {
+        Arc::new(DocumentAnalysis {
             uri: u.clone(),
             text: String::new(),
             tables: vec![TableDef {
@@ -367,7 +371,7 @@ fn hover_for_table_shows_schema_and_permissions() {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
-        },
+        }),
     );
     let model = MergedSemanticModel::build(&ws, &Default::default());
     let hover = model
@@ -412,7 +416,7 @@ fn completion_includes_user_js_function() {
     let mut ws = WorkspaceIndex::default();
     ws.documents.insert(
         u.clone(),
-        DocumentAnalysis {
+        Arc::new(DocumentAnalysis {
             uri: u.clone(),
             text: String::new(),
             tables: Vec::new(),
@@ -440,7 +444,7 @@ fn completion_includes_user_js_function() {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
-        },
+        }),
     );
     let model = MergedSemanticModel::build(&ws, &Default::default());
     let items = model.completion_items("fn::sl", false, None, None, None);
@@ -611,7 +615,7 @@ fn error_diagnostic_for_denied_permission() {
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
         diagnostics[0].severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
     );
 }
 
@@ -901,8 +905,8 @@ fn local_function_overrides_remote() {
         document_symbols: Vec::new(),
     };
     let mut ws = WorkspaceIndex::default();
-    ws.documents.insert(remote.uri.clone(), remote);
-    ws.documents.insert(local.uri.clone(), local);
+    ws.documents.insert(remote.uri.clone(), Arc::new(remote));
+    ws.documents.insert(local.uri.clone(), Arc::new(local));
     let model = MergedSemanticModel::build(&ws, &Default::default());
     assert_eq!(
         model.functions["fn::util"].comment.as_deref(),
@@ -931,7 +935,7 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
     let mut ws = WorkspaceIndex::default();
     ws.documents.insert(
         u.clone(),
-        DocumentAnalysis {
+        Arc::new(DocumentAnalysis {
             uri: u.clone(),
             text: String::new(),
             tables: vec![TableDef {
@@ -978,7 +982,7 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
-        },
+        }),
     );
     let model = MergedSemanticModel::build(&ws, &Default::default());
     let results = model.workspace_symbol_items("invoice");
@@ -1026,7 +1030,7 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
     let actions = model.code_actions(&u, &analysis, &[]);
     assert!(
         actions.iter().any(|a| {
-            if let tower_lsp::lsp_types::CodeActionOrCommand::CodeAction(ca) = a {
+            if let tower_lsp_server::ls_types::CodeActionOrCommand::CodeAction(ca) = a {
                 ca.title.contains("widget") && ca.title.to_lowercase().contains("permissions")
             } else {
                 false

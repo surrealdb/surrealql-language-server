@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use strsim::jaro_winkler;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind,
     Diagnostic, DiagnosticSeverity, DocumentChanges, Documentation, Location, MarkupContent,
     MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, TextDocumentEdit,
-    TextEdit, Url, WorkspaceEdit,
+    TextEdit, Uri, WorkspaceEdit,
 };
 
 use crate::config::{AuthContext, ServerSettings};
@@ -26,15 +26,15 @@ impl MergedSemanticModel {
         let mut model = Self::default();
 
         for analysis in workspace.documents.values() {
-            model.absorb_analysis(analysis);
+            model.absorb_analysis(analysis.as_ref());
         }
         for analysis in live.documents.values() {
-            model.absorb_analysis(analysis);
+            model.absorb_analysis(analysis.as_ref());
         }
 
         for analysis in workspace.documents.values() {
             for reference in &analysis.references {
-                if reference.kind == tower_lsp::lsp_types::SymbolKind::FUNCTION {
+                if reference.kind == tower_lsp_server::ls_types::SymbolKind::FUNCTION {
                     model
                         .function_references
                         .entry(reference.name.clone())
@@ -68,6 +68,101 @@ impl MergedSemanticModel {
                 .then_with(|| left.name.cmp(&right.name))
         });
         tables
+    }
+
+    /// Returns *only* column (field) completion items for the given target
+    /// tables. Use when the cursor is positioned in a slot that syntactically
+    /// only accepts a column name (e.g. between `SELECT` and `FROM`, after
+    /// `UPDATE tbl SET `, or after a `tbl.` qualifier).
+    ///
+    /// Mirrors the field branch of [`Self::completion_items`] but emits no
+    /// keywords / functions / params / namespaces.
+    pub fn column_completion_items(
+        &self,
+        prefix: &str,
+        tables: &[String],
+        multi_table_context: bool,
+        _active_context: Option<&AuthContext>,
+    ) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        for table_name in tables {
+            for field in self.fields_for_table(table_name) {
+                let qualified_label = format!("{}.{}", field.table, field.name);
+                let matches_prefix = prefix.is_empty()
+                    || field.name.starts_with(prefix)
+                    || (multi_table_context && qualified_label.starts_with(prefix));
+                if !matches_prefix {
+                    continue;
+                }
+
+                let label = if multi_table_context {
+                    qualified_label.clone()
+                } else {
+                    field.name.clone()
+                };
+                let insert_text = if multi_table_context {
+                    qualified_label
+                } else {
+                    field.name.clone()
+                };
+                let mut detail = vec![format!("table: {}", field.table)];
+                if let Some(type_expr) = &field.type_expr {
+                    detail.push(format!("type: {type_expr}"));
+                }
+                detail.push(format!("source: {}", origin_label(field.origin)));
+
+                items.push(CompletionItem {
+                    label,
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(detail.join(" | ")),
+                    insert_text: Some(insert_text),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format_field_hover(field),
+                    })),
+                    sort_text: Some(format!("0-fld-{}-{}", field.table, field.name)),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+        items
+    }
+
+    /// Returns *only* table-name completion items (no keywords, functions,
+    /// fields, params, etc). Use when the cursor is positioned in a slot
+    /// that syntactically only accepts a table name (e.g. right after
+    /// `SELECT * FROM `, `INSERT INTO `, `UPDATE `).
+    pub fn table_completion_items(
+        &self,
+        prefix: &str,
+        active_context: Option<&AuthContext>,
+    ) -> Vec<CompletionItem> {
+        self.table_names_by_priority()
+            .into_iter()
+            .filter(|table| prefix.is_empty() || table.name.starts_with(prefix))
+            .map(|table| CompletionItem {
+                label: table.name.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some(format!(
+                    "{} schema, source: {}",
+                    table
+                        .schema_mode
+                        .clone()
+                        .unwrap_or_else(|| "inferred".to_string()),
+                    origin_label(table.origin)
+                )),
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format_table_hover(table, self, active_context),
+                })),
+                sort_text: Some(format!(
+                    "0-{}-{}",
+                    symbol_priority(table.origin),
+                    table.name
+                )),
+                ..CompletionItem::default()
+            })
+            .collect()
     }
 
     pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
@@ -349,12 +444,11 @@ impl MergedSemanticModel {
                             kind: MarkupKind::Markdown,
                             value: format_field_hover(field),
                         })),
-                        sort_text: Some(format!(
-                            "0f-{}-{}-{}",
-                            symbol_priority(field.origin),
-                            field.table,
-                            field.name
-                        )),
+                        // `0-fld-...` sorts above `1-` user functions, `2-`
+                        // builtin functions, and unsorted keywords so that
+                        // in loose contexts (WHERE / ORDER BY / GROUP BY)
+                        // the relevant column names surface first.
+                        sort_text: Some(format!("0-fld-{}-{}", field.table, field.name)),
                         ..CompletionItem::default()
                     });
                 }
@@ -459,7 +553,7 @@ impl MergedSemanticModel {
 
     pub fn code_actions(
         &self,
-        uri: &Url,
+        uri: &Uri,
         analysis: &DocumentAnalysis,
         diagnostics: &[Diagnostic],
     ) -> Vec<CodeActionOrCommand> {
@@ -478,7 +572,7 @@ impl MergedSemanticModel {
                         diagnostics: Some(vec![diagnostic.clone()]),
                         edit: Some(WorkspaceEdit {
                             document_changes: Some(DocumentChanges::Operations(vec![
-                                tower_lsp::lsp_types::DocumentChangeOperation::Edit(
+                                tower_lsp_server::ls_types::DocumentChangeOperation::Edit(
                                     TextDocumentEdit {
                                         text_document: OptionalVersionedTextDocumentIdentifier {
                                             uri: uri.clone(),
@@ -508,7 +602,7 @@ impl MergedSemanticModel {
                 title: format!("Add PERMISSIONS clause to table `{}`", table.name),
                 kind: Some(CodeActionKind::REFACTOR_REWRITE),
                 edit: Some(WorkspaceEdit {
-                    document_changes: Some(DocumentChanges::Operations(vec![tower_lsp::lsp_types::DocumentChangeOperation::Edit(
+                    document_changes: Some(DocumentChanges::Operations(vec![tower_lsp_server::ls_types::DocumentChangeOperation::Edit(
                         TextDocumentEdit {
                             text_document: OptionalVersionedTextDocumentIdentifier {
                                 uri: uri.clone(),
@@ -580,13 +674,13 @@ impl MergedSemanticModel {
             .unwrap_or_default()
     }
 
-    pub fn rename_edits(&self, name: &str, new_name: &str) -> Option<HashMap<Url, Vec<TextEdit>>> {
+    pub fn rename_edits(&self, name: &str, new_name: &str) -> Option<HashMap<Uri, Vec<TextEdit>>> {
         let function = self.functions.get(name)?;
         if function.origin != SymbolOrigin::Local {
             return None;
         }
 
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
         changes
             .entry(function.location.uri.clone())
             .or_default()
@@ -611,14 +705,14 @@ impl MergedSemanticModel {
     pub fn workspace_symbol_items(
         &self,
         query: &str,
-    ) -> Vec<tower_lsp::lsp_types::SymbolInformation> {
+    ) -> Vec<tower_lsp_server::ls_types::SymbolInformation> {
         let needle = query.to_ascii_lowercase();
         let mut items = Vec::new();
         for table in self.tables.values() {
             if needle.is_empty() || table.name.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &table.name,
-                    tower_lsp::lsp_types::SymbolKind::STRUCT,
+                    tower_lsp_server::ls_types::SymbolKind::STRUCT,
                     &table.location,
                 ));
             }
@@ -628,7 +722,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &label,
-                    tower_lsp::lsp_types::SymbolKind::FIELD,
+                    tower_lsp_server::ls_types::SymbolKind::FIELD,
                     &field.location,
                 ));
             }
@@ -638,7 +732,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &label,
-                    tower_lsp::lsp_types::SymbolKind::EVENT,
+                    tower_lsp_server::ls_types::SymbolKind::EVENT,
                     &event.location,
                 ));
             }
@@ -648,7 +742,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &label,
-                    tower_lsp::lsp_types::SymbolKind::KEY,
+                    tower_lsp_server::ls_types::SymbolKind::KEY,
                     &index.location,
                 ));
             }
@@ -657,7 +751,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || function.name.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &function.name,
-                    tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                    tower_lsp_server::ls_types::SymbolKind::FUNCTION,
                     &function.location,
                 ));
             }
@@ -669,30 +763,34 @@ impl MergedSemanticModel {
         self.query_facts
             .entry(analysis.uri.clone())
             .or_default()
-            .extend(analysis.query_facts.clone());
+            .extend(analysis.query_facts.iter().cloned());
         self.workspace_symbols
             .extend(analysis.document_symbols.iter().cloned());
 
+        // Pass references to the merge functions; they clone the candidate
+        // only when it actually wins over the current entry. For workspaces
+        // with many overlapping definitions (saved + open + remote merged
+        // together) this skips a lot of throwaway allocations.
         for table in &analysis.tables {
-            merge_table(&mut self.tables, table.clone());
+            merge_table(&mut self.tables, table);
         }
         for event in &analysis.events {
-            merge_event(&mut self.events, event.clone());
+            merge_event(&mut self.events, event);
         }
         for index in &analysis.indexes {
-            merge_index(&mut self.indexes, index.clone());
+            merge_index(&mut self.indexes, index);
         }
         for field in &analysis.fields {
-            merge_field(&mut self.fields, field.clone());
+            merge_field(&mut self.fields, field);
         }
         for function in &analysis.functions {
-            merge_function(&mut self.functions, function.clone());
+            merge_function(&mut self.functions, function);
         }
         for param in &analysis.params {
-            merge_param(&mut self.params, param.clone());
+            merge_param(&mut self.params, param);
         }
         for access in &analysis.accesses {
-            merge_access(&mut self.accesses, access.clone());
+            merge_access(&mut self.accesses, access);
         }
     }
 
@@ -771,77 +869,77 @@ struct PermissionOutcome {
     message: String,
 }
 
-fn merge_table(target: &mut HashMap<String, TableDef>, candidate: TableDef) {
+fn merge_table(target: &mut HashMap<String, TableDef>, candidate: &TableDef) {
     let replace = target
         .get(&candidate.name)
-        .map(|current| should_replace_table(current, &candidate))
+        .map(|current| should_replace_table(current, candidate))
         .unwrap_or(true);
     if replace {
-        target.insert(candidate.name.clone(), candidate);
+        target.insert(candidate.name.clone(), candidate.clone());
     }
 }
 
-fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: EventDef) {
+fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: &EventDef) {
+    if let Some(current) = target.get(&(candidate.table.clone(), candidate.name.clone())) {
+        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
+            return;
+        }
+    }
+    target.insert(
+        (candidate.table.clone(), candidate.name.clone()),
+        candidate.clone(),
+    );
+}
+
+fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: &IndexDef) {
+    if let Some(current) = target.get(&(candidate.table.clone(), candidate.name.clone())) {
+        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
+            return;
+        }
+    }
+    target.insert(
+        (candidate.table.clone(), candidate.name.clone()),
+        candidate.clone(),
+    );
+}
+
+fn merge_field(target: &mut HashMap<(String, String), FieldDef>, candidate: &FieldDef) {
     let key = (candidate.table.clone(), candidate.name.clone());
     let replace = target
         .get(&key)
-        .map(|current| symbol_priority(candidate.origin) >= symbol_priority(current.origin))
+        .map(|current| should_replace_field(current, candidate))
         .unwrap_or(true);
     if replace {
-        target.insert(key, candidate);
+        target.insert(key, candidate.clone());
     }
 }
 
-fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: IndexDef) {
-    let key = (candidate.table.clone(), candidate.name.clone());
-    let replace = target
-        .get(&key)
-        .map(|current| symbol_priority(candidate.origin) >= symbol_priority(current.origin))
-        .unwrap_or(true);
-    if replace {
-        target.insert(key, candidate);
-    }
-}
-
-fn merge_field(target: &mut HashMap<(String, String), FieldDef>, candidate: FieldDef) {
-    let key = (candidate.table.clone(), candidate.name.clone());
-    let replace = target
-        .get(&key)
-        .map(|current| should_replace_field(current, &candidate))
-        .unwrap_or(true);
-    if replace {
-        target.insert(key, candidate);
-    }
-}
-
-fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: FunctionDef) {
+fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: &FunctionDef) {
     let replace = target
         .get(&candidate.name)
-        .map(|current| should_replace_function(current, &candidate))
+        .map(|current| should_replace_function(current, candidate))
         .unwrap_or(true);
     if replace {
-        target.insert(candidate.name.clone(), candidate);
+        target.insert(candidate.name.clone(), candidate.clone());
     }
 }
 
-fn merge_param(target: &mut HashMap<String, ParamDef>, candidate: ParamDef) {
-    let replace = target
-        .get(&candidate.name)
-        .map(|current| symbol_priority(candidate.origin) >= symbol_priority(current.origin))
-        .unwrap_or(true);
-    if replace {
-        target.insert(candidate.name.clone(), candidate);
+fn merge_param(target: &mut HashMap<String, ParamDef>, candidate: &ParamDef) {
+    if let Some(current) = target.get(&candidate.name) {
+        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
+            return;
+        }
     }
+    target.insert(candidate.name.clone(), candidate.clone());
 }
 
-fn merge_access(target: &mut HashMap<String, AccessDef>, candidate: AccessDef) {
-    let replace = target
-        .get(&candidate.name)
-        .map(|current| symbol_priority(candidate.origin) >= symbol_priority(current.origin))
-        .unwrap_or(true);
-    if replace {
-        target.insert(candidate.name.clone(), candidate);
+fn merge_access(target: &mut HashMap<String, AccessDef>, candidate: &AccessDef) {
+    if let Some(current) = target.get(&candidate.name) {
+        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
+            return;
+        }
     }
+    target.insert(candidate.name.clone(), candidate.clone());
 }
 
 fn should_replace_table(current: &TableDef, candidate: &TableDef) -> bool {
@@ -1231,11 +1329,11 @@ fn quoted_literals(input: &str) -> Vec<String> {
 
 fn symbol_information(
     name: &str,
-    kind: tower_lsp::lsp_types::SymbolKind,
+    kind: tower_lsp_server::ls_types::SymbolKind,
     location: &Location,
-) -> tower_lsp::lsp_types::SymbolInformation {
+) -> tower_lsp_server::ls_types::SymbolInformation {
     #[allow(deprecated)]
-    tower_lsp::lsp_types::SymbolInformation {
+    tower_lsp_server::ls_types::SymbolInformation {
         name: name.to_string(),
         kind,
         tags: None,
@@ -1265,7 +1363,7 @@ fn action_label(action: QueryAction) -> &'static str {
     }
 }
 
-fn field_completion_tables(
+pub(crate) fn field_completion_tables(
     statement_fact: Option<&QueryFact>,
     qualifier: Option<&str>,
 ) -> Vec<String> {
@@ -1322,7 +1420,10 @@ pub fn is_record_type_context(source: &str, position: Position) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Location, Position, Range, Url};
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use tower_lsp_server::ls_types::{DiagnosticSeverity, Location, Position, Range, Uri};
 
     use crate::config::{AuthContext, ServerSettings};
     use crate::semantic::types::{
@@ -1334,7 +1435,7 @@ mod tests {
 
     #[test]
     fn local_definitions_override_inferred() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let explicit = TableDef {
             name: "person".to_string(),
             schema_mode: Some("schemafull".to_string()),
@@ -1371,7 +1472,9 @@ mod tests {
             document_symbols: Vec::new(),
         };
         let mut workspace = WorkspaceIndex::default();
-        workspace.documents.insert(analysis.uri.clone(), analysis);
+        workspace
+            .documents
+            .insert(analysis.uri.clone(), Arc::new(analysis));
         let model = MergedSemanticModel::build(&workspace, &Default::default());
         assert_eq!(model.tables["person"].schema_mode, explicit.schema_mode);
     }
@@ -1407,7 +1510,7 @@ mod tests {
             explicit: true,
             inference: None,
             location: Location::new(
-                Url::parse("file:///workspace/schema.surql").expect("valid uri"),
+                Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 Range::default(),
             ),
         };
@@ -1419,14 +1522,14 @@ mod tests {
             touched_fields: Vec::new(),
             dynamic: false,
             location: Location::new(
-                Url::parse("file:///workspace/query.surql").expect("valid uri"),
+                Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 Range::default(),
             ),
             source_preview: "SELECT * FROM person".to_string(),
         };
         let result = model.semantic_diagnostics(
             &DocumentAnalysis {
-                uri: Url::parse("file:///workspace/query.surql").expect("valid uri"),
+                uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tables: Vec::new(),
                 events: Vec::new(),
@@ -1463,7 +1566,7 @@ mod tests {
             explicit: true,
             inference: None,
             location: Location::new(
-                Url::parse("file:///workspace/schema.surql").expect("valid uri"),
+                Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 Range::default(),
             ),
         };
@@ -1472,7 +1575,7 @@ mod tests {
 
         let diagnostics = model.semantic_diagnostics(
             &DocumentAnalysis {
-                uri: Url::parse("file:///workspace/query.surql").expect("valid uri"),
+                uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tables: Vec::new(),
                 events: Vec::new(),
@@ -1487,7 +1590,7 @@ mod tests {
                     touched_fields: Vec::new(),
                     dynamic: false,
                     location: Location::new(
-                        Url::parse("file:///workspace/query.surql").expect("valid uri"),
+                        Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                         Range::default(),
                     ),
                     source_preview: "SELECT * FROM person".to_string(),
@@ -1505,11 +1608,11 @@ mod tests {
 
     #[test]
     fn record_type_hover_resolves_underlying_table() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut workspace = WorkspaceIndex::default();
         workspace.documents.insert(
             uri.clone(),
-            DocumentAnalysis {
+            Arc::new(DocumentAnalysis {
                 uri: uri.clone(),
                 text: String::new(),
                 tables: vec![TableDef {
@@ -1532,7 +1635,7 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
-            },
+            }),
         );
         let model = MergedSemanticModel::build(&workspace, &Default::default());
         let hover = model
@@ -1544,7 +1647,7 @@ mod tests {
 
     #[test]
     fn record_type_definition_resolves_underlying_table() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let location = Location::new(
             uri.clone(),
             Range {
@@ -1555,8 +1658,8 @@ mod tests {
         let mut workspace = WorkspaceIndex::default();
         workspace.documents.insert(
             uri,
-            DocumentAnalysis {
-                uri: Url::parse("file:///workspace/schema.surql").expect("valid uri"),
+            Arc::new(DocumentAnalysis {
+                uri: Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 text: String::new(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
@@ -1578,7 +1681,7 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
-            },
+            }),
         );
         let model = MergedSemanticModel::build(&workspace, &Default::default());
 
@@ -1587,7 +1690,7 @@ mod tests {
 
     #[test]
     fn table_hover_lists_indexes_events_and_permission_posture() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let analysis = DocumentAnalysis {
             uri: uri.clone(),
             text: String::new(),
@@ -1637,7 +1740,9 @@ mod tests {
             document_symbols: Vec::new(),
         };
         let mut workspace = WorkspaceIndex::default();
-        workspace.documents.insert(analysis.uri.clone(), analysis);
+        workspace
+            .documents
+            .insert(analysis.uri.clone(), Arc::new(analysis));
         let model = MergedSemanticModel::build(&workspace, &Default::default());
         let hover = model
             .hover_markdown_for_token("person", None)
@@ -1672,7 +1777,7 @@ mod tests {
 
     #[test]
     fn completion_items_include_statement_fields_for_select_update_create() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
         model.fields.insert(
             ("person".to_string(), "email".to_string()),
@@ -1750,8 +1855,152 @@ mod tests {
     }
 
     #[test]
+    fn column_completion_items_returns_only_fields() {
+        use tower_lsp_server::ls_types::CompletionItemKind;
+
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
+        let mut model = MergedSemanticModel::default();
+        // Tables and functions should NOT leak into the column-only output.
+        model.tables.insert(
+            "person".to_string(),
+            TableDef {
+                name: "person".to_string(),
+                schema_mode: Some("schemafull".to_string()),
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+            },
+        );
+        model.functions.insert(
+            "fn::greet".to_string(),
+            FunctionDef {
+                name: "fn::greet".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                language: crate::semantic::types::FunctionLanguage::SurrealQL,
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+                selection_range: Range::default(),
+                body_range: None,
+                called_functions: Vec::new(),
+            },
+        );
+        for field_name in ["email", "name"] {
+            model.fields.insert(
+                ("person".to_string(), field_name.to_string()),
+                crate::semantic::types::FieldDef {
+                    table: "person".to_string(),
+                    name: field_name.to_string(),
+                    type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                        "string".to_string(),
+                    )),
+                    comment: None,
+                    permissions: Vec::new(),
+                    origin: SymbolOrigin::Local,
+                    explicit: true,
+                    inference: None,
+                    location: Location::new(uri.clone(), Range::default()),
+                },
+            );
+        }
+
+        let items = model.column_completion_items("", &["person".to_string()], false, None);
+        assert_eq!(items.len(), 2, "expected exactly the two fields");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind == Some(CompletionItemKind::FIELD)),
+            "all items must be FIELD; got {:?}",
+            items
+                .iter()
+                .map(|i| (i.label.clone(), i.kind))
+                .collect::<Vec<_>>()
+        );
+        let labels: Vec<_> = items.iter().map(|item| item.label.clone()).collect();
+        assert!(labels.contains(&"email".to_string()));
+        assert!(labels.contains(&"name".to_string()));
+        // No table / function leakage.
+        assert!(!labels.iter().any(|l| l == "person" || l == "fn::greet"));
+    }
+
+    #[test]
+    fn field_sort_text_puts_fields_above_functions_in_loose_mode() {
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
+        let mut model = MergedSemanticModel::default();
+        model.fields.insert(
+            ("person".to_string(), "email".to_string()),
+            crate::semantic::types::FieldDef {
+                table: "person".to_string(),
+                name: "email".to_string(),
+                type_expr: None,
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+            },
+        );
+        model.functions.insert(
+            "fn::greet".to_string(),
+            FunctionDef {
+                name: "fn::greet".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                language: crate::semantic::types::FunctionLanguage::SurrealQL,
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri, Range::default()),
+                selection_range: Range::default(),
+                body_range: None,
+                called_functions: Vec::new(),
+            },
+        );
+
+        let statement_fact = crate::semantic::types::QueryFact {
+            action: QueryAction::Select,
+            target_tables: vec!["person".to_string()],
+            touched_fields: Vec::new(),
+            dynamic: false,
+            location: Location::new(
+                Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
+                Range::default(),
+            ),
+            source_preview: "SELECT email FROM person".to_string(),
+        };
+        let items = model.completion_items("", false, None, Some(&statement_fact), None);
+
+        let field_sort = items
+            .iter()
+            .find(|item| item.label == "email")
+            .and_then(|item| item.sort_text.clone())
+            .expect("field item must have sort_text");
+        let function_sort = items
+            .iter()
+            .find(|item| item.label == "fn::greet")
+            .and_then(|item| item.sort_text.clone())
+            .expect("function item must have sort_text");
+        assert!(
+            field_sort < function_sort,
+            "field sort_text `{field_sort}` must sort before function sort_text `{function_sort}`"
+        );
+        assert!(field_sort.starts_with("0-fld-"));
+        assert!(function_sort.starts_with("1-"));
+    }
+
+    #[test]
     fn remote_functions_cannot_be_renamed() {
-        let uri = Url::parse("file:///workspace/schema.surql").expect("valid uri");
+        let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
         model.functions.insert(
             "fn::remote".to_string(),
