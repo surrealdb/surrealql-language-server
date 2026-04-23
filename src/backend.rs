@@ -93,7 +93,6 @@ impl Backend {
         };
         let settings = ServerSettings::from_sources(None, configuration.as_ref())
             .merge_with_env_if_missing(current_settings);
-
         self.apply_settings(settings).await;
     }
 
@@ -125,17 +124,24 @@ impl Backend {
                 .map(|previous| previous != &folder_signature)
                 .unwrap_or(true);
 
-            let saved_workspace = if need_walk {
-                let folders_for_walk = folders.clone();
-                let walked = tokio::task::spawn_blocking(move || {
-                    load_workspace_documents(&folders_for_walk)
-                })
-                .await
-                .unwrap_or_default();
-                Arc::new(walked)
+            let saved_workspace = if settings_for_bg.metadata.filesystem_enabled() {
+                if need_walk {
+                    let folders_for_walk = folders.clone();
+                    let walked = tokio::task::spawn_blocking(move || {
+                        load_workspace_documents(&folders_for_walk)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    Arc::new(walked)
+                } else {
+                    let s = state.read().await;
+                    Arc::clone(&s.saved_workspace)
+                }
             } else {
-                let s = state.read().await;
-                Arc::clone(&s.saved_workspace)
+                // Filesystem inference is disabled. Clear the walk cache so that
+                // re-enabling it later will trigger a fresh walk.
+                state.write().await.last_walked = None;
+                Arc::new(WorkspaceIndex::default())
             };
 
             let live_metadata = Arc::new(SurrealDbProvider::fetch_snapshot(&settings_for_bg).await);
@@ -1210,6 +1216,14 @@ impl SettingsMergeExt for ServerSettings {
         }
         if self.auth_contexts.is_empty() {
             self.auth_contexts = fallback.auth_contexts;
+        }
+        // `workspace/configuration` responses rarely include `metadata.mode`; when they
+        // don't, the field defaults to "workspace+db". Preserve the value from the
+        // initialization_options (stored in `fallback`) so that settings like
+        // "db" survive the post-`initialized` reload cycle.
+        let default_mode = crate::config::MetadataSettings::default().mode;
+        if self.metadata.mode == default_mode && fallback.metadata.mode != default_mode {
+            self.metadata.mode = fallback.metadata.mode;
         }
         self
     }

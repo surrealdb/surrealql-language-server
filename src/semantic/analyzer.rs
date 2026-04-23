@@ -845,7 +845,6 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
         for identifier in descendants_of_kind(relevant, "identifier")
             .into_iter()
             .chain(descendants_of_kind(relevant, "record_id").into_iter())
-            .chain(descendants_of_kind(relevant, "record_id_ident").into_iter())
         {
             if let Some(name) =
                 text_of(source, identifier).and_then(|value| normalize_table_name(&value))

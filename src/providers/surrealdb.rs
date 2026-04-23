@@ -26,7 +26,10 @@ pub struct SurrealDbProvider;
 
 impl SurrealDbProvider {
     pub async fn fetch_snapshot(settings: &ServerSettings) -> LiveMetadataSnapshot {
-        if !settings.metadata.enable_live_metadata || !settings.connection.is_configured() {
+        if !settings.metadata.enable_live_metadata
+            || !settings.metadata.db_enabled()
+            || !settings.connection.is_configured()
+        {
             return LiveMetadataSnapshot::default();
         }
 
