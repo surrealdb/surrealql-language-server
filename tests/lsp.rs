@@ -1147,3 +1147,114 @@ fn scripting_function_as_value_in_create() {
         analysis.syntax_diagnostics
     );
 }
+
+// --- Trailing comma tests (issue #2) ---
+
+#[test]
+fn trailing_comma_in_define_function_params_no_diagnostic() {
+    let u = uri("trailing.surql");
+    let text = r#"
+        DEFINE FUNCTION fn::greet($name: string,) {
+            RETURN "hi";
+        };
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in DEFINE FUNCTION params should be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+    assert_eq!(analysis.functions.len(), 1);
+    assert_eq!(analysis.functions[0].params.len(), 1);
+}
+
+#[test]
+fn trailing_comma_in_define_function_multiple_params_no_diagnostic() {
+    let u = uri("trailing.surql");
+    let text = r#"
+        DEFINE FUNCTION fn::add($a: number, $b: number,) -> number {
+            RETURN $a + $b;
+        };
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in multi-param DEFINE FUNCTION should be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+    assert_eq!(analysis.functions.len(), 1);
+    assert_eq!(analysis.functions[0].params.len(), 2);
+}
+
+#[test]
+fn trailing_comma_in_function_call_args_no_diagnostic() {
+    let u = uri("trailing.surql");
+    let text = r#"
+        SELECT fn::add(1, 2,) FROM person;
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in function call arguments should be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
+fn trailing_comma_in_object_literal_no_diagnostic() {
+    let u = uri("trailing.surql");
+    let text = r#"
+        LET $p = { name: "Alice", age: 30, };
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in object literal should be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
+fn trailing_comma_in_object_single_property_no_diagnostic() {
+    let u = uri("trailing.surql");
+    let text = r#"
+        LET $p = { name: "Alice", };
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in single-property object should be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
+fn no_regression_define_function_without_trailing_comma() {
+    let u = uri("no_trailing.surql");
+    let text = r#"
+        DEFINE FUNCTION fn::check($role: string, $level: number) -> bool {
+            RETURN $level > 0;
+        };
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "standard DEFINE FUNCTION (no trailing comma) must still be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+    assert_eq!(analysis.functions[0].params.len(), 2);
+}
+
+#[test]
+fn no_regression_object_without_trailing_comma() {
+    let u = uri("no_trailing.surql");
+    let text = r#"
+        LET $x = { a: 1, b: 2 };
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "standard object (no trailing comma) must still be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
