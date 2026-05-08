@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ls_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Uri};
 use serde::{Deserialize, Serialize};
-use tower_lsp_server::ls_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Uri};
 
 use crate::semantic::type_expr::TypeExpr;
 

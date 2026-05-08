@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use strsim::jaro_winkler;
-use tower_lsp_server::ls_types::{
+use ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind,
     Diagnostic, DiagnosticSeverity, DocumentChanges, Documentation, Location, MarkupContent,
     MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, TextDocumentEdit,
     TextEdit, Uri, WorkspaceEdit,
 };
+use strsim::jaro_winkler;
 
 use crate::config::{AuthContext, ServerSettings};
 use crate::grammar::{
@@ -34,7 +34,7 @@ impl MergedSemanticModel {
 
         for analysis in workspace.documents.values() {
             for reference in &analysis.references {
-                if reference.kind == tower_lsp_server::ls_types::SymbolKind::FUNCTION {
+                if reference.kind == ls_types::SymbolKind::FUNCTION {
                     model
                         .function_references
                         .entry(reference.name.clone())
@@ -572,7 +572,7 @@ impl MergedSemanticModel {
                         diagnostics: Some(vec![diagnostic.clone()]),
                         edit: Some(WorkspaceEdit {
                             document_changes: Some(DocumentChanges::Operations(vec![
-                                tower_lsp_server::ls_types::DocumentChangeOperation::Edit(
+                                ls_types::DocumentChangeOperation::Edit(
                                     TextDocumentEdit {
                                         text_document: OptionalVersionedTextDocumentIdentifier {
                                             uri: uri.clone(),
@@ -602,7 +602,7 @@ impl MergedSemanticModel {
                 title: format!("Add PERMISSIONS clause to table `{}`", table.name),
                 kind: Some(CodeActionKind::REFACTOR_REWRITE),
                 edit: Some(WorkspaceEdit {
-                    document_changes: Some(DocumentChanges::Operations(vec![tower_lsp_server::ls_types::DocumentChangeOperation::Edit(
+                    document_changes: Some(DocumentChanges::Operations(vec![ls_types::DocumentChangeOperation::Edit(
                         TextDocumentEdit {
                             text_document: OptionalVersionedTextDocumentIdentifier {
                                 uri: uri.clone(),
@@ -705,14 +705,14 @@ impl MergedSemanticModel {
     pub fn workspace_symbol_items(
         &self,
         query: &str,
-    ) -> Vec<tower_lsp_server::ls_types::SymbolInformation> {
+    ) -> Vec<ls_types::SymbolInformation> {
         let needle = query.to_ascii_lowercase();
         let mut items = Vec::new();
         for table in self.tables.values() {
             if needle.is_empty() || table.name.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &table.name,
-                    tower_lsp_server::ls_types::SymbolKind::STRUCT,
+                    ls_types::SymbolKind::STRUCT,
                     &table.location,
                 ));
             }
@@ -722,7 +722,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &label,
-                    tower_lsp_server::ls_types::SymbolKind::FIELD,
+                    ls_types::SymbolKind::FIELD,
                     &field.location,
                 ));
             }
@@ -732,7 +732,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &label,
-                    tower_lsp_server::ls_types::SymbolKind::EVENT,
+                    ls_types::SymbolKind::EVENT,
                     &event.location,
                 ));
             }
@@ -742,7 +742,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &label,
-                    tower_lsp_server::ls_types::SymbolKind::KEY,
+                    ls_types::SymbolKind::KEY,
                     &index.location,
                 ));
             }
@@ -751,7 +751,7 @@ impl MergedSemanticModel {
             if needle.is_empty() || function.name.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
                     &function.name,
-                    tower_lsp_server::ls_types::SymbolKind::FUNCTION,
+                    ls_types::SymbolKind::FUNCTION,
                     &function.location,
                 ));
             }
@@ -1329,11 +1329,11 @@ fn quoted_literals(input: &str) -> Vec<String> {
 
 fn symbol_information(
     name: &str,
-    kind: tower_lsp_server::ls_types::SymbolKind,
+    kind: ls_types::SymbolKind,
     location: &Location,
-) -> tower_lsp_server::ls_types::SymbolInformation {
+) -> ls_types::SymbolInformation {
     #[allow(deprecated)]
-    tower_lsp_server::ls_types::SymbolInformation {
+    ls_types::SymbolInformation {
         name: name.to_string(),
         kind,
         tags: None,
@@ -1423,7 +1423,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use tower_lsp_server::ls_types::{DiagnosticSeverity, Location, Position, Range, Uri};
+    use ls_types::{DiagnosticSeverity, Location, Position, Range, Uri};
 
     use crate::config::{AuthContext, ServerSettings};
     use crate::semantic::types::{
@@ -1856,7 +1856,7 @@ mod tests {
 
     #[test]
     fn column_completion_items_returns_only_fields() {
-        use tower_lsp_server::ls_types::CompletionItemKind;
+        use ls_types::CompletionItemKind;
 
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();

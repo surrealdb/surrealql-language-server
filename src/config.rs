@@ -1,7 +1,19 @@
-use std::env;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Reads an environment variable when running natively. Returns `None`
+/// on `wasm32-unknown-unknown` because the browser sandbox has no
+/// environment to inspect — Surrealist supplies these values via the
+/// LSP `initializationOptions` / `workspace/configuration` flow.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_env(_name: &str) -> Option<String> {
+    None
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -178,27 +190,27 @@ impl ServerSettings {
         self.connection.endpoint = self
             .connection
             .endpoint
-            .or_else(|| env::var("SURREALDB_ENDPOINT").ok());
+            .or_else(|| read_env("SURREALDB_ENDPOINT"));
         self.connection.namespace = self
             .connection
             .namespace
-            .or_else(|| env::var("SURREALDB_NAMESPACE").ok());
+            .or_else(|| read_env("SURREALDB_NAMESPACE"));
         self.connection.database = self
             .connection
             .database
-            .or_else(|| env::var("SURREALDB_DATABASE").ok());
+            .or_else(|| read_env("SURREALDB_DATABASE"));
         self.connection.username = self
             .connection
             .username
-            .or_else(|| env::var("SURREALDB_USERNAME").ok());
+            .or_else(|| read_env("SURREALDB_USERNAME"));
         self.connection.password = self
             .connection
             .password
-            .or_else(|| env::var("SURREALDB_PASSWORD").ok());
+            .or_else(|| read_env("SURREALDB_PASSWORD"));
         self.connection.token = self
             .connection
             .token
-            .or_else(|| env::var("SURREALDB_TOKEN").ok());
+            .or_else(|| read_env("SURREALDB_TOKEN"));
         self
     }
 

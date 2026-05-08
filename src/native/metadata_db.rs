@@ -1,26 +1,44 @@
+//! [`MetadataProvider`] implementation that talks to a real SurrealDB
+//! instance via the [`surrealdb`] Rust SDK.
+//!
+//! Walks `INFO FOR DB` and every `INFO FOR TABLE <name>`, harvests the
+//! returned `DEFINE …` statements, and re-parses them through the
+//! analyzer so live tables/fields/functions appear alongside the
+//! workspace ones in the merged semantic model.
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use ls_types::Uri;
 use serde_json::Value as JsonValue;
 use surrealdb::engine::any::connect;
 use surrealdb::opt::auth::{Database, Root};
 use surrealdb::types::Value as SurrealValue;
 use tokio::time::timeout;
-use tower_lsp_server::ls_types::Uri;
 
 use crate::config::ServerSettings;
+use crate::core::client::MetadataProvider;
 use crate::semantic::analyzer::analyze_document;
 use crate::semantic::types::{LiveMetadataSnapshot, SymbolOrigin};
 
-/// Hard ceiling on the total INFO-FOR-DB + INFO-FOR-TABLE walk so that a
-/// degenerate database (thousands of tables) or an unreachable endpoint still
-/// can't pin the cold-start task forever.
+/// Hard ceiling on the total INFO-FOR-DB + INFO-FOR-TABLE walk so that
+/// a degenerate database (thousands of tables) or an unreachable
+/// endpoint can't pin the cold-start task forever.
 const TOTAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub struct SurrealDbProvider;
+#[derive(Default)]
+pub struct SurrealDbMetadataProvider;
 
-impl SurrealDbProvider {
-    pub async fn fetch_snapshot(settings: &ServerSettings) -> LiveMetadataSnapshot {
+impl SurrealDbMetadataProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl MetadataProvider for SurrealDbMetadataProvider {
+    async fn fetch(&self, settings: &ServerSettings) -> LiveMetadataSnapshot {
         if !settings.metadata.enable_live_metadata
             || !settings.metadata.db_enabled()
             || !settings.connection.is_configured()

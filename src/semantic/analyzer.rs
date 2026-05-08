@@ -1,6 +1,4 @@
-use tower_lsp_server::ls_types::{
-    Diagnostic, DiagnosticSeverity, DocumentSymbol, Location, SymbolKind, Uri,
-};
+use ls_types::{Diagnostic, DiagnosticSeverity, DocumentSymbol, Location, SymbolKind, Uri};
 use tree_sitter::{Node, Parser};
 
 use crate::grammar::language;
@@ -1150,7 +1148,7 @@ fn action_label(action: QueryAction) -> &'static str {
 mod tests {
     use std::str::FromStr;
 
-    use tower_lsp_server::ls_types::Uri;
+    use ls_types::Uri;
 
     use crate::semantic::types::SymbolOrigin;
 

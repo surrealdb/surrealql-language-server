@@ -7,15 +7,48 @@ license-file = 'LICENSE'
 description = 'Language Server Protocol implementation for SurrealQL'
 keywords = ['surrealdb', 'language-server']
 
+# `cdylib` is required so `wasm-pack build --target web` can produce the
+# browser-loadable wasm module; `rlib` keeps `cargo build`/`cargo test`
+# behaviour identical to the previous lib layout.
+[lib]
+crate-type = ['cdylib', 'rlib']
+
+# Dependencies shared by both the native binary and the WASM module. Keep
+# this list strictly target-agnostic — anything that pulls in tokio,
+# tower-lsp-server, surrealdb, or filesystem walkers belongs in one of
+# the target-conditional sections below.
 [dependencies]
+async-trait = '0.1'
+ls-types = '0.0.6'
 serde = { version = '1.0', features = ['derive'] }
 serde_json = '1.0'
-surrealdb = { version = '3.0.5', default-features = false, features = ['protocol-http', 'protocol-ws', 'rustls'] }
 strsim = '0.11.1'
+tree-sitter = '0.26.6'
+
+# Native (binary + library) dependencies. Pulls in the multi-threaded
+# tokio runtime, the tower-lsp-server stdio framework, the SurrealDB
+# Rust SDK for live metadata, and walkdir for workspace ingestion.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+surrealdb = { version = '3.0.5', default-features = false, features = ['protocol-http', 'protocol-ws', 'rustls'] }
 tokio = { version = '1.48.0', features = ['io-std', 'macros', 'rt-multi-thread', 'sync', 'time'] }
 tower-lsp-server = '0.23.0'
-tree-sitter = '0.26.6'
 walkdir = '2.5.0'
+
+# Browser (wasm32-unknown-unknown) dependencies. tokio_with_wasm provides
+# a drop-in subset of tokio (sync, time, task) backed by the JavaScript
+# event loop, so all shared core code compiles unchanged. send_wrapper
+# lets us satisfy the Send + Sync bounds of the portable traits with
+# `js_sys::Function` callbacks (sound on wasm because there is only one
+# thread).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = '0.1'
+js-sys = '0.3'
+parking_lot = '0.12'
+send_wrapper = '0.6'
+serde-wasm-bindgen = '0.6'
+tokio_with_wasm = { version = '0.9', features = ['macros', 'rt', 'sync', 'time'] }
+wasm-bindgen = '0.2'
+wasm-bindgen-futures = '0.4'
 
 [build-dependencies]
 cc = '1.2.56'
@@ -23,9 +56,23 @@ cc = '1.2.56'
 [dev-dependencies]
 pretty_assertions = '1.4.1'
 
-[profile.release]
+[target.'cfg(not(target_arch = "wasm32"))'.profile.release]
 lto = 'fat'
 codegen-units = 1
 strip = 'symbols'
 panic = 'abort'
 opt-level = 3
+
+# Modern clang emits wasm instructions from several post-MVP
+# proposals (bulk-memory for memory.copy/fill, nontrapping-fptoint
+# for trunc_sat, sign-ext for i32.extend8_s, etc.). Pass the
+# matching `--enable-*` flags through to `wasm-opt` so the release
+# pipeline can validate and optimise the module.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    '-O',
+    '--enable-bulk-memory',
+    '--enable-nontrapping-float-to-int',
+    '--enable-sign-ext',
+    '--enable-mutable-globals',
+]
