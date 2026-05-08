@@ -22,7 +22,9 @@ impl TowerNotifier {
 #[async_trait]
 impl LspNotifier for TowerNotifier {
     async fn publish_diagnostics(&self, uri: Uri, diagnostics: Vec<Diagnostic>) {
-        self.client.publish_diagnostics(uri, diagnostics, None).await;
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 
     async fn log_message(&self, level: MessageType, message: String) {

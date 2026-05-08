@@ -572,18 +572,16 @@ impl MergedSemanticModel {
                         diagnostics: Some(vec![diagnostic.clone()]),
                         edit: Some(WorkspaceEdit {
                             document_changes: Some(DocumentChanges::Operations(vec![
-                                ls_types::DocumentChangeOperation::Edit(
-                                    TextDocumentEdit {
-                                        text_document: OptionalVersionedTextDocumentIdentifier {
-                                            uri: uri.clone(),
-                                            version: None,
-                                        },
-                                        edits: vec![OneOf::Left(TextEdit {
-                                            range: diagnostic.range,
-                                            new_text: replacement.name.clone(),
-                                        })],
+                                ls_types::DocumentChangeOperation::Edit(TextDocumentEdit {
+                                    text_document: OptionalVersionedTextDocumentIdentifier {
+                                        uri: uri.clone(),
+                                        version: None,
                                     },
-                                ),
+                                    edits: vec![OneOf::Left(TextEdit {
+                                        range: diagnostic.range,
+                                        new_text: replacement.name.clone(),
+                                    })],
+                                }),
                             ])),
                             ..WorkspaceEdit::default()
                         }),
@@ -702,10 +700,7 @@ impl MergedSemanticModel {
         Some(changes)
     }
 
-    pub fn workspace_symbol_items(
-        &self,
-        query: &str,
-    ) -> Vec<ls_types::SymbolInformation> {
+    pub fn workspace_symbol_items(&self, query: &str) -> Vec<ls_types::SymbolInformation> {
         let needle = query.to_ascii_lowercase();
         let mut items = Vec::new();
         for table in self.tables.values() {

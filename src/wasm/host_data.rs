@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use ls_types::Uri;
 use parking_lot::RwLock;
 
-use crate::core::client::{MetadataProvider, WorkspaceLoader};
 use crate::config::ServerSettings;
+use crate::core::client::{MetadataProvider, WorkspaceLoader};
 use crate::semantic::types::{LiveMetadataSnapshot, WorkspaceIndex};
 
 /// Snapshot of `.surql` documents the host has pushed in.

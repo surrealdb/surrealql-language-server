@@ -31,9 +31,7 @@ use crate::runtime;
 use crate::semantic::analyzer::analyze_document;
 use crate::semantic::model::{field_completion_tables, is_record_type_context};
 use crate::semantic::text::{position_to_offset, token_at, word_range};
-use crate::semantic::types::{
-    DocumentAnalysis, FunctionDef, MergedSemanticModel, SymbolOrigin,
-};
+use crate::semantic::types::{DocumentAnalysis, FunctionDef, MergedSemanticModel, SymbolOrigin};
 
 /// Hosting-agnostic language server. Generic over the three boundary
 /// traits so that a native (tower-lsp + walkdir + surrealdb) and a
@@ -70,9 +68,7 @@ where
     /// LSP capability advertisement, identical for both targets.
     pub fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                TextDocumentSyncKind::FULL,
-            )),
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             completion_provider: Some(CompletionOptions {
                 resolve_provider: Some(false),
                 trigger_characters: Some(vec![
@@ -350,10 +346,7 @@ where
     // Per-request handlers
     // ──────────────────────────────────────────────────────────────────
 
-    pub async fn completion(
-        &self,
-        params: CompletionParams,
-    ) -> Option<CompletionResponse> {
+    pub async fn completion(&self, params: CompletionParams) -> Option<CompletionResponse> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
@@ -434,7 +427,9 @@ where
         let token = token_at(&analysis.text, position)?;
         let range = word_range(&analysis.text, position)?;
         let contents = model.hover_markdown_for_token(
-            token.trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')),
+            token.trim_matches(|ch: char| {
+                matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
+            }),
             settings.active_auth_context(),
         )?;
 

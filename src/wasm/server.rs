@@ -80,11 +80,7 @@ impl WasmLanguageServer {
     /// of the saved workspace. Used by Surrealist to seed the server
     /// with files that aren't currently open in any editor.
     #[wasm_bindgen(js_name = pushWorkspaceDocument)]
-    pub async fn push_workspace_document(
-        &self,
-        uri: String,
-        text: String,
-    ) -> Result<(), JsValue> {
+    pub async fn push_workspace_document(&self, uri: String, text: String) -> Result<(), JsValue> {
         let parsed = parse_uri(&uri)?;
         let mut workspace = self.workspace.snapshot();
         if let Some(analysis) = analyze_document(parsed.clone(), &text, SymbolOrigin::Local) {

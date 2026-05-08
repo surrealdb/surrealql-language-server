@@ -206,18 +206,14 @@ async fn dispatch(core: &WasmCore, method: &str, params: Value) -> Outcome {
             Ok(params) => Outcome::from_value(core.prepare_call_hierarchy(params).await),
             Err(error) => error,
         },
-        "callHierarchy/incomingCalls" => {
-            match decode::<CallHierarchyIncomingCallsParams>(params) {
-                Ok(params) => Outcome::from_value(core.incoming_calls(params).await),
-                Err(error) => error,
-            }
-        }
-        "callHierarchy/outgoingCalls" => {
-            match decode::<CallHierarchyOutgoingCallsParams>(params) {
-                Ok(params) => Outcome::from_value(core.outgoing_calls(params).await),
-                Err(error) => error,
-            }
-        }
+        "callHierarchy/incomingCalls" => match decode::<CallHierarchyIncomingCallsParams>(params) {
+            Ok(params) => Outcome::from_value(core.incoming_calls(params).await),
+            Err(error) => error,
+        },
+        "callHierarchy/outgoingCalls" => match decode::<CallHierarchyOutgoingCallsParams>(params) {
+            Ok(params) => Outcome::from_value(core.outgoing_calls(params).await),
+            Err(error) => error,
+        },
 
         _ => Outcome::Error {
             code: METHOD_NOT_FOUND,
