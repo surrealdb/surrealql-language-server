@@ -1,13 +1,16 @@
-use ls_types::{Diagnostic, DiagnosticSeverity, DocumentSymbol, Location, SymbolKind, Uri};
+use ls_types::{
+    Diagnostic, DiagnosticSeverity, DocumentSymbol, InlayHint, InlayHintKind, InlayHintLabel,
+    Location, NumberOrString, SymbolKind, Uri,
+};
 use tree_sitter::{Node, Parser};
 
 use crate::grammar::language;
-use crate::semantic::text::{byte_range_to_lsp, compact_preview};
+use crate::semantic::text::{byte_range_to_lsp, compact_preview, offset_to_position};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
     AccessDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage, FunctionParam,
-    IndexDef, InferenceFact, ParamDef, PermissionMode, PermissionRule, QueryAction, QueryFact,
-    SymbolOrigin, SymbolReference, TableDef,
+    IndexDef, InferenceFact, MergedSemanticModel, ParamDef, PermissionMode, PermissionRule,
+    QueryAction, QueryFact, SymbolOrigin, SymbolReference, TableDef,
 };
 
 const TRANSPARENT_NODES: &[&str] = &[
@@ -1048,6 +1051,10 @@ fn collect_node_diagnostics(source: &str, node: Node<'_>, diagnostics: &mut Vec<
         diagnostics.push(Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::ERROR),
+            // Tagging parse diagnostics with `parse` lets clients
+            // distinguish them from semantic warnings (which leave
+            // `code` unset) without parsing message strings.
+            code: Some(NumberOrString::String("parse".to_string())),
             source: Some("surreal-language-server".to_string()),
             message: format!("Missing syntax near `{}`.", node.kind()),
             ..Diagnostic::default()
@@ -1059,6 +1066,7 @@ fn collect_node_diagnostics(source: &str, node: Node<'_>, diagnostics: &mut Vec<
         diagnostics.push(Diagnostic {
             range: byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
             severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("parse".to_string())),
             source: Some("surreal-language-server".to_string()),
             message: syntax_error_message(source, node),
             ..Diagnostic::default()
@@ -1141,6 +1149,103 @@ fn action_label(action: QueryAction) -> &'static str {
         QueryAction::Delete => "DELETE",
         QueryAction::Relate => "RELATE",
         QueryAction::Execute => "EXECUTE",
+    }
+}
+
+/// Walk the document and emit `param_name:` inlay hints next to every
+/// argument of every custom function call that overlaps the requested
+/// byte range. Builtin functions are skipped because their grammar
+/// definitions only carry free-form signature strings, not structured
+/// parameter names we can map onto positional arguments.
+pub fn collect_inlay_hints(
+    source: &str,
+    range_start: usize,
+    range_end: usize,
+    model: &MergedSemanticModel,
+) -> Vec<InlayHint> {
+    let mut parser = Parser::new();
+    if parser.set_language(&language()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let mut hints = Vec::new();
+    walk_inlay_hints(
+        tree.root_node(),
+        source,
+        range_start,
+        range_end,
+        model,
+        &mut hints,
+    );
+    hints
+}
+
+fn walk_inlay_hints(
+    node: Node<'_>,
+    source: &str,
+    range_start: usize,
+    range_end: usize,
+    model: &MergedSemanticModel,
+    hints: &mut Vec<InlayHint>,
+) {
+    if node.start_byte() > range_end || node.end_byte() < range_start {
+        return;
+    }
+
+    if node.kind() == "function_call" {
+        if let Some(name_node) = node
+            .children(&mut node.walk())
+            .find(|child| child.kind() == "custom_function_name")
+        {
+            if let Ok(raw) = name_node.utf8_text(source.as_bytes()) {
+                let stripped = raw.strip_prefix("fn::").unwrap_or(raw);
+                if let Some(function) = model.functions.get(stripped) {
+                    if let Some(arg_list) = node
+                        .children(&mut node.walk())
+                        .find(|child| child.kind() == "argument_list")
+                    {
+                        emit_argument_hints(arg_list, source, function, hints);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_inlay_hints(child, source, range_start, range_end, model, hints);
+    }
+}
+
+fn emit_argument_hints(
+    arg_list: Node<'_>,
+    source: &str,
+    function: &FunctionDef,
+    hints: &mut Vec<InlayHint>,
+) {
+    let mut cursor = arg_list.walk();
+    let arguments: Vec<Node<'_>> = arg_list
+        .children(&mut cursor)
+        .filter(|child| child.is_named())
+        .collect();
+
+    for (index, argument) in arguments.iter().enumerate() {
+        let Some(param) = function.params.get(index) else {
+            break;
+        };
+        hints.push(InlayHint {
+            position: offset_to_position(source, argument.start_byte()),
+            label: InlayHintLabel::String(format!("{}:", param.name)),
+            kind: Some(InlayHintKind::PARAMETER),
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(false),
+            padding_right: Some(true),
+            data: None,
+        });
     }
 }
 

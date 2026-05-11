@@ -143,6 +143,10 @@ impl LanguageServer for Backend {
         Ok(Some(self.core.document_highlight(params).await))
     }
 
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        Ok(Some(self.core.inlay_hint(params).await))
+    }
+
     async fn prepare_call_hierarchy(
         &self,
         params: CallHierarchyPrepareParams,

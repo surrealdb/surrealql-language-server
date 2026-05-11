@@ -94,6 +94,12 @@ where
             }),
             code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
             document_highlight_provider: Some(OneOf::Left(true)),
+            inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+                InlayHintOptions {
+                    resolve_provider: Some(false),
+                    ..InlayHintOptions::default()
+                },
+            ))),
             call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
             document_symbol_provider: Some(OneOf::Left(true)),
             workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -603,6 +609,27 @@ where
                 kind: Some(DocumentHighlightKind::READ),
             })
             .collect()
+    }
+
+    /// Emit `parameter_name:` hints next to each argument of every
+    /// custom function call in the requested viewport range. Builtin
+    /// functions don't expose structured parameter names (their
+    /// signatures are free-form strings), so they're skipped.
+    pub async fn inlay_hint(&self, params: InlayHintParams) -> Vec<InlayHint> {
+        let uri = params.text_document.uri;
+        let Some((analysis, model, _)) = self.snapshot_for_uri(&uri).await else {
+            return Vec::new();
+        };
+
+        let range_start = position_to_offset(&analysis.text, params.range.start);
+        let range_end = position_to_offset(&analysis.text, params.range.end);
+
+        crate::semantic::analyzer::collect_inlay_hints(
+            &analysis.text,
+            range_start,
+            range_end,
+            &model,
+        )
     }
 
     pub async fn prepare_call_hierarchy(

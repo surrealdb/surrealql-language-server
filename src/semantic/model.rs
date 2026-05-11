@@ -513,23 +513,31 @@ impl MergedSemanticModel {
                     continue;
                 };
 
-                let permission = self.evaluate_permissions(fact, table_def, active_context);
-                match permission.result {
-                    AccessResult::Denied => diagnostics.push(Diagnostic {
-                        range: fact.location.range,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some("surreal-language-server".to_string()),
-                        message: permission.message,
-                        ..Diagnostic::default()
-                    }),
-                    AccessResult::Unknown => diagnostics.push(Diagnostic {
-                        range: fact.location.range,
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        source: Some("surreal-language-server".to_string()),
-                        message: permission.message,
-                        ..Diagnostic::default()
-                    }),
-                    AccessResult::Allowed => {}
+                // SELECT and RELATE are intentionally exempt from
+                // static permission checking: their permission rules
+                // routinely depend on row-level state (e.g.
+                // `WHERE $auth.id = id`) that can't be evaluated
+                // without the actual record, so the diagnostics tend
+                // to be noisy false-positives in the editor.
+                if !matches!(fact.action, QueryAction::Select | QueryAction::Relate) {
+                    let permission = self.evaluate_permissions(fact, table_def, active_context);
+                    match permission.result {
+                        AccessResult::Denied => diagnostics.push(Diagnostic {
+                            range: fact.location.range,
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("surreal-language-server".to_string()),
+                            message: permission.message,
+                            ..Diagnostic::default()
+                        }),
+                        AccessResult::Unknown => diagnostics.push(Diagnostic {
+                            range: fact.location.range,
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("surreal-language-server".to_string()),
+                            message: permission.message,
+                            ..Diagnostic::default()
+                        }),
+                        AccessResult::Allowed => {}
+                    }
                 }
 
                 for field in &fact.touched_fields {
@@ -1545,15 +1553,19 @@ mod tests {
 
     #[test]
     fn denied_permissions_produce_error_diagnostic() {
+        // SELECT and RELATE are deliberately exempt from static
+        // permission checks (their rules are usually row-level and
+        // can't be evaluated without an actual record), so this test
+        // uses CREATE to exercise the denied-permission code path.
         let settings = ServerSettings::default();
         let table = TableDef {
             name: "person".to_string(),
             schema_mode: None,
             comment: None,
             permissions: vec![PermissionRule {
-                actions: vec![QueryAction::Select],
+                actions: vec![QueryAction::Create],
                 mode: PermissionMode::None,
-                raw: "PERMISSIONS FOR select NONE".to_string(),
+                raw: "PERMISSIONS FOR create NONE".to_string(),
                 origin: SymbolOrigin::Local,
                 location: None,
             }],
@@ -1580,7 +1592,7 @@ mod tests {
                 params: Vec::new(),
                 accesses: Vec::new(),
                 query_facts: vec![crate::semantic::types::QueryFact {
-                    action: QueryAction::Select,
+                    action: QueryAction::Create,
                     target_tables: vec!["person".to_string()],
                     touched_fields: Vec::new(),
                     dynamic: false,
@@ -1588,7 +1600,7 @@ mod tests {
                         Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                         Range::default(),
                     ),
-                    source_preview: "SELECT * FROM person".to_string(),
+                    source_preview: "CREATE person".to_string(),
                 }],
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
@@ -1599,6 +1611,83 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn select_and_relate_skip_permission_checks() {
+        // Even with `PERMISSIONS FOR select NONE` (which would block
+        // every reader at runtime), the LSP should not flag SELECTs
+        // because runtime row-level rules make static evaluation
+        // unreliable. The same applies to RELATE.
+        let settings = ServerSettings::default();
+        let person = TableDef {
+            name: "person".to_string(),
+            schema_mode: None,
+            comment: None,
+            permissions: vec![
+                PermissionRule {
+                    actions: vec![QueryAction::Select],
+                    mode: PermissionMode::None,
+                    raw: "PERMISSIONS FOR select NONE".to_string(),
+                    origin: SymbolOrigin::Local,
+                    location: None,
+                },
+                PermissionRule {
+                    actions: vec![QueryAction::Relate],
+                    mode: PermissionMode::None,
+                    raw: "PERMISSIONS FOR relate NONE".to_string(),
+                    origin: SymbolOrigin::Local,
+                    location: None,
+                },
+            ],
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(
+                Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
+                Range::default(),
+            ),
+        };
+        let mut model = MergedSemanticModel::default();
+        model.tables.insert("person".to_string(), person);
+
+        let analysis_uri =
+            Uri::from_str("file:///workspace/query.surql").expect("valid uri");
+        let make_fact = |action: QueryAction| crate::semantic::types::QueryFact {
+            action,
+            target_tables: vec!["person".to_string()],
+            touched_fields: Vec::new(),
+            dynamic: false,
+            location: Location::new(analysis_uri.clone(), Range::default()),
+            source_preview: String::new(),
+        };
+
+        let diagnostics = model.semantic_diagnostics(
+            &DocumentAnalysis {
+                uri: analysis_uri.clone(),
+                text: String::new(),
+                tables: Vec::new(),
+                events: Vec::new(),
+                indexes: Vec::new(),
+                fields: Vec::new(),
+                functions: Vec::new(),
+                params: Vec::new(),
+                accesses: Vec::new(),
+                query_facts: vec![
+                    make_fact(QueryAction::Select),
+                    make_fact(QueryAction::Relate),
+                ],
+                references: Vec::new(),
+                syntax_diagnostics: Vec::new(),
+                document_symbols: Vec::new(),
+            },
+            &settings,
+        );
+
+        assert!(
+            diagnostics.is_empty(),
+            "expected no diagnostics, got {diagnostics:?}"
+        );
     }
 
     #[test]

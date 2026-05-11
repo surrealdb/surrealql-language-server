@@ -200,6 +200,10 @@ async fn dispatch(core: &WasmCore, method: &str, params: Value) -> Outcome {
             Ok(params) => Outcome::from_value(core.document_highlight(params).await),
             Err(error) => error,
         },
+        "textDocument/inlayHint" => match decode::<InlayHintParams>(params) {
+            Ok(params) => Outcome::from_value(core.inlay_hint(params).await),
+            Err(error) => error,
+        },
 
         // ── Call hierarchy ─────────────────────────────────────────
         "textDocument/prepareCallHierarchy" => match decode::<CallHierarchyPrepareParams>(params) {
