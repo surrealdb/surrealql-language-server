@@ -119,9 +119,25 @@ jobs:
                   version: latest
             - name: Build wasm package
               run: bash scripts/build-wasm.sh
+            - name: Set up Node.js
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              with:
+                  node-version: '24'
+                  registry-url: https://registry.npmjs.org
+            - name: Align npm package version with release tag
+              working-directory: pkg
+              run: |
+                  VERSION="${GITHUB_REF_NAME#v}"
+                  npm pkg set "version=${VERSION}"
             - name: Pack npm tarball
               working-directory: pkg
               run: npm pack
+            - name: Publish to npm
+              if: ${{ secrets.NPM_TOKEN != '' }}
+              working-directory: pkg
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+              run: npm publish
             - name: Upload to GitHub Release
               uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
               with:
