@@ -97,3 +97,48 @@ jobs:
               env:
                   CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
                   TREE_SITTER_SURREALQL_DIR: ${{ github.workspace }}/../surrealql-tree-sitter
+
+    wasm:
+        if: startsWith(github.ref, 'refs/tags/v')
+        permissions:
+            contents: write
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Check out tree-sitter grammar
+              run: git clone --depth 1 https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
+            - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.94.0
+                  targets: wasm32-unknown-unknown
+            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+              name: Cache Rust Artifacts
+            - name: Install wasm-pack
+              uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa
+              with:
+                  version: latest
+            - name: Build wasm package
+              run: bash scripts/build-wasm.sh
+            - name: Set up Node.js
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              with:
+                  node-version: '24'
+                  registry-url: https://registry.npmjs.org
+            - name: Align npm package version with release tag
+              working-directory: pkg
+              run: |
+                  VERSION="${GITHUB_REF_NAME#v}"
+                  npm pkg set "version=${VERSION}"
+            - name: Pack npm tarball
+              working-directory: pkg
+              run: npm pack
+            - name: Publish to npm
+              if: ${{ secrets.NPM_TOKEN != '' }}
+              working-directory: pkg
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+              run: npm publish
+            - name: Upload to GitHub Release
+              uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+              with:
+                  files: pkg/*.tgz
