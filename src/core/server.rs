@@ -332,6 +332,7 @@ where
             state.saved_workspace = workspace;
         }
         self.recompute_model().await;
+        self.republish_open_diagnostics().await;
     }
 
     /// Replace the current live metadata snapshot. Used by the WASM
@@ -346,6 +347,7 @@ where
             state.live_metadata = Arc::new(snapshot);
         }
         self.recompute_model().await;
+        self.republish_open_diagnostics().await;
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -751,6 +753,19 @@ where
             state.live_metadata = live_metadata;
         }
         self.recompute_model().await;
+    }
+
+    /// Republish diagnostics for every open editor buffer after the
+    /// merged model changes without a document edit (e.g. live
+    /// metadata arriving from the host).
+    async fn republish_open_diagnostics(&self) {
+        let uris = {
+            let state = self.state.read().await;
+            state.open_documents.keys().cloned().collect::<Vec<_>>()
+        };
+        for uri in uris {
+            self.publish_diagnostics_for_uri(&uri).await;
+        }
     }
 
     async fn publish_diagnostics_for_uri(&self, uri: &Uri) {

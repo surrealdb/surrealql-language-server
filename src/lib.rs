@@ -3,7 +3,7 @@
 //! The crate is organised so the same business logic feeds both the
 //! native LSP binary (this crate's `[[bin]]` target, see
 //! [`crate::native::Backend`]) and a `wasm-bindgen` browser package
-//! (built with `wasm-pack build --target web`, see
+//! (built with `scripts/build-wasm.sh`, see
 //! [`crate::wasm::WasmLanguageServer`]).
 //!
 //! * [`config`], [`grammar`], [`semantic`] hold the portable data
