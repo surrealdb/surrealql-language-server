@@ -1651,8 +1651,7 @@ mod tests {
         let mut model = MergedSemanticModel::default();
         model.tables.insert("person".to_string(), person);
 
-        let analysis_uri =
-            Uri::from_str("file:///workspace/query.surql").expect("valid uri");
+        let analysis_uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
         let make_fact = |action: QueryAction| crate::semantic::types::QueryFact {
             action,
             target_tables: vec!["person".to_string()],
