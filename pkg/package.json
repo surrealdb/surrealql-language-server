@@ -1,0 +1,26 @@
+{
+  "name": "@surrealdb/surrealql-language-server",
+  "type": "module",
+  "description": "Language Server Protocol implementation for SurrealQL",
+  "version": "0.1.4",
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://github.com/surrealdb/surrealql-language-server",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/surrealdb/surrealql-language-server.git"
+  },
+  "files": [
+    "surrealql_language_server_bg.wasm",
+    "surrealql_language_server.js",
+    "surrealql_language_server.d.ts",
+    "LICENSE"
+  ],
+  "main": "surrealql_language_server.js",
+  "types": "surrealql_language_server.d.ts",
+  "keywords": [
+    "surrealdb",
+    "language-server",
+    "surrealql",
+    "wasm"
+  ]
+}
