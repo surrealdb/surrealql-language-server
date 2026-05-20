@@ -102,6 +102,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         permissions:
             contents: write
+            id-token: write
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -113,10 +114,10 @@ jobs:
                   targets: wasm32-unknown-unknown
             - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
               name: Cache Rust Artifacts
-            - name: Install wasm-pack
-              uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa
-              with:
-                  version: latest
+            - name: Install wasm-bindgen-cli
+              run: command -v wasm-bindgen && wasm-bindgen --version | grep -q 0.2.108 || cargo install -f wasm-bindgen-cli --version 0.2.108
+            - name: Install wasm-opt
+              run: command -v wasm-opt || cargo install wasm-opt
             - name: Build wasm package
               run: bash scripts/build-wasm.sh
             - name: Set up Node.js
@@ -132,12 +133,12 @@ jobs:
             - name: Pack npm tarball
               working-directory: pkg
               run: npm pack
-            - name: Publish to npm
-              if: ${{ secrets.NPM_TOKEN != '' }}
+            - name: Dry run publish to npm
               working-directory: pkg
-              env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-              run: npm publish
+              run: npm publish --dry-run --access public
+            - name: Publish to npm
+              working-directory: pkg
+              run: npm publish --access public
             - name: Upload to GitHub Release
               uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
               with:

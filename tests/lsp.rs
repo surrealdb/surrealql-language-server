@@ -25,6 +25,7 @@ fn empty_location(path: &str) -> Location {
     Location::new(uri(path), empty_range())
 }
 
+#[allow(dead_code)]
 fn workspace_from(analyses: Vec<DocumentAnalysis>) -> WorkspaceIndex {
     let mut ws = WorkspaceIndex::default();
     for a in analyses {
@@ -466,7 +467,6 @@ fn completion_includes_keywords_and_builtins() {
 
 #[test]
 fn completion_in_record_type_context_shows_only_tables() {
-    let u = uri("schema.surql");
     let mut model = MergedSemanticModel::default();
     model.tables.insert(
         "person".to_string(),
@@ -493,7 +493,6 @@ fn completion_in_record_type_context_shows_only_tables() {
 
 #[test]
 fn completion_for_fields_scoped_to_statement_target_table() {
-    let u = uri("schema.surql");
     let mut model = MergedSemanticModel::default();
     model.fields.insert(
         ("product".to_string(), "price".to_string()),
@@ -570,15 +569,17 @@ fn no_diagnostics_for_allowed_permission() {
 
 #[test]
 fn error_diagnostic_for_denied_permission() {
+    // SELECT and RELATE are exempt from static permission checks, so
+    // use CREATE to exercise the denied-permission diagnostic path.
     let u = uri("query.surql");
     let table = TableDef {
         name: "secret".to_string(),
         schema_mode: None,
         comment: None,
         permissions: vec![PermissionRule {
-            actions: vec![QueryAction::Select],
+            actions: vec![QueryAction::Create],
             mode: PermissionMode::None,
-            raw: "PERMISSIONS FOR select NONE".to_string(),
+            raw: "PERMISSIONS FOR create NONE".to_string(),
             origin: SymbolOrigin::Local,
             location: None,
         }],
@@ -600,12 +601,12 @@ fn error_diagnostic_for_denied_permission() {
         params: Vec::new(),
         accesses: Vec::new(),
         query_facts: vec![QueryFact {
-            action: QueryAction::Select,
+            action: QueryAction::Create,
             target_tables: vec!["secret".to_string()],
             touched_fields: Vec::new(),
             dynamic: false,
             location: empty_location("query.surql"),
-            source_preview: "SELECT * FROM secret".to_string(),
+            source_preview: "CREATE secret".to_string(),
         }],
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -621,7 +622,7 @@ fn error_diagnostic_for_denied_permission() {
 
 #[test]
 fn warning_for_unknown_table_in_query() {
-    let mut model = MergedSemanticModel::default();
+    let model = MergedSemanticModel::default();
     let u = uri("query.surql");
     let analysis = DocumentAnalysis {
         uri: u.clone(),
@@ -748,7 +749,6 @@ fn definition_resolves_local_function() {
 
 #[test]
 fn definition_of_remote_function_returns_none() {
-    let u = uri("fn.surql");
     let mut model = MergedSemanticModel::default();
     model.functions.insert(
         "fn::remote".to_string(),
@@ -820,7 +820,6 @@ fn rename_produces_edits_for_all_references() {
 
 #[test]
 fn rename_of_remote_function_returns_none() {
-    let u = uri("fn.surql");
     let mut model = MergedSemanticModel::default();
     model.functions.insert(
         "fn::remote".to_string(),

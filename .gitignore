@@ -3,3 +3,7 @@ node_modules
 
 grammars
 *.wasm
+
+# Generated wasm-bindgen output (package.json is source-controlled)
+pkg/*
+!pkg/package.json

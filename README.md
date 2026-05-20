@@ -40,10 +40,26 @@ TREE_SITTER_SURREALQL_DIR=/path/to/surrealql-tree-sitter cargo build
 
 ## Building
 
+### Native binary
+
 ```bash
 cargo build --release
-# binary at: target/release/surreal-language-server
+# binary at: target/release/surrealql-language-server
 ```
+
+### Browser WASM package
+
+Build the wasm-bindgen npm package (outputs to `pkg/`):
+
+```bash
+bash scripts/build-wasm.sh
+```
+
+Requirements:
+
+- `wasm-bindgen` CLI (`cargo install wasm-bindgen-cli --version 0.2.108`)
+- `wasm-opt` (`cargo install wasm-opt`)
+- On macOS, a wasm-capable clang (e.g. `brew install llvm`; the script auto-detects Homebrew LLVM)
 
 ## Testing
 
@@ -93,3 +109,24 @@ The `src/parser.c` is auto-generated and should not be edited directly. JavaScri
 ## CI
 
 GitHub Actions runs `cargo fmt --check` and `cargo test` on every push and pull request. The grammar sibling repo is cloned automatically during CI.
+
+## Releases
+
+### Native binaries and crates.io
+
+Push a `v*` tag (e.g. `v0.1.5`). CI builds platform binaries, uploads them to the GitHub Release, and publishes the Rust crate to [crates.io](https://crates.io).
+
+### Browser WASM npm package
+
+The scoped package [`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server) is built with `scripts/build-wasm.sh` (`cargo` → `wasm-bindgen` → `wasm-opt`) and published to npm on the same `v*` tag. A `.tgz` is also attached to the GitHub Release.
+
+Release checklist:
+
+1. Bump `version` in [`Cargo.toml`](Cargo.toml) and [`pkg/package.json`](pkg/package.json).
+2. Push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Confirm the `wasm` CI job succeeds and the package appears on npm.
+
+npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC from GitHub Actions). Before the first publish, an `@surrealdb` org admin must configure a trusted publisher on npmjs.com:
+
+- Repository: `surrealdb/surrealql-language-server`
+- Workflow filename: `ci.yml`

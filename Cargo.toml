@@ -7,7 +7,7 @@ license-file = 'LICENSE'
 description = 'Language Server Protocol implementation for SurrealQL'
 keywords = ['surrealdb', 'language-server']
 
-# `cdylib` is required so `wasm-pack build --target web` can produce the
+# `cdylib` is required so `scripts/build-wasm.sh` can produce the
 # browser-loadable wasm module; `rlib` keeps `cargo build`/`cargo test`
 # behaviour identical to the previous lib layout.
 [lib]
@@ -47,8 +47,8 @@ parking_lot = '0.12'
 send_wrapper = '0.6'
 serde-wasm-bindgen = '0.6'
 tokio_with_wasm = { version = '0.9', features = ['macros', 'rt', 'sync', 'time'] }
-wasm-bindgen = '0.2'
-wasm-bindgen-futures = '0.4'
+wasm-bindgen = '=0.2.108'
+wasm-bindgen-futures = '=0.4.58'
 
 [build-dependencies]
 cc = '1.2.56'
@@ -56,23 +56,9 @@ cc = '1.2.56'
 [dev-dependencies]
 pretty_assertions = '1.4.1'
 
-[target.'cfg(not(target_arch = "wasm32"))'.profile.release]
-lto = 'fat'
+[profile.release]
+lto = true
 codegen-units = 1
-strip = 'symbols'
+strip = true
 panic = 'abort'
-opt-level = 3
-
-# Modern clang emits wasm instructions from several post-MVP
-# proposals (bulk-memory for memory.copy/fill, nontrapping-fptoint
-# for trunc_sat, sign-ext for i32.extend8_s, etc.). Pass the
-# matching `--enable-*` flags through to `wasm-opt` so the release
-# pipeline can validate and optimise the module.
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = [
-    '-O',
-    '--enable-bulk-memory',
-    '--enable-nontrapping-float-to-int',
-    '--enable-sign-ext',
-    '--enable-mutable-globals',
-]
+opt-level = 'z'
