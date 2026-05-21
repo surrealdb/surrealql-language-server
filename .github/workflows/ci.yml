@@ -120,11 +120,14 @@ jobs:
               run: command -v wasm-opt || cargo install wasm-opt
             - name: Build wasm package
               run: bash scripts/build-wasm.sh
+            # Do not set registry-url here — it writes an .npmrc that forces
+            # NODE_AUTH_TOKEN auth and breaks npm OIDC trusted publishing.
             - name: Set up Node.js
               uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
               with:
                   node-version: '24'
-                  registry-url: https://registry.npmjs.org
+            - name: Ensure npm supports OIDC trusted publishing
+              run: npm install -g npm@latest && npm --version
             - name: Align npm package version with release tag
               working-directory: pkg
               run: |

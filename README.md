@@ -126,7 +126,12 @@ Release checklist:
 2. Push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. Confirm the `wasm` CI job succeeds and the package appears on npm.
 
-npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC from GitHub Actions). Before the first publish, an `@surrealdb` org admin must configure a trusted publisher on npmjs.com:
+npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC from GitHub Actions). Before the first publish, an `@surrealdb` org admin must configure a trusted publisher on the package's npm **Access** page ([`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server)) with:
 
-- Repository: `surrealdb/surrealql-language-server`
-- Workflow filename: `ci.yml`
+- Repository owner: `surrealdb`
+- Repository name: `surrealql-language-server`
+- Workflow filename: `ci.yml` (exact match, case-sensitive)
+
+The CI workflow intentionally does **not** set `registry-url` on `actions/setup-node` — that option writes an `.npmrc` which forces token auth and breaks OIDC ([npm/cli#8730](https://github.com/npm/cli/issues/8730)). Do not add a `NODE_AUTH_TOKEN` secret for this job.
+
+If the first CI publish still fails with a misleading `404`, an org admin can bootstrap the package once locally (`bash scripts/build-wasm.sh && npm publish --access public` from `pkg/`), then configure the trusted publisher for subsequent tag releases.
