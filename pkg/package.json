@@ -7,7 +7,10 @@
   "homepage": "https://github.com/surrealdb/surrealql-language-server",
   "repository": {
     "type": "git",
-    "url": "https://github.com/surrealdb/surrealql-language-server.git"
+    "url": "https://github.com/surrealdb/surrealql-language-server"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "surrealql_language_server_bg.wasm",
