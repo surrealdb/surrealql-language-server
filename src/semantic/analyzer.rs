@@ -1516,4 +1516,21 @@ mod tests {
         assert_eq!(analysis.indexes[0].name, "documents_vec_index");
         assert_eq!(analysis.indexes[0].fields, vec!["embedding".to_string()]);
     }
+
+    #[test]
+    fn accepts_bare_f_float_literals() {
+        let uri = Uri::from_str("file:///workspace/vectors.surql").expect("valid uri");
+        let text = r#"
+        LET $n = 1f;
+        CREATE documents CONTENT { text: "foo", embedding: [1f, 2f, 3f, 4f] };
+        "#;
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+    }
 }
