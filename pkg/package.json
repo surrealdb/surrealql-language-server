@@ -18,6 +18,13 @@
     "surrealql_language_server.d.ts",
     "LICENSE"
   ],
+  "exports": {
+    ".": {
+      "types": "./surrealql_language_server.d.ts",
+      "default": "./surrealql_language_server.js"
+    },
+    "./surrealql_language_server_bg.wasm": "./surrealql_language_server_bg.wasm"
+  },
   "main": "surrealql_language_server.js",
   "types": "surrealql_language_server.d.ts",
   "keywords": [

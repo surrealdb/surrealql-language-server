@@ -1086,13 +1086,16 @@ fn full_analysis_pipeline_js_and_surql_mixed() {
     );
 }
 
-// Smoke tests for scripting functions in non-FUNCTION contexts
+// Smoke tests for scripting functions in non-FUNCTION contexts. The
+// parity-branch grammar mirrors lezer's `ThenClause` body, which is
+// `commaSep<(SubQuery | Block)>` — a bare `function() { ... }` must be
+// wrapped in `{ ... }` or `( ... )` to satisfy the grammar.
 #[test]
 fn scripting_function_in_define_event() {
     let u = uri("events.surql");
     let text = r#"
         DEFINE EVENT score ON TABLE person WHEN $event = 'CREATE'
-            THEN function() { return { ok: true }; };
+            THEN { RETURN function() { return { ok: true }; }; };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert!(
@@ -1106,7 +1109,7 @@ fn scripting_function_in_define_event() {
 fn scripting_function_in_define_api() {
     let u = uri("api.surql");
     let text = r#"
-        DEFINE API '/test' FOR get THEN function() { return { status: 200 }; };
+        DEFINE API '/test' FOR get THEN { RETURN function() { return { status: 200 }; }; };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert!(
@@ -1120,9 +1123,11 @@ fn scripting_function_in_define_api() {
 fn scripting_function_nested_braces_in_event() {
     let u = uri("events.surql");
     let text = r#"
-        DEFINE EVENT complex ON TABLE t THEN function() {
-            const obj = { a: 1, b: { c: 2 } };
-            return obj;
+        DEFINE EVENT complex ON TABLE t THEN {
+            RETURN function() {
+                const obj = { a: 1, b: { c: 2 } };
+                return obj;
+            };
         };
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
@@ -1149,8 +1154,14 @@ fn scripting_function_as_value_in_create() {
 
 // --- Trailing comma tests (issue #2) ---
 
+/// `DEFINE FUNCTION` parameters use lezer's `commaSep` (no trailing
+/// comma allowed). The pre-parity tree-sitter grammar accepted trailing
+/// commas as a deliberate extension; the parity-branch grammar reverts
+/// to lezer's behaviour so the two parsers stay in lock-step. This
+/// test pins the new (parity-correct) behaviour: a trailing comma in
+/// `DEFINE FUNCTION` params is a parse error.
 #[test]
-fn trailing_comma_in_define_function_params_no_diagnostic() {
+fn trailing_comma_in_define_function_params_reports_diagnostic() {
     let u = uri("trailing.surql");
     let text = r#"
         DEFINE FUNCTION fn::greet($name: string,) {
@@ -1159,16 +1170,13 @@ fn trailing_comma_in_define_function_params_no_diagnostic() {
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert!(
-        analysis.syntax_diagnostics.is_empty(),
-        "trailing comma in DEFINE FUNCTION params should be valid: {:?}",
-        analysis.syntax_diagnostics
+        !analysis.syntax_diagnostics.is_empty(),
+        "expected a diagnostic for trailing comma in DEFINE FUNCTION params, got none"
     );
-    assert_eq!(analysis.functions.len(), 1);
-    assert_eq!(analysis.functions[0].params.len(), 1);
 }
 
 #[test]
-fn trailing_comma_in_define_function_multiple_params_no_diagnostic() {
+fn trailing_comma_in_define_function_multiple_params_reports_diagnostic() {
     let u = uri("trailing.surql");
     let text = r#"
         DEFINE FUNCTION fn::add($a: number, $b: number,) -> number {
@@ -1177,12 +1185,9 @@ fn trailing_comma_in_define_function_multiple_params_no_diagnostic() {
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert!(
-        analysis.syntax_diagnostics.is_empty(),
-        "trailing comma in multi-param DEFINE FUNCTION should be valid: {:?}",
-        analysis.syntax_diagnostics
+        !analysis.syntax_diagnostics.is_empty(),
+        "expected a diagnostic for trailing comma in multi-param DEFINE FUNCTION, got none"
     );
-    assert_eq!(analysis.functions.len(), 1);
-    assert_eq!(analysis.functions[0].params.len(), 2);
 }
 
 #[test]
