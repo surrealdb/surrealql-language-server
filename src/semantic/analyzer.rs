@@ -1535,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_piped_create_record_id_range() {
+    fn accepts_range_create_record_id() {
         let uri = Uri::from_str("file:///workspace/mock.surql").expect("valid uri");
         let text = "CREATE |node:1..10|;";
 
