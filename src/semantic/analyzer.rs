@@ -1533,4 +1533,51 @@ mod tests {
             analysis.syntax_diagnostics
         );
     }
+
+    #[test]
+    fn accepts_piped_create_record_id_range() {
+        let uri = Uri::from_str("file:///workspace/mock.surql").expect("valid uri");
+        let text = "CREATE |node:1..10|;";
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_recurse_collect_inclusive_options() {
+        let uri = Uri::from_str("file:///workspace/graph.surql").expect("valid uri");
+        let text = "RETURN a:1.{..+collect+inclusive}(->edge->a[?bool]);";
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_for_loop_with_unparenthesized_select() {
+        let uri = Uri::from_str("file:///workspace/graph.surql").expect("valid uri");
+        let text = r#"
+        FOR $node IN SELECT * FROM node {
+            LET $next = type::record("node", $node.id.id() + 1);
+            RELATE $node->edge->$next SET read = rand::bool();
+        };
+        "#;
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+    }
 }
