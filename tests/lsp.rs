@@ -1262,3 +1262,23 @@ fn no_regression_object_without_trailing_comma() {
         analysis.syntax_diagnostics
     );
 }
+
+#[test]
+fn prefix_not_in_where_clause_no_diagnostic() {
+    let u = uri("prefix_not.surql");
+    let text = r#"
+        SELECT VALUE slug
+        FROM event
+        WHERE !external_url;
+
+        SELECT VALUE slug
+        FROM event
+        WHERE !$external_url;
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "prefix ! on fields and parameters should be valid: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
