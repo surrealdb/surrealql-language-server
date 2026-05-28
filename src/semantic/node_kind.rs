@@ -132,6 +132,7 @@ pub const SET: &str = "Set";
 pub const POINT: &str = "Point";
 
 pub const RECORD_ID: &str = "RecordId";
+pub const RANGE_RECORD_ID: &str = "RangeRecordId";
 pub const RECORD_TB_IDENT: &str = "RecordTbIdent";
 pub const RECORD_ID_IDENT: &str = "RecordIdIdent";
 

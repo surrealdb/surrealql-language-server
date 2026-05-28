@@ -937,6 +937,7 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
                         k::IDENT
                             | k::IDIOM
                             | k::RECORD_ID
+                            | k::RANGE_RECORD_ID
                             | k::FUNCTION_CALL
                             | k::VARIABLE_NAME
                             | k::PATH
@@ -950,7 +951,12 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
             .filter(|child| {
                 matches!(
                     child.kind(),
-                    k::IDENT | k::RECORD_ID | k::FUNCTION_CALL | k::VARIABLE_NAME | k::ARRAY
+                    k::IDENT
+                        | k::RECORD_ID
+                        | k::RANGE_RECORD_ID
+                        | k::FUNCTION_CALL
+                        | k::VARIABLE_NAME
+                        | k::ARRAY
                 )
             })
             .collect(),
@@ -1545,6 +1551,15 @@ mod tests {
             analysis.syntax_diagnostics.is_empty(),
             "unexpected diagnostics: {:?}",
             analysis.syntax_diagnostics
+        );
+        assert_eq!(analysis.query_facts.len(), 1);
+        assert_eq!(
+            analysis.query_facts[0].target_tables,
+            vec!["node".to_string()]
+        );
+        assert!(
+            !analysis.query_facts[0].dynamic,
+            "range record id target should resolve statically"
         );
     }
 
