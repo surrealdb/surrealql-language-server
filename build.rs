@@ -104,18 +104,31 @@ fn grammar_dir(manifest_dir: &Path) -> PathBuf {
     }
 }
 
+/// Extract every SurrealQL keyword referenced by `grammar.js`. The grammar
+/// declares each keyword via the `kw("word")` / `kw('word')` helper, so
+/// we scan for both quote styles and uppercase the matches before handing
+/// them to the rest of the language server.
+///
+/// The set is deduplicated and sorted alphabetically. Both the
+/// `_kw_<name>` rule definitions *and* the corresponding `kw(...)` calls
+/// live in the same file, so a single scan captures every keyword the
+/// grammar recognises.
 fn extract_keywords(grammar_source: &str) -> Vec<String> {
     let mut keywords = BTreeSet::new();
-    let needle = "make_keyword('";
-    let mut rest = grammar_source;
 
-    while let Some(start) = rest.find(needle) {
-        let after = &rest[start + needle.len()..];
-        if let Some(end) = after.find("')") {
-            keywords.insert(after[..end].to_string());
-            rest = &after[end + 2..];
-        } else {
-            break;
+    for (needle, quote) in [("kw(\"", '"'), ("kw('", '\'')] {
+        let mut rest = grammar_source;
+        while let Some(start) = rest.find(needle) {
+            let after = &rest[start + needle.len()..];
+            if let Some(end) = after.find(quote) {
+                let word = &after[..end];
+                if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    keywords.insert(word.to_ascii_uppercase());
+                }
+                rest = &after[end + 1..];
+            } else {
+                break;
+            }
         }
     }
 
@@ -129,8 +142,30 @@ mod tests {
 
     #[test]
     fn extracts_keywords_from_grammar() {
-        let source = "keyword_select: (_) => make_keyword('SELECT'),\nkeyword_set: (_) => make_keyword('SET')";
+        let source = "_kw_select: ($) => kw(\"select\"),\n_kw_set: ($) => kw(\"set\")";
         let keywords = extract_keywords(source);
         assert_eq!(keywords, vec!["SELECT".to_string(), "SET".to_string()]);
+    }
+
+    #[test]
+    fn extracts_single_quoted_keywords_from_grammar() {
+        let source = "_kw_select: ($) => kw('select'),\n_kw_set: ($) => kw('set')";
+        let keywords = extract_keywords(source);
+        assert_eq!(keywords, vec!["SELECT".to_string(), "SET".to_string()]);
+    }
+
+    #[test]
+    fn deduplicates_keywords() {
+        let source = "kw(\"select\") kw(\"select\") kw(\"from\")";
+        let keywords = extract_keywords(source);
+        assert_eq!(keywords, vec!["FROM".to_string(), "SELECT".to_string()]);
+    }
+
+    #[test]
+    fn ignores_non_kw_call_sites() {
+        // `kw("foo bar")` would not be a valid identifier - filtered out.
+        let source = "kw(\"select\") kw(\"foo bar\") kw(\"from\")";
+        let keywords = extract_keywords(source);
+        assert_eq!(keywords, vec!["FROM".to_string(), "SELECT".to_string()]);
     }
 }

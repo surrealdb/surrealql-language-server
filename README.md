@@ -61,6 +61,22 @@ Requirements:
 - `wasm-opt` (`cargo install wasm-opt`)
 - On macOS, a wasm-capable clang (e.g. `brew install llvm`; the script auto-detects Homebrew LLVM)
 
+#### Browser hosts (Surrealist, etc.)
+
+Initialize the module with `fetch` + `arrayBuffer`, then pass the bytes to the default export — the same pattern used by [`@surrealdb/wasm`](https://github.com/surrealdb/surrealdb.js/tree/main/packages/wasm). Avoid passing a URL string directly to `init()` when the build pipeline pre-gzips `.wasm` assets in place: browsers only gunzip automatically when the response carries `Content-Encoding: gzip` (S3 production uploads do; many static preview servers do not).
+
+```ts
+import init, { WasmLanguageServer } from "@surrealdb/surrealql-language-server";
+import wasmUrl from "@surrealdb/surrealql-language-server/surrealql_language_server_bg.wasm?url";
+
+const wasmCode = await fetch(wasmUrl).then((response) => response.arrayBuffer());
+await init({ module_or_path: wasmCode });
+
+const server = new WasmLanguageServer({ /* callbacks */ });
+```
+
+The `./surrealql_language_server_bg.wasm` export is declared in `pkg/package.json` for bundlers that resolve deep imports.
+
 ## Testing
 
 ```bash
