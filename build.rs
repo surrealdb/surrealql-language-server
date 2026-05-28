@@ -122,8 +122,7 @@ fn extract_keywords(grammar_source: &str) -> Vec<String> {
             let after = &rest[start + needle.len()..];
             if let Some(end) = after.find(quote) {
                 let word = &after[..end];
-                if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     keywords.insert(word.to_ascii_uppercase());
                 }
                 rest = &after[end + 1..];
