@@ -1254,9 +1254,8 @@ fn text_of(source: &str, node: Node<'_>) -> Option<String> {
         .map(|text| text.trim().to_string())
 }
 
-/// The second meaningful child of a `TypeClause` is the actual type
-/// payload. `TypeClause` is either `(Keyword[TYPE], <type>)` or
-/// `(Keyword[FLEXIBLE], Keyword[TYPE], <type>)`.
+/// The type payload inside a `TypeClause` (not the optional `FLEXIBLE`
+/// keywords). `TypeClause` is `[FLEXIBLE] TYPE <type> [FLEXIBLE]`.
 fn second_type_payload(clause: Node<'_>) -> Option<Node<'_>> {
     let children = k::named_children(clause);
     children.into_iter().find(|child| {
