@@ -231,6 +231,18 @@ fn clean_surql_produces_no_syntax_diagnostics() {
 }
 
 #[test]
+fn define_field_flexible_after_type_no_syntax_diagnostics() {
+    let u = uri("define.surql");
+    let text = "DEFINE FIELD OVERWRITE alternatives ON file TYPE option<object> FLEXIBLE;";
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "TYPE ... FLEXIBLE on DEFINE FIELD should parse: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
 fn update_merge_expression_on_path_target_no_syntax_diagnostics() {
     let u = uri("update.surql");
     let text = r#"
