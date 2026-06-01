@@ -231,6 +231,21 @@ fn clean_surql_produces_no_syntax_diagnostics() {
 }
 
 #[test]
+fn update_merge_expression_on_path_target_no_syntax_diagnostics() {
+    let u = uri("update.surql");
+    let text = r#"
+        RETURN UPDATE $object.id MERGE ($object + {updatedBy: $user});
+        UPDATE $object.id MERGE ($object + {updatedBy: $user});
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "UPDATE with path target and MERGE expression should parse: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
 fn hover_for_js_function_shows_javascript_badge() {
     let u = uri("functions.surql");
     let mut ws = WorkspaceIndex::default();
