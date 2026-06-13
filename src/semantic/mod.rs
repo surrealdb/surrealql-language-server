@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod highlight;
 pub mod model;
 pub mod node_kind;
 pub mod text;

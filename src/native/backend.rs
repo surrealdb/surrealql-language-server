@@ -106,6 +106,13 @@ impl LanguageServer for Backend {
         Ok(self.core.document_symbol(params).await)
     }
 
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        Ok(self.core.semantic_tokens_full(params).await)
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,

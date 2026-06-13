@@ -167,6 +167,11 @@ pub const PIPE: &str = "Pipe";
 pub const BRACE_OPEN: &str = "BraceOpen";
 pub const BRACE_CLOSE: &str = "BraceClose";
 
+// ---- Comments (grammar `extras`) -----------------------------------------
+
+pub const COMMENT: &str = "Comment";
+pub const BLOCK_COMMENT: &str = "BlockComment";
+
 // ---- Helpers --------------------------------------------------------------
 
 /// Returns the source text covered by `node`, trimmed.
