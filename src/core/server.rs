@@ -101,6 +101,14 @@ where
                 },
             ))),
             call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+            semantic_tokens_provider: Some(
+                SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                    legend: crate::semantic::highlight::legend(),
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    range: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+            ),
             document_symbol_provider: Some(OneOf::Left(true)),
             workspace_symbol_provider: Some(OneOf::Left(true)),
             workspace: Some(WorkspaceServerCapabilities {
@@ -459,6 +467,22 @@ where
         Some(DocumentSymbolResponse::Nested(
             analysis.document_symbols.clone(),
         ))
+    }
+
+    /// Full-document semantic tokens. Re-parses the document and maps
+    /// tree-sitter node kinds onto the standard LSP token legend (see
+    /// [`crate::semantic::highlight`]).
+    pub async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Option<SemanticTokensResult> {
+        let uri = params.text_document.uri;
+        let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
+        let data = crate::semantic::highlight::collect_semantic_tokens(&analysis.text);
+        Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        }))
     }
 
     pub async fn goto_definition(

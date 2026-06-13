@@ -1282,3 +1282,110 @@ fn prefix_not_in_where_clause_no_diagnostic() {
         analysis.syntax_diagnostics
     );
 }
+
+// ── Semantic tokens ────────────────────────────────────────────────────────
+
+use surrealql_language_server::semantic::highlight::{collect_semantic_tokens, legend};
+use surrealql_language_server::semantic::text::position_to_offset;
+
+/// Decode the LSP delta-encoding back into `(source_text, type_index)`
+/// pairs so assertions can talk about real spans instead of offsets.
+fn decode_tokens(source: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let (mut line, mut start) = (0u32, 0u32);
+    for token in collect_semantic_tokens(source) {
+        line += token.delta_line;
+        start = if token.delta_line == 0 {
+            start + token.delta_start
+        } else {
+            token.delta_start
+        };
+        let begin = position_to_offset(source, Position::new(line, start));
+        let end = position_to_offset(source, Position::new(line, start + token.length));
+        out.push((source[begin..end].to_string(), token.token_type));
+    }
+    out
+}
+
+/// Type index of the first token whose text equals `needle`.
+fn type_of(tokens: &[(String, u32)], needle: &str) -> Option<u32> {
+    tokens
+        .iter()
+        .find(|(text, _)| text == needle)
+        .map(|(_, ty)| *ty)
+}
+
+#[test]
+fn semantic_tokens_use_standard_legend_order() {
+    let token_types = legend().token_types;
+    let names: Vec<&str> = token_types.iter().map(|t| t.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "keyword",
+            "function",
+            "parameter",
+            "type",
+            "string",
+            "number",
+            "comment",
+            "variable",
+        ],
+        "legend order is part of the wire protocol and must not drift"
+    );
+    assert!(legend().token_modifiers.is_empty(), "v1 ships no modifiers");
+}
+
+#[test]
+fn semantic_tokens_classify_core_node_kinds() {
+    // keyword=0 function=1 parameter=2 type=3 string=4 number=5 comment=6 variable=7
+    let source = "-- pick a user\nLET $count = math::abs(-3) + duration::secs(5s);\nSELECT name FROM user:tobie WHERE age > 18 AND note = \"hi\";";
+    let tokens = decode_tokens(source);
+
+    assert_eq!(type_of(&tokens, "LET"), Some(0), "LET is a keyword");
+    assert_eq!(type_of(&tokens, "SELECT"), Some(0), "SELECT is a keyword");
+    assert_eq!(type_of(&tokens, "$count"), Some(2), "$count is a parameter");
+    assert_eq!(
+        type_of(&tokens, "math::abs"),
+        Some(1),
+        "math::abs is a function name"
+    );
+    assert_eq!(
+        type_of(&tokens, "5s"),
+        Some(5),
+        "duration is number-coloured"
+    );
+    assert_eq!(type_of(&tokens, "18"), Some(5), "18 is a number");
+    assert_eq!(type_of(&tokens, "\"hi\""), Some(4), "\"hi\" is a string");
+    assert_eq!(
+        type_of(&tokens, "user:tobie"),
+        Some(7),
+        "record id is variable-coloured"
+    );
+    assert_eq!(
+        type_of(&tokens, "-- pick a user"),
+        Some(6),
+        "line comment is a comment"
+    );
+}
+
+#[test]
+fn semantic_tokens_split_multiline_block_comment_per_line() {
+    let source = "/* line one\nline two */\nRETURN 1;";
+    let tokens = decode_tokens(source);
+    let comment_lines: Vec<&str> = tokens
+        .iter()
+        .filter(|(_, ty)| *ty == 6)
+        .map(|(text, _)| text.as_str())
+        .collect();
+    assert_eq!(
+        comment_lines,
+        vec!["/* line one", "line two */"],
+        "a block comment must yield one single-line token per line"
+    );
+}
+
+#[test]
+fn semantic_tokens_empty_for_blank_document() {
+    assert!(collect_semantic_tokens("").is_empty());
+}
