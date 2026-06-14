@@ -105,7 +105,7 @@ where
                 SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                     legend: crate::semantic::highlight::legend(),
                     full: Some(SemanticTokensFullOptions::Bool(true)),
-                    range: Some(false),
+                    range: Some(true),
                     work_done_progress_options: Default::default(),
                 }),
             ),
@@ -480,6 +480,23 @@ where
         let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
         let data = crate::semantic::highlight::collect_semantic_tokens(&analysis.text);
         Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        }))
+    }
+
+    /// Semantic tokens for a viewport range — same mapping as
+    /// [`Self::semantic_tokens_full`], restricted to nodes overlapping
+    /// `params.range`.
+    pub async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Option<SemanticTokensRangeResult> {
+        let uri = params.text_document.uri;
+        let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
+        let data =
+            crate::semantic::highlight::collect_semantic_tokens_range(&analysis.text, params.range);
+        Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
             result_id: None,
             data,
         }))

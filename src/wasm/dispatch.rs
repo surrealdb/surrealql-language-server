@@ -176,6 +176,10 @@ async fn dispatch(core: &WasmCore, method: &str, params: Value) -> Outcome {
             Ok(params) => Outcome::from_value(core.semantic_tokens_full(params).await),
             Err(error) => error,
         },
+        "textDocument/semanticTokens/range" => match decode::<SemanticTokensRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.semantic_tokens_range(params).await),
+            Err(error) => error,
+        },
         "textDocument/definition" => match decode::<GotoDefinitionParams>(params) {
             Ok(params) => Outcome::from_value(core.goto_definition(params).await),
             Err(error) => error,

@@ -113,6 +113,13 @@ impl LanguageServer for Backend {
         Ok(self.core.semantic_tokens_full(params).await)
     }
 
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        Ok(self.core.semantic_tokens_range(params).await)
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
