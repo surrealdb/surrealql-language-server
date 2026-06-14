@@ -16,9 +16,8 @@
 use ls_types::{
     Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokensLegend,
 };
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
-use crate::grammar::language;
 use crate::semantic::node_kind as k;
 use crate::semantic::text::offset_to_position;
 
@@ -127,33 +126,31 @@ struct AbsToken {
 }
 
 /// Full-document semantic tokens, delta-encoded per the LSP wire format.
-pub fn collect_semantic_tokens(source: &str) -> Vec<SemanticToken> {
-    encode(collect_absolute(source))
+/// `tree` is the cached parse of `source` (see [`DocumentAnalysis::tree`]).
+///
+/// [`DocumentAnalysis::tree`]: crate::semantic::types::DocumentAnalysis::tree
+pub fn collect_semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> {
+    encode(collect_absolute(tree, source))
 }
 
 /// Semantic tokens for a single `range` of the document. Any token that
 /// overlaps the range is included whole (tokens are never split at the
 /// range boundary).
-pub fn collect_semantic_tokens_range(source: &str, range: Range) -> Vec<SemanticToken> {
-    let tokens = collect_absolute(source)
+pub fn collect_semantic_tokens_range(
+    tree: &Tree,
+    source: &str,
+    range: Range,
+) -> Vec<SemanticToken> {
+    let tokens = collect_absolute(tree, source)
         .into_iter()
         .filter(|token| overlaps(token, &range))
         .collect();
     encode(tokens)
 }
 
-/// Parse `source` and gather its tokens as absolute positions, sorted by
-/// (line, start). Empty if the grammar fails to load or the document
-/// fails to parse.
-fn collect_absolute(source: &str) -> Vec<AbsToken> {
-    let mut parser = Parser::new();
-    if parser.set_language(&language()).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-
+/// Walk the cached `tree` and gather its tokens as absolute positions,
+/// sorted by (line, start).
+fn collect_absolute(tree: &Tree, source: &str) -> Vec<AbsToken> {
     let mut tokens = Vec::new();
     walk(tree.root_node(), source, &mut tokens);
 

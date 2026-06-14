@@ -478,7 +478,8 @@ where
     ) -> Option<SemanticTokensResult> {
         let uri = params.text_document.uri;
         let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
-        let data = crate::semantic::highlight::collect_semantic_tokens(&analysis.text);
+        let data =
+            crate::semantic::highlight::collect_semantic_tokens(&analysis.tree, &analysis.text);
         Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -494,8 +495,11 @@ where
     ) -> Option<SemanticTokensRangeResult> {
         let uri = params.text_document.uri;
         let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
-        let data =
-            crate::semantic::highlight::collect_semantic_tokens_range(&analysis.text, params.range);
+        let data = crate::semantic::highlight::collect_semantic_tokens_range(
+            &analysis.tree,
+            &analysis.text,
+            params.range,
+        );
         Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -668,6 +672,7 @@ where
         let range_end = position_to_offset(&analysis.text, params.range.end);
 
         crate::semantic::analyzer::collect_inlay_hints(
+            analysis.tree.root_node(),
             &analysis.text,
             range_start,
             range_end,

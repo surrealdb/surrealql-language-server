@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use ls_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Uri};
 use serde::{Deserialize, Serialize};
+use tree_sitter::Tree;
 
 use crate::semantic::type_expr::TypeExpr;
 
@@ -170,6 +171,13 @@ pub struct SymbolReference {
 pub struct DocumentAnalysis {
     pub uri: Uri,
     pub text: String,
+    /// The tree-sitter parse of [`Self::text`], cached so request
+    /// handlers (semantic tokens, inlay hints, …) reuse it instead of
+    /// re-parsing the document on every call. `Tree::clone` is a shallow,
+    /// ref-counted copy, so storing it is cheap. This is also the
+    /// foundation for incremental re-parsing once the server moves to
+    /// incremental document sync.
+    pub tree: Tree,
     pub tables: Vec<TableDef>,
     pub events: Vec<EventDef>,
     pub indexes: Vec<IndexDef>,
