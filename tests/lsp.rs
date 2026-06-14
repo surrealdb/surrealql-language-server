@@ -1285,15 +1285,25 @@ fn prefix_not_in_where_clause_no_diagnostic() {
 
 // ── Semantic tokens ────────────────────────────────────────────────────────
 
-use surrealql_language_server::semantic::highlight::{collect_semantic_tokens, legend};
+use surrealql_language_server::semantic::highlight::{
+    collect_semantic_tokens, collect_semantic_tokens_range, legend,
+};
 use surrealql_language_server::semantic::text::position_to_offset;
+use tower_lsp_server::ls_types::SemanticToken;
 
-/// Decode the LSP delta-encoding back into `(source_text, type_index)`
-/// pairs so assertions can talk about real spans instead of offsets.
-fn decode_tokens(source: &str) -> Vec<(String, u32)> {
+/// One decoded token: its source text, type index, and modifier bitset.
+struct Tok {
+    text: String,
+    ty: u32,
+    mods: u32,
+}
+
+/// Decode an encoded token stream back into absolute `Tok`s so
+/// assertions can talk about real spans instead of offsets.
+fn decode(tokens: Vec<SemanticToken>, source: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     let (mut line, mut start) = (0u32, 0u32);
-    for token in collect_semantic_tokens(source) {
+    for token in tokens {
         line += token.delta_line;
         start = if token.delta_line == 0 {
             start + token.delta_start
@@ -1302,25 +1312,35 @@ fn decode_tokens(source: &str) -> Vec<(String, u32)> {
         };
         let begin = position_to_offset(source, Position::new(line, start));
         let end = position_to_offset(source, Position::new(line, start + token.length));
-        out.push((source[begin..end].to_string(), token.token_type));
+        out.push(Tok {
+            text: source[begin..end].to_string(),
+            ty: token.token_type,
+            mods: token.token_modifiers_bitset,
+        });
     }
     out
 }
 
+fn decode_tokens(source: &str) -> Vec<Tok> {
+    decode(collect_semantic_tokens(source), source)
+}
+
+/// The first token whose text equals `needle`.
+fn find<'a>(tokens: &'a [Tok], needle: &str) -> Option<&'a Tok> {
+    tokens.iter().find(|tok| tok.text == needle)
+}
+
 /// Type index of the first token whose text equals `needle`.
-fn type_of(tokens: &[(String, u32)], needle: &str) -> Option<u32> {
-    tokens
-        .iter()
-        .find(|(text, _)| text == needle)
-        .map(|(_, ty)| *ty)
+fn type_of(tokens: &[Tok], needle: &str) -> Option<u32> {
+    find(tokens, needle).map(|tok| tok.ty)
 }
 
 #[test]
 fn semantic_tokens_use_standard_legend_order() {
-    let token_types = legend().token_types;
-    let names: Vec<&str> = token_types.iter().map(|t| t.as_str()).collect();
+    let legend = legend();
+    let types: Vec<&str> = legend.token_types.iter().map(|t| t.as_str()).collect();
     assert_eq!(
-        names,
+        types,
         vec![
             "keyword",
             "function",
@@ -1333,7 +1353,12 @@ fn semantic_tokens_use_standard_legend_order() {
         ],
         "legend order is part of the wire protocol and must not drift"
     );
-    assert!(legend().token_modifiers.is_empty(), "v1 ships no modifiers");
+    let mods: Vec<&str> = legend.token_modifiers.iter().map(|m| m.as_str()).collect();
+    assert_eq!(
+        mods,
+        vec!["declaration", "defaultLibrary"],
+        "modifier bit order is part of the wire protocol and must not drift"
+    );
 }
 
 #[test]
@@ -1375,8 +1400,8 @@ fn semantic_tokens_split_multiline_block_comment_per_line() {
     let tokens = decode_tokens(source);
     let comment_lines: Vec<&str> = tokens
         .iter()
-        .filter(|(_, ty)| *ty == 6)
-        .map(|(text, _)| text.as_str())
+        .filter(|tok| tok.ty == 6)
+        .map(|tok| tok.text.as_str())
         .collect();
     assert_eq!(
         comment_lines,
@@ -1388,4 +1413,86 @@ fn semantic_tokens_split_multiline_block_comment_per_line() {
 #[test]
 fn semantic_tokens_empty_for_blank_document() {
     assert!(collect_semantic_tokens("").is_empty());
+}
+
+// keyword=0 function=1 parameter=2 type=3 string=4 number=5 comment=6 variable=7
+// modifier bits: declaration=1<<0, defaultLibrary=1<<1
+const MOD_DECLARATION: u32 = 1 << 0;
+const MOD_DEFAULT_LIBRARY: u32 = 1 << 1;
+
+#[test]
+fn semantic_tokens_mark_declarations() {
+    let source = "DEFINE FUNCTION fn::double($n: number) { RETURN fn::double($n); };\nDEFINE PARAM $page VALUE 20;";
+    let tokens = decode_tokens(source);
+
+    // The defining occurrence carries `declaration`; the call site does not.
+    let defs: Vec<&Tok> = tokens.iter().filter(|t| t.text == "fn::double").collect();
+    assert_eq!(defs.len(), 2, "one definition + one call");
+    assert_eq!(defs[0].mods, MOD_DECLARATION, "definition is a declaration");
+    assert_eq!(defs[1].mods, 0, "call site is a plain reference");
+
+    // `$n` is declared in the param list, referenced in the body.
+    let n_uses: Vec<&Tok> = tokens.iter().filter(|t| t.text == "$n").collect();
+    assert_eq!(n_uses[0].mods, MOD_DECLARATION, "param binding declares $n");
+    assert_eq!(n_uses[1].mods, 0, "body use of $n is a reference");
+
+    // DEFINE PARAM binds its var directly under the DefineStatement.
+    assert_eq!(find(&tokens, "$page").unwrap().mods, MOD_DECLARATION);
+}
+
+#[test]
+fn semantic_tokens_mark_builtin_functions() {
+    let source = "RETURN math::abs(-3) + fn::custom();";
+    let tokens = decode_tokens(source);
+    assert_eq!(
+        find(&tokens, "math::abs").unwrap().mods,
+        MOD_DEFAULT_LIBRARY,
+        "builtins carry defaultLibrary"
+    );
+    assert_eq!(
+        find(&tokens, "fn::custom").unwrap().mods,
+        0,
+        "user fn:: calls do not"
+    );
+}
+
+#[test]
+fn semantic_tokens_split_param_name_and_type() {
+    // Regression: `ParamDefinition` wraps the name AND its type
+    // annotation; they must be coloured separately, not swallowed.
+    let source = "DEFINE FUNCTION fn::f($n: number) { RETURN $n; };";
+    let tokens = decode_tokens(source);
+    assert_eq!(type_of(&tokens, "$n"), Some(2), "$n is a parameter");
+    assert_eq!(
+        type_of(&tokens, "number"),
+        Some(3),
+        "number annotation is a type"
+    );
+}
+
+#[test]
+fn semantic_tokens_range_limits_to_viewport() {
+    let source = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+    // Request only the middle line.
+    let range = Range::new(Position::new(1, 0), Position::new(1, 9));
+    let tokens = decode(collect_semantic_tokens_range(source, range), source);
+    let keywords: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.ty == 0)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(
+        keywords,
+        vec!["SELECT"],
+        "only the in-range SELECT is emitted"
+    );
+    assert_eq!(
+        type_of(&tokens, "2"),
+        Some(5),
+        "the in-range number is present"
+    );
+    assert!(
+        find(&tokens, "1").is_none() && find(&tokens, "3").is_none(),
+        "tokens outside the range are excluded"
+    );
 }
