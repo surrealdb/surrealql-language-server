@@ -237,6 +237,7 @@ fn hover_for_js_function_shows_javascript_badge() {
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -292,6 +293,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -346,6 +348,7 @@ fn hover_for_table_shows_schema_and_permissions() {
         Arc::new(DocumentAnalysis {
             uri: u.clone(),
             text: String::new(),
+            tree: tree_of(""),
             tables: vec![TableDef {
                 name: "account".to_string(),
                 schema_mode: Some("schemafull".to_string()),
@@ -420,6 +423,7 @@ fn completion_includes_user_js_function() {
         Arc::new(DocumentAnalysis {
             uri: u.clone(),
             text: String::new(),
+            tree: tree_of(""),
             tables: Vec::new(),
             events: Vec::new(),
             indexes: Vec::new(),
@@ -544,6 +548,7 @@ fn no_diagnostics_for_allowed_permission() {
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -593,6 +598,7 @@ fn error_diagnostic_for_denied_permission() {
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -627,6 +633,7 @@ fn warning_for_unknown_table_in_query() {
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -688,6 +695,7 @@ fn role_based_permission_allowed_for_matching_context() {
     let analysis = DocumentAnalysis {
         uri: u,
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -848,6 +856,7 @@ fn local_function_overrides_remote() {
     let remote = DocumentAnalysis {
         uri: uri("remote.surql"),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -877,6 +886,7 @@ fn local_function_overrides_remote() {
     let local = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -937,6 +947,7 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
         Arc::new(DocumentAnalysis {
             uri: u.clone(),
             text: String::new(),
+            tree: tree_of(""),
             tables: vec![TableDef {
                 name: "invoice".to_string(),
                 schema_mode: None,
@@ -1004,6 +1015,7 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
+        tree: tree_of(""),
         tables: vec![TableDef {
             name: "widget".to_string(),
             schema_mode: Some("schemafull".to_string()),
@@ -1290,6 +1302,14 @@ use surrealql_language_server::semantic::highlight::{
 };
 use surrealql_language_server::semantic::text::position_to_offset;
 use tower_lsp_server::ls_types::SemanticToken;
+use tree_sitter::Tree;
+
+/// The cached parse tree for `source`, via the same path the server uses.
+fn tree_of(source: &str) -> Tree {
+    analyze_document(uri("highlight.surql"), source, SymbolOrigin::Local)
+        .expect("analysis")
+        .tree
+}
 
 /// One decoded token: its source text, type index, and modifier bitset.
 struct Tok {
@@ -1322,7 +1342,7 @@ fn decode(tokens: Vec<SemanticToken>, source: &str) -> Vec<Tok> {
 }
 
 fn decode_tokens(source: &str) -> Vec<Tok> {
-    decode(collect_semantic_tokens(source), source)
+    decode(collect_semantic_tokens(&tree_of(source), source), source)
 }
 
 /// The first token whose text equals `needle`.
@@ -1412,7 +1432,7 @@ fn semantic_tokens_split_multiline_block_comment_per_line() {
 
 #[test]
 fn semantic_tokens_empty_for_blank_document() {
-    assert!(collect_semantic_tokens("").is_empty());
+    assert!(collect_semantic_tokens(&tree_of(""), "").is_empty());
 }
 
 // keyword=0 function=1 parameter=2 type=3 string=4 number=5 comment=6 variable=7
@@ -1475,7 +1495,10 @@ fn semantic_tokens_range_limits_to_viewport() {
     let source = "SELECT 1;\nSELECT 2;\nSELECT 3;";
     // Request only the middle line.
     let range = Range::new(Position::new(1, 0), Position::new(1, 9));
-    let tokens = decode(collect_semantic_tokens_range(source, range), source);
+    let tokens = decode(
+        collect_semantic_tokens_range(&tree_of(source), source, range),
+        source,
+    );
     let keywords: Vec<&str> = tokens
         .iter()
         .filter(|t| t.ty == 0)

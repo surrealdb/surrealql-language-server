@@ -23,6 +23,9 @@ pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<Do
     let mut analysis = DocumentAnalysis {
         uri: uri.clone(),
         text: text.to_string(),
+        // Shallow (ref-counted) copy; `root` keeps borrowing the local
+        // `tree` for the `collect_statements` walk below.
+        tree: tree.clone(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1288,28 +1291,14 @@ fn action_label(action: QueryAction) -> &'static str {
 /// definitions only carry free-form signature strings, not structured
 /// parameter names we can map onto positional arguments.
 pub fn collect_inlay_hints(
+    root: Node<'_>,
     source: &str,
     range_start: usize,
     range_end: usize,
     model: &MergedSemanticModel,
 ) -> Vec<InlayHint> {
-    let mut parser = Parser::new();
-    if parser.set_language(&language()).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-
     let mut hints = Vec::new();
-    walk_inlay_hints(
-        tree.root_node(),
-        source,
-        range_start,
-        range_end,
-        model,
-        &mut hints,
-    );
+    walk_inlay_hints(root, source, range_start, range_end, model, &mut hints);
     hints
 }
 

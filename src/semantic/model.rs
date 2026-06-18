@@ -1436,6 +1436,16 @@ mod tests {
 
     use super::{MergedSemanticModel, is_record_type_context};
 
+    /// A placeholder parse tree for the `DocumentAnalysis` literals in
+    /// these model tests, which exercise the derived fields, not the tree.
+    fn empty_tree() -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::grammar::language())
+            .expect("load grammar");
+        parser.parse("", None).expect("parse empty")
+    }
+
     #[test]
     fn local_definitions_override_inferred() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
@@ -1462,6 +1472,7 @@ mod tests {
         let analysis = DocumentAnalysis {
             uri,
             text: String::new(),
+            tree: empty_tree(),
             tables: vec![inferred, explicit.clone()],
             events: Vec::new(),
             indexes: Vec::new(),
@@ -1534,6 +1545,7 @@ mod tests {
             &DocumentAnalysis {
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
+                tree: empty_tree(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -1584,6 +1596,7 @@ mod tests {
             &DocumentAnalysis {
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
+                tree: empty_tree(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -1665,6 +1678,7 @@ mod tests {
             &DocumentAnalysis {
                 uri: analysis_uri.clone(),
                 text: String::new(),
+                tree: empty_tree(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -1698,6 +1712,7 @@ mod tests {
             Arc::new(DocumentAnalysis {
                 uri: uri.clone(),
                 text: String::new(),
+                tree: empty_tree(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
@@ -1744,6 +1759,7 @@ mod tests {
             Arc::new(DocumentAnalysis {
                 uri: Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 text: String::new(),
+                tree: empty_tree(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
@@ -1777,6 +1793,7 @@ mod tests {
         let analysis = DocumentAnalysis {
             uri: uri.clone(),
             text: String::new(),
+            tree: empty_tree(),
             tables: vec![TableDef {
                 name: "person".to_string(),
                 schema_mode: Some("schemafull".to_string()),
