@@ -1166,14 +1166,11 @@ fn scripting_function_as_value_in_create() {
 
 // --- Trailing comma tests (issue #2) ---
 
-/// `DEFINE FUNCTION` parameters use lezer's `commaSep` (no trailing
-/// comma allowed). The pre-parity tree-sitter grammar accepted trailing
-/// commas as a deliberate extension; the parity-branch grammar reverts
-/// to lezer's behaviour so the two parsers stay in lock-step. This
-/// test pins the new (parity-correct) behaviour: a trailing comma in
-/// `DEFINE FUNCTION` params is a parse error.
+/// Grammar v3 accepts trailing commas in `DEFINE FUNCTION` parameter
+/// lists (matching SurrealQL, which permits them). A trailing comma is
+/// therefore valid and must not produce a syntax diagnostic.
 #[test]
-fn trailing_comma_in_define_function_params_reports_diagnostic() {
+fn trailing_comma_in_define_function_params_no_diagnostic() {
     let u = uri("trailing.surql");
     let text = r#"
         DEFINE FUNCTION fn::greet($name: string,) {
@@ -1182,13 +1179,14 @@ fn trailing_comma_in_define_function_params_reports_diagnostic() {
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert!(
-        !analysis.syntax_diagnostics.is_empty(),
-        "expected a diagnostic for trailing comma in DEFINE FUNCTION params, got none"
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in DEFINE FUNCTION params should be valid: {:?}",
+        analysis.syntax_diagnostics
     );
 }
 
 #[test]
-fn trailing_comma_in_define_function_multiple_params_reports_diagnostic() {
+fn trailing_comma_in_define_function_multiple_params_no_diagnostic() {
     let u = uri("trailing.surql");
     let text = r#"
         DEFINE FUNCTION fn::add($a: number, $b: number,) -> number {
@@ -1197,8 +1195,9 @@ fn trailing_comma_in_define_function_multiple_params_reports_diagnostic() {
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert!(
-        !analysis.syntax_diagnostics.is_empty(),
-        "expected a diagnostic for trailing comma in multi-param DEFINE FUNCTION, got none"
+        analysis.syntax_diagnostics.is_empty(),
+        "trailing comma in multi-param DEFINE FUNCTION should be valid: {:?}",
+        analysis.syntax_diagnostics
     );
 }
 

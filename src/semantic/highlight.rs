@@ -67,14 +67,17 @@ pub fn legend() -> SemanticTokensLegend {
 /// which holds a `VariableName` and a `Type`) deliberately return `None`
 /// so their parts are coloured individually.
 fn token_type(kind: &str) -> Option<u32> {
+    // Every keyword is its own `keyword_*` kind in grammar v3.
+    if kind.starts_with("keyword_") {
+        return Some(KEYWORD);
+    }
     Some(match kind {
-        k::KEYWORD => KEYWORD,
-        k::FUNCTION_NAME => FUNCTION,
+        k::CUSTOM_FUNCTION_NAME | k::BUILTIN_FUNCTION_NAME | k::FUNCTION_NAME => FUNCTION,
         k::VARIABLE_NAME => PARAMETER,
         k::TYPE_NAME | k::TYPE => TYPE,
-        k::STRING | k::FORMAT_STRING | k::REGEX => STRING,
+        k::STRING | k::PREFIXED_STRING | k::REGEX => STRING,
         k::NUMBER | k::INT | k::FLOAT | k::DECIMAL | k::DURATION => NUMBER,
-        k::COMMENT | k::BLOCK_COMMENT => COMMENT,
+        k::COMMENT => COMMENT,
         // `table:id` record literals get their own colour via `variable`.
         k::RECORD_ID => VARIABLE,
         _ => return None,
@@ -85,26 +88,27 @@ fn token_type(kind: &str) -> Option<u32> {
 /// the tree. Returns `0` for the common "plain reference" case.
 fn modifiers(node: Node<'_>, source: &str) -> u32 {
     let parent_kind = node.parent().map(|parent| parent.kind());
+    let _ = source;
     match node.kind() {
-        // `fn::foo` at `DEFINE FUNCTION fn::foo` is a declaration; any
-        // non-`fn::` callee is a builtin from the standard library.
-        k::FUNCTION_NAME => {
-            if parent_kind == Some(k::DEFINE_STATEMENT) {
+        // `fn::foo` at `DEFINE FUNCTION fn::foo` is a declaration; other
+        // `custom_function_name` occurrences are plain references.
+        k::CUSTOM_FUNCTION_NAME => {
+            if parent_kind == Some(k::DEFINE_FUNCTION_STATEMENT) {
                 MOD_DECLARATION
-            } else if node
-                .utf8_text(source.as_bytes())
-                .is_ok_and(|text| !text.trim().starts_with("fn::"))
-            {
-                MOD_DEFAULT_LIBRARY
             } else {
                 0
             }
         }
+        // Builtin function calls come from the standard library.
+        k::BUILTIN_FUNCTION_NAME => MOD_DEFAULT_LIBRARY,
         // A `$var` is a declaration at its binding site: function params
-        // and `LET` bindings wrap it in `ParamDefinition`; `DEFINE PARAM`
-        // places it directly under the `DefineStatement`.
+        // live in a `param_list`; `LET` and `DEFINE PARAM` place it
+        // directly under their statement.
         k::VARIABLE_NAME => {
-            if matches!(parent_kind, Some(k::PARAM_DEFINITION | k::DEFINE_STATEMENT)) {
+            if matches!(
+                parent_kind,
+                Some(k::PARAM_LIST | k::LET_STATEMENT | k::DEFINE_PARAM_STATEMENT)
+            ) {
                 MOD_DECLARATION
             } else {
                 0

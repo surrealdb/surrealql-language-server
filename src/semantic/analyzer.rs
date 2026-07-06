@@ -59,23 +59,38 @@ fn collect_statements(
     let kind = node.kind();
 
     match kind {
-        k::DEFINE_STATEMENT => {
-            match k::define_statement_variant(node, source).as_deref() {
-                Some("TABLE") => extract_table(node, source, uri, origin, analysis),
-                Some("FIELD") => extract_field(node, source, uri, origin, analysis),
-                Some("EVENT") => extract_event(node, source, uri, origin, analysis),
-                Some("FUNCTION") => extract_function(node, source, uri, origin, analysis),
-                Some("INDEX") => extract_index(node, source, uri, origin, analysis),
-                Some("PARAM") => extract_param(node, source, uri, origin, analysis),
-                Some("ACCESS") | Some("SCOPE") => {
-                    extract_access(node, source, uri, origin, analysis)
-                }
-                _ => {
-                    if let Some(symbol) = statement_symbol(node, source, uri) {
-                        analysis.document_symbols.push(symbol);
-                    }
-                }
-            }
+        k::DEFINE_TABLE_STATEMENT => {
+            extract_table(node, source, uri, origin, analysis);
+            collect_function_references(node, source, uri, analysis);
+            return;
+        }
+        k::DEFINE_FIELD_STATEMENT => {
+            extract_field(node, source, uri, origin, analysis);
+            collect_function_references(node, source, uri, analysis);
+            return;
+        }
+        k::DEFINE_EVENT_STATEMENT => {
+            extract_event(node, source, uri, origin, analysis);
+            collect_function_references(node, source, uri, analysis);
+            return;
+        }
+        k::DEFINE_FUNCTION_STATEMENT => {
+            extract_function(node, source, uri, origin, analysis);
+            collect_function_references(node, source, uri, analysis);
+            return;
+        }
+        k::DEFINE_INDEX_STATEMENT => {
+            extract_index(node, source, uri, origin, analysis);
+            collect_function_references(node, source, uri, analysis);
+            return;
+        }
+        k::DEFINE_PARAM_STATEMENT => {
+            extract_param(node, source, uri, origin, analysis);
+            collect_function_references(node, source, uri, analysis);
+            return;
+        }
+        k::DEFINE_ACCESS_STATEMENT | k::DEFINE_SCOPE_STATEMENT => {
+            extract_access(node, source, uri, origin, analysis);
             collect_function_references(node, source, uri, analysis);
             return;
         }
@@ -105,7 +120,10 @@ fn collect_statements(
             return;
         }
         // Other statements we still want symbol entries for.
-        kind if kind.ends_with("Statement") && kind != k::SURREALQL => {
+        // `subquery_statement` is a transparent wrapper — never treat it
+        // as a leaf statement; fall through so we descend into the real
+        // statement it wraps.
+        kind if kind.ends_with("_statement") && kind != "subquery_statement" => {
             if let Some(symbol) = statement_symbol(node, source, uri) {
                 analysis.document_symbols.push(symbol);
             }
@@ -186,14 +204,13 @@ fn extract_field(
 ) {
     let children = k::named_children(node);
 
-    // The field name is the `Idiom` immediately following `DEFINE FIELD`.
-    // Compound field names like `address.city` parse as
-    // `Idiom(Ident("address"), Ident("city"))` and become `address.city`
-    // in our model.
+    // The field name follows `DEFINE FIELD` as an `inclusive_predicate`.
+    // Compound field names like `address.city` parse as a `path` and
+    // become `address.city` in our model.
     let Some(name) = children
         .iter()
-        .find(|child| child.kind() == k::IDIOM)
-        .and_then(|child| k::idiom_text(source, *child))
+        .find(|child| child.kind() == k::INCLUSIVE_PREDICATE)
+        .and_then(|child| k::dotted_name(source, *child))
     else {
         return;
     };
@@ -283,17 +300,20 @@ fn extract_event(
         .and_then(|child| identifier_from_on_table_clause(*child, source))
         .unwrap_or_else(|| "unknown".to_string());
 
-    // In the new grammar `WhenClause` and `ThenClause` are direct
-    // children of `DefineStatement` (no `when_then_clause` wrapper).
-    let when_clause = children
+    // `WHEN <cond> THEN <block>` parses into a single `when_then_clause`.
+    // The condition is the `value` between the WHEN/THEN keywords; the
+    // action is the trailing `block`/`sub_query`.
+    let when_then = children
         .iter()
-        .find(|child| child.kind() == k::WHEN_CLAUSE)
-        .and_then(|child| text_of(source, *child))
+        .find(|child| child.kind() == k::WHEN_THEN_CLAUSE)
+        .copied();
+    let when_clause = when_then
+        .and_then(|clause| k::find_child(clause, k::VALUE))
+        .and_then(|child| text_of(source, child))
         .map(|text| compact_preview(&text));
-    let then_clause = children
-        .iter()
-        .find(|child| child.kind() == k::THEN_CLAUSE)
-        .and_then(|child| text_of(source, *child))
+    let then_clause = when_then
+        .and_then(|clause| k::find_child_any(clause, &[k::BLOCK, k::SUB_QUERY]))
+        .and_then(|child| text_of(source, child))
         .map(|text| compact_preview(&text));
 
     analysis.document_symbols.push(definition_symbol(
@@ -322,12 +342,13 @@ fn extract_function(
 ) {
     let children = k::named_children(node);
 
-    // Custom function names share the visible `FunctionName` kind with
-    // builtin names. The first `FunctionName` child of `DefineStatement`
-    // is always the function being defined.
+    // User functions are named with the dedicated `custom_function_name`
+    // kind (builtin calls use `builtin_function_name`). The
+    // `custom_function_name` child of the define statement is the
+    // function being defined.
     let Some(name_node) = children
         .iter()
-        .find(|child| child.kind() == k::FUNCTION_NAME)
+        .find(|child| child.kind() == k::CUSTOM_FUNCTION_NAME)
         .copied()
     else {
         return;
@@ -336,17 +357,20 @@ fn extract_function(
         return;
     };
 
-    // Parameters are direct `ParamDefinition` children, not wrapped in a
-    // `param_list` node anymore.
-    let params = parse_function_params(&children, source);
+    // Parameters live inside a `param_list` node as `variable_name`
+    // followed by an optional `type`.
+    let params = children
+        .iter()
+        .find(|child| child.kind() == k::PARAM_LIST)
+        .map(|list| parse_function_params(*list, source))
+        .unwrap_or_default();
 
-    // `-> type` is encoded as a `Type` (composite) or a bare `TypeName`
-    // child immediately following the parameters. The grammar emits one
-    // of these whenever the source has a return-type annotation.
+    // `-> type` is a `returns_clause` wrapping the return `type`.
     let return_type = children
         .iter()
-        .find(|child| child.kind() == k::TYPE || child.kind() == k::TYPE_NAME)
-        .and_then(|child| text_of(source, *child))
+        .find(|child| child.kind() == k::RETURNS_CLAUSE)
+        .and_then(|clause| k::find_child_any(*clause, &[k::TYPE, k::TYPE_NAME]))
+        .and_then(|child| text_of(source, child))
         .map(|text| TypeExpr::parse(text.trim_start_matches("->").trim()));
 
     let language = detect_function_language(&children);
@@ -434,47 +458,43 @@ fn extract_index(
         .and_then(|child| identifier_from_on_table_clause(*child, source))
         .unwrap_or_else(|| "unknown".to_string());
 
-    // FIELDS / COLUMNS each get their own `Idiom` child (one per field).
+    // `FIELDS`/`COLUMNS <a>, <b>` — each field is an identifier (or a
+    // dotted `path` for compound fields) under the clause.
     let fields = children
         .iter()
         .find(|child| child.kind() == k::FIELDS_COLUMNS_CLAUSE)
         .map(|clause| {
             k::named_children(*clause)
                 .into_iter()
-                .filter(|c| c.kind() == k::IDIOM)
-                .filter_map(|c| k::idiom_text(source, c))
+                .filter(|c| !k::is_keyword(*c))
+                .filter_map(|c| k::dotted_name(source, c))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    // The `IndexClause` wraps the actual index variant. It might be a
-    // `UniqueClause`, `SearchAnalyzerClause`, `MtreeClause`, or
-    // `HnswClause`.
-    let index_clause = children
+    // A `unique_clause` sibling marks a UNIQUE index.
+    let unique = children
         .iter()
-        .find(|child| child.kind() == k::INDEX_CLAUSE);
+        .any(|child| child.kind() == k::UNIQUE_CLAUSE);
 
-    let unique = index_clause.is_some_and(|clause| {
-        k::named_children(*clause)
-            .iter()
-            .any(|child| child.kind() == k::UNIQUE_CLAUSE)
-    });
-
-    let options = index_clause
-        .map(|clause| {
-            k::named_children(*clause)
-                .into_iter()
-                .filter(|child| {
-                    matches!(
-                        child.kind(),
-                        k::SEARCH_ANALYZER_CLAUSE | k::MTREE_CLAUSE | k::HNSW_CLAUSE
-                    )
-                })
-                .filter_map(|child| text_of(source, child))
-                .map(|text| compact_preview(&text))
-                .collect::<Vec<_>>()
+    // Any remaining index-variant clause (HNSW/MTREE/search analyzer/…) is
+    // captured verbatim as an option string.
+    let options = children
+        .iter()
+        .filter(|child| {
+            let kind = child.kind();
+            kind.ends_with("_clause")
+                && !matches!(
+                    kind,
+                    k::ON_TABLE_CLAUSE
+                        | k::FIELDS_COLUMNS_CLAUSE
+                        | k::UNIQUE_CLAUSE
+                        | k::COMMENT_CLAUSE
+                )
         })
-        .unwrap_or_default();
+        .filter_map(|child| text_of(source, *child))
+        .map(|text| compact_preview(&text))
+        .collect::<Vec<_>>();
 
     analysis.document_symbols.push(definition_symbol(
         &format!("INDEX {table}.{name}"),
@@ -516,10 +536,11 @@ fn extract_param(
         .iter()
         .rev()
         .find(|child| {
-            !matches!(
-                child.kind(),
-                k::KEYWORD | k::VARIABLE_NAME | k::PERMISSIONS_BASIC_CLAUSE | k::COMMENT_CLAUSE
-            )
+            !k::is_keyword(**child)
+                && !matches!(
+                    child.kind(),
+                    k::VARIABLE_NAME | k::PERMISSIONS_BASIC_CLAUSE | k::COMMENT_CLAUSE
+                )
         })
         .and_then(|child| text_of(source, *child))
         .map(|text| compact_preview(&text));
@@ -546,15 +567,9 @@ fn extract_access(
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
-    // `DEFINE ACCESS x ...` parses as
-    // `DefineStatement(Keyword[DEFINE], AccessDefinition(Keyword[ACCESS], Ident, ...))`.
-    // Similarly `DEFINE SCOPE x ...` wraps in `ScopeDefinition`.
-    let wrapper = k::named_children(node)
-        .into_iter()
-        .find(|child| matches!(child.kind(), k::ACCESS_DEFINITION | k::SCOPE_DEFINITION));
-    let lookup_root = wrapper.unwrap_or(node);
-
-    let Some(name) = k::named_children(lookup_root)
+    // `DEFINE ACCESS x ...` / `DEFINE SCOPE x ...` name the access as the
+    // first `identifier` child of the statement.
+    let Some(name) = k::named_children(node)
         .into_iter()
         .find(|child| child.kind() == k::IDENT)
         .and_then(|child| text_of(source, child))
@@ -660,7 +675,12 @@ fn infer_fields_from_statement(
         let type_expr = children
             .iter()
             .rev()
-            .find(|child| !matches!(child.kind(), k::IDENT | k::OPERATOR))
+            .find(|child| {
+                !matches!(
+                    child.kind(),
+                    k::IDENT | k::OPERATOR | k::ASSIGNMENT_OPERATOR
+                )
+            })
             .map(|child| infer_type_from_value(*child, source));
 
         fields.push(inferred_field(
@@ -694,11 +714,11 @@ fn infer_fields_from_statement(
             }) else {
                 continue;
             };
-            // Value is the last named child of the property (after Colon).
+            // Value is the last named child of the property (the key aside).
             let value_node = property_children
                 .iter()
                 .rev()
-                .find(|item| !matches!(item.kind(), k::OBJECT_KEY | k::COLON))
+                .find(|item| item.kind() != k::OBJECT_KEY)
                 .copied();
             let type_expr = value_node.map(|value| infer_type_from_value(value, source));
             fields.push(inferred_field(
@@ -766,7 +786,7 @@ fn collect_function_references(
     uri: &Uri,
     analysis: &mut DocumentAnalysis,
 ) {
-    for reference in descendants_of_kind(node, k::FUNCTION_NAME) {
+    for reference in descendants_of_kind(node, k::CUSTOM_FUNCTION_NAME) {
         let Some(name) = text_of(source, reference) else {
             continue;
         };
@@ -788,7 +808,7 @@ fn collect_function_references(
 }
 
 fn collect_called_functions(node: Node<'_>, source: &str) -> Vec<String> {
-    descendants_of_kind(node, k::FUNCTION_NAME)
+    descendants_of_kind(node, k::CUSTOM_FUNCTION_NAME)
         .into_iter()
         .filter_map(|child| text_of(source, child))
         .filter(|name| name.starts_with("fn::"))
@@ -801,11 +821,11 @@ fn collect_called_functions(node: Node<'_>, source: &str) -> Vec<String> {
 /// body live deeper in the tree (inside a `Block`/`FunctionCall`) and
 /// are kept.
 fn is_function_being_defined(node: Node<'_>) -> bool {
-    if node.kind() != k::FUNCTION_NAME {
+    if node.kind() != k::CUSTOM_FUNCTION_NAME {
         return false;
     }
     node.parent()
-        .is_some_and(|parent| parent.kind() == k::DEFINE_STATEMENT)
+        .is_some_and(|parent| parent.kind() == k::DEFINE_FUNCTION_STATEMENT)
 }
 
 fn infer_record_types_from_table(
@@ -817,28 +837,30 @@ fn infer_record_types_from_table(
     Vec::new()
 }
 
-fn parse_function_params(children: &[Node<'_>], source: &str) -> Vec<FunctionParam> {
+/// Parse a `param_list` node. Parameters appear as a `variable_name`
+/// optionally followed by a `type` (`$a: int, $b` → `[($a, int), ($b, _)]`).
+fn parse_function_params(param_list: Node<'_>, source: &str) -> Vec<FunctionParam> {
+    let children = k::named_children(param_list);
     let mut params = Vec::new();
-    for child in children {
-        if child.kind() != k::PARAM_DEFINITION {
+    let mut index = 0;
+    while index < children.len() {
+        let child = children[index];
+        if child.kind() != k::VARIABLE_NAME {
+            index += 1;
             continue;
         }
-        let inner = k::named_children(*child);
-        let name = inner
-            .iter()
-            .find(|item| item.kind() == k::VARIABLE_NAME)
-            .and_then(|item| text_of(source, *item));
-        // Type is wrapped in a `Type` node when present; the inner
-        // hidden `_safeType` resolves to `TypeName`, `ParameterizedType`,
-        // etc.
-        let type_expr = inner
-            .iter()
-            .find(|item| item.kind() == k::TYPE)
-            .and_then(|item| text_of(source, *item))
+        let Some(name) = text_of(source, child) else {
+            index += 1;
+            continue;
+        };
+        // A `type` immediately following the name is its declared type.
+        let type_expr = children
+            .get(index + 1)
+            .filter(|next| next.kind() == k::TYPE || next.kind() == k::TYPE_NAME)
+            .and_then(|next| text_of(source, *next))
             .map(|text| TypeExpr::parse(&text));
-        if let Some(name) = name {
-            params.push(FunctionParam { name, type_expr });
-        }
+        params.push(FunctionParam { name, type_expr });
+        index += 1;
     }
     params
 }
@@ -849,36 +871,22 @@ fn parse_permission_rule(
     origin: SymbolOrigin,
     uri: &Uri,
 ) -> PermissionRule {
-    // `PermissionsForClause(Keyword[PERMISSIONS], PermissionGroup+|None|Literal)`
-    // `PermissionsBasicClause(Keyword[PERMISSIONS], None|Literal|WhereClause)`
+    // `permissions_for_clause(keyword_permissions, keyword_for,
+    //   keyword_<action>+, where_clause | keyword_full | keyword_none)`
+    // `permissions_basic_clause(keyword_permissions, keyword_full |
+    //   keyword_none | where_clause)`
     //
-    // For each `PermissionGroup` (or for the simpler basic clause body)
-    // we collect the explicit action keywords (SELECT/CREATE/UPDATE/
-    // DELETE) and decide on the mode.
-    let children = k::named_children(node);
-
-    let groups: Vec<Node<'_>> = children
-        .iter()
-        .copied()
-        .filter(|child| child.kind() == k::PERMISSION_GROUP)
-        .collect();
+    // Actions come from the dedicated `keyword_select/create/update/delete`
+    // nodes; the mode is FULL/NONE keywords or a `where_clause` expression.
+    let scope = k::named_children(node);
 
     let mut actions = Vec::new();
-    let scope: Vec<Node<'_>> = if groups.is_empty() {
-        children
-    } else {
-        groups.iter().copied().flat_map(k::named_children).collect()
-    };
-
     for child in &scope {
-        if child.kind() != k::KEYWORD {
-            continue;
-        }
-        match text_of(source, *child).as_deref() {
-            Some(text) if text.eq_ignore_ascii_case("SELECT") => actions.push(QueryAction::Select),
-            Some(text) if text.eq_ignore_ascii_case("CREATE") => actions.push(QueryAction::Create),
-            Some(text) if text.eq_ignore_ascii_case("UPDATE") => actions.push(QueryAction::Update),
-            Some(text) if text.eq_ignore_ascii_case("DELETE") => actions.push(QueryAction::Delete),
+        match child.kind() {
+            "keyword_select" => actions.push(QueryAction::Select),
+            "keyword_create" => actions.push(QueryAction::Create),
+            "keyword_update" => actions.push(QueryAction::Update),
+            "keyword_delete" => actions.push(QueryAction::Delete),
             _ => {}
         }
     }
@@ -886,9 +894,9 @@ fn parse_permission_rule(
         actions.push(QueryAction::Execute);
     }
 
-    let mode = if scope.iter().any(|child| child.kind() == k::LITERAL) {
+    let mode = if scope.iter().any(|child| child.kind() == "keyword_full") {
         PermissionMode::Full
-    } else if scope.iter().any(|child| child.kind() == k::NONE) {
+    } else if scope.iter().any(|child| child.kind() == "keyword_none") {
         PermissionMode::None
     } else {
         let expression = scope
@@ -911,69 +919,67 @@ fn parse_permission_rule(
 fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
     let children = k::named_children(node);
     // For each CRUD form we collect candidate "target value" subtrees,
-    // then walk them for `Ident` / `RecordId` leaves.
+    // then walk them for `identifier` / `record_id` leaves (v3 wraps the
+    // target of most statements in a clause or a dedicated *_target node).
     let relevant_nodes: Vec<Node<'_>> = match node.kind() {
         k::SELECT_STATEMENT => {
-            // After `FROM` keyword: take all named children until a
-            // clause node. The hidden value rule means `FROM <ident>`
-            // shows up as `Keyword[FROM]` followed by the `Ident`.
-            let mut found_from = false;
+            // Targets are the `value` children of the `from_clause` (its
+            // trailing `where_clause`, if any, is skipped).
             children
                 .iter()
-                .copied()
-                .filter(|child| {
-                    if k::is_kw(*child, source, "FROM") {
-                        found_from = true;
-                        return false;
-                    }
-                    found_from && !child.kind().ends_with("Clause")
+                .find(|child| child.kind() == k::FROM_CLAUSE)
+                .map(|from| {
+                    k::named_children(*from)
+                        .into_iter()
+                        .filter(|child| child.kind() == k::VALUE)
+                        .collect::<Vec<_>>()
                 })
-                .collect()
+                .unwrap_or_default()
         }
-        k::CREATE_STATEMENT | k::UPDATE_STATEMENT | k::UPSERT_STATEMENT | k::DELETE_STATEMENT => {
-            children
-                .iter()
-                .copied()
-                .filter(|child| {
-                    matches!(
-                        child.kind(),
-                        k::IDENT
-                            | k::IDIOM
-                            | k::RECORD_ID
-                            | k::RANGE_RECORD_ID
-                            | k::FUNCTION_CALL
-                            | k::VARIABLE_NAME
-                            | k::PATH
-                    )
-                })
-                .collect()
-        }
+        k::CREATE_STATEMENT | k::UPSERT_STATEMENT => children
+            .iter()
+            .copied()
+            .filter(|child| matches!(child.kind(), k::CREATE_TARGET | k::VALUE))
+            .collect(),
+        k::UPDATE_STATEMENT | k::DELETE_STATEMENT => children
+            .iter()
+            .copied()
+            .filter(|child| matches!(child.kind(), k::VALUE | k::CREATE_TARGET))
+            .collect(),
         k::RELATE_STATEMENT => children
             .iter()
             .copied()
-            .filter(|child| {
-                matches!(
-                    child.kind(),
-                    k::IDENT
-                        | k::RECORD_ID
-                        | k::RANGE_RECORD_ID
-                        | k::FUNCTION_CALL
-                        | k::VARIABLE_NAME
-                        | k::ARRAY
-                )
-            })
+            .filter(|child| child.kind() == k::RELATE_SUBJECT)
             .collect(),
+        k::INSERT_STATEMENT => {
+            // The table is the identifier immediately after `INTO`.
+            let mut after_into = false;
+            let mut targets = Vec::new();
+            for child in &children {
+                if k::is_kw(*child, source, "INTO") {
+                    after_into = true;
+                    continue;
+                }
+                if after_into && child.kind() == k::IDENT {
+                    targets.push(*child);
+                    break;
+                }
+            }
+            targets
+        }
         _ => vec![node],
     };
 
     let mut names = Vec::new();
     for relevant in relevant_nodes {
-        for identifier in descendants_of_kind(relevant, k::IDENT)
+        // A `record_id` names its table in an `object_key`, so normalising
+        // the record-id text (splitting on `:`) yields the table name.
+        for candidate in descendants_of_kind(relevant, k::IDENT)
             .into_iter()
             .chain(descendants_of_kind(relevant, k::RECORD_ID))
         {
             if let Some(name) =
-                text_of(source, identifier).and_then(|value| normalize_table_name(&value))
+                text_of(source, candidate).and_then(|value| normalize_table_name(&value))
                 && !names.contains(&name)
             {
                 names.push(name);
@@ -999,32 +1005,26 @@ fn collect_field_names(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 fn infer_type_from_value(node: Node<'_>, source: &str) -> TypeExpr {
-    let kind = if node.kind() == k::IDENT
-        || node.kind() == k::STRING
-        || node.kind() == k::NUMBER
-        || node.kind() == k::ARRAY
-        || node.kind() == k::OBJECT
-        || node.kind() == k::RECORD_ID
-        || node.kind() == k::BOOL
-        || node.kind() == k::NONE
-    {
-        Some(node)
-    } else {
-        first_named_descendant(node)
-    };
-    match kind.as_ref().map(Node::kind) {
-        Some(k::STRING) | Some(k::FORMAT_STRING) => TypeExpr::Scalar("string".to_string()),
-        Some(k::INT) | Some(k::FLOAT) | Some(k::DECIMAL) | Some(k::NUMBER) => {
-            TypeExpr::Scalar("number".to_string())
+    // Unwrap the transparent `value`/`base_value` layers down to the
+    // concrete literal/record node.
+    let mut concrete = node;
+    while matches!(concrete.kind(), k::VALUE | k::BASE_VALUE) {
+        match first_named_descendant(concrete) {
+            Some(child) => concrete = child,
+            None => break,
         }
-        Some(k::ARRAY) => TypeExpr::Array(Box::new(TypeExpr::Unknown)),
-        Some(k::OBJECT) => TypeExpr::Scalar("object".to_string()),
-        Some(k::RECORD_ID) => text_of(source, kind.unwrap())
+    }
+    match concrete.kind() {
+        k::STRING | k::PREFIXED_STRING => TypeExpr::Scalar("string".to_string()),
+        k::INT | k::FLOAT | k::DECIMAL | k::NUMBER => TypeExpr::Scalar("number".to_string()),
+        k::ARRAY => TypeExpr::Array(Box::new(TypeExpr::Unknown)),
+        k::OBJECT => TypeExpr::Scalar("object".to_string()),
+        k::RECORD_ID => text_of(source, concrete)
             .and_then(|value| normalize_table_name(&value))
             .map(TypeExpr::Record)
             .unwrap_or(TypeExpr::Unknown),
-        Some(k::BOOL) => TypeExpr::Scalar("bool".to_string()),
-        Some(k::NONE) => TypeExpr::Scalar("null".to_string()),
+        "keyword_true" | "keyword_false" => TypeExpr::Scalar("bool".to_string()),
+        "keyword_none" | "keyword_null" => TypeExpr::Scalar("null".to_string()),
         _ => TypeExpr::Unknown,
     }
 }
@@ -1055,16 +1055,14 @@ fn normalize_table_name(value: &str) -> Option<String> {
 }
 
 fn identifier_from_on_table_clause(node: Node<'_>, source: &str) -> Option<String> {
-    // `OnTableClause(Keyword[ON], Keyword[TABLE]?, _value)`. The
-    // hidden value rule means the target appears directly as `Ident`,
-    // `Idiom`, etc.
+    // `on_table_clause(keyword_on, keyword_table?, identifier)`. The
+    // table target is the first non-keyword child.
     k::named_children(node)
         .into_iter()
-        .filter(|child| !matches!(child.kind(), k::KEYWORD))
-        .find_map(|child| match child.kind() {
+        .find(|child| !k::is_keyword(*child))
+        .and_then(|child| match child.kind() {
             k::IDENT => text_of(source, child),
-            k::IDIOM => k::idiom_text(source, child),
-            _ => text_of(source, child),
+            _ => k::dotted_name(source, child).or_else(|| text_of(source, child)),
         })
 }
 
@@ -1257,17 +1255,12 @@ fn text_of(source: &str, node: Node<'_>) -> Option<String> {
         .map(|text| text.trim().to_string())
 }
 
-/// The second meaningful child of a `TypeClause` is the actual type
-/// payload. `TypeClause` is either `(Keyword[TYPE], <type>)` or
-/// `(Keyword[FLEXIBLE], Keyword[TYPE], <type>)`.
+/// The type payload of a `type_clause` — `(keyword_type, type)` or
+/// `(keyword_flexible, keyword_type, type)`. The `type` node wraps the
+/// concrete `type_name`/`parameterized_type`/union, so its text is the
+/// full type expression.
 fn second_type_payload(clause: Node<'_>) -> Option<Node<'_>> {
-    let children = k::named_children(clause);
-    children.into_iter().find(|child| {
-        matches!(
-            child.kind(),
-            k::TYPE_NAME | k::TYPE | "ParameterizedType" | "UnionType" | "LiteralType"
-        )
-    })
+    k::find_child_any(clause, &[k::TYPE, k::TYPE_NAME, k::PARAMETERIZED_TYPE])
 }
 
 fn unquote(value: &str) -> String {
@@ -1318,7 +1311,7 @@ fn walk_inlay_hints(
         let mut cursor = node.walk();
         let name_node = node
             .children(&mut cursor)
-            .find(|child| child.kind() == k::FUNCTION_NAME);
+            .find(|child| child.kind() == k::CUSTOM_FUNCTION_NAME);
         if let Some(name_node) = name_node
             && let Ok(raw) = name_node.utf8_text(source.as_bytes())
             && let Some(stripped) = raw.strip_prefix("fn::")

@@ -38,6 +38,13 @@ Or set `TREE_SITTER_SURREALQL_DIR` to point to an existing checkout:
 TREE_SITTER_SURREALQL_DIR=/path/to/surrealql-tree-sitter cargo build
 ```
 
+The grammar is **pinned** to a specific commit (`GRAMMAR_REF` in
+[`scripts/setup-grammar.sh`](scripts/setup-grammar.sh) and the checkout steps
+in CI) because the analysis layer is coupled to the grammar's node kinds.
+Bump it deliberately alongside any [`src/semantic/node_kind.rs`](src/semantic/node_kind.rs)
+change. Known grammar parse gaps (and the tests that track them) are listed in
+[`docs/grammar-gaps.md`](docs/grammar-gaps.md).
+
 ## Building
 
 ### Native binary

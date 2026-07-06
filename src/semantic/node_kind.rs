@@ -1,176 +1,133 @@
 //! Tree-sitter node-kind constants and small helpers.
 //!
-//! The grammar lives at `../surrealql-tree-sitter` and mirrors
-//! `@surrealdb/lezer` 1:1, so every visible rule uses PascalCase. Some
-//! rules are intentionally "hidden" in the new grammar (leading
-//! underscore in `grammar.js`); their children appear directly under the
-//! parent in the tree. The constants below cover every kind the
-//! analyzer needs to dispatch on. Keep them in sync with
-//! `surrealql-tree-sitter/grammar.js`.
+//! The grammar lives at `../surrealql-tree-sitter`. As of grammar **v3**
+//! every rule is emitted in `snake_case` (e.g. `select_statement`,
+//! `identifier`, `function_call`), each `DEFINE ...` form is its own
+//! dedicated statement kind (`define_table_statement`,
+//! `define_field_statement`, …) rather than one generic `DefineStatement`,
+//! and every keyword is its own node (`keyword_from`, `keyword_where`, …)
+//! instead of a single `Keyword` kind. The constants below cover every
+//! kind the analyzer and highlighter dispatch on. Keep them in sync with
+//! `surrealql-tree-sitter/src/node-types.json`.
 
 use tree_sitter::Node;
 
 // ---- Top-level / transparent ---------------------------------------------
 
-/// Root node emitted by `grammar.js::SurrealQL`.
-pub const SURREALQL: &str = "SurrealQL";
+/// Root node emitted by the grammar.
+pub const SOURCE_FILE: &str = "source_file";
 
-// Hidden grammar rules (`_expressions`, `_expression`, `_subqueryStatement`,
-// `_statement`, `_value`, `_baseValue`, `_computedValue`, `_modifierClause`,
-// `_dataClause`, `_pathElement`, `_dotPart`, `_idName`, `_recordIdValue`,
-// `_inclusivePredicate`, `_type`, etc.) do not appear in the tree. The
-// analyzer must descend through `named_children()` to find what it wants.
+// Transparent wrapper rules that merely nest statements/values:
+// `expressions`, `expression`, `subquery_statement`, `value`,
+// `base_value`, `predicate`, `inclusive_predicate`. The analyzer descends
+// through them via `named_children()`.
+pub const VALUE: &str = "value";
+pub const BASE_VALUE: &str = "base_value";
+pub const PREDICATE: &str = "predicate";
+pub const INCLUSIVE_PREDICATE: &str = "inclusive_predicate";
+pub const SUB_QUERY: &str = "sub_query";
+pub const BLOCK: &str = "block";
 
-// ---- Define statement family ---------------------------------------------
+// ---- Define statement family (v3: one kind per DEFINE form) ---------------
 
-/// All `DEFINE ...` statements share a single visible kind. The variant
-/// (TABLE / FIELD / INDEX / FUNCTION / PARAM / EVENT / ACCESS / TOKEN /
-/// USER / ANALYZER / SCOPE / CONFIG / API / BUCKET / NAMESPACE / DATABASE)
-/// is encoded as the text of the second child, which is either a
-/// `Keyword` or a dedicated wrapper (`AccessDefinition`,
-/// `ScopeDefinition`).
-pub const DEFINE_STATEMENT: &str = "DefineStatement";
-pub const ACCESS_DEFINITION: &str = "AccessDefinition";
-pub const SCOPE_DEFINITION: &str = "ScopeDefinition";
-
-pub const ALTER_STATEMENT: &str = "AlterStatement";
-pub const REMOVE_STATEMENT: &str = "RemoveStatement";
-pub const REBUILD_STATEMENT: &str = "RebuildStatement";
+pub const DEFINE_TABLE_STATEMENT: &str = "define_table_statement";
+pub const DEFINE_FIELD_STATEMENT: &str = "define_field_statement";
+pub const DEFINE_EVENT_STATEMENT: &str = "define_event_statement";
+pub const DEFINE_FUNCTION_STATEMENT: &str = "define_function_statement";
+pub const DEFINE_INDEX_STATEMENT: &str = "define_index_statement";
+pub const DEFINE_PARAM_STATEMENT: &str = "define_param_statement";
+pub const DEFINE_ACCESS_STATEMENT: &str = "define_access_statement";
+pub const DEFINE_SCOPE_STATEMENT: &str = "define_scope_statement";
 
 // ---- CRUD statements -----------------------------------------------------
 
-pub const SELECT_STATEMENT: &str = "SelectStatement";
-pub const CREATE_STATEMENT: &str = "CreateStatement";
-pub const UPDATE_STATEMENT: &str = "UpdateStatement";
-pub const UPSERT_STATEMENT: &str = "UpsertStatement";
-pub const DELETE_STATEMENT: &str = "DeleteStatement";
-pub const RELATE_STATEMENT: &str = "RelateStatement";
-pub const INSERT_STATEMENT: &str = "InsertStatement";
-
-pub const RETURN_STATEMENT: &str = "ReturnStatement";
-pub const LET_STATEMENT: &str = "LetStatement";
-pub const FOR_STATEMENT: &str = "ForStatement";
-pub const IF_ELSE_STATEMENT: &str = "IfElseStatement";
+pub const SELECT_STATEMENT: &str = "select_statement";
+pub const CREATE_STATEMENT: &str = "create_statement";
+pub const UPDATE_STATEMENT: &str = "update_statement";
+pub const UPSERT_STATEMENT: &str = "upsert_statement";
+pub const DELETE_STATEMENT: &str = "delete_statement";
+pub const RELATE_STATEMENT: &str = "relate_statement";
+pub const INSERT_STATEMENT: &str = "insert_statement";
+pub const LET_STATEMENT: &str = "let_statement";
 
 // ---- Clauses -------------------------------------------------------------
 
-pub const ON_TABLE_CLAUSE: &str = "OnTableClause";
-pub const ON_ROOT_NS_DB_CLAUSE: &str = "OnRootNsDbClause";
-pub const TYPE_CLAUSE: &str = "TypeClause";
-pub const DEFAULT_CLAUSE: &str = "DefaultClause";
-pub const ASSERT_CLAUSE: &str = "AssertClause";
-pub const VALUE_CLAUSE: &str = "ValueClause";
-pub const READONLY_CLAUSE: &str = "ReadonlyClause";
-pub const REFERENCE_CLAUSE: &str = "ReferenceClause";
-pub const COMPUTED_CLAUSE: &str = "ComputedClause";
-pub const COMMENT_CLAUSE: &str = "CommentClause";
-pub const CONTENT_CLAUSE: &str = "ContentClause";
-pub const SET_CLAUSE: &str = "SetClause";
-pub const MERGE_CLAUSE: &str = "MergeClause";
-pub const PATCH_CLAUSE: &str = "PatchClause";
-pub const REPLACE_CLAUSE: &str = "ReplaceClause";
-pub const UNSET_CLAUSE: &str = "UnsetClause";
-pub const RETURN_CLAUSE: &str = "ReturnClause";
-pub const WHERE_CLAUSE: &str = "WhereClause";
-pub const WITH_CLAUSE: &str = "WithClause";
-pub const SPLIT_CLAUSE: &str = "SplitClause";
-pub const GROUP_CLAUSE: &str = "GroupClause";
-pub const ORDER_CLAUSE: &str = "OrderClause";
-pub const LIMIT_START_COMBO_CLAUSE: &str = "LimitStartComboClause";
-pub const FETCH_CLAUSE: &str = "FetchClause";
-pub const TIMEOUT_CLAUSE: &str = "TimeoutClause";
-pub const PARALLEL_CLAUSE: &str = "ParallelClause";
-pub const TEMPFILES_CLAUSE: &str = "TempfilesClause";
-pub const EXPLAIN_CLAUSE: &str = "ExplainClause";
-pub const VERSION_CLAUSE: &str = "VersionClause";
-pub const OMIT_CLAUSE: &str = "OmitClause";
+pub const ON_TABLE_CLAUSE: &str = "on_table_clause";
+pub const TYPE_CLAUSE: &str = "type_clause";
+pub const COMMENT_CLAUSE: &str = "comment_clause";
+pub const CONTENT_CLAUSE: &str = "content_clause";
+pub const SET_CLAUSE: &str = "set_clause";
+pub const RETURN_CLAUSE: &str = "return_clause";
+pub const RETURNS_CLAUSE: &str = "returns_clause";
+pub const WHERE_CLAUSE: &str = "where_clause";
+pub const FROM_CLAUSE: &str = "from_clause";
+pub const SELECT_CLAUSE: &str = "select_clause";
+pub const GROUP_CLAUSE: &str = "group_clause";
 
-pub const WHEN_CLAUSE: &str = "WhenClause";
-pub const THEN_CLAUSE: &str = "ThenClause";
+pub const WHEN_THEN_CLAUSE: &str = "when_then_clause";
 
-pub const FIELDS_COLUMNS_CLAUSE: &str = "FieldsColumnsClause";
-pub const INDEX_CLAUSE: &str = "IndexClause";
-pub const UNIQUE_CLAUSE: &str = "UniqueClause";
-pub const SEARCH_ANALYZER_CLAUSE: &str = "SearchAnalyzerClause";
-pub const MTREE_CLAUSE: &str = "MtreeClause";
-pub const HNSW_CLAUSE: &str = "HnswClause";
-pub const INDEX_DIMENSION_CLAUSE: &str = "IndexDimensionClause";
+pub const FIELDS_COLUMNS_CLAUSE: &str = "fields_columns_clause";
+pub const UNIQUE_CLAUSE: &str = "unique_clause";
 
-pub const PERMISSIONS_FOR_CLAUSE: &str = "PermissionsForClause";
-pub const PERMISSIONS_BASIC_CLAUSE: &str = "PermissionsBasicClause";
-pub const PERMISSION_GROUP: &str = "PermissionGroup";
+pub const PERMISSIONS_FOR_CLAUSE: &str = "permissions_for_clause";
+pub const PERMISSIONS_BASIC_CLAUSE: &str = "permissions_basic_clause";
+pub const PERMISSIONS_EXPRESSION_CLAUSE: &str = "permissions_expression_clause";
 
-pub const TABLE_TYPE_CLAUSE: &str = "TableTypeClause";
-pub const TABLE_VIEW_CLAUSE: &str = "TableViewClause";
-pub const CHANGEFEED_CLAUSE: &str = "ChangefeedClause";
-pub const DURATION_CLAUSE: &str = "DurationClause";
+// ---- Targets -------------------------------------------------------------
+
+pub const CREATE_TARGET: &str = "create_target";
+pub const RELATE_SUBJECT: &str = "relate_subject";
 
 // ---- Values and expressions ----------------------------------------------
 
-pub const BINARY_EXPRESSION: &str = "BinaryExpression";
-pub const PATH: &str = "Path";
-pub const RANGE: &str = "Range";
-pub const ARGUMENT_LIST: &str = "ArgumentList";
-pub const FUNCTION_CALL: &str = "FunctionCall";
-pub const FUNCTION_JS: &str = "FunctionJs";
-pub const JAVASCRIPT_BLOCK: &str = "JavaScriptBlock";
+pub const BINARY_EXPRESSION: &str = "binary_expression";
+pub const PATH: &str = "path";
+pub const PATH_ELEMENT: &str = "path_element";
+pub const SUBSCRIPT: &str = "subscript";
+pub const ARGUMENT_LIST: &str = "argument_list";
+pub const FUNCTION_CALL: &str = "function_call";
+pub const SCRIPTING_FUNCTION: &str = "scripting_function";
+pub const JS_FUNCTION_BODY: &str = "js_function_body";
 
-pub const BLOCK: &str = "Block";
-pub const SUB_QUERY: &str = "SubQuery";
-pub const FIELDS: &str = "Fields";
+pub const PARAM_LIST: &str = "param_list";
 
-pub const PARAM_DEFINITION: &str = "ParamDefinition";
+pub const FIELD_ASSIGNMENT: &str = "field_assignment";
+pub const OBJECT: &str = "object";
+pub const OBJECT_CONTENT: &str = "object_content";
+pub const OBJECT_PROPERTY: &str = "object_property";
+pub const OBJECT_KEY: &str = "object_key";
+pub const ARRAY: &str = "array";
 
-pub const FIELD_ASSIGNMENT: &str = "FieldAssignment";
-pub const OBJECT: &str = "Object";
-pub const OBJECT_CONTENT: &str = "ObjectContent";
-pub const OBJECT_PROPERTY: &str = "ObjectProperty";
-pub const OBJECT_KEY: &str = "ObjectKey";
-pub const KEY_NAME: &str = "KeyName";
-pub const ARRAY: &str = "Array";
-pub const SET: &str = "Set";
-pub const POINT: &str = "Point";
+pub const RECORD_ID: &str = "record_id";
+pub const RECORD_ID_VALUE: &str = "record_id_value";
+pub const RECORD_ID_RANGE: &str = "record_id_range";
+pub const MULTI_RECORD: &str = "multi_record";
 
-pub const RECORD_ID: &str = "RecordId";
-pub const RANGE_RECORD_ID: &str = "RangeRecordId";
-pub const RECORD_TB_IDENT: &str = "RecordTbIdent";
-pub const RECORD_ID_IDENT: &str = "RecordIdIdent";
+pub const IDENT: &str = "identifier";
+pub const CUSTOM_FUNCTION_NAME: &str = "custom_function_name";
+pub const BUILTIN_FUNCTION_NAME: &str = "builtin_function_name";
+pub const FUNCTION_NAME: &str = "function_name";
+pub const VARIABLE_NAME: &str = "variable_name";
+pub const TYPE_NAME: &str = "type_name";
+pub const FUNCTION_JS: &str = "scripting_function";
 
-pub const IDENT: &str = "Ident";
-pub const IDIOM: &str = "Idiom";
-pub const TYPE_NAME: &str = "TypeName";
-pub const FUNCTION_NAME: &str = "FunctionName";
-pub const VARIABLE_NAME: &str = "VariableName";
+pub const NUMBER: &str = "number";
+pub const INT: &str = "int";
+pub const FLOAT: &str = "float";
+pub const DECIMAL: &str = "decimal";
+pub const STRING: &str = "string";
+pub const PREFIXED_STRING: &str = "prefixed_string";
+pub const REGEX: &str = "regex";
+pub const DURATION: &str = "duration";
 
-pub const NUMBER: &str = "Number";
-pub const INT: &str = "Int";
-pub const FLOAT: &str = "Float";
-pub const DECIMAL: &str = "Decimal";
-pub const STRING: &str = "String";
-pub const FORMAT_STRING: &str = "FormatString";
-pub const REGEX: &str = "Regex";
-pub const DURATION: &str = "Duration";
-pub const DURATION_PART: &str = "DurationPart";
+pub const TYPE: &str = "type";
+pub const PARAMETERIZED_TYPE: &str = "parameterized_type";
 
-pub const BOOL: &str = "Bool";
-pub const NONE: &str = "None";
-pub const LITERAL: &str = "Literal";
+// ---- Operators / comments ------------------------------------------------
 
-pub const TYPE: &str = "Type";
-
-// ---- Visible keyword and operator nodes ----------------------------------
-
-pub const KEYWORD: &str = "Keyword";
-pub const OPERATOR: &str = "Operator";
-pub const COLON: &str = "Colon";
-pub const PIPE: &str = "Pipe";
-pub const BRACE_OPEN: &str = "BraceOpen";
-pub const BRACE_CLOSE: &str = "BraceClose";
-
-// ---- Comments (grammar `extras`) -----------------------------------------
-
-pub const COMMENT: &str = "Comment";
-pub const BLOCK_COMMENT: &str = "BlockComment";
+pub const OPERATOR: &str = "operator";
+pub const ASSIGNMENT_OPERATOR: &str = "assignment_operator";
+pub const COMMENT: &str = "comment";
 
 // ---- Helpers --------------------------------------------------------------
 
@@ -179,13 +136,23 @@ pub fn text_of<'a>(source: &'a str, node: Node<'_>) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok().map(str::trim)
 }
 
-/// Returns true when `node` is a `Keyword` whose source text matches
-/// `expected` (case-insensitive).
+/// True when `node` is a keyword node. In grammar v3 every keyword is its
+/// own kind (`keyword_from`, `keyword_where`, …), so a prefix test covers
+/// them all.
+pub fn is_keyword(node: Node<'_>) -> bool {
+    node.kind().starts_with("keyword_")
+}
+
+/// True when `node` is a keyword whose source text matches `expected`
+/// (case-insensitive). Works across every dedicated `keyword_*` kind.
 pub fn is_kw(node: Node<'_>, source: &str, expected: &str) -> bool {
-    if node.kind() != KEYWORD {
-        return false;
-    }
-    text_of(source, node).is_some_and(|text| text.eq_ignore_ascii_case(expected))
+    is_keyword(node)
+        && text_of(source, node).is_some_and(|text| text.eq_ignore_ascii_case(expected))
+}
+
+/// True when `kind` is one of the dedicated `define_*_statement` kinds.
+pub fn is_define_statement(kind: &str) -> bool {
+    kind.starts_with("define_") && kind.ends_with("_statement")
 }
 
 /// First child node with a matching kind (named children only).
@@ -207,25 +174,9 @@ pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
     node.named_children(&mut cursor).collect()
 }
 
-/// Identify the "kind" of a `DefineStatement` by inspecting its second
-/// named child. Returns an uppercase canonical name such as `TABLE`,
-/// `FIELD`, `INDEX`, `FUNCTION`, `PARAM`, `EVENT`, `ACCESS`,
-/// `NAMESPACE`, etc. Returns `None` if the statement is malformed.
-pub fn define_statement_variant(node: Node<'_>, source: &str) -> Option<String> {
-    debug_assert_eq!(node.kind(), DEFINE_STATEMENT);
-    let mut cursor = node.walk();
-    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-    let second = children.get(1)?;
-    match second.kind() {
-        ACCESS_DEFINITION => Some("ACCESS".to_string()),
-        SCOPE_DEFINITION => Some("SCOPE".to_string()),
-        KEYWORD => text_of(source, *second).map(|s| s.to_ascii_uppercase()),
-        _ => None,
-    }
-}
-
 /// Returns true when any descendant of `node` (inclusive) has the given
-/// kind. Useful for "does this block contain a `FunctionJs`?" checks.
+/// kind. Useful for "does this block contain a `scripting_function`?"
+/// checks.
 pub fn has_descendant(node: Node<'_>, kind: &str) -> bool {
     if node.kind() == kind {
         return true;
@@ -239,28 +190,31 @@ pub fn has_descendant(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-/// Concatenate the source text of every `Ident` descendant inside an
-/// `Idiom`, joined with `.`. Used to canonicalise field names such as
-/// `address.city`. When `node` itself is an `Ident`, returns its text.
-pub fn idiom_text(source: &str, node: Node<'_>) -> Option<String> {
-    if node.kind() == IDENT {
-        return text_of(source, node).map(str::to_string);
-    }
-    if node.kind() != IDIOM {
-        return text_of(source, node).map(str::to_string);
-    }
+/// Extract a dotted name (e.g. `address.city`) from a value/predicate/path
+/// subtree by collecting every `identifier` leaf in source order, joined
+/// with `.`. Simple field names return the single identifier; compound
+/// idioms parsed as `path(base_value(identifier), path_element(subscript(
+/// identifier)))` become `a.b`. Returns `None` when no identifier is found
+/// (e.g. a `*` projection).
+pub fn dotted_name(source: &str, node: Node<'_>) -> Option<String> {
     let mut parts = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == IDENT
-            && let Some(text) = text_of(source, child)
-        {
-            parts.push(text.to_string());
-        }
-    }
+    collect_identifier_parts(source, node, &mut parts);
     if parts.is_empty() {
         None
     } else {
         Some(parts.join("."))
+    }
+}
+
+fn collect_identifier_parts(source: &str, node: Node<'_>, parts: &mut Vec<String>) {
+    if node.kind() == IDENT
+        && let Some(text) = text_of(source, node)
+    {
+        parts.push(text.to_string());
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_identifier_parts(source, child, parts);
     }
 }
