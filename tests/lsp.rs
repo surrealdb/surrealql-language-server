@@ -231,6 +231,20 @@ fn clean_surql_produces_no_syntax_diagnostics() {
 }
 
 #[test]
+fn optional_chaining_produces_no_syntax_diagnostics() {
+    let u = uri("optional-chain.surql");
+    let text = r#"
+        DEFINE FIELD firstName ON user TYPE option<string> VALUE $value.?.trim();
+    "#;
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "optional chaining should not produce syntax diagnostics: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
 fn hover_for_js_function_shows_javascript_badge() {
     let u = uri("functions.surql");
     let mut ws = WorkspaceIndex::default();

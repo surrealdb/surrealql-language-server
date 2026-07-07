@@ -58,6 +58,25 @@ fn collect_statements(
 ) {
     let kind = node.kind();
 
+    if kind == k::DEFINE_STATEMENT {
+        match define_form(node, source).as_deref() {
+            Some("table") => extract_table(node, source, uri, origin, analysis),
+            Some("field") => extract_field(node, source, uri, origin, analysis),
+            Some("event") => extract_event(node, source, uri, origin, analysis),
+            Some("function") => extract_function(node, source, uri, origin, analysis),
+            Some("index") => extract_index(node, source, uri, origin, analysis),
+            Some("param") => extract_param(node, source, uri, origin, analysis),
+            Some("access" | "scope") => extract_access(node, source, uri, origin, analysis),
+            _ => {
+                if let Some(symbol) = statement_symbol(node, source, uri) {
+                    analysis.document_symbols.push(symbol);
+                }
+            }
+        }
+        collect_function_references(node, source, uri, analysis);
+        return;
+    }
+
     match kind {
         k::DEFINE_TABLE_STATEMENT => {
             extract_table(node, source, uri, origin, analysis);
@@ -123,7 +142,9 @@ fn collect_statements(
         // `subquery_statement` is a transparent wrapper — never treat it
         // as a leaf statement; fall through so we descend into the real
         // statement it wraps.
-        kind if kind.ends_with("_statement") && kind != "subquery_statement" => {
+        kind if (kind.ends_with("_statement") || kind.ends_with("Statement"))
+            && kind != "subquery_statement" =>
+        {
             if let Some(symbol) = statement_symbol(node, source, uri) {
                 analysis.document_symbols.push(symbol);
             }
@@ -138,6 +159,15 @@ fn collect_statements(
     for child in node.named_children(&mut cursor) {
         collect_statements(child, source, uri, origin, analysis);
     }
+}
+
+fn define_form(node: Node<'_>, source: &str) -> Option<String> {
+    k::named_children(node)
+        .into_iter()
+        .filter(|child| k::is_keyword(*child))
+        .nth(1)
+        .and_then(|child| text_of(source, child))
+        .map(|text| text.to_ascii_lowercase())
 }
 
 fn extract_table(
@@ -209,7 +239,12 @@ fn extract_field(
     // become `address.city` in our model.
     let Some(name) = children
         .iter()
-        .find(|child| child.kind() == k::INCLUSIVE_PREDICATE)
+        .find(|child| {
+            matches!(
+                child.kind(),
+                k::INCLUSIVE_PREDICATE | k::IDIOM | k::PATH | k::IDENT
+            )
+        })
         .and_then(|child| k::dotted_name(source, *child))
     else {
         return;
@@ -300,18 +335,25 @@ fn extract_event(
         .and_then(|child| identifier_from_on_table_clause(*child, source))
         .unwrap_or_else(|| "unknown".to_string());
 
-    // `WHEN <cond> THEN <block>` parses into a single `when_then_clause`.
-    // The condition is the `value` between the WHEN/THEN keywords; the
-    // action is the trailing `block`/`sub_query`.
+    // The snake_case grammar wraps `WHEN ... THEN ...` in one node; the
+    // local PascalCase grammar emits separate WhenClause/ThenClause nodes.
     let when_then = children
         .iter()
         .find(|child| child.kind() == k::WHEN_THEN_CLAUSE)
         .copied();
-    let when_clause = when_then
-        .and_then(|clause| k::find_child(clause, k::VALUE))
+    let when_clause = children
+        .iter()
+        .find(|child| child.kind() == k::WHEN_CLAUSE)
+        .copied()
+        .or(when_then)
+        .and_then(|clause| first_non_keyword_child(clause))
         .and_then(|child| text_of(source, child))
         .map(|text| compact_preview(&text));
-    let then_clause = when_then
+    let then_clause = children
+        .iter()
+        .find(|child| child.kind() == k::THEN_CLAUSE)
+        .copied()
+        .or(when_then)
         .and_then(|clause| k::find_child_any(clause, &[k::BLOCK, k::SUB_QUERY]))
         .and_then(|child| text_of(source, child))
         .map(|text| compact_preview(&text));
@@ -363,7 +405,13 @@ fn extract_function(
         .iter()
         .find(|child| child.kind() == k::PARAM_LIST)
         .map(|list| parse_function_params(*list, source))
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            children
+                .iter()
+                .filter(|child| child.kind() == k::PARAM_DEFINITION)
+                .flat_map(|param| parse_function_params(*param, source))
+                .collect()
+        });
 
     // `-> type` is a `returns_clause` wrapping the return `type`.
     let return_type = children
@@ -473,9 +521,9 @@ fn extract_index(
         .unwrap_or_default();
 
     // A `unique_clause` sibling marks a UNIQUE index.
-    let unique = children
-        .iter()
-        .any(|child| child.kind() == k::UNIQUE_CLAUSE);
+    let unique = children.iter().any(|child| {
+        child.kind() == k::UNIQUE_CLAUSE || k::has_descendant(*child, k::UNIQUE_CLAUSE)
+    });
 
     // Any remaining index-variant clause (HNSW/MTREE/search analyzer/…) is
     // captured verbatim as an option string.
@@ -483,7 +531,7 @@ fn extract_index(
         .iter()
         .filter(|child| {
             let kind = child.kind();
-            kind.ends_with("_clause")
+            (kind.ends_with("_clause") || kind.ends_with("Clause"))
                 && !matches!(
                     kind,
                     k::ON_TABLE_CLAUSE
@@ -491,6 +539,7 @@ fn extract_index(
                         | k::UNIQUE_CLAUSE
                         | k::COMMENT_CLAUSE
                 )
+                && !(unique && k::has_descendant(**child, k::UNIQUE_CLAUSE))
         })
         .filter_map(|child| text_of(source, *child))
         .map(|text| compact_preview(&text))
@@ -882,21 +931,23 @@ fn parse_permission_rule(
 
     let mut actions = Vec::new();
     for child in &scope {
-        match child.kind() {
-            "keyword_select" => actions.push(QueryAction::Select),
-            "keyword_create" => actions.push(QueryAction::Create),
-            "keyword_update" => actions.push(QueryAction::Update),
-            "keyword_delete" => actions.push(QueryAction::Delete),
-            _ => {}
+        if k::is_kw(*child, source, "select") {
+            actions.push(QueryAction::Select);
+        } else if k::is_kw(*child, source, "create") {
+            actions.push(QueryAction::Create);
+        } else if k::is_kw(*child, source, "update") {
+            actions.push(QueryAction::Update);
+        } else if k::is_kw(*child, source, "delete") {
+            actions.push(QueryAction::Delete);
         }
     }
     if actions.is_empty() {
         actions.push(QueryAction::Execute);
     }
 
-    let mode = if scope.iter().any(|child| child.kind() == "keyword_full") {
+    let mode = if scope.iter().any(|child| k::is_kw(*child, source, "full")) {
         PermissionMode::Full
-    } else if scope.iter().any(|child| child.kind() == "keyword_none") {
+    } else if scope.iter().any(|child| k::is_kw(*child, source, "none")) {
         PermissionMode::None
     } else {
         let expression = scope
@@ -931,7 +982,7 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
                 .map(|from| {
                     k::named_children(*from)
                         .into_iter()
-                        .filter(|child| child.kind() == k::VALUE)
+                        .filter(|child| !k::is_keyword(*child) && child.kind() != k::WHERE_CLAUSE)
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()
@@ -939,17 +990,42 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
         k::CREATE_STATEMENT | k::UPSERT_STATEMENT => children
             .iter()
             .copied()
-            .filter(|child| matches!(child.kind(), k::CREATE_TARGET | k::VALUE))
+            .filter(|child| {
+                matches!(
+                    child.kind(),
+                    k::CREATE_TARGET
+                        | k::VALUE
+                        | k::IDENT
+                        | k::RECORD_ID
+                        | k::RECORD_ID_RANGE
+                        | k::PATH
+                )
+            })
             .collect(),
         k::UPDATE_STATEMENT | k::DELETE_STATEMENT => children
             .iter()
             .copied()
-            .filter(|child| matches!(child.kind(), k::VALUE | k::CREATE_TARGET))
+            .filter(|child| {
+                matches!(
+                    child.kind(),
+                    k::VALUE
+                        | k::CREATE_TARGET
+                        | k::IDENT
+                        | k::RECORD_ID
+                        | k::RECORD_ID_RANGE
+                        | k::PATH
+                )
+            })
             .collect(),
         k::RELATE_STATEMENT => children
             .iter()
             .copied()
-            .filter(|child| child.kind() == k::RELATE_SUBJECT)
+            .filter(|child| {
+                matches!(
+                    child.kind(),
+                    k::RELATE_SUBJECT | k::IDENT | k::RECORD_ID | k::RECORD_ID_RANGE | k::PATH
+                )
+            })
             .collect(),
         k::INSERT_STATEMENT => {
             // The table is the identifier immediately after `INTO`.
@@ -977,6 +1053,7 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
         for candidate in descendants_of_kind(relevant, k::IDENT)
             .into_iter()
             .chain(descendants_of_kind(relevant, k::RECORD_ID))
+            .chain(descendants_of_kind(relevant, k::RECORD_ID_RANGE))
         {
             if let Some(name) =
                 text_of(source, candidate).and_then(|value| normalize_table_name(&value))
@@ -1023,14 +1100,14 @@ fn infer_type_from_value(node: Node<'_>, source: &str) -> TypeExpr {
             .and_then(|value| normalize_table_name(&value))
             .map(TypeExpr::Record)
             .unwrap_or(TypeExpr::Unknown),
-        "keyword_true" | "keyword_false" => TypeExpr::Scalar("bool".to_string()),
-        "keyword_none" | "keyword_null" => TypeExpr::Scalar("null".to_string()),
+        "Bool" | "keyword_true" | "keyword_false" => TypeExpr::Scalar("bool".to_string()),
+        "None" | "keyword_none" | "keyword_null" => TypeExpr::Scalar("null".to_string()),
         _ => TypeExpr::Unknown,
     }
 }
 
 fn normalize_table_name(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_matches('`');
+    let trimmed = value.trim().trim_matches(|ch| matches!(ch, '`' | '|'));
     if trimmed.is_empty() {
         return None;
     }
@@ -1039,7 +1116,7 @@ fn normalize_table_name(value: &str) -> Option<String> {
         .split(':')
         .next()
         .unwrap_or(trimmed)
-        .trim_matches(|ch| matches!(ch, '<' | '>' | '(' | ')' | '[' | ']'))
+        .trim_matches(|ch| matches!(ch, '<' | '>' | '(' | ')' | '[' | ']' | '|'))
         .to_string();
 
     if candidate.is_empty()
@@ -1247,6 +1324,12 @@ fn collect_descendants<'tree>(node: Node<'tree>, kind: &str, matches: &mut Vec<N
 fn first_named_descendant(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
+}
+
+fn first_non_keyword_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| !k::is_keyword(*child))
 }
 
 fn text_of(source: &str, node: Node<'_>) -> Option<String> {
