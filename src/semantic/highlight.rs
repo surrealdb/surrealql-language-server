@@ -67,12 +67,14 @@ pub fn legend() -> SemanticTokensLegend {
 /// which holds a `VariableName` and a `Type`) deliberately return `None`
 /// so their parts are coloured individually.
 fn token_type(kind: &str) -> Option<u32> {
+    if kind == "Keyword" || kind.starts_with("keyword_") {
+        return Some(KEYWORD);
+    }
     Some(match kind {
-        k::KEYWORD => KEYWORD,
         k::FUNCTION_NAME => FUNCTION,
         k::VARIABLE_NAME => PARAMETER,
         k::TYPE_NAME | k::TYPE => TYPE,
-        k::STRING | k::FORMAT_STRING | k::REGEX => STRING,
+        k::STRING | k::PREFIXED_STRING | k::REGEX => STRING,
         k::NUMBER | k::INT | k::FLOAT | k::DECIMAL | k::DURATION => NUMBER,
         k::COMMENT | k::BLOCK_COMMENT => COMMENT,
         // `table:id` record literals get their own colour via `variable`.
@@ -86,25 +88,44 @@ fn token_type(kind: &str) -> Option<u32> {
 fn modifiers(node: Node<'_>, source: &str) -> u32 {
     let parent_kind = node.parent().map(|parent| parent.kind());
     match node.kind() {
-        // `fn::foo` at `DEFINE FUNCTION fn::foo` is a declaration; any
-        // non-`fn::` callee is a builtin from the standard library.
         k::FUNCTION_NAME => {
-            if parent_kind == Some(k::DEFINE_STATEMENT) {
-                MOD_DECLARATION
-            } else if node
+            let text = node
                 .utf8_text(source.as_bytes())
-                .is_ok_and(|text| !text.trim().starts_with("fn::"))
+                .ok()
+                .map(str::trim)
+                .unwrap_or_default();
+            if parent_kind == Some(k::DEFINE_FUNCTION_STATEMENT)
+                || node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == k::DEFINE_STATEMENT)
+                    && define_form(node.parent().expect("checked above"), source).as_deref()
+                        == Some("function")
             {
-                MOD_DEFAULT_LIBRARY
-            } else {
+                MOD_DECLARATION
+            } else if text.starts_with("fn::") {
                 0
+            } else {
+                MOD_DEFAULT_LIBRARY
             }
         }
         // A `$var` is a declaration at its binding site: function params
-        // and `LET` bindings wrap it in `ParamDefinition`; `DEFINE PARAM`
-        // places it directly under the `DefineStatement`.
+        // live in a `param_list`; `LET` and `DEFINE PARAM` place it
+        // directly under their statement.
         k::VARIABLE_NAME => {
-            if matches!(parent_kind, Some(k::PARAM_DEFINITION | k::DEFINE_STATEMENT)) {
+            if matches!(
+                parent_kind,
+                Some(
+                    k::PARAM_LIST
+                        | k::PARAM_DEFINITION
+                        | k::LET_STATEMENT
+                        | k::DEFINE_PARAM_STATEMENT
+                )
+            ) || node
+                .parent()
+                .is_some_and(|parent| parent.kind() == k::DEFINE_STATEMENT)
+                && define_form(node.parent().expect("checked above"), source).as_deref()
+                    == Some("param")
+            {
                 MOD_DECLARATION
             } else {
                 0
@@ -112,6 +133,15 @@ fn modifiers(node: Node<'_>, source: &str) -> u32 {
         }
         _ => 0,
     }
+}
+
+fn define_form(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| k::is_keyword(*child))
+        .nth(1)
+        .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+        .map(|text| text.trim().to_ascii_lowercase())
 }
 
 /// An absolute (pre-delta-encoding) token. LSP requires every token to

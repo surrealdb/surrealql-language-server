@@ -104,19 +104,22 @@ fn grammar_dir(manifest_dir: &Path) -> PathBuf {
     }
 }
 
-/// Extract every SurrealQL keyword referenced by `grammar.js`. The grammar
-/// declares each keyword via the `kw("word")` / `kw('word')` helper, so
-/// we scan for both quote styles and uppercase the matches before handing
-/// them to the rest of the language server.
+/// Extract every SurrealQL keyword referenced by `grammar.js`. Grammar v3
+/// declares each keyword via `make_keyword('WORD')`; older grammars used
+/// `kw("word")`. We scan for both helpers in both quote styles and
+/// uppercase the matches before handing them to the rest of the language
+/// server.
 ///
-/// The set is deduplicated and sorted alphabetically. Both the
-/// `_kw_<name>` rule definitions *and* the corresponding `kw(...)` calls
-/// live in the same file, so a single scan captures every keyword the
-/// grammar recognises.
+/// The set is deduplicated and sorted alphabetically.
 fn extract_keywords(grammar_source: &str) -> Vec<String> {
     let mut keywords = BTreeSet::new();
 
-    for (needle, quote) in [("kw(\"", '"'), ("kw('", '\'')] {
+    for (needle, quote) in [
+        ("make_keyword(\"", '"'),
+        ("make_keyword('", '\''),
+        ("kw(\"", '"'),
+        ("kw('", '\''),
+    ] {
         let mut rest = grammar_source;
         while let Some(start) = rest.find(needle) {
             let after = &rest[start + needle.len()..];
@@ -152,6 +155,14 @@ mod tests {
         let source = "_kw_select: ($) => kw('select'),\n_kw_set: ($) => kw('set')";
         let keywords = extract_keywords(source);
         assert_eq!(keywords, vec!["SELECT".to_string(), "SET".to_string()]);
+    }
+
+    #[test]
+    fn extracts_make_keyword_calls_from_v3_grammar() {
+        let source = "keyword_select: (_) => make_keyword('SELECT'),\n\
+                      keyword_from: (_) => make_keyword('FROM')";
+        let keywords = extract_keywords(source);
+        assert_eq!(keywords, vec!["FROM".to_string(), "SELECT".to_string()]);
     }
 
     #[test]
