@@ -149,6 +149,29 @@ pub struct AccessDef {
     pub location: Location,
 }
 
+/// A name paired with the tight range of the token that produced it,
+/// so diagnostics can underline `prson` instead of the whole statement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedRange {
+    pub name: String,
+    pub range: Range,
+}
+
+/// Why a statement's target table list is (or isn't) statically known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TargetResolution {
+    /// Targets are literal table names / record ids.
+    Static,
+    /// The target is a `$parameter` — resolvable only at runtime, and
+    /// not worth a "could not be resolved" warning.
+    Parameter,
+    /// The target is an expression (function call, subquery, block).
+    Expression,
+    /// Nothing recognisable — the legacy "dynamic" case.
+    #[default]
+    Unresolved,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryFact {
     pub action: QueryAction,
@@ -157,6 +180,17 @@ pub struct QueryFact {
     pub dynamic: bool,
     pub location: Location,
     pub source_preview: String,
+    /// Tight token ranges for [`Self::target_tables`] entries.
+    /// `#[serde(default)]` keeps previously-serialized facts loading.
+    #[serde(default)]
+    pub target_refs: Vec<NamedRange>,
+    /// Tight token ranges for [`Self::touched_fields`] entries.
+    #[serde(default)]
+    pub field_refs: Vec<NamedRange>,
+    /// How the target list was resolved (drives warning suppression
+    /// for `$param` / expression targets).
+    #[serde(default)]
+    pub target_resolution: TargetResolution,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,12 +225,27 @@ pub struct DocumentAnalysis {
     pub document_symbols: Vec<DocumentSymbol>,
 }
 
+/// What a workspace scan had to skip. Non-zero counters are reported
+/// to the client so silent truncation doesn't look like coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkspaceScanStats {
+    /// Directory entries the walker could not read (permissions, IO).
+    pub walk_errors: usize,
+    /// Files skipped because they exceed the size ceiling.
+    pub skipped_oversize: usize,
+    /// Files that matched but could not be read as UTF-8 text.
+    pub skipped_unreadable: usize,
+    /// True when the workspace file cap stopped the scan early.
+    pub file_cap_hit: bool,
+}
+
 /// Documents are shared via [`Arc`] so that cloning a [`WorkspaceIndex`]
 /// across the background task / read-snapshot boundary is O(documents) pointer
 /// copies instead of O(total source bytes) string clones.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceIndex {
     pub documents: HashMap<Uri, Arc<DocumentAnalysis>>,
+    pub scan_stats: WorkspaceScanStats,
 }
 
 #[derive(Debug, Clone, Default)]

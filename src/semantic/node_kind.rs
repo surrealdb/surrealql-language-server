@@ -123,6 +123,7 @@ pub const DURATION: &str = "Duration";
 
 pub const TYPE: &str = "Type";
 pub const PARAMETERIZED_TYPE: &str = "ParameterizedType";
+pub const TYPE_CAST: &str = "TypeCast";
 
 // ---- Operators / comments ------------------------------------------------
 

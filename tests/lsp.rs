@@ -8,7 +8,8 @@ use surrealql_language_server::semantic::model::is_record_type_context;
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
     DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, MergedSemanticModel, PermissionMode,
-    PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
+    PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, TargetResolution,
+    WorkspaceIndex,
 };
 
 fn uri(path: &str) -> Uri {
@@ -212,6 +213,131 @@ fn syntax_errors_produce_diagnostics() {
     assert!(
         !analysis.syntax_diagnostics.is_empty(),
         "broken surql should produce diagnostics"
+    );
+    // Wire-compat tripwires: these identity fields are observable by
+    // every LSP client and must never drift.
+    for diagnostic in &analysis.syntax_diagnostics {
+        assert_eq!(
+            diagnostic.source.as_deref(),
+            Some("surreal-language-server")
+        );
+        assert_eq!(
+            diagnostic.code,
+            Some(tower_lsp_server::ls_types::NumberOrString::String(
+                "parse".to_string()
+            ))
+        );
+        assert_eq!(
+            diagnostic.severity,
+            Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
+        );
+    }
+}
+
+#[test]
+fn syntax_error_suggests_keyword_for_typo() {
+    let u = uri("typo.surql");
+    let analysis =
+        analyze_document(u, "SELECT * FRO person;", SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis
+            .syntax_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Did you mean `FROM`?")),
+        "expected a FROM suggestion: {:?}",
+        analysis.syntax_diagnostics
+    );
+
+    let u = uri("typo2.surql");
+    let analysis = analyze_document(
+        u,
+        "DEFINE TABLE person SCHEMAFULL PERMISSION FOR select FULL;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+    assert!(
+        analysis
+            .syntax_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Did you mean `PERMISSIONS`?")),
+        "expected a PERMISSIONS suggestion: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
+fn keyword_typo_hint_skips_identifiers_defined_in_the_document() {
+    let u = uri("orders.surql");
+    // `orders` is a defined table, so the broken statement must
+    // suggest WHERE (the actual typo), never `ORDER` for `orders`.
+    let text = "DEFINE TABLE orders SCHEMALESS;\nSELECT * FROM orders WHRE id = 1;";
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis
+            .syntax_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("`ORDER`")),
+        "defined identifier must not be treated as a keyword typo: {:?}",
+        analysis.syntax_diagnostics
+    );
+}
+
+#[test]
+fn missing_token_diagnostic_names_the_expected_token() {
+    let u = uri("missing.surql");
+    let analysis = analyze_document(
+        u,
+        "SELECT * FROM (SELECT * FROM person;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+    let missing = analysis
+        .syntax_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.starts_with("Expected"))
+        .expect("missing-token diagnostic");
+    assert_eq!(missing.message, "Expected `)`.");
+    assert!(
+        missing.range.end.character > missing.range.start.character,
+        "missing-token squiggles must be visible (non-zero width): {:?}",
+        missing.range
+    );
+}
+
+#[test]
+fn multi_line_error_is_clamped_to_first_line_with_related_info() {
+    let u = uri("multiline.surql");
+    let text = "SELECT * FROM person\nWHERE broken (\nmore garbage here\nDEFINE TABLE other;";
+    let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
+    let clamped = analysis
+        .syntax_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.related_information.is_some())
+        .expect("a clamped multi-line error with related info");
+    assert_eq!(
+        clamped.range.start.line, clamped.range.end.line,
+        "clamped error range must stay on one line: {:?}",
+        clamped.range
+    );
+    let related = clamped.related_information.as_ref().unwrap();
+    assert!(related[0].message.contains("continues to line"));
+    assert!(
+        related[0].location.range.end.line > clamped.range.end.line,
+        "related info must carry the full span"
+    );
+}
+
+#[test]
+fn pathological_input_caps_syntax_diagnostics() {
+    let u = uri("pathological.surql");
+    // Hundreds of broken statements — the cap keeps the problems
+    // panel usable instead of publishing thousands of entries.
+    let text = "@@@ ;\n".repeat(500);
+    let analysis = analyze_document(u, &text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.len() <= 100,
+        "syntax diagnostics must be capped at 100, got {}",
+        analysis.syntax_diagnostics.len()
     );
 }
 
@@ -533,6 +659,9 @@ fn completion_for_fields_scoped_to_statement_target_table() {
         dynamic: false,
         location: empty_location("schema.surql"),
         source_preview: "SELECT price FROM product".to_string(),
+        target_refs: Vec::new(),
+        field_refs: Vec::new(),
+        target_resolution: TargetResolution::Static,
     };
     let items = model.completion_items("pr", false, None, Some(&fact), None);
     assert!(items.iter().any(|i| i.label == "price"));
@@ -577,6 +706,9 @@ fn no_diagnostics_for_allowed_permission() {
             dynamic: false,
             location: empty_location("query.surql"),
             source_preview: "SELECT * FROM thing".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         }],
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -627,6 +759,9 @@ fn error_diagnostic_for_denied_permission() {
             dynamic: false,
             location: empty_location("query.surql"),
             source_preview: "CREATE secret".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         }],
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -637,6 +772,10 @@ fn error_diagnostic_for_denied_permission() {
     assert_eq!(
         diagnostics[0].severity,
         Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
+    );
+    assert_eq!(
+        diagnostics[0].source.as_deref(),
+        Some("surreal-language-server")
     );
 }
 
@@ -662,6 +801,9 @@ fn warning_for_unknown_table_in_query() {
             dynamic: false,
             location: empty_location("query.surql"),
             source_preview: "SELECT * FROM totally_unknown_table".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         }],
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -670,6 +812,29 @@ fn warning_for_unknown_table_in_query() {
     let diagnostics = model.semantic_diagnostics(&analysis, &ServerSettings::default());
     assert!(!diagnostics.is_empty());
     assert!(diagnostics[0].message.contains("Unknown table"));
+    assert!(diagnostics[0].message.contains("totally_unknown_table"));
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(
+        diagnostics[0].source.as_deref(),
+        Some("surreal-language-server")
+    );
+    assert_eq!(
+        diagnostics[0].code,
+        Some(tower_lsp_server::ls_types::NumberOrString::String(
+            "unknown-table".to_string()
+        ))
+    );
+    assert_eq!(
+        diagnostics[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("table"))
+            .and_then(|table| table.as_str()),
+        Some("totally_unknown_table")
+    );
 }
 
 #[test]
@@ -724,6 +889,9 @@ fn role_based_permission_allowed_for_matching_context() {
             dynamic: false,
             location: empty_location("query.surql"),
             source_preview: "SELECT * FROM orders".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         }],
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),

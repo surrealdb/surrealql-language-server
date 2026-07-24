@@ -112,8 +112,18 @@ impl WasmLanguageServer {
 
         let mut workspace = WorkspaceIndex::default();
         for DocumentEntry { uri, text } in entries {
-            let Ok(parsed) = uri.parse::<Uri>() else {
-                continue;
+            let parsed = match uri.parse::<Uri>() {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    // Consistent with pushWorkspaceDocument's loud
+                    // rejection: a bad entry shouldn't vanish, but it
+                    // also shouldn't abort the whole bulk replace.
+                    self.log_skipped_entry(&format!(
+                        "replaceWorkspace skipped document with invalid uri `{uri}`: {error}"
+                    ))
+                    .await;
+                    continue;
+                }
             };
             if let Some(analysis) = analyze_document(parsed.clone(), &text, SymbolOrigin::Local) {
                 workspace.documents.insert(parsed, Arc::new(analysis));
@@ -137,6 +147,13 @@ impl WasmLanguageServer {
         for (index, define) in strings.into_iter().enumerate() {
             let uri_string = format!("surrealdb:///metadata/{}.surql", index);
             let Ok(uri) = uri_string.parse::<Uri>() else {
+                // The URI is synthesised from the loop index, so this
+                // is unreachable in practice — but if it ever fires,
+                // say so instead of silently dropping schema.
+                self.log_skipped_entry(&format!(
+                    "setLiveMetadata skipped entry {index}: invalid metadata uri"
+                ))
+                .await;
                 continue;
             };
             if let Some(analysis) = analyze_document(uri.clone(), &define, SymbolOrigin::Remote) {
@@ -146,6 +163,20 @@ impl WasmLanguageServer {
         self.metadata.replace(snapshot.clone());
         self.core.replace_live_metadata(snapshot).await;
         Ok(())
+    }
+}
+
+impl WasmLanguageServer {
+    /// Route a skipped-entry note through the host's log callback.
+    async fn log_skipped_entry(&self, message: &str) {
+        use crate::core::client::LspNotifier;
+        self.core
+            .notifier()
+            .log_message(
+                ls_types::MessageType::WARNING,
+                format!("SurrealQL: {message}"),
+            )
+            .await;
     }
 }
 

@@ -10,6 +10,13 @@ async fn main() {
     use surrealql_language_server::native::Backend;
     use tower_lsp_server::{LspService, Server};
 
+    // The release profile aborts on panic, so this hook is the only
+    // trace a crash leaves. It must write to stderr: stdout carries
+    // the LSP wire and editors surface stderr in their output panel.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("surrealql-language-server panicked: {info}");
+    }));
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 

@@ -104,12 +104,6 @@ pub struct AuthContext {
     pub variables: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct RootSettings {
-    #[serde(default)]
-    surrealql: Option<ServerSettings>,
-}
-
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
@@ -155,20 +149,60 @@ impl Default for AuthContext {
     }
 }
 
+/// The `metadata.mode` strings the server understands. Anything else
+/// is repaired to the default with a warning instead of silently
+/// disabling every schema source.
+pub const ACCEPTED_METADATA_MODES: &[&str] = &[
+    "both",
+    "workspace+db",
+    "filesystem",
+    "workspace",
+    "db",
+    "remote",
+];
+
 impl ServerSettings {
     pub fn from_sources(
         initialization_options: Option<&Value>,
         configuration: Option<&Value>,
     ) -> Self {
-        let mut settings = Self::default();
+        Self::from_sources_with_warnings(initialization_options, configuration).0
+    }
 
-        for value in [initialization_options, configuration] {
-            if let Some(parsed) = value.and_then(parse_settings_value) {
-                settings = parsed.merge_with_env();
+    /// Like [`Self::from_sources`], but also returns human-readable
+    /// warnings for every part of the payload that could not be used
+    /// (malformed JSON shapes, unknown enum-like strings). Callers
+    /// forward these to the client via `window/logMessage` so a typo
+    /// in the editor settings is no longer a silent no-op.
+    pub fn from_sources_with_warnings(
+        initialization_options: Option<&Value>,
+        configuration: Option<&Value>,
+    ) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut settings = Self::default();
+        let mut parsed_any = false;
+
+        for (label, value) in [
+            ("initializationOptions", initialization_options),
+            ("workspace configuration", configuration),
+        ] {
+            let Some(value) = value else { continue };
+            match parse_settings_value(value) {
+                Ok(Some(parsed)) => {
+                    settings = parsed.merge_with_env();
+                    parsed_any = true;
+                }
+                Ok(None) => {}
+                Err(error) => warnings.push(format!(
+                    "invalid `surrealql` settings in {label}: {error}; the payload was ignored"
+                )),
             }
         }
 
-        if initialization_options.is_none() && configuration.is_none() {
+        // No usable payload (none given, `null` sections, or every
+        // payload malformed): the SURREALDB_* environment fallbacks
+        // must still apply, exactly as they did pre-0.3.
+        if !parsed_any {
             settings = settings.merge_with_env();
         }
 
@@ -183,7 +217,49 @@ impl ServerSettings {
                 .map(|context| context.name.clone());
         }
 
-        settings
+        warnings.extend(settings.validate_and_repair());
+
+        (settings, warnings)
+    }
+
+    /// Repair unknown enum-like values back to safe defaults and
+    /// describe each repair. Unknown `metadata.mode` previously turned
+    /// off both the workspace scan *and* the live DB fetch with no
+    /// feedback at all.
+    fn validate_and_repair(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if !ACCEPTED_METADATA_MODES.contains(&self.metadata.mode.as_str()) {
+            // Don't promise a specific effective value here: a later
+            // merge with in-flight settings may restore the previous
+            // mode over the repaired default.
+            warnings.push(format!(
+                "unknown metadata.mode `{}` was ignored (accepted values: {})",
+                self.metadata.mode,
+                ACCEPTED_METADATA_MODES.join(", "),
+            ));
+            self.metadata.mode = default_metadata_mode();
+        }
+
+        if let Some(active) = &self.active_auth_context {
+            let known = self
+                .auth_contexts
+                .iter()
+                .any(|context| &context.name == active);
+            if !known {
+                let fallback = self
+                    .auth_contexts
+                    .first()
+                    .map(|context| context.name.as_str())
+                    .unwrap_or("<none>");
+                warnings.push(format!(
+                    "activeAuthContext `{active}` does not match any configured auth context; \
+                     using `{fallback}` instead"
+                ));
+            }
+        }
+
+        warnings
     }
 
     pub fn merge_with_env(mut self) -> Self {
@@ -232,11 +308,31 @@ impl ConnectionSettings {
     }
 }
 
-fn parse_settings_value(value: &Value) -> Option<ServerSettings> {
-    serde_json::from_value::<RootSettings>(value.clone())
-        .ok()
-        .and_then(|root| root.surrealql)
-        .or_else(|| serde_json::from_value::<ServerSettings>(value.clone()).ok())
+/// Parse one settings payload. `Ok(None)` means the payload carried
+/// nothing for us (e.g. `null`); `Err` carries the serde error for a
+/// payload that *tried* to configure `surrealql` but was malformed —
+/// previously that error was swallowed and the whole object silently
+/// dropped.
+fn parse_settings_value(value: &Value) -> Result<Option<ServerSettings>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    // A nested `{ "surrealql": { ... } }` root: parse the section
+    // directly so a typo inside it surfaces instead of falling back
+    // to an all-defaults flat parse.
+    if let Some(section) = value.get("surrealql") {
+        if section.is_null() {
+            return Ok(None);
+        }
+        return serde_json::from_value::<ServerSettings>(section.clone())
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+
+    serde_json::from_value::<ServerSettings>(value.clone())
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn default_true() -> bool {

@@ -95,11 +95,10 @@ fn modifiers(node: Node<'_>, source: &str) -> u32 {
                 .map(str::trim)
                 .unwrap_or_default();
             if parent_kind == Some(k::DEFINE_FUNCTION_STATEMENT)
-                || node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == k::DEFINE_STATEMENT)
-                    && define_form(node.parent().expect("checked above"), source).as_deref()
-                        == Some("function")
+                || node.parent().is_some_and(|parent| {
+                    parent.kind() == k::DEFINE_STATEMENT
+                        && define_form(parent, source).as_deref() == Some("function")
+                })
             {
                 MOD_DECLARATION
             } else if text.starts_with("fn::") {
@@ -120,12 +119,10 @@ fn modifiers(node: Node<'_>, source: &str) -> u32 {
                         | k::LET_STATEMENT
                         | k::DEFINE_PARAM_STATEMENT
                 )
-            ) || node
-                .parent()
-                .is_some_and(|parent| parent.kind() == k::DEFINE_STATEMENT)
-                && define_form(node.parent().expect("checked above"), source).as_deref()
-                    == Some("param")
-            {
+            ) || node.parent().is_some_and(|parent| {
+                parent.kind() == k::DEFINE_STATEMENT
+                    && define_form(parent, source).as_deref() == Some("param")
+            }) {
                 MOD_DECLARATION
             } else {
                 0
