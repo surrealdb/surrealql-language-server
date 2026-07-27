@@ -21,7 +21,13 @@ codes, and actionable wording. Full audit trail in
   `DEFINE TABLE person` now yields ``Unknown table `prson`. Did you
   mean `person`?`` with a one-click replace quick fix — this path was
   previously dead code because schema inference masked it. Unknown
-  fields on SCHEMAFULL tables get the same treatment.
+  fields on SCHEMAFULL tables get the same treatment. Guarded against
+  false positives (PR #18 review): singular/plural sibling names
+  (`orders`/`order`) never trigger, names used in more than one
+  statement are treated as deliberate tables, and detection stands
+  down entirely while the live-metadata connection is failing (remote
+  tables missing from the model would otherwise light up local
+  near-misses in bulk).
 - **Syntax-error hints**: misspelled keywords are detected against the
   grammar's own keyword list (``… Did you mean `FROM`?``); MISSING
   tokens name what was expected (``Expected `)`.``, ``Expected
@@ -33,7 +39,12 @@ codes, and actionable wording. Full audit trail in
 - **Configuration validation**: malformed `surrealql` settings
   payloads, unknown `metadata.mode` values, and unknown
   `activeAuthContext` names are reported via `window/logMessage`
-  instead of being silently ignored.
+  instead of being silently ignored. Misspelled setting *keys* are
+  detected too (serde otherwise ignores unknown fields):
+  ``unknown setting `connection.endpint` — did you mean `endpoint`?``.
+  Warning sets are deduplicated — a persistently bad configuration
+  logs once per distinct set, with an INFO line when the warnings
+  resolve.
 - **Workspace-scan reporting**: unreadable entries, oversized files,
   and the file-count cap are counted and summarized in the log; a
   toast fires when the cap truncates indexing.

@@ -267,4 +267,8 @@ pub struct MergedSemanticModel {
     pub function_callers: HashMap<String, Vec<String>>,
     pub workspace_symbols: Vec<DocumentSymbol>,
     pub query_facts: HashMap<Uri, Vec<QueryFact>>,
+    /// True when the live-metadata fetch reported errors while this
+    /// model was built — remote tables may be missing, so
+    /// unknown-name judgments are unreliable until recovery.
+    pub metadata_degraded: bool,
 }

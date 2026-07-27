@@ -43,6 +43,10 @@ pub struct ServerState {
     /// client is ready to receive `window/logMessage`. Drained by
     /// `initialized`.
     pub pending_settings_warnings: Vec<String>,
+    /// Sorted signature of the settings warnings most recently logged,
+    /// so a persistently bad configuration doesn't re-log on every
+    /// pull. Same pattern as [`Self::last_metadata_errors`].
+    pub last_settings_warnings: Option<Vec<String>>,
 }
 
 /// Stable signature of a workspace-folder set, used to short-circuit

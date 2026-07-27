@@ -488,6 +488,206 @@ async fn relate_set_fields_are_not_checked_against_subject_tables() {
     );
 }
 
+/// PR #18 review: singular/plural sibling tables are a naming
+/// convention, not typos — `orders` next to explicit `order` must not
+/// warn (and must not offer a quick fix that rewrites the query
+/// against a different real table).
+#[tokio::test]
+async fn sibling_singular_plural_tables_are_not_typos() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "plural.surql",
+        "DEFINE TABLE order SCHEMAFULL;\nCREATE orders SET total = 1;",
+    )
+    .await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("plural.surql"))
+        .expect("published");
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Some(NumberOrString::String("unknown-table".to_string()))
+        }),
+        "plural sibling of an explicit table must not be flagged: {diagnostics:?}"
+    );
+}
+
+/// The plural guard must not swallow real typos of s-ending names:
+/// `address` pluralises with `es`, so `addres` is a dropped letter,
+/// not a singular sibling.
+#[tokio::test]
+async fn trailing_s_typo_of_s_ending_table_still_warns() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "address.surql",
+        "DEFINE TABLE address SCHEMAFULL;\nCREATE addres SET street = 'x';",
+    )
+    .await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("address.surql"))
+        .expect("published");
+    let unknown = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == Some(NumberOrString::String("unknown-table".to_string()))
+        })
+        .expect("dropped-letter typo of an s-ending table must still warn");
+    assert!(unknown.message.contains("Did you mean `address`?"));
+}
+
+/// PR #18 review: a name used in several statements is a deliberate
+/// (if undeclared) table. Trade-off documented here: the same typo
+/// pasted twice also goes silent.
+#[tokio::test]
+async fn repeated_usage_of_inferred_table_is_not_a_typo() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "repeated.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         CREATE prson SET x = 1;\n\
+         SELECT * FROM prson;",
+    )
+    .await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("repeated.surql"))
+        .expect("published");
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Some(NumberOrString::String("unknown-table".to_string()))
+        }),
+        "multi-use inferred names are deliberate tables: {diagnostics:?}"
+    );
+}
+
+/// PR #18 review: when the DB connection is down, remote tables drop
+/// out of the merged model and local near-misses would warn in bulk —
+/// right when the metadata-unavailable toast already fires. Typo
+/// detection must stand down while metadata is degraded.
+#[tokio::test]
+async fn typo_detection_suppressed_while_metadata_unavailable() {
+    use surrealql_language_server::semantic::types::LiveMetadataSnapshot;
+
+    let failing = LiveMetadataSnapshot {
+        documents: Default::default(),
+        errors: vec!["failed to connect to SurrealDB: connection refused".to_string()],
+    };
+    let (core, notifier, _) = core_with(Default::default(), failing);
+
+    // The failing snapshot only reaches the model through a fetch —
+    // drive the real initialize flow, not just did_open.
+    core.initialize(InitializeParams::default()).await;
+    core.initialized().await;
+    open(
+        &core,
+        "degraded.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nCREATE prson SET x = 1;",
+    )
+    .await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("degraded.surql"))
+        .expect("published");
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Some(NumberOrString::String("unknown-table".to_string()))
+        }),
+        "typo detection must stand down while metadata is degraded: {diagnostics:?}"
+    );
+    assert!(
+        notifier
+            .shows()
+            .iter()
+            .any(|(_, message)| message.contains("live schema metadata unavailable")),
+        "the outage itself is still reported"
+    );
+}
+
+/// PR #18 review: a persistently bad configuration must not re-log
+/// the same warnings on every configuration push.
+#[tokio::test]
+async fn settings_warnings_do_not_repeat() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    core.initialize(InitializeParams::default()).await;
+
+    let bad_payload = json!({ "surrealql": { "metadata": { "mode": "workspaceanddb" } } });
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: bad_payload.clone(),
+    })
+    .await;
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: bad_payload,
+    })
+    .await;
+
+    let warning_count = notifier
+        .logs()
+        .iter()
+        .filter(|(level, message)| {
+            *level == MessageType::WARNING && message.starts_with("SurrealQL settings:")
+        })
+        .count();
+    assert_eq!(
+        warning_count,
+        1,
+        "identical warning sets must log once: {:?}",
+        notifier.logs()
+    );
+
+    // A clean payload resolves the warnings — once.
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: json!({ "surrealql": {} }),
+    })
+    .await;
+    assert!(
+        notifier.logs().iter().any(|(level, message)| {
+            *level == MessageType::INFO && message.contains("previous warnings resolved")
+        }),
+        "recovery must be logged: {:?}",
+        notifier.logs()
+    );
+}
+
+/// A client with no `surrealql` workspace section answers the
+/// configuration pull with `None` (unsupported) or JSON `null`
+/// (VS Code / Neovim) — neither must reset the warning-dedup state
+/// nor fire a spurious "resolved" line right after the
+/// initializationOptions warnings were logged.
+#[tokio::test]
+async fn configless_pull_does_not_resolve_init_options_warnings() {
+    for pulled in [None, Some(serde_json::Value::Null)] {
+        let (core, notifier, _) = core_with(Default::default(), Default::default());
+        *notifier.configuration.lock().unwrap() = pulled;
+
+        core.initialize(InitializeParams {
+            initialization_options: Some(json!({
+                "surrealql": { "connection": { "endpint": "ws://x:8000/rpc" } }
+            })),
+            ..InitializeParams::default()
+        })
+        .await;
+        core.initialized().await;
+
+        let logs = notifier.logs();
+        let warning_count = logs
+            .iter()
+            .filter(|(level, message)| {
+                *level == MessageType::WARNING && message.contains("endpint")
+            })
+            .count();
+        assert_eq!(warning_count, 1, "warning logged exactly once: {logs:?}");
+        assert!(
+            logs.iter()
+                .all(|(_, message)| !message.contains("previous warnings resolved")),
+            "a config-less pull must not fake a resolution: {logs:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn workspace_scan_stats_are_reported() {
     use surrealql_language_server::semantic::types::{WorkspaceIndex, WorkspaceScanStats};

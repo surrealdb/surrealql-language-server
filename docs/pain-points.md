@@ -9,7 +9,7 @@
 
 | # | Finding | Where | Status |
 |---|---------|-------|--------|
-| H1 | **Typo detection was dead code.** The analyzer infers a table/field from the very statement that misuses it, so the merged model always "knew" the typo'd name — the "Unknown table/field" diagnostics and the replace quick fix could never fire in the real pipeline. Unit tests passed only because they hand-built models without inference. | `src/semantic/model.rs:505`, `src/semantic/analyzer.rs:1224` | ✅ provenance-aware check + did-you-mean + relatedInformation + e2e test |
+| H1 | **Typo detection was dead code.** The analyzer infers a table/field from the very statement that misuses it, so the merged model always "knew" the typo'd name — the "Unknown table/field" diagnostics and the replace quick fix could never fire in the real pipeline. Unit tests passed only because they hand-built models without inference. | `src/semantic/model.rs:505`, `src/semantic/analyzer.rs:1224` | ✅ provenance-aware check + did-you-mean + relatedInformation + e2e test; hardened per PR #18 review (plural-sibling guard, single-use heuristic, stands down while metadata is degraded) |
 | H2 | **SurrealDB connection/auth/timeout errors were never surfaced.** `LiveMetadataSnapshot.errors` was populated but read by nothing — a bad endpoint looked identical to an empty schema. | `src/native/metadata_db.rs:51` | ✅ `window/showMessage` toast (deduped per failure set) + per-error logs + recovery log |
 | H3 | **Generic/leaky syntax errors.** Everything was "Invalid SurrealQL syntax near …"; MISSING nodes leaked grammar rule names with zero-width ranges; one typo smeared a single squiggle over the rest of the file. | `src/semantic/analyzer.rs:1261` | ✅ keyword did-you-mean hints, human `Expected …` names, ≥1-char MISSING ranges, first-line clamping + relatedInformation, nested-error surfacing, 100-diagnostic cap |
 | H4 | **`panic = 'abort'` with no native panic hook.** Any panic killed the server with no trace (wasm had `console_error_panic_hook`; native printed nothing). | `Cargo.toml:63`, `src/main.rs` | ✅ stderr panic hook; `panic='abort'` kept deliberately (see comment in Cargo.toml); remaining production panic sites audited — none reachable from user input |
@@ -29,7 +29,7 @@
 - Whole-statement diagnostic ranges → token-tight ranges via `QueryFact.target_refs`/`field_refs`.
 - No `Diagnostic.code` on semantic diagnostics; quick fixes matched on message *text* → stable code registry (`src/semantic/codes.rs`) + `data` payloads; code actions match code+data with the legacy string fallback kept for one release (remove in 0.4).
 - No relatedInformation / did-you-mean → both added for unknown-table/unknown-field.
-- Malformed settings JSON silently dropped (`config.rs:235`) → parse errors reported via `window/logMessage`.
+- Malformed settings JSON silently dropped (`config.rs:235`) → parse errors reported via `window/logMessage`; misspelled setting *keys* swept against known-key lists with did-you-mean (PR #18 review); warning sets deduplicated per distinct signature.
 - Unknown `metadata.mode` silently disabled all schema sources (`config.rs:55`) → warns and repairs to the default (`workspace+db`). **Deliberate behavior change**, see CHANGELOG.
 - Unknown `activeAuthContext` silently fell back to the first context (`config.rs:217`) → warns.
 - Workspace scan swallowed walkdir errors and silently skipped >2 MB files / the 5,000-file cap / non-UTF8 reads (`workspace_fs.rs:63,74`) → counted in `WorkspaceScanStats`, summarized in the log, toast when the cap is hit.

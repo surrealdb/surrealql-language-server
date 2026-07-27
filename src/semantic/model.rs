@@ -26,6 +26,11 @@ use crate::semantic::types::{
 impl MergedSemanticModel {
     pub fn build(workspace: &WorkspaceIndex, live: &LiveMetadataSnapshot) -> Self {
         let mut model = Self::default();
+        // A failing (or partially failing) metadata fetch means remote
+        // tables are missing from this model — judgments like "this
+        // inferred name must be a typo" can't be trusted until the
+        // connection recovers.
+        model.metadata_degraded = !live.errors.is_empty();
 
         for analysis in workspace.documents.values() {
             model.absorb_analysis(analysis.as_ref());
@@ -237,6 +242,28 @@ impl MergedSemanticModel {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(table, _)| table)
+    }
+
+    /// Like [`Self::find_nearest_explicit_table`], but restricted to
+    /// candidates that plausibly indicate a *typo* rather than a
+    /// deliberate sibling name: bare singular/plural pairs
+    /// (`orders`/`order`, `categories`/`category`) score ~0.96 on
+    /// jaro-winkler yet are the most common intentional naming
+    /// pattern in schemas, so they are excluded here.
+    fn find_probable_typo_of_explicit_table(&self, unknown: &str) -> Option<&TableDef> {
+        self.find_nearest_explicit_table(unknown)
+            .filter(|candidate| !is_plural_variant(unknown, &candidate.name))
+    }
+
+    /// How many query facts across the workspace target `name`. A
+    /// name used in several statements is a deliberate table, not a
+    /// one-off typo.
+    fn target_usage_count(&self, name: &str) -> usize {
+        self.query_facts
+            .values()
+            .flatten()
+            .filter(|fact| fact.target_tables.iter().any(|table| table == name))
+            .count()
     }
 
     /// Nearest explicitly defined field on `table` — the unknown-field
@@ -551,21 +578,49 @@ impl MergedSemanticModel {
                 let table_range = range_for_name(&fact.target_refs, table, fact.location.range);
                 let table_def = match self.tables.get(table) {
                     None => {
-                        diagnostics.push(self.unknown_table_diagnostic(table, table_range));
+                        let suggestion = self.find_nearest_explicit_table(table);
+                        diagnostics.push(self.unknown_table_diagnostic(
+                            table,
+                            table_range,
+                            suggestion,
+                        ));
                         continue;
                     }
                     // The statement being checked is itself enough to
                     // *infer* a table, so a typo'd name always "exists"
                     // by the time we validate it. An inferred-only def
-                    // that is a near-miss of an explicitly defined
-                    // table is treated as the typo it almost certainly
-                    // is; inferred-only names with no near-miss stay
-                    // untouched — schema inference from usage is a
-                    // feature, not an error.
+                    // is treated as a typo only when ALL of these hold:
+                    //
+                    // 1. Live metadata is healthy. When the DB fetch
+                    //    is failing (including partial per-table INFO
+                    //    errors), previously-known remote tables drop
+                    //    out of the model and would light up as
+                    //    near-misses in bulk — right when the
+                    //    "metadata unavailable" toast already fires.
+                    // 2. The name is used only once across the
+                    //    workspace. Repeated usage means a deliberate
+                    //    (if undeclared) table; the trade-off is that
+                    //    the same typo pasted twice goes silent.
+                    // 3. An explicit table is a near-miss that is NOT
+                    //    a bare singular/plural sibling — `orders`
+                    //    next to `order` is a naming convention, not a
+                    //    typo, and the quick fix would rewrite the
+                    //    query against a different real table.
+                    //
+                    // Everything else stays untouched — schema
+                    // inference from usage is a feature, not an error.
                     Some(table_def) if !table_def.explicit => {
-                        if self.find_nearest_explicit_table(table).is_some() {
-                            diagnostics.push(self.unknown_table_diagnostic(table, table_range));
-                            continue;
+                        if !self.metadata_degraded && self.target_usage_count(table) <= 1 {
+                            if let Some(suggestion) =
+                                self.find_probable_typo_of_explicit_table(table)
+                            {
+                                diagnostics.push(self.unknown_table_diagnostic(
+                                    table,
+                                    table_range,
+                                    Some(suggestion),
+                                ));
+                                continue;
+                            }
                         }
                         table_def
                     }
@@ -641,8 +696,12 @@ impl MergedSemanticModel {
         diagnostics
     }
 
-    fn unknown_table_diagnostic(&self, table: &str, range: Range) -> Diagnostic {
-        let suggestion = self.find_nearest_explicit_table(table);
+    fn unknown_table_diagnostic(
+        &self,
+        table: &str,
+        range: Range,
+        suggestion: Option<&TableDef>,
+    ) -> Diagnostic {
         let message = match suggestion {
             Some(candidate) => format!(
                 "Unknown table `{table}`. Did you mean `{}`?",
@@ -1016,6 +1075,34 @@ impl MergedSemanticModel {
 struct PermissionOutcome {
     result: AccessResult,
     message: String,
+}
+
+/// True when the two names are bare singular/plural forms of each
+/// other (`order`/`orders`, `box`/`boxes`, `category`/`categories`),
+/// in either direction and case-insensitively.
+fn is_plural_variant(left: &str, right: &str) -> bool {
+    fn is_plural_of(plural: &str, singular: &str) -> bool {
+        if let Some(stem) = plural.strip_suffix("ies") {
+            if format!("{stem}y") == singular {
+                return true;
+            }
+        }
+        if let Some(stem) = plural.strip_suffix("es")
+            && stem == singular
+        {
+            return true;
+        }
+        // Bare-`s` plurals only apply when the stem doesn't itself
+        // end in `s`: s-ending nouns pluralise with `es`, so
+        // `address`/`addres` is a real typo, not a plural pair.
+        plural
+            .strip_suffix('s')
+            .is_some_and(|stem| stem == singular && !stem.ends_with('s'))
+    }
+
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    is_plural_of(&left, &right) || is_plural_of(&right, &left)
 }
 
 /// Tight token range for `name`, falling back to the statement range

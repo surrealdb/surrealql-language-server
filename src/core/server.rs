@@ -191,7 +191,17 @@ where
         let configuration = self.notifier.request_configuration().await;
         let (settings, warnings) =
             ServerSettings::from_sources_with_warnings(None, configuration.as_ref());
-        self.report_settings_warnings(&warnings).await;
+        // A client without configuration support answers `None`, and
+        // VS Code / Neovim answer the pull with JSON `null` when no
+        // `surrealql` section is configured — both always yield zero
+        // warnings. Reporting those would reset the dedup signature
+        // and fire a spurious "resolved" line right after the
+        // initialize-stashed warnings. (A *real* clean section does
+        // report: it replaces the previous settings, so its empty
+        // warning set genuinely resolves them.)
+        if configuration.as_ref().is_some_and(|value| !value.is_null()) {
+            self.report_settings_warnings(&warnings).await;
+        }
 
         let _guard = self.config_lock.lock().await;
         let current_settings = {
@@ -202,7 +212,36 @@ where
         self.apply_settings_inner(settings).await;
     }
 
+    /// Log settings warnings, once per *distinct* warning set — a
+    /// persistently misconfigured editor would otherwise re-log the
+    /// same lines on every configuration pull and `didChange`. Same
+    /// pattern as [`Self::report_metadata_errors`]: the state lock is
+    /// released before any notifier await.
     async fn report_settings_warnings(&self, warnings: &[String]) {
+        let mut signature = warnings.to_vec();
+        signature.sort();
+
+        let previous = {
+            let mut state = self.state.write().await;
+            state.last_settings_warnings.replace(signature.clone())
+        };
+
+        if previous.as_ref() == Some(&signature) {
+            return;
+        }
+
+        if signature.is_empty() {
+            if previous.is_some_and(|previous| !previous.is_empty()) {
+                self.notifier
+                    .log_message(
+                        MessageType::INFO,
+                        "SurrealQL settings: previous warnings resolved".to_string(),
+                    )
+                    .await;
+            }
+            return;
+        }
+
         for warning in warnings {
             self.notifier
                 .log_message(
