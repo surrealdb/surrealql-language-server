@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod completion_context;
+pub mod dispatch;
 pub mod server;
 pub mod state;
 

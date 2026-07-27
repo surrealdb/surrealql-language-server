@@ -1,17 +1,19 @@
 use ls_types::{
-    Diagnostic, DiagnosticSeverity, DocumentSymbol, InlayHint, InlayHintKind, InlayHintLabel,
-    Location, NumberOrString, SymbolKind, Uri,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DocumentSymbol, InlayHint,
+    InlayHintKind, InlayHintLabel, Location, SymbolKind, Uri,
 };
 use tree_sitter::{Node, Parser};
 
 use crate::grammar::language;
+use crate::semantic::codes;
 use crate::semantic::node_kind as k;
 use crate::semantic::text::{byte_range_to_lsp, compact_preview, offset_to_position};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
     AccessDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage, FunctionParam,
-    IndexDef, InferenceFact, MergedSemanticModel, ParamDef, PermissionMode, PermissionRule,
-    QueryAction, QueryFact, SymbolOrigin, SymbolReference, TableDef,
+    IndexDef, InferenceFact, MergedSemanticModel, NamedRange, ParamDef, PermissionMode,
+    PermissionRule, QueryAction, QueryFact, SymbolOrigin, SymbolReference, TableDef,
+    TargetResolution,
 };
 
 pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<DocumentAnalysis> {
@@ -35,17 +37,48 @@ pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<Do
         accesses: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
-        syntax_diagnostics: collect_syntax_diagnostics(text, root),
+        syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
     };
 
     collect_statements(root, text, &uri, origin, &mut analysis);
+
+    // Syntax diagnostics run after extraction so the keyword-typo
+    // hint can skip names that are identifiers in this document
+    // (a table named `orders` must not become "Did you mean `ORDER`?").
+    let known_names: std::collections::HashSet<String> = analysis
+        .tables
+        .iter()
+        .map(|table| table.name.to_ascii_uppercase())
+        .chain(
+            analysis
+                .fields
+                .iter()
+                .map(|field| field.name.to_ascii_uppercase()),
+        )
+        .collect();
+    analysis.syntax_diagnostics =
+        collect_syntax_diagnostics_at(Some(&uri), text, root, &known_names);
     Some(analysis)
 }
 
 pub fn collect_syntax_diagnostics(source: &str, node: Node<'_>) -> Vec<Diagnostic> {
+    collect_syntax_diagnostics_at(None, source, node, &Default::default())
+}
+
+/// Like [`collect_syntax_diagnostics`], but able to attach
+/// `relatedInformation` (which needs a document URI) when a clamped
+/// error span continues beyond its first line, and to suppress
+/// keyword-typo hints for `known_names` (uppercased identifiers
+/// defined in the document).
+pub fn collect_syntax_diagnostics_at(
+    uri: Option<&Uri>,
+    source: &str,
+    node: Node<'_>,
+    known_names: &std::collections::HashSet<String>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    collect_node_diagnostics(source, node, &mut diagnostics);
+    collect_node_diagnostics(uri, source, node, known_names, &mut diagnostics);
     diagnostics
 }
 
@@ -647,8 +680,16 @@ fn extract_query_fact(
     action: QueryAction,
     analysis: &mut DocumentAnalysis,
 ) {
-    let targets = target_tables_for_statement(node, source);
-    let touched_fields = collect_field_names(node, source);
+    let target_nodes = target_nodes_for_statement(node, source);
+    let target_refs = target_refs_from_nodes(&target_nodes, source);
+    let targets: Vec<String> = target_refs.iter().map(|entry| entry.name.clone()).collect();
+    let field_refs = collect_field_refs(node, source);
+    let touched_fields: Vec<String> = field_refs.iter().map(|entry| entry.name.clone()).collect();
+    let target_resolution = if targets.is_empty() {
+        classify_unresolved_targets(&target_nodes)
+    } else {
+        TargetResolution::Static
+    };
     let dynamic = targets.is_empty();
     let preview = node
         .utf8_text(source.as_bytes())
@@ -668,6 +709,9 @@ fn extract_query_fact(
         dynamic,
         location: location(uri, source, node),
         source_preview: preview,
+        target_refs,
+        field_refs,
+        target_resolution,
     });
 
     for table in &targets {
@@ -967,66 +1011,75 @@ fn parse_permission_rule(
     }
 }
 
-fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
+/// Node kinds a table *name* can be read from. Expression-shaped
+/// targets (`$param`, function calls, subqueries, blocks) are kept in
+/// the target region for [`classify_unresolved_targets`] but excluded
+/// here so e.g. `DELETE fn::pick(person)` doesn't claim `person`.
+/// Arrays and type casts can wrap record ids (`FROM [person:1]`,
+/// `FROM <record> person:1`) so their names are extracted.
+fn is_target_name_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        k::CREATE_TARGET
+            | k::VALUE
+            | k::IDENT
+            | k::RECORD_ID
+            | k::RECORD_ID_RANGE
+            | k::PATH
+            | k::ARRAY
+            | k::TYPE_CAST
+    ) || kind == k::RELATE_SUBJECT
+}
+
+/// The subtrees that make up a statement's target region ("what comes
+/// after CREATE/UPDATE/DELETE/FROM/INTO"), before any trailing
+/// clauses. Includes expression-shaped targets so classification can
+/// tell a `$param` target apart from something truly opaque.
+fn target_nodes_for_statement<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
     let children = k::named_children(node);
-    // For each CRUD form we collect candidate "target value" subtrees,
-    // then walk them for `identifier` / `record_id` leaves (v3 wraps the
-    // target of most statements in a clause or a dedicated *_target node).
-    let relevant_nodes: Vec<Node<'_>> = match node.kind() {
+    let is_region_kind = |child: &Node<'tree>| {
+        is_target_name_kind(child.kind())
+            || matches!(
+                child.kind(),
+                k::VARIABLE_NAME | k::FUNCTION_CALL | k::SUB_QUERY | k::BLOCK
+            )
+    };
+    match node.kind() {
         k::SELECT_STATEMENT => {
-            // Targets are the `value` children of the `from_clause` (its
-            // trailing `where_clause`, if any, is skipped).
-            children
-                .iter()
-                .find(|child| child.kind() == k::FROM_CLAUSE)
-                .map(|from| {
-                    k::named_children(*from)
-                        .into_iter()
-                        .filter(|child| !k::is_keyword(*child) && child.kind() != k::WHERE_CLAUSE)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+            // Older grammar builds wrapped the targets in a
+            // `from_clause`; the current one lays them out as direct
+            // children after the `FROM` keyword, up to the first
+            // trailing clause (`WHERE`, `GROUP`, …).
+            if let Some(from) = children.iter().find(|child| child.kind() == k::FROM_CLAUSE) {
+                return k::named_children(*from)
+                    .into_iter()
+                    .filter(|child| !k::is_keyword(*child) && child.kind() != k::WHERE_CLAUSE)
+                    .collect();
+            }
+            let mut after_from = false;
+            let mut region = Vec::new();
+            for child in &children {
+                if k::is_kw(*child, source, "FROM") {
+                    after_from = true;
+                    continue;
+                }
+                if !after_from {
+                    continue;
+                }
+                if child.kind().ends_with("Clause") {
+                    break;
+                }
+                if is_region_kind(child) {
+                    region.push(*child);
+                }
+            }
+            region
         }
-        k::CREATE_STATEMENT | k::UPSERT_STATEMENT => children
-            .iter()
-            .copied()
-            .filter(|child| {
-                matches!(
-                    child.kind(),
-                    k::CREATE_TARGET
-                        | k::VALUE
-                        | k::IDENT
-                        | k::RECORD_ID
-                        | k::RECORD_ID_RANGE
-                        | k::PATH
-                )
-            })
-            .collect(),
-        k::UPDATE_STATEMENT | k::DELETE_STATEMENT => children
-            .iter()
-            .copied()
-            .filter(|child| {
-                matches!(
-                    child.kind(),
-                    k::VALUE
-                        | k::CREATE_TARGET
-                        | k::IDENT
-                        | k::RECORD_ID
-                        | k::RECORD_ID_RANGE
-                        | k::PATH
-                )
-            })
-            .collect(),
-        k::RELATE_STATEMENT => children
-            .iter()
-            .copied()
-            .filter(|child| {
-                matches!(
-                    child.kind(),
-                    k::RELATE_SUBJECT | k::IDENT | k::RECORD_ID | k::RECORD_ID_RANGE | k::PATH
-                )
-            })
-            .collect(),
+        k::CREATE_STATEMENT
+        | k::UPSERT_STATEMENT
+        | k::UPDATE_STATEMENT
+        | k::DELETE_STATEMENT
+        | k::RELATE_STATEMENT => children.iter().copied().filter(is_region_kind).collect(),
         k::INSERT_STATEMENT => {
             // The table is the identifier immediately after `INTO`.
             let mut after_into = false;
@@ -1044,38 +1097,97 @@ fn target_tables_for_statement(node: Node<'_>, source: &str) -> Vec<String> {
             targets
         }
         _ => vec![node],
-    };
+    }
+}
 
-    let mut names = Vec::new();
-    for relevant in relevant_nodes {
-        // A `record_id` names its table in an `object_key`, so normalising
-        // the record-id text (splitting on `:`) yields the table name.
-        for candidate in descendants_of_kind(relevant, k::IDENT)
+/// Walk the candidate target subtrees for `identifier` / `record_id`
+/// leaves, keeping the tight range of the first token that produced
+/// each deduped table name. A `record_id`'s range is narrowed to its
+/// table prefix (the text before `:`) so a quick fix can replace just
+/// the table name.
+fn target_refs_from_nodes(relevant_nodes: &[Node<'_>], source: &str) -> Vec<NamedRange> {
+    let mut refs: Vec<NamedRange> = Vec::new();
+    for relevant in relevant_nodes
+        .iter()
+        .filter(|node| is_target_name_kind(node.kind()))
+    {
+        for candidate in descendants_of_kind(*relevant, k::IDENT)
             .into_iter()
-            .chain(descendants_of_kind(relevant, k::RECORD_ID))
-            .chain(descendants_of_kind(relevant, k::RECORD_ID_RANGE))
+            .chain(descendants_of_kind(*relevant, k::RECORD_ID))
+            .chain(descendants_of_kind(*relevant, k::RECORD_ID_RANGE))
         {
-            if let Some(name) =
-                text_of(source, candidate).and_then(|value| normalize_table_name(&value))
-                && !names.contains(&name)
-            {
-                names.push(name);
+            let Some(raw) = candidate.utf8_text(source.as_bytes()).ok() else {
+                continue;
+            };
+            let Some(name) = normalize_table_name(raw) else {
+                continue;
+            };
+            if refs.iter().any(|existing| existing.name == name) {
+                continue;
+            }
+            let end_byte = match raw.find(':') {
+                Some(colon) => candidate.start_byte() + colon,
+                None => candidate.end_byte(),
+            };
+            refs.push(NamedRange {
+                name,
+                range: byte_range_to_lsp(source, candidate.start_byte(), end_byte),
+            });
+        }
+    }
+    refs
+}
+
+/// Explain *why* no static target was found, so the "could not be
+/// resolved" warning fires only for genuinely opaque targets and not
+/// for `$param` / expression targets that are fine at runtime.
+fn classify_unresolved_targets(relevant_nodes: &[Node<'_>]) -> TargetResolution {
+    // A bare `$param` target is the strongest signal — check every
+    // region node's own kind before falling back to deep scans.
+    if relevant_nodes
+        .iter()
+        .any(|node| node.kind() == k::VARIABLE_NAME)
+    {
+        return TargetResolution::Parameter;
+    }
+    if relevant_nodes.iter().any(|node| {
+        matches!(
+            node.kind(),
+            k::FUNCTION_CALL | k::SUB_QUERY | k::BLOCK | k::SELECT_STATEMENT | k::ARRAY
+        )
+    }) {
+        return TargetResolution::Expression;
+    }
+    for relevant in relevant_nodes {
+        // Fallback statements land here whole — scan their children,
+        // not the node itself (a SELECT contains itself otherwise).
+        for child in k::named_children(*relevant) {
+            if !descendants_of_kind(child, k::VARIABLE_NAME).is_empty() {
+                return TargetResolution::Parameter;
+            }
+            for kind in [k::FUNCTION_CALL, k::SUB_QUERY, k::BLOCK] {
+                if !descendants_of_kind(child, kind).is_empty() {
+                    return TargetResolution::Expression;
+                }
             }
         }
     }
-    names
+    TargetResolution::Unresolved
 }
 
-fn collect_field_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut fields = Vec::new();
+fn collect_field_refs(node: Node<'_>, source: &str) -> Vec<NamedRange> {
+    let mut fields: Vec<NamedRange> = Vec::new();
     for assignment in descendants_of_kind(node, k::FIELD_ASSIGNMENT) {
-        if let Some(name) = k::named_children(assignment)
+        if let Some((name, ident)) = k::named_children(assignment)
             .into_iter()
             .find(|child| child.kind() == k::IDENT)
-            .and_then(|child| text_of(source, child))
-            && !fields.contains(&name)
+            .and_then(|child| text_of(source, child).map(|name| (name, child)))
+            && !fields.iter().any(|existing| existing.name == name)
         {
-            fields.push(name);
+            fields.push(NamedRange {
+                name,
+                range: byte_range_to_lsp(source, ident.start_byte(), ident.end_byte()),
+            });
         }
     }
     fields
@@ -1258,35 +1370,165 @@ fn location(uri: &Uri, source: &str, node: Node<'_>) -> Location {
     )
 }
 
-fn collect_node_diagnostics(source: &str, node: Node<'_>, diagnostics: &mut Vec<Diagnostic>) {
+/// Upper bound on syntax diagnostics per document. A pathological
+/// buffer (generated dumps, pasted binaries) shouldn't flood the
+/// editor's problems panel.
+const MAX_SYNTAX_DIAGNOSTICS: usize = 100;
+
+fn collect_node_diagnostics(
+    uri: Option<&Uri>,
+    source: &str,
+    node: Node<'_>,
+    known_names: &std::collections::HashSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if diagnostics.len() >= MAX_SYNTAX_DIAGNOSTICS {
+        return;
+    }
+
     if node.is_missing() {
-        let range = byte_range_to_lsp(source, node.start_byte(), node.start_byte());
-        diagnostics.push(Diagnostic {
-            range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String("parse".to_string())),
-            source: Some("surreal-language-server".to_string()),
-            message: format!("Missing syntax near `{}`.", node.kind()),
-            ..Diagnostic::default()
-        });
+        diagnostics.push(missing_node_diagnostic(source, node));
         return;
     }
 
     if node.is_error() {
-        diagnostics.push(Diagnostic {
-            range: byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String("parse".to_string())),
-            source: Some("surreal-language-server".to_string()),
-            message: syntax_error_message(source, node),
-            ..Diagnostic::default()
-        });
+        diagnostics.push(error_node_diagnostic(uri, source, node, known_names));
+        // A single typo often makes tree-sitter emit one ERROR node
+        // spanning a large region that still contains more precise
+        // nested MISSING/ERROR nodes — surface those too instead of
+        // hiding them behind one giant squiggle.
+        descend_into_error(
+            uri,
+            source,
+            node,
+            known_names,
+            node.start_position().row,
+            diagnostics,
+        );
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_node_diagnostics(source, child, diagnostics);
+        collect_node_diagnostics(uri, source, child, known_names, diagnostics);
+    }
+}
+
+/// Walk the children of a reported ERROR node. Nested errors starting
+/// on the same line as the already-reported parent would only repeat
+/// the same underline, so they're descended through without their own
+/// diagnostic; errors on later lines get reported (the parent's range
+/// was clamped to its first line).
+fn descend_into_error(
+    uri: Option<&Uri>,
+    source: &str,
+    node: Node<'_>,
+    known_names: &std::collections::HashSet<String>,
+    reported_row: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if diagnostics.len() >= MAX_SYNTAX_DIAGNOSTICS {
+            return;
+        }
+        if child.is_missing() {
+            diagnostics.push(missing_node_diagnostic(source, child));
+            continue;
+        }
+        if child.is_error() {
+            if child.start_position().row == reported_row {
+                descend_into_error(uri, source, child, known_names, reported_row, diagnostics);
+            } else {
+                diagnostics.push(error_node_diagnostic(uri, source, child, known_names));
+                descend_into_error(
+                    uri,
+                    source,
+                    child,
+                    known_names,
+                    child.start_position().row,
+                    diagnostics,
+                );
+            }
+            continue;
+        }
+        collect_node_diagnostics(uri, source, child, known_names, diagnostics);
+    }
+}
+
+fn missing_node_diagnostic(source: &str, node: Node<'_>) -> Diagnostic {
+    // MISSING nodes are zero-width; extend the range over the next
+    // character so editors render a visible squiggle. `get` instead of
+    // slicing — this path must never panic on odd byte offsets.
+    let start = node.start_byte();
+    let end = source
+        .get(start..)
+        .and_then(|rest| rest.chars().next())
+        .map(|ch| start + ch.len_utf8())
+        .unwrap_or(start);
+    Diagnostic {
+        range: byte_range_to_lsp(source, start, end),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: codes::as_code(codes::PARSE),
+        source: Some("surreal-language-server".to_string()),
+        // `grammar_name` bypasses the `Keyword` alias, so a missing
+        // `_kw_then` renders as "Expected `THEN`." instead of leaking
+        // internal rule names.
+        message: format!("Expected {}.", friendly_symbol_name(node.grammar_name())),
+        ..Diagnostic::default()
+    }
+}
+
+fn error_node_diagnostic(
+    uri: Option<&Uri>,
+    source: &str,
+    node: Node<'_>,
+    known_names: &std::collections::HashSet<String>,
+) -> Diagnostic {
+    let full_start = node.start_byte();
+    let full_end = node.end_byte();
+    let spans_multiple_lines = node.end_position().row > node.start_position().row;
+
+    // One giant multi-line squiggle hides everything under it; clamp
+    // the reported range to the error's first line and point at the
+    // full extent through relatedInformation.
+    let range_end = if spans_multiple_lines {
+        source
+            .get(full_start..full_end)
+            .and_then(|region| region.find('\n'))
+            .map(|offset| full_start + offset)
+            .unwrap_or(full_end)
+    } else {
+        full_end
+    };
+
+    let mut message = syntax_error_message(source, node);
+    if let Some(hint) =
+        keyword_typo_hint(source, node, known_names).or_else(|| expected_tokens_hint(node))
+    {
+        message.push(' ');
+        message.push_str(&hint);
+    }
+
+    let related_information = match (spans_multiple_lines, uri) {
+        (true, Some(uri)) => Some(vec![DiagnosticRelatedInformation {
+            location: Location::new(uri.clone(), byte_range_to_lsp(source, full_start, full_end)),
+            message: format!(
+                "The invalid region continues to line {}.",
+                node.end_position().row + 1
+            ),
+        }]),
+        _ => None,
+    };
+
+    Diagnostic {
+        range: byte_range_to_lsp(source, full_start, range_end),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: codes::as_code(codes::PARSE),
+        source: Some("surreal-language-server".to_string()),
+        message,
+        related_information,
+        ..Diagnostic::default()
     }
 }
 
@@ -1301,6 +1543,228 @@ fn syntax_error_message(source: &str, node: Node<'_>) -> String {
         "Invalid SurrealQL syntax.".to_string()
     } else {
         format!("Invalid SurrealQL syntax near `{snippet}`.")
+    }
+}
+
+/// Keywords worth offering as "did you mean" targets. Deliberately
+/// restricted to high-traffic statement/clause words: the full
+/// grammar keyword list contains obscure entries (`PEARSON`,
+/// `EUCLIDEAN`, …) that ordinary identifiers like `person` resemble
+/// closely enough to produce absurd suggestions.
+const HINTABLE_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "CREATE",
+    "UPDATE",
+    "UPSERT",
+    "DELETE",
+    "RELATE",
+    "INSERT",
+    "INTO",
+    "DEFINE",
+    "REMOVE",
+    "TABLE",
+    "FIELD",
+    "INDEX",
+    "EVENT",
+    "FUNCTION",
+    "PARAM",
+    "ANALYZER",
+    "ACCESS",
+    "NAMESPACE",
+    "DATABASE",
+    "SCHEMAFULL",
+    "SCHEMALESS",
+    "PERMISSIONS",
+    "TYPE",
+    "VALUE",
+    "VALUES",
+    "DEFAULT",
+    "ASSERT",
+    "FLEXIBLE",
+    "CONTENT",
+    "MERGE",
+    "PATCH",
+    "RETURN",
+    "GROUP",
+    "ORDER",
+    "LIMIT",
+    "START",
+    "FETCH",
+    "SPLIT",
+    "TIMEOUT",
+    "PARALLEL",
+    "BEGIN",
+    "COMMIT",
+    "CANCEL",
+    "TRANSACTION",
+    "THEN",
+    "WHEN",
+    "COLUMNS",
+    "FIELDS",
+    "UNIQUE",
+    "COMMENT",
+];
+
+/// The most common cause of an ERROR node is a misspelled keyword
+/// (`FRO`, `PERMISSION`, `WHRE`). Scan the error region's words for a
+/// near-miss of a common keyword and suggest the fix.
+///
+/// The *leftmost* qualifying word wins, not the best-scoring one: the
+/// parser fails at the earliest problem, so a later near-miss must
+/// not outbid the actual typo.
+fn keyword_typo_hint(
+    source: &str,
+    node: Node<'_>,
+    known_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let text = node.utf8_text(source.as_bytes()).ok()?;
+
+    for word in text
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|word| word.len() >= 2)
+    {
+        let upper = word.to_ascii_uppercase();
+        // Identifiers defined in this document are not keyword typos.
+        if crate::grammar::KEYWORDS.contains(&upper.as_str()) || known_names.contains(&upper) {
+            continue;
+        }
+        let best = HINTABLE_KEYWORDS
+            .iter()
+            // Never suggest a keyword the compiled grammar doesn't have.
+            .filter(|keyword| crate::grammar::KEYWORDS.contains(*keyword))
+            // Typos are a letter or two off; a large length gap means
+            // the similarity score is prefix-bonus noise (`person` vs
+            // `PERMISSIONS`).
+            .filter(|keyword| keyword.len().abs_diff(upper.len()) <= 2)
+            .map(|keyword| (strsim::jaro_winkler(&upper, keyword), keyword))
+            .filter(|(score, _)| *score >= 0.88)
+            .max_by(|left, right| {
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some((_, keyword)) = best {
+            return Some(format!("Did you mean `{keyword}`?"));
+        }
+    }
+
+    None
+}
+
+/// Derive an "Expected …" hint from the parser state after the last
+/// token consumed inside the error via tree-sitter's lookahead
+/// iterator. Every failure path returns `None`, degrading to exactly
+/// the pre-hint message. Hints are omitted when the valid-token set
+/// is large or dominated by the anonymous `Keyword` alias (the
+/// grammar erases *which* keyword at the symbol level) — a vague list
+/// helps nobody.
+fn expected_tokens_hint(node: Node<'_>) -> Option<String> {
+    const MAX_SHOWN: usize = 4;
+
+    // ERROR nodes report parse state 0 and their prev sibling reports
+    // u16::MAX; the informative state is the one after the last leaf
+    // the parser managed to shift inside the error region.
+    let state = last_usable_parse_state(node)?;
+
+    let language = language();
+    let mut iterator = language.lookahead_iterator(state)?;
+    let mut names: Vec<String> = Vec::new();
+    for name in iterator.iter_names() {
+        if matches!(name, "end" | "ERROR" | "Comment" | "BlockComment")
+            || (name.starts_with('_') && !name.starts_with("_kw_"))
+        {
+            continue;
+        }
+        // The keyword tokens all alias to the bare name "Keyword" —
+        // there is no way to say *which* keyword, so a set containing
+        // them is too vague to show.
+        if name == "Keyword" {
+            return None;
+        }
+        let friendly = friendly_symbol_name(name);
+        if names.contains(&friendly) {
+            continue;
+        }
+        names.push(friendly);
+        if names.len() > MAX_SHOWN {
+            return None;
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+
+    Some(match names.len() {
+        1 => format!("Expected {}.", names[0]),
+        2 => format!("Expected {} or {}.", names[0], names[1]),
+        _ => {
+            let (last, rest) = names.split_last().expect("len >= 3");
+            format!("Expected {}, or {last}.", rest.join(", "))
+        }
+    })
+}
+
+/// The parse state after the last leaf inside `node` that carries a
+/// real state (0 = none, u16::MAX = sentinel inside error subtrees).
+fn last_usable_parse_state(node: Node<'_>) -> Option<u16> {
+    fn walk(node: Node<'_>, found: &mut Option<u16>) {
+        if node.child_count() == 0 {
+            let state = node.next_parse_state();
+            if state != 0 && state != u16::MAX {
+                *found = Some(state);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, found);
+        }
+    }
+
+    let mut found = None;
+    walk(node, &mut found);
+    found
+}
+
+/// Render a grammar symbol name as something a SurrealQL user
+/// recognises: `_kw_then` → ``` `THEN` ```, `Ident` → "an
+/// identifier", punctuation passes through in backticks.
+fn friendly_symbol_name(raw: &str) -> String {
+    if let Some(word) = raw.strip_prefix("_kw_") {
+        return format!("`{}`", word.to_ascii_uppercase());
+    }
+    match raw {
+        k::IDENT | "RecordTbIdent" | "RecordIdIdent" | "KeyName" => "an identifier".to_string(),
+        k::STRING | k::PREFIXED_STRING => "a string".to_string(),
+        k::NUMBER | k::INT | k::FLOAT | k::DECIMAL => "a number".to_string(),
+        k::VARIABLE_NAME => "a `$parameter`".to_string(),
+        k::DURATION => "a duration".to_string(),
+        k::FUNCTION_NAME => "a function name".to_string(),
+        k::TYPE_NAME | k::TYPE => "a type".to_string(),
+        k::OBJECT => "an object".to_string(),
+        k::ARRAY => "an array".to_string(),
+        k::RECORD_ID => "a record id".to_string(),
+        "Keyword" => "a keyword".to_string(),
+        "BraceOpen" => "`{`".to_string(),
+        "BraceClose" => "`}`".to_string(),
+        "Colon" => "`:`".to_string(),
+        other if !other.is_empty() && other.chars().all(|ch| ch.is_ascii_punctuation()) => {
+            format!("`{other}`")
+        }
+        other => {
+            // Humanize leftover PascalCase rule names ("WhereClause" →
+            // "a where clause") instead of leaking them verbatim.
+            let mut words = String::new();
+            for (index, ch) in other.chars().enumerate() {
+                if ch.is_uppercase() && index > 0 {
+                    words.push(' ');
+                }
+                words.push(ch.to_ascii_lowercase());
+            }
+            format!("a {words}")
+        }
     }
 }
 

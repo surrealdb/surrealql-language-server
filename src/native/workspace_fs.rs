@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 
 use crate::core::client::WorkspaceLoader;
 use crate::semantic::analyzer::analyze_document;
-use crate::semantic::types::{DocumentAnalysis, SymbolOrigin, WorkspaceIndex};
+use crate::semantic::types::{DocumentAnalysis, SymbolOrigin, WorkspaceIndex, WorkspaceScanStats};
 
 /// Skip files larger than this — pathological generated SurrealQL dumps
 /// would otherwise blow up parser memory at startup.
@@ -54,15 +54,27 @@ impl WorkspaceLoader for FilesystemWorkspaceLoader {
 }
 
 fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
-    // First pass: gather candidate file paths sequentially (cheap, IO-bound).
+    let mut stats = WorkspaceScanStats::default();
+
+    // First pass: gather candidate file paths sequentially (cheap,
+    // IO-bound). The traversal order (and therefore which files win
+    // under the cap) must stay identical to the pre-stats code.
     let mut candidates: Vec<PathBuf> = Vec::new();
     'outer: for folder in workspace_folders {
         for entry in WalkDir::new(folder)
             .into_iter()
             .filter_entry(|entry| should_descend(entry.path()))
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
         {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    stats.walk_errors += 1;
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
             let path = entry.path();
             if !matches!(
                 path.extension().and_then(|ext| ext.to_str()),
@@ -75,10 +87,12 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
                 .map(|meta| meta.len() > MAX_FILE_SIZE_BYTES)
                 .unwrap_or(false)
             {
+                stats.skipped_oversize += 1;
                 continue;
             }
             candidates.push(path.to_path_buf());
             if candidates.len() >= MAX_WORKSPACE_FILES {
+                stats.file_cap_hit = true;
                 break 'outer;
             }
         }
@@ -98,26 +112,31 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
         let mut handles = Vec::with_capacity(worker_count);
         for chunk in candidates.chunks(chunk_size) {
             let chunk = chunk.to_vec();
-            handles.push(scope.spawn(move || -> Vec<(Uri, Arc<DocumentAnalysis>)> {
-                let mut local = Vec::with_capacity(chunk.len());
-                for path in chunk {
-                    let Some(uri) = Uri::from_file_path(&path) else {
-                        continue;
-                    };
-                    let Some(text) = fs::read_to_string(&path).ok() else {
-                        continue;
-                    };
-                    if let Some(analysis) =
-                        analyze_document(uri.clone(), &text, SymbolOrigin::Local)
-                    {
-                        local.push((uri, Arc::new(analysis)));
+            handles.push(
+                scope.spawn(move || -> (Vec<(Uri, Arc<DocumentAnalysis>)>, usize) {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    let mut unreadable = 0usize;
+                    for path in chunk {
+                        let Some(uri) = Uri::from_file_path(&path) else {
+                            continue;
+                        };
+                        let Some(text) = fs::read_to_string(&path).ok() else {
+                            unreadable += 1;
+                            continue;
+                        };
+                        if let Some(analysis) =
+                            analyze_document(uri.clone(), &text, SymbolOrigin::Local)
+                        {
+                            local.push((uri, Arc::new(analysis)));
+                        }
                     }
-                }
-                local
-            }));
+                    (local, unreadable)
+                }),
+            );
         }
         for handle in handles {
-            if let Ok(results) = handle.join() {
+            if let Ok((results, unreadable)) = handle.join() {
+                stats.skipped_unreadable += unreadable;
                 for (uri, analysis) in results {
                     index.documents.insert(uri, analysis);
                 }
@@ -125,6 +144,7 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
         }
     });
 
+    index.scan_stats = stats;
     index
 }
 
