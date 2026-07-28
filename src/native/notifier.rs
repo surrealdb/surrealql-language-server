@@ -31,6 +31,10 @@ impl LspNotifier for TowerNotifier {
         self.client.log_message(level, message).await;
     }
 
+    async fn show_message(&self, level: MessageType, message: String) {
+        self.client.show_message(level, message).await;
+    }
+
     async fn request_configuration(&self) -> Option<Value> {
         self.client
             .configuration(vec![ConfigurationItem {

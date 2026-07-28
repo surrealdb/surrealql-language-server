@@ -33,7 +33,10 @@ use crate::semantic::model::{
     field_completion_tables, function_signature, is_record_type_context, param_label,
 };
 use crate::semantic::text::{position_to_offset, token_at, word_range};
-use crate::semantic::types::{DocumentAnalysis, FunctionDef, MergedSemanticModel, SymbolOrigin};
+use crate::semantic::types::{
+    DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
+    WorkspaceIndex,
+};
 
 /// The crate version plus the source and grammar revisions this binary was
 /// compiled from.
@@ -60,6 +63,11 @@ pub struct LanguageServerCore<N: LspNotifier, W: WorkspaceLoader, M: MetadataPro
     workspace_loader: Arc<W>,
     metadata_provider: Arc<M>,
     state: Arc<runtime::sync::RwLock<ServerState>>,
+    /// Serializes every settings/metadata application (the native
+    /// adapter spawns `didChangeConfiguration` / `didSave` handlers,
+    /// so two read-merge-apply sequences would otherwise interleave
+    /// and lose updates or invert the metadata-error status).
+    config_lock: Arc<runtime::sync::Mutex<()>>,
 }
 
 impl<N, W, M> LanguageServerCore<N, W, M>
@@ -74,6 +82,7 @@ where
             workspace_loader: Arc::new(workspace_loader),
             metadata_provider: Arc::new(metadata_provider),
             state: Arc::new(runtime::sync::RwLock::new(ServerState::default())),
+            config_lock: Arc::new(runtime::sync::Mutex::new(())),
         }
     }
 
@@ -149,16 +158,19 @@ where
     /// deferred to [`Self::apply_settings`], usually triggered by
     /// `initialized → reload_from_client_configuration`.
     pub async fn initialize(&self, params: InitializeParams) -> InitializeResult {
-        let settings = Arc::new(ServerSettings::from_sources(
+        let (settings, warnings) = ServerSettings::from_sources_with_warnings(
             params.initialization_options.as_ref(),
             None,
-        ));
+        );
         let workspace_folders = resolve_workspace_folders(&params);
 
         {
             let mut state = self.state.write().await;
-            state.settings = settings;
+            state.settings = Arc::new(settings);
             state.workspace_folders = workspace_folders;
+            // The client can't receive `window/logMessage` until the
+            // initialize handshake completes; `initialized` drains these.
+            state.pending_settings_warnings = warnings;
         }
 
         InitializeResult {
@@ -174,6 +186,11 @@ where
     /// Pull the latest configuration from the client and re-run
     /// [`Self::apply_settings`]. Logs an info message on completion.
     pub async fn initialized(&self) {
+        let pending_warnings = {
+            let mut state = self.state.write().await;
+            std::mem::take(&mut state.pending_settings_warnings)
+        };
+        self.report_settings_warnings(&pending_warnings).await;
         self.reload_from_client_configuration().await;
         self.notifier
             .log_message(
@@ -187,14 +204,70 @@ where
     /// (`workspace/configuration`), merges the response with whatever
     /// settings are already in flight, and applies the result.
     pub async fn reload_from_client_configuration(&self) {
+        // Ask the client before taking the config lock — a slow
+        // configuration pull must not stall other settings work.
         let configuration = self.notifier.request_configuration().await;
+        let (settings, warnings) =
+            ServerSettings::from_sources_with_warnings(None, configuration.as_ref());
+        // A client without configuration support answers `None`, and
+        // VS Code / Neovim answer the pull with JSON `null` when no
+        // `surrealql` section is configured — both always yield zero
+        // warnings. Reporting those would reset the dedup signature
+        // and fire a spurious "resolved" line right after the
+        // initialize-stashed warnings. (A *real* clean section does
+        // report: it replaces the previous settings, so its empty
+        // warning set genuinely resolves them.)
+        if configuration.as_ref().is_some_and(|value| !value.is_null()) {
+            self.report_settings_warnings(&warnings).await;
+        }
+
+        let _guard = self.config_lock.lock().await;
         let current_settings = {
             let state = self.state.read().await;
             (*state.settings).clone()
         };
-        let settings = ServerSettings::from_sources(None, configuration.as_ref())
-            .merge_with_env_if_missing(current_settings);
-        self.apply_settings(settings).await;
+        let settings = settings.merge_with_env_if_missing(current_settings);
+        self.apply_settings_inner(settings).await;
+    }
+
+    /// Log settings warnings, once per *distinct* warning set — a
+    /// persistently misconfigured editor would otherwise re-log the
+    /// same lines on every configuration pull and `didChange`. Same
+    /// pattern as [`Self::report_metadata_errors`]: the state lock is
+    /// released before any notifier await.
+    async fn report_settings_warnings(&self, warnings: &[String]) {
+        let mut signature = warnings.to_vec();
+        signature.sort();
+
+        let previous = {
+            let mut state = self.state.write().await;
+            state.last_settings_warnings.replace(signature.clone())
+        };
+
+        if previous.as_ref() == Some(&signature) {
+            return;
+        }
+
+        if signature.is_empty() {
+            if previous.is_some_and(|previous| !previous.is_empty()) {
+                self.notifier
+                    .log_message(
+                        MessageType::INFO,
+                        "SurrealQL settings: previous warnings resolved".to_string(),
+                    )
+                    .await;
+            }
+            return;
+        }
+
+        for warning in warnings {
+            self.notifier
+                .log_message(
+                    MessageType::WARNING,
+                    format!("SurrealQL settings: {warning}"),
+                )
+                .await;
+        }
     }
 
     /// Persist new settings, re-load the saved workspace, refresh live
@@ -206,6 +279,12 @@ where
     /// — there is no advantage to background scheduling on a
     /// single-threaded event loop.
     pub async fn apply_settings(&self, settings: ServerSettings) {
+        let _guard = self.config_lock.lock().await;
+        self.apply_settings_inner(settings).await;
+    }
+
+    /// [`Self::apply_settings`] body; callers must hold `config_lock`.
+    async fn apply_settings_inner(&self, settings: ServerSettings) {
         let (workspace_folders, last_walked) = {
             let mut state = self.state.write().await;
             state.settings = Arc::new(settings.clone());
@@ -231,6 +310,10 @@ where
         };
 
         let live_metadata = Arc::new(self.metadata_provider.fetch(&settings).await);
+        self.report_metadata_errors(&live_metadata).await;
+        if need_walk {
+            self.report_scan_stats(&saved_workspace).await;
+        }
         let (open_documents, uris_for_diag) = {
             let s = self.state.read().await;
             (
@@ -313,8 +396,30 @@ where
     }
 
     pub async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        let settings = ServerSettings::from_sources(None, Some(&params.settings));
-        self.apply_settings(settings).await;
+        // Clients that support configuration pulls send `null` here as
+        // a "something changed, ask me" signal.
+        if params.settings.is_null() {
+            self.reload_from_client_configuration().await;
+            return;
+        }
+
+        // Merge over the in-flight settings — a partial payload (e.g.
+        // one that only carries `metadata.*`) must not wipe the
+        // connection details that arrived via initializationOptions.
+        // The read-merge-apply sequence runs under the config lock so
+        // two spawned configuration changes can't lose each other's
+        // updates.
+        let (settings, warnings) =
+            ServerSettings::from_sources_with_warnings(None, Some(&params.settings));
+        self.report_settings_warnings(&warnings).await;
+
+        let _guard = self.config_lock.lock().await;
+        let current_settings = {
+            let state = self.state.read().await;
+            (*state.settings).clone()
+        };
+        let settings = settings.merge_with_env_if_missing(current_settings);
+        self.apply_settings_inner(settings).await;
     }
 
     pub async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
@@ -353,6 +458,7 @@ where
             state.workspace_folders.clone()
         };
         let workspace = Arc::new(self.workspace_loader.load(&folders).await);
+        self.report_scan_stats(&workspace).await;
         {
             let mut state = self.state.write().await;
             state.saved_workspace = workspace;
@@ -802,16 +908,121 @@ where
     }
 
     async fn refresh_remote_metadata_if_needed(&self) {
+        // Under the config lock so a concurrent apply_settings can't
+        // interleave its fetch/report/store with this one (which
+        // would let a stale "clean" fetch overwrite a fresh failure
+        // report, or vice versa).
+        let _guard = self.config_lock.lock().await;
         let settings = {
             let state = self.state.read().await;
             Arc::clone(&state.settings)
         };
         let live_metadata = Arc::new(self.metadata_provider.fetch(&settings).await);
+        self.report_metadata_errors(&live_metadata).await;
         {
             let mut state = self.state.write().await;
             state.live_metadata = live_metadata;
         }
         self.recompute_model().await;
+    }
+
+    /// Forward live-metadata fetch failures (bad endpoint, auth
+    /// failure, timeout, per-table query errors) to the IDE. Before
+    /// this existed, `LiveMetadataSnapshot.errors` was collected and
+    /// then dropped — a misconfigured connection looked identical to
+    /// an empty schema.
+    ///
+    /// Each *distinct* failure set toasts once (`window/showMessage`)
+    /// with full details in the log, and recovery back to a clean
+    /// fetch logs an INFO line. The state lock is released before any
+    /// notifier call — the wasm executor is single-threaded and a
+    /// held lock across an await can deadlock it.
+    async fn report_metadata_errors(&self, snapshot: &LiveMetadataSnapshot) {
+        let mut signature = snapshot.errors.clone();
+        signature.sort();
+
+        let previous = {
+            let mut state = self.state.write().await;
+            state.last_metadata_errors.replace(signature.clone())
+        };
+
+        if previous.as_ref() == Some(&signature) {
+            return;
+        }
+
+        if signature.is_empty() {
+            if previous.is_some_and(|previous| !previous.is_empty()) {
+                self.notifier
+                    .log_message(
+                        MessageType::INFO,
+                        "SurrealQL: live schema metadata is available again".to_string(),
+                    )
+                    .await;
+            }
+            return;
+        }
+
+        for error in &snapshot.errors {
+            self.notifier
+                .log_message(MessageType::WARNING, format!("SurrealQL metadata: {error}"))
+                .await;
+        }
+
+        let first = &snapshot.errors[0];
+        let message = match snapshot.errors.len() {
+            1 => format!("SurrealQL: live schema metadata unavailable: {first}"),
+            more => format!(
+                "SurrealQL: live schema metadata unavailable: {first} (+{} more — see the log)",
+                more - 1
+            ),
+        };
+        self.notifier
+            .show_message(MessageType::WARNING, message)
+            .await;
+    }
+
+    /// Summarize what a fresh workspace walk had to skip (unreadable
+    /// entries, oversized files, the file-count cap) so silent
+    /// truncation doesn't masquerade as full coverage.
+    async fn report_scan_stats(&self, workspace: &WorkspaceIndex) {
+        let stats = workspace.scan_stats;
+        if stats == Default::default() {
+            return;
+        }
+
+        let mut parts = Vec::new();
+        if stats.walk_errors > 0 {
+            parts.push(format!(
+                "{} unreadable directory entries",
+                stats.walk_errors
+            ));
+        }
+        if stats.skipped_oversize > 0 {
+            parts.push(format!("{} oversized files", stats.skipped_oversize));
+        }
+        if stats.skipped_unreadable > 0 {
+            parts.push(format!("{} unreadable files", stats.skipped_unreadable));
+        }
+        if stats.file_cap_hit {
+            parts.push("the workspace file limit was reached".to_string());
+        }
+        self.notifier
+            .log_message(
+                MessageType::WARNING,
+                format!("SurrealQL: workspace scan skipped {}.", parts.join(", ")),
+            )
+            .await;
+
+        if stats.file_cap_hit {
+            self.notifier
+                .show_message(
+                    MessageType::WARNING,
+                    "SurrealQL: the workspace contains more .surql files than the indexing \
+                     limit; some files were not indexed."
+                        .to_string(),
+                )
+                .await;
+        }
     }
 
     /// Republish diagnostics for every open editor buffer after the

@@ -60,5 +60,10 @@ pretty_assertions = '1.4.1'
 lto = true
 codegen-units = 1
 strip = true
+# Kept deliberately: catch_unwind is inert under abort anyway, dropping
+# abort grows the size-optimized wasm/native artifacts, and continuing
+# after a panic risks serving from partially-mutated state. Crash
+# visibility comes from the stderr panic hook in main.rs (native) and
+# console_error_panic_hook (wasm); editors auto-restart crashed servers.
 panic = 'abort'
 opt-level = 'z'

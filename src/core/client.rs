@@ -27,6 +27,13 @@ pub trait LspNotifier: Send + Sync + 'static {
     /// Equivalent to LSP `window/logMessage`.
     async fn log_message(&self, level: MessageType, message: String);
 
+    /// Equivalent to LSP `window/showMessage`. Defaults to
+    /// `log_message` so existing implementors keep compiling and
+    /// hosts without a toast surface still capture the message.
+    async fn show_message(&self, level: MessageType, message: String) {
+        self.log_message(level, message).await;
+    }
+
     /// Equivalent to LSP `workspace/configuration` for the
     /// `surrealql` section. Returns `None` when the client either
     /// doesn't support configuration pulls or returns nothing.

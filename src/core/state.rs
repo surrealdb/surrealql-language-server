@@ -34,6 +34,19 @@ pub struct ServerState {
     /// skips the walk entirely — the common path for
     /// `didChangeConfiguration` events that don't touch the folder set.
     pub last_walked: Option<Vec<PathBuf>>,
+    /// Sorted signature of the metadata errors most recently surfaced
+    /// to the user. `Some(vec![])` means "last fetch was clean";
+    /// `None` means nothing has been reported yet. Used to toast each
+    /// distinct failure set once instead of on every save.
+    pub last_metadata_errors: Option<Vec<String>>,
+    /// Settings warnings gathered during `initialize`, before the
+    /// client is ready to receive `window/logMessage`. Drained by
+    /// `initialized`.
+    pub pending_settings_warnings: Vec<String>,
+    /// Sorted signature of the settings warnings most recently logged,
+    /// so a persistently bad configuration doesn't re-log on every
+    /// pull. Same pattern as [`Self::last_metadata_errors`].
+    pub last_settings_warnings: Option<Vec<String>>,
 }
 
 /// Stable signature of a workspace-folder set, used to short-circuit

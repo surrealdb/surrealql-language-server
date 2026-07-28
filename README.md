@@ -86,6 +86,10 @@ The `./surrealql_language_server_bg.wasm` export is declared in `pkg/package.jso
 
 ## Testing
 
+Tests need the grammar sibling checkout (see Requirements above) —
+run `bash scripts/setup-grammar.sh` or set `TREE_SITTER_SURREALQL_DIR`
+first, then:
+
 ```bash
 cargo test
 ```
@@ -95,19 +99,33 @@ cargo test
 ```text
 .
 ├── src/
-│   ├── main.rs               # LSP stdio entry point
-│   ├── backend.rs            # tower-lsp request handlers
-│   ├── config.rs             # workspace settings
-│   ├── grammar.rs            # tree-sitter language binding
-│   ├── providers/            # completion, hover, rename, etc.
+│   ├── main.rs               # LSP stdio entry point (+ panic hook)
+│   ├── config.rs             # workspace settings (+ validation warnings)
+│   ├── grammar.rs            # tree-sitter language binding, builtin catalog
+│   ├── core/
+│   │   ├── server.rs         # transport-agnostic request handlers
+│   │   ├── dispatch.rs       # JSON-RPC dispatch table (shared with WASM)
+│   │   ├── client.rs         # LspNotifier / WorkspaceLoader / MetadataProvider traits
+│   │   ├── state.rs          # shared server state
+│   │   └── completion_context.rs
+│   ├── native/               # tower-lsp adapter, walkdir loader, SurrealDB metadata
+│   ├── wasm/                 # wasm-bindgen adapter (Surrealist)
 │   └── semantic/
-│       ├── analyzer.rs       # document analysis (parse + extract)
-│       ├── model.rs          # merged workspace model, code actions
+│       ├── analyzer.rs       # document analysis (parse + extract + syntax diagnostics)
+│       ├── model.rs          # merged workspace model, semantic diagnostics, code actions
+│       ├── codes.rs          # stable Diagnostic.code registry
 │       ├── types.rs          # DocumentAnalysis, TableDef, FunctionDef, ...
 │       ├── type_expr.rs      # SurrealQL type expression parser
 │       └── text.rs           # LSP range utilities
 ├── tests/
-│   └── lsp.rs                # integration tests
+│   ├── lsp.rs                # analyzer/model integration tests
+│   ├── core_server.rs        # end-to-end server tests (mock notifier)
+│   ├── dispatch.rs           # JSON-RPC wire tests
+│   ├── compat.rs             # backwards-compatibility tripwires
+│   └── common/               # shared mocks for the three boundary traits
+├── docs/
+│   ├── pain-points.md        # audited pain-point catalog + status
+│   └── grammar-gaps.md       # known gaps at the pinned grammar revision
 ├── build.rs                  # compiles tree-sitter grammar (C)
 └── scripts/
     └── setup-grammar.sh      # clones/updates the grammar sibling repo

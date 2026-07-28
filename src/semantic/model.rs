@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind,
-    Diagnostic, DiagnosticSeverity, DocumentChanges, Documentation, Location, MarkupContent,
-    MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, TextDocumentEdit,
-    TextEdit, Uri, WorkspaceEdit,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DocumentChanges, Documentation,
+    Location, MarkupContent, MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
+    Range, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 use strsim::jaro_winkler;
 
@@ -13,17 +13,24 @@ use crate::grammar::{
     BUILTIN_FUNCTIONS, BUILTIN_NAMESPACES, BuiltinFunction, KEYWORDS, SPECIAL_VARIABLES,
     builtin_function, builtin_namespace,
 };
+use crate::semantic::codes;
 use crate::semantic::text::compact_preview;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
     AccessDef, AccessResult, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
-    FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel, ParamDef, PermissionMode,
-    PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
+    FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel, NamedRange, ParamDef,
+    PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef,
+    TargetResolution, WorkspaceIndex,
 };
 
 impl MergedSemanticModel {
     pub fn build(workspace: &WorkspaceIndex, live: &LiveMetadataSnapshot) -> Self {
         let mut model = Self::default();
+        // A failing (or partially failing) metadata fetch means remote
+        // tables are missing from this model — judgments like "this
+        // inferred name must be a typo" can't be trusted until the
+        // connection recovers.
+        model.metadata_degraded = !live.errors.is_empty();
 
         for analysis in workspace.documents.values() {
             model.absorb_analysis(analysis.as_ref());
@@ -272,6 +279,63 @@ impl MergedSemanticModel {
             }
         }
         self.hover_markdown_for_token(token, active_context)
+    }
+
+    /// Like [`Self::find_nearest_table`], but only explicitly defined
+    /// tables qualify as "did you mean" candidates — suggesting an
+    /// inferred name would just echo another usage site back.
+    fn find_nearest_explicit_table(&self, unknown: &str) -> Option<&TableDef> {
+        self.tables
+            .values()
+            .filter(|table| table.explicit && table.name != unknown)
+            .map(|table| (table, jaro_winkler(unknown, &table.name)))
+            .filter(|(_, score)| *score > 0.86)
+            .max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(table, _)| table)
+    }
+
+    /// Like [`Self::find_nearest_explicit_table`], but restricted to
+    /// candidates that plausibly indicate a *typo* rather than a
+    /// deliberate sibling name: bare singular/plural pairs
+    /// (`orders`/`order`, `categories`/`category`) score ~0.96 on
+    /// jaro-winkler yet are the most common intentional naming
+    /// pattern in schemas, so they are excluded here.
+    fn find_probable_typo_of_explicit_table(&self, unknown: &str) -> Option<&TableDef> {
+        self.find_nearest_explicit_table(unknown)
+            .filter(|candidate| !is_plural_variant(unknown, &candidate.name))
+    }
+
+    /// How many query facts across the workspace target `name`. A
+    /// name used in several statements is a deliberate table, not a
+    /// one-off typo.
+    fn target_usage_count(&self, name: &str) -> usize {
+        self.query_facts
+            .values()
+            .flatten()
+            .filter(|fact| fact.target_tables.iter().any(|table| table == name))
+            .count()
+    }
+
+    /// Nearest explicitly defined field on `table` — the unknown-field
+    /// "did you mean" candidate.
+    fn find_nearest_explicit_field(&self, table: &str, unknown: &str) -> Option<&FieldDef> {
+        self.fields
+            .iter()
+            .filter(|((field_table, _), field)| {
+                field_table == table && field.explicit && field.name != unknown
+            })
+            .map(|(_, field)| (field, jaro_winkler(unknown, &field.name)))
+            .filter(|(_, score)| *score > 0.86)
+            .max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(field, _)| field)
     }
 
     pub fn hover_markdown_for_token(
@@ -542,9 +606,18 @@ impl MergedSemanticModel {
 
         for fact in analysis.query_facts.iter() {
             if fact.target_tables.is_empty() {
+                // `$param` / expression targets are resolvable only at
+                // runtime — warning about them is pure noise.
+                if matches!(
+                    fact.target_resolution,
+                    TargetResolution::Parameter | TargetResolution::Expression
+                ) {
+                    continue;
+                }
                 diagnostics.push(Diagnostic {
                     range: fact.location.range,
                     severity: Some(DiagnosticSeverity::WARNING),
+                    code: codes::as_code(codes::DYNAMIC_TARGET),
                     source: Some("surreal-language-server".to_string()),
                     message: format!(
                         "{} target could not be resolved statically.",
@@ -556,15 +629,56 @@ impl MergedSemanticModel {
             }
 
             for table in &fact.target_tables {
-                let Some(table_def) = self.tables.get(table) else {
-                    diagnostics.push(Diagnostic {
-                        range: fact.location.range,
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        source: Some("surreal-language-server".to_string()),
-                        message: format!("Unknown table `{table}`."),
-                        ..Diagnostic::default()
-                    });
-                    continue;
+                let table_range = range_for_name(&fact.target_refs, table, fact.location.range);
+                let table_def = match self.tables.get(table) {
+                    None => {
+                        let suggestion = self.find_nearest_explicit_table(table);
+                        diagnostics.push(self.unknown_table_diagnostic(
+                            table,
+                            table_range,
+                            suggestion,
+                        ));
+                        continue;
+                    }
+                    // The statement being checked is itself enough to
+                    // *infer* a table, so a typo'd name always "exists"
+                    // by the time we validate it. An inferred-only def
+                    // is treated as a typo only when ALL of these hold:
+                    //
+                    // 1. Live metadata is healthy. When the DB fetch
+                    //    is failing (including partial per-table INFO
+                    //    errors), previously-known remote tables drop
+                    //    out of the model and would light up as
+                    //    near-misses in bulk — right when the
+                    //    "metadata unavailable" toast already fires.
+                    // 2. The name is used only once across the
+                    //    workspace. Repeated usage means a deliberate
+                    //    (if undeclared) table; the trade-off is that
+                    //    the same typo pasted twice goes silent.
+                    // 3. An explicit table is a near-miss that is NOT
+                    //    a bare singular/plural sibling — `orders`
+                    //    next to `order` is a naming convention, not a
+                    //    typo, and the quick fix would rewrite the
+                    //    query against a different real table.
+                    //
+                    // Everything else stays untouched — schema
+                    // inference from usage is a feature, not an error.
+                    Some(table_def) if !table_def.explicit => {
+                        if !self.metadata_degraded && self.target_usage_count(table) <= 1 {
+                            if let Some(suggestion) =
+                                self.find_probable_typo_of_explicit_table(table)
+                            {
+                                diagnostics.push(self.unknown_table_diagnostic(
+                                    table,
+                                    table_range,
+                                    Some(suggestion),
+                                ));
+                                continue;
+                            }
+                        }
+                        table_def
+                    }
+                    Some(table_def) => table_def,
                 };
 
                 // SELECT and RELATE are intentionally exempt from
@@ -577,15 +691,17 @@ impl MergedSemanticModel {
                     let permission = self.evaluate_permissions(fact, table_def, active_context);
                     match permission.result {
                         AccessResult::Denied => diagnostics.push(Diagnostic {
-                            range: fact.location.range,
+                            range: table_range,
                             severity: Some(DiagnosticSeverity::ERROR),
+                            code: codes::as_code(codes::PERMISSION_DENIED),
                             source: Some("surreal-language-server".to_string()),
                             message: permission.message,
                             ..Diagnostic::default()
                         }),
                         AccessResult::Unknown => diagnostics.push(Diagnostic {
-                            range: fact.location.range,
+                            range: table_range,
                             severity: Some(DiagnosticSeverity::WARNING),
+                            code: codes::as_code(codes::PERMISSION_UNKNOWN),
                             source: Some("surreal-language-server".to_string()),
                             message: permission.message,
                             ..Diagnostic::default()
@@ -594,23 +710,114 @@ impl MergedSemanticModel {
                     }
                 }
 
+                // Unknown-field only applies where the schema is
+                // closed: on a SCHEMALESS (or unspecified) table any
+                // ad-hoc field is legal and the warning would be a
+                // false positive. RELATE is exempt as well — its
+                // target list mixes the subject tables with the edge
+                // table, so SET fields (which belong to the edge)
+                // would be checked against the wrong schemas.
+                let schemafull = table_def
+                    .schema_mode
+                    .as_deref()
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("schemafull"));
+                if !(table_def.explicit && schemafull) || fact.action == QueryAction::Relate {
+                    continue;
+                }
                 for field in &fact.touched_fields {
-                    if self.fields.get(&(table.clone(), field.clone())).is_none()
-                        && table_def.explicit
-                    {
-                        diagnostics.push(Diagnostic {
-                            range: fact.location.range,
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("surreal-language-server".to_string()),
-                            message: format!("Unknown field `{table}.{field}`."),
-                            ..Diagnostic::default()
-                        });
+                    // Builtin fields exist on every record without a
+                    // DEFINE FIELD (`in`/`out` are the relation
+                    // endpoints).
+                    if matches!(field.as_str(), "id" | "in" | "out") {
+                        continue;
+                    }
+                    // Same masking hazard as tables: the statement
+                    // under scrutiny *infers* a field def for every
+                    // name it assigns, so only an explicit definition
+                    // counts as "known" on a closed schema.
+                    let explicitly_defined = self
+                        .fields
+                        .get(&(table.clone(), field.clone()))
+                        .is_some_and(|field_def| field_def.explicit);
+                    if !explicitly_defined {
+                        let range = range_for_name(&fact.field_refs, field, fact.location.range);
+                        diagnostics.push(self.unknown_field_diagnostic(table, field, range));
                     }
                 }
             }
         }
 
         diagnostics
+    }
+
+    fn unknown_table_diagnostic(
+        &self,
+        table: &str,
+        range: Range,
+        suggestion: Option<&TableDef>,
+    ) -> Diagnostic {
+        let message = match suggestion {
+            Some(candidate) => format!(
+                "Unknown table `{table}`. Did you mean `{}`?",
+                candidate.name
+            ),
+            None => format!("Unknown table `{table}`."),
+        };
+        let data = match suggestion {
+            Some(candidate) => {
+                serde_json::json!({ "table": table, "suggestion": candidate.name })
+            }
+            None => serde_json::json!({ "table": table }),
+        };
+        Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: codes::as_code(codes::UNKNOWN_TABLE),
+            source: Some("surreal-language-server".to_string()),
+            message,
+            data: Some(data),
+            related_information: suggestion.map(|candidate| {
+                vec![DiagnosticRelatedInformation {
+                    location: candidate.location.clone(),
+                    message: format!("`{}` is defined here.", candidate.name),
+                }]
+            }),
+            ..Diagnostic::default()
+        }
+    }
+
+    fn unknown_field_diagnostic(&self, table: &str, field: &str, range: Range) -> Diagnostic {
+        let suggestion = self.find_nearest_explicit_field(table, field);
+        let message = match suggestion {
+            Some(candidate) => format!(
+                "Unknown field `{table}.{field}`. Did you mean `{}`?",
+                candidate.name
+            ),
+            None => format!("Unknown field `{table}.{field}`."),
+        };
+        let data = match suggestion {
+            Some(candidate) => serde_json::json!({
+                "table": table,
+                "field": field,
+                "suggestion": candidate.name,
+            }),
+            None => serde_json::json!({ "table": table, "field": field }),
+        };
+        Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: codes::as_code(codes::UNKNOWN_FIELD),
+            source: Some("surreal-language-server".to_string()),
+            message,
+            data: Some(data),
+            related_information: suggestion.map(|candidate| {
+                vec![DiagnosticRelatedInformation {
+                    location: candidate.location.clone(),
+                    message: format!("`{}` is defined here.", candidate.name),
+                }]
+            }),
+            ..Diagnostic::default()
+        }
     }
 
     pub fn code_actions(
@@ -622,14 +829,12 @@ impl MergedSemanticModel {
         let mut actions = Vec::new();
 
         for diagnostic in diagnostics {
-            if let Some(table) = diagnostic
-                .message
-                .strip_prefix("Unknown table `")
-                .and_then(|message| message.strip_suffix("`."))
-            {
-                if let Some(replacement) = self.find_nearest_table(table) {
+            if let Some((table, suggestion)) = unknown_table_payload(diagnostic) {
+                let replacement =
+                    suggestion.or_else(|| self.find_nearest_table(&table).map(|t| t.name.clone()));
+                if let Some(replacement) = replacement {
                     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: format!("Replace `{table}` with `{}`", replacement.name),
+                        title: format!("Replace `{table}` with `{replacement}`"),
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: Some(vec![diagnostic.clone()]),
                         edit: Some(WorkspaceEdit {
@@ -641,7 +846,7 @@ impl MergedSemanticModel {
                                     },
                                     edits: vec![OneOf::Left(TextEdit {
                                         range: diagnostic.range,
-                                        new_text: replacement.name.clone(),
+                                        new_text: replacement.clone(),
                                     })],
                                 }),
                             ])),
@@ -924,6 +1129,75 @@ impl MergedSemanticModel {
 struct PermissionOutcome {
     result: AccessResult,
     message: String,
+}
+
+/// True when the two names are bare singular/plural forms of each
+/// other (`order`/`orders`, `box`/`boxes`, `category`/`categories`),
+/// in either direction and case-insensitively.
+fn is_plural_variant(left: &str, right: &str) -> bool {
+    fn is_plural_of(plural: &str, singular: &str) -> bool {
+        if let Some(stem) = plural.strip_suffix("ies") {
+            if format!("{stem}y") == singular {
+                return true;
+            }
+        }
+        if let Some(stem) = plural.strip_suffix("es")
+            && stem == singular
+        {
+            return true;
+        }
+        // Bare-`s` plurals only apply when the stem doesn't itself
+        // end in `s`: s-ending nouns pluralise with `es`, so
+        // `address`/`addres` is a real typo, not a plural pair.
+        plural
+            .strip_suffix('s')
+            .is_some_and(|stem| stem == singular && !stem.ends_with('s'))
+    }
+
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    is_plural_of(&left, &right) || is_plural_of(&right, &left)
+}
+
+/// Tight token range for `name`, falling back to the statement range
+/// for facts recorded before ranges were tracked.
+fn range_for_name(refs: &[NamedRange], name: &str, fallback: Range) -> Range {
+    refs.iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.range)
+        .unwrap_or(fallback)
+}
+
+/// Extract the `(table, suggested_replacement)` payload from an
+/// unknown-table diagnostic. Matches on the stable `unknown-table`
+/// code + `data` first; falls back to parsing the legacy message text
+/// so quick fixes keep working for diagnostics cached by pre-0.3
+/// clients. Remove the string fallback in 0.4.
+fn unknown_table_payload(diagnostic: &Diagnostic) -> Option<(String, Option<String>)> {
+    // Primary path: stable code + structured data.
+    if codes::has_code(diagnostic, codes::UNKNOWN_TABLE)
+        && let Some(data) = diagnostic.data.as_ref()
+        && let Some(table) = data.get("table").and_then(|value| value.as_str())
+    {
+        let suggestion = data
+            .get("suggestion")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        return Some((table.to_string(), suggestion));
+    }
+
+    // Fallback: parse the message text. This keeps quick fixes alive
+    // for clients that strip the non-standard `data` field (or, pre-
+    // 0.3, the code too). Takes the table up to the closing backtick
+    // so both "Unknown table `x`." and
+    // "Unknown table `x`. Did you mean `y`?" parse.
+    let rest = diagnostic.message.strip_prefix("Unknown table `")?;
+    let (table, tail) = rest.split_once('`')?;
+    let suggestion = tail
+        .strip_prefix(". Did you mean `")
+        .and_then(|tail| tail.split_once('`'))
+        .map(|(suggestion, _)| suggestion.to_string());
+    Some((table.to_string(), suggestion))
 }
 
 fn merge_table(target: &mut HashMap<String, TableDef>, candidate: &TableDef) {
@@ -1509,7 +1783,7 @@ mod tests {
     use crate::config::{AuthContext, ServerSettings};
     use crate::semantic::types::{
         DocumentAnalysis, EventDef, FunctionDef, IndexDef, PermissionMode, PermissionRule,
-        QueryAction, SymbolOrigin, TableDef, WorkspaceIndex,
+        QueryAction, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
     };
 
     use super::{MergedSemanticModel, is_record_type_context};
@@ -1618,6 +1892,9 @@ mod tests {
                 Range::default(),
             ),
             source_preview: "SELECT * FROM person".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         };
         let result = model.semantic_diagnostics(
             &DocumentAnalysis {
@@ -1692,6 +1969,9 @@ mod tests {
                         Range::default(),
                     ),
                     source_preview: "CREATE person".to_string(),
+                    target_refs: Vec::new(),
+                    field_refs: Vec::new(),
+                    target_resolution: TargetResolution::Static,
                 }],
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
@@ -1702,6 +1982,14 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].source.as_deref(),
+            Some("surreal-language-server")
+        );
+        assert!(crate::semantic::codes::has_code(
+            &diagnostics[0],
+            crate::semantic::codes::PERMISSION_DENIED
+        ));
     }
 
     #[test]
@@ -1750,6 +2038,9 @@ mod tests {
             dynamic: false,
             location: Location::new(analysis_uri.clone(), Range::default()),
             source_preview: String::new(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         };
 
         let diagnostics = model.semantic_diagnostics(
@@ -1997,6 +2288,9 @@ mod tests {
             dynamic: false,
             location: Location::new(uri.clone(), Range::default()),
             source_preview: "SELECT email FROM person".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         };
 
         let items = model.completion_items("em", false, None, Some(&single_table), None);
@@ -2016,6 +2310,9 @@ mod tests {
             dynamic: false,
             location: Location::new(uri.clone(), Range::default()),
             source_preview: "SELECT * FROM person, company".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         };
         let items = model.completion_items("em", false, None, Some(&multi_table), None);
         assert!(items.iter().any(|item| item.label == "person.email"));
@@ -2155,6 +2452,9 @@ mod tests {
                 Range::default(),
             ),
             source_preview: "SELECT email FROM person".to_string(),
+            target_refs: Vec::new(),
+            field_refs: Vec::new(),
+            target_resolution: TargetResolution::Static,
         };
         let items = model.completion_items("", false, None, Some(&statement_fact), None);
 
@@ -2207,5 +2507,162 @@ mod tests {
         let source = "DEFINE FIELD friends ON TABLE person TYPE array<record<per";
         let position = Position::new(0, source.len() as u32);
         assert!(is_record_type_context(source, position));
+    }
+
+    fn model_with_person_table() -> (MergedSemanticModel, DocumentAnalysis) {
+        let uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
+        let mut model = MergedSemanticModel::default();
+        model.tables.insert(
+            "person".to_string(),
+            TableDef {
+                name: "person".to_string(),
+                schema_mode: None,
+                comment: None,
+                permissions: vec![PermissionRule {
+                    actions: vec![QueryAction::Select],
+                    mode: PermissionMode::Full,
+                    raw: "PERMISSIONS FULL".to_string(),
+                    origin: SymbolOrigin::Local,
+                    location: None,
+                }],
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(
+                    Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
+                    Range::default(),
+                ),
+            },
+        );
+        let analysis = DocumentAnalysis {
+            uri,
+            text: String::new(),
+            tree: empty_tree(),
+            tables: Vec::new(),
+            events: Vec::new(),
+            indexes: Vec::new(),
+            fields: Vec::new(),
+            functions: Vec::new(),
+            params: Vec::new(),
+            accesses: Vec::new(),
+            query_facts: Vec::new(),
+            references: Vec::new(),
+            syntax_diagnostics: Vec::new(),
+            document_symbols: Vec::new(),
+        };
+        (model, analysis)
+    }
+
+    #[test]
+    fn code_action_matches_on_stable_code_and_data_not_message_text() {
+        let (model, analysis) = model_with_person_table();
+        let diagnostic = ls_types::Diagnostic {
+            range: Range::default(),
+            code: crate::semantic::codes::as_code(crate::semantic::codes::UNKNOWN_TABLE),
+            // Sentinel wording proves the matcher never consults the
+            // message when the code + data are present.
+            message: "totally reworded message".to_string(),
+            data: Some(serde_json::json!({ "table": "prson" })),
+            ..Default::default()
+        };
+
+        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let quick_fix = actions
+            .iter()
+            .find_map(|action| match action {
+                ls_types::CodeActionOrCommand::CodeAction(action)
+                    if action.title.starts_with("Replace") =>
+                {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .expect("code+data diagnostic must yield the quick fix");
+        assert_eq!(quick_fix.title, "Replace `prson` with `person`");
+    }
+
+    #[test]
+    fn code_action_legacy_message_fallback_still_works() {
+        // Pre-0.3 diagnostics carried no code; the string fallback
+        // keeps their quick fixes alive for one release. Remove in 0.4.
+        let (model, analysis) = model_with_person_table();
+        let diagnostic = ls_types::Diagnostic {
+            range: Range::default(),
+            message: "Unknown table `prson`.".to_string(),
+            ..Default::default()
+        };
+
+        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                ls_types::CodeActionOrCommand::CodeAction(action)
+                    if action.title == "Replace `prson` with `person`"
+            )),
+            "legacy message-only diagnostic must still yield the quick fix"
+        );
+    }
+
+    #[test]
+    fn code_action_survives_clients_that_strip_diagnostic_data() {
+        // Several clients round-trip `code` but drop the non-standard
+        // `data` field — the message fallback must still work.
+        let (model, analysis) = model_with_person_table();
+        let diagnostic = ls_types::Diagnostic {
+            range: Range::default(),
+            code: crate::semantic::codes::as_code(crate::semantic::codes::UNKNOWN_TABLE),
+            message: "Unknown table `prson`.".to_string(),
+            data: None,
+            ..Default::default()
+        };
+
+        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ls_types::CodeActionOrCommand::CodeAction(action)
+                if action.title == "Replace `prson` with `person`"
+        )));
+    }
+
+    #[test]
+    fn code_action_message_fallback_parses_did_you_mean_shape() {
+        // The 0.3 message carries a suggestion suffix; the fallback
+        // parser must extract both table and suggestion from it.
+        let (model, analysis) = model_with_person_table();
+        let diagnostic = ls_types::Diagnostic {
+            range: Range::default(),
+            message: "Unknown table `zzz`. Did you mean `person`?".to_string(),
+            ..Default::default()
+        };
+
+        // `zzz` has no near-miss, so only the parsed suggestion can
+        // produce this action.
+        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ls_types::CodeActionOrCommand::CodeAction(action)
+                if action.title == "Replace `zzz` with `person`"
+        )));
+    }
+
+    #[test]
+    fn code_action_honours_precomputed_suggestion_in_data() {
+        let (model, analysis) = model_with_person_table();
+        let diagnostic = ls_types::Diagnostic {
+            range: Range::default(),
+            code: crate::semantic::codes::as_code(crate::semantic::codes::UNKNOWN_TABLE),
+            message: "Unknown table `zzz`. Did you mean `person`?".to_string(),
+            data: Some(serde_json::json!({ "table": "zzz", "suggestion": "person" })),
+            ..Default::default()
+        };
+
+        // `zzz` is nowhere near `person` by string distance, so only
+        // the precomputed suggestion can produce this action.
+        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ls_types::CodeActionOrCommand::CodeAction(action)
+                if action.title == "Replace `zzz` with `person`"
+        )));
     }
 }
