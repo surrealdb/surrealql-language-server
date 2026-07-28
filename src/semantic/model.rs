@@ -17,8 +17,8 @@ use crate::semantic::text::compact_preview;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
     AccessDef, AccessResult, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
-    IndexDef, LiveMetadataSnapshot, MergedSemanticModel, ParamDef, PermissionMode, PermissionRule,
-    QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
+    FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel, ParamDef, PermissionMode,
+    PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, WorkspaceIndex,
 };
 
 impl MergedSemanticModel {
@@ -218,6 +218,60 @@ impl MergedSemanticModel {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(table, _)| table)
+    }
+
+    /// Completion items for the `$variables` in scope at `position`.
+    ///
+    /// These were never offered before — only `SPECIAL_VARIABLES` and
+    /// `DEFINE PARAM` entries reached the dropdown, so a `LET` binding two
+    /// lines up was invisible.
+    pub fn variable_completion_items(
+        &self,
+        analysis: &DocumentAnalysis,
+        position: Position,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
+        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+        bindings
+            .visible_at(offset)
+            .into_iter()
+            .filter(|binding| prefix.is_empty() || binding.name.starts_with(prefix))
+            .map(|binding| CompletionItem {
+                label: binding.name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                // `CompletionItemKind::VARIABLE` already says "variable";
+                // the useful detail is the type it holds.
+                detail: Some(binding.ty.to_string()),
+                insert_text: Some(binding.name.clone()),
+                sort_text: Some(format!("0-var-{}", binding.name)),
+                ..CompletionItem::default()
+            })
+            .collect()
+    }
+
+    /// Position-aware hover.
+    ///
+    /// A `$variable` can only be resolved with a position: the same name
+    /// may be bound several times in one document, and the enclosing
+    /// scope decides which one is meant. Everything else is
+    /// position-independent and falls through to
+    /// [`Self::hover_markdown_for_token`].
+    pub fn hover_markdown_at(
+        &self,
+        analysis: &DocumentAnalysis,
+        position: Position,
+        token: &str,
+        active_context: Option<&AuthContext>,
+    ) -> Option<String> {
+        if token.starts_with('$') {
+            let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+            let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+            if let Some(binding) = bindings.at(token, offset) {
+                return Some(format_binding_hover(binding));
+            }
+        }
+        self.hover_markdown_for_token(token, active_context)
     }
 
     pub fn hover_markdown_for_token(
@@ -483,7 +537,7 @@ impl MergedSemanticModel {
         analysis: &DocumentAnalysis,
         settings: &ServerSettings,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = crate::semantic::infer::type_diagnostics(analysis, self, settings);
         let active_context = settings.active_auth_context();
 
         for fact in analysis.query_facts.iter() {
@@ -1141,6 +1195,20 @@ fn format_builtin_function_hover(function: &BuiltinFunction, token: &str) -> Str
     )
 }
 
+fn format_binding_hover(binding: &crate::semantic::infer::Binding) -> String {
+    let mut facts = vec![format!("Type: `{}`", binding.ty)];
+    // Only worth saying when the author didn't write the type themselves.
+    if binding.declared.is_none() && binding.ty != TypeExpr::Unknown {
+        facts.push("Inferred from the assigned value.".to_string());
+    }
+    hover_block(
+        format!("{} {}", binding.kind.label(), binding.name),
+        None,
+        facts,
+        Vec::new(),
+    )
+}
+
 fn format_param_hover(param: &ParamDef) -> String {
     let mut sections = Vec::new();
     if let Some(value_preview) = &param.value_preview {
@@ -1185,14 +1253,24 @@ fn format_field_hover(field: &FieldDef) -> String {
     )
 }
 
-fn function_signature(function: &FunctionDef) -> String {
+/// How one parameter is spelled wherever a signature is shown to the user.
+///
+/// Shared by function hover and by signature help
+/// ([`crate::core::LanguageServerCore::signature_help`]) so the two cannot
+/// drift — they previously formatted this identically but separately.
+pub fn param_label(param: &FunctionParam) -> String {
+    match &param.type_expr {
+        Some(type_expr) => format!("{}: {}", param.name, type_expr),
+        None => param.name.clone(),
+    }
+}
+
+/// `fn::name($a: type, …) -> type`, as rendered in hover and signature help.
+pub fn function_signature(function: &FunctionDef) -> String {
     let params = function
         .params
         .iter()
-        .map(|param| match &param.type_expr {
-            Some(type_expr) => format!("{}: {}", param.name, type_expr),
-            None => param.name.clone(),
-        })
+        .map(param_label)
         .collect::<Vec<_>>()
         .join(", ");
     let base = format!("{}({params})", function.name);

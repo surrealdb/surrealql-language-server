@@ -23,6 +23,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", parser_c.display());
     println!("cargo:rerun-if-changed={}", grammar_js.display());
 
+    emit_build_provenance(&manifest_dir, &grammar_dir);
+
     let scanner_c = grammar_dir.join("src/scanner.c");
     let mut build = cc::Build::new();
     build.file(&parser_c).include(&header_dir).warnings(false);
@@ -90,6 +92,56 @@ fn locate_wasm_clang() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Record which source revision and which grammar this binary was built
+/// from, as `SURREALQL_LS_BUILD`.
+///
+/// `CARGO_PKG_VERSION` alone cannot answer "is the editor running the
+/// binary I just built?" — an unreleased branch and the published release
+/// share the same version string. That ambiguity is expensive to debug
+/// from the outside, so the answer is compiled in and surfaced through
+/// `initialize`'s `serverInfo.version`.
+///
+/// Both lookups are best-effort: a source tarball with no `.git`, or no
+/// `git` on PATH, simply yields `unknown` rather than failing the build.
+fn emit_build_provenance(manifest_dir: &Path, grammar_dir: &Path) {
+    let source = git_describe(manifest_dir).unwrap_or_else(|| "unknown".to_string());
+    let grammar = git_short_revision(grammar_dir).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=SURREALQL_LS_BUILD={source}, grammar {grammar}");
+
+    // A new commit (or a newly dirty tree) must re-stamp the binary.
+    let head = manifest_dir.join(".git/HEAD");
+    if head.exists() {
+        println!("cargo:rerun-if-changed={}", head.display());
+    }
+}
+
+fn git_describe(dir: &Path) -> Option<String> {
+    let described = git(dir, &["describe", "--always", "--dirty", "--tags"])?;
+    match git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        // Detached HEAD reports `HEAD`, which adds nothing.
+        Some(branch) if branch != "HEAD" => Some(format!("{branch}-{described}")),
+        _ => Some(described),
+    }
+}
+
+fn git_short_revision(dir: &Path) -> Option<String> {
+    git(dir, &["rev-parse", "--short", "HEAD"])
+}
+
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn grammar_dir(manifest_dir: &Path) -> PathBuf {

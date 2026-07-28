@@ -1,4 +1,9 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use tree_sitter::Language;
+
+use crate::semantic::type_expr::TypeExpr;
 
 unsafe extern "C" {
     fn tree_sitter_surrealql() -> *const tree_sitter::ffi::TSLanguage;
@@ -560,11 +565,52 @@ pub fn builtin_namespace(name: &str) -> Option<&'static BuiltinNamespace> {
         .find(|namespace| namespace.name.eq_ignore_ascii_case(&normalized))
 }
 
+/// Builtins indexed by their normalized name, together with the return
+/// type parsed out of the signature string.
+///
+/// Built once. The previous linear scan was fine when only hover used it;
+/// type checking looks a function up at every call site.
+static BUILTIN_INDEX: LazyLock<HashMap<&'static str, (&'static BuiltinFunction, TypeExpr)>> =
+    LazyLock::new(|| {
+        BUILTIN_FUNCTIONS
+            .iter()
+            .map(|function| {
+                let returns = parse_return_type(function.signature);
+                (function.name, (function, returns))
+            })
+            .collect()
+    });
+
+/// Pull the return type out of a signature such as
+/// `"string::slice(string, from: number, to?: number) -> string"`.
+///
+/// Splitting on the *last* `->` matters: a parameter type could contain
+/// one in principle, and the return type never can.
+fn parse_return_type(signature: &str) -> TypeExpr {
+    match signature.rsplit_once("->") {
+        Some((_, returns)) => TypeExpr::parse(returns.trim()),
+        None => TypeExpr::Unknown,
+    }
+}
+
 pub fn builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
     let normalized = normalize_builtin_function_name(name);
-    BUILTIN_FUNCTIONS
-        .iter()
-        .find(|function| function.name.eq_ignore_ascii_case(&normalized))
+    BUILTIN_INDEX
+        .get(normalized.as_str())
+        .map(|(function, _)| *function)
+}
+
+/// The declared return type of a builtin, from its signature string.
+///
+/// Types the table spells in ways [`TypeExpr::parse`] cannot model
+/// (`field`, `range<record>`) come back as a non-primitive `Scalar` or
+/// `Other`, which the assignability rules treat as unknown — so a fuzzy
+/// entry here can only ever silence a diagnostic, never invent one.
+pub fn builtin_return_type(name: &str) -> Option<&'static TypeExpr> {
+    let normalized = normalize_builtin_function_name(name);
+    BUILTIN_INDEX
+        .get(normalized.as_str())
+        .map(|(_, returns)| returns)
 }
 
 fn normalize_builtin_function_name(name: &str) -> String {

@@ -29,9 +29,27 @@ use crate::core::state::{ServerState, merged_workspace, workspace_signature};
 use crate::grammar::{BuiltinFunction, builtin_function};
 use crate::runtime;
 use crate::semantic::analyzer::analyze_document;
-use crate::semantic::model::{field_completion_tables, is_record_type_context};
+use crate::semantic::model::{
+    field_completion_tables, function_signature, is_record_type_context, param_label,
+};
 use crate::semantic::text::{position_to_offset, token_at, word_range};
 use crate::semantic::types::{DocumentAnalysis, FunctionDef, MergedSemanticModel, SymbolOrigin};
+
+/// The crate version plus the source and grammar revisions this binary was
+/// compiled from.
+///
+/// The bare crate version is the *same string* on an unreleased branch and
+/// on the published release, so on its own it cannot tell you which binary
+/// an editor is actually talking to. Clients surface
+/// `serverInfo.version`, which makes that answerable at a glance instead of
+/// by deduction.
+pub fn build_version() -> String {
+    format!(
+        "{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("SURREALQL_LS_BUILD")
+    )
+}
 
 /// Hosting-agnostic language server. Generic over the three boundary
 /// traits so that a native (tower-lsp + walkdir + surrealdb) and a
@@ -146,7 +164,7 @@ where
         InitializeResult {
             server_info: Some(ServerInfo {
                 name: "surreal-language-server".to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                version: Some(build_version()),
             }),
             capabilities: Self::server_capabilities(),
             ..Default::default()
@@ -425,13 +443,21 @@ where
             }
         }
 
-        let items = model.completion_items(
+        let mut items = model.completion_items(
             trimmed_prefix,
             record_type_context,
             settings.active_auth_context(),
             statement_fact,
             qualifier.as_deref(),
         );
+        // In-scope `$variables` sort above everything else: when the user
+        // has typed a `$`, a local binding is almost always what they mean.
+        if !record_type_context {
+            let mut variables =
+                model.variable_completion_items(&analysis, position, trimmed_prefix);
+            variables.append(&mut items);
+            items = variables;
+        }
         Some(CompletionResponse::Array(items))
     }
 
@@ -442,7 +468,9 @@ where
 
         let token = token_at(&analysis.text, position)?;
         let range = word_range(&analysis.text, position)?;
-        let contents = model.hover_markdown_for_token(
+        let contents = model.hover_markdown_at(
+            &analysis,
+            position,
             token.trim_matches(|ch: char| {
                 matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
             }),
@@ -582,19 +610,7 @@ where
         if let Some(function) = model.functions.get(function_name) {
             return Some(SignatureHelp {
                 signatures: vec![SignatureInformation {
-                    label: format!(
-                        "{}({})",
-                        function.name,
-                        function
-                            .params
-                            .iter()
-                            .map(|param| match &param.type_expr {
-                                Some(type_expr) => format!("{}: {}", param.name, type_expr),
-                                None => param.name.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                    label: function_signature(function),
                     documentation: function.comment.clone().map(|value| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -606,10 +622,7 @@ where
                             .params
                             .iter()
                             .map(|param| ParameterInformation {
-                                label: ParameterLabel::Simple(match &param.type_expr {
-                                    Some(type_expr) => format!("{}: {}", param.name, type_expr),
-                                    None => param.name.clone(),
-                                }),
+                                label: ParameterLabel::Simple(param_label(param)),
                                 documentation: None,
                             })
                             .collect(),
