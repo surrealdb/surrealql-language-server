@@ -74,7 +74,7 @@ fn token_type(kind: &str) -> Option<u32> {
         k::FUNCTION_NAME => FUNCTION,
         k::VARIABLE_NAME => PARAMETER,
         k::TYPE_NAME | k::TYPE => TYPE,
-        k::STRING | k::PREFIXED_STRING | k::REGEX => STRING,
+        k::STRING | k::FORMAT_STRING | k::REGEX => STRING,
         k::NUMBER | k::INT | k::FLOAT | k::DECIMAL | k::DURATION => NUMBER,
         k::COMMENT | k::BLOCK_COMMENT => COMMENT,
         // `table:id` record literals get their own colour via `variable`.
@@ -87,6 +87,16 @@ fn token_type(kind: &str) -> Option<u32> {
 /// the tree. Returns `0` for the common "plain reference" case.
 fn modifiers(node: Node<'_>, source: &str) -> u32 {
     let parent_kind = node.parent().map(|parent| parent.kind());
+    // True when the node sits directly under a `DEFINE <form>` statement.
+    let defined_by = |form: &str| {
+        parent_kind == Some(k::DEFINE_STATEMENT)
+            && node
+                .parent()
+                .and_then(|parent| define_form(parent, source))
+                .as_deref()
+                == Some(form)
+    };
+
     match node.kind() {
         k::FUNCTION_NAME => {
             let text = node
@@ -94,12 +104,7 @@ fn modifiers(node: Node<'_>, source: &str) -> u32 {
                 .ok()
                 .map(str::trim)
                 .unwrap_or_default();
-            if parent_kind == Some(k::DEFINE_FUNCTION_STATEMENT)
-                || node.parent().is_some_and(|parent| {
-                    parent.kind() == k::DEFINE_STATEMENT
-                        && define_form(parent, source).as_deref() == Some("function")
-                })
-            {
+            if defined_by("function") {
                 MOD_DECLARATION
             } else if text.starts_with("fn::") {
                 0
@@ -107,22 +112,13 @@ fn modifiers(node: Node<'_>, source: &str) -> u32 {
                 MOD_DEFAULT_LIBRARY
             }
         }
-        // A `$var` is a declaration at its binding site: function params
-        // live in a `param_list`; `LET` and `DEFINE PARAM` place it
-        // directly under their statement.
+        // A `$var` is a declaration at its binding site: function and
+        // closure parameters live in a `ParamDefinition`; `LET` and
+        // `DEFINE PARAM` place it directly under their statement.
         k::VARIABLE_NAME => {
-            if matches!(
-                parent_kind,
-                Some(
-                    k::PARAM_LIST
-                        | k::PARAM_DEFINITION
-                        | k::LET_STATEMENT
-                        | k::DEFINE_PARAM_STATEMENT
-                )
-            ) || node.parent().is_some_and(|parent| {
-                parent.kind() == k::DEFINE_STATEMENT
-                    && define_form(parent, source).as_deref() == Some("param")
-            }) {
+            if matches!(parent_kind, Some(k::PARAM_DEFINITION | k::LET_STATEMENT))
+                || defined_by("param")
+            {
                 MOD_DECLARATION
             } else {
                 0

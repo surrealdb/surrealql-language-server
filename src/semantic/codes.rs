@@ -19,6 +19,14 @@ pub const PERMISSION_DENIED: &str = "permission-denied";
 pub const PERMISSION_UNKNOWN: &str = "permission-unknown";
 /// The statement target could not be resolved to a static table name.
 pub const DYNAMIC_TARGET: &str = "dynamic-target";
+/// An argument's type cannot satisfy the declared parameter type.
+pub const ARGUMENT_TYPE: &str = "argument-type";
+/// A call passes too many or too few arguments.
+pub const ARGUMENT_COUNT: &str = "argument-count";
+/// A `LET $x: T = …` value cannot satisfy the declared type `T`.
+pub const LET_TYPE: &str = "let-type";
+/// A `$variable` reference that nothing in scope binds.
+pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
 
 /// Wrap a code constant in the LSP `Diagnostic.code` representation.
 pub fn as_code(value: &str) -> Option<NumberOrString> {

@@ -42,6 +42,11 @@ pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<Do
     };
 
     collect_statements(root, text, &uri, origin, &mut analysis);
+    // One sweep over the whole tree rather than per-statement calls: a
+    // `fn::` call can appear anywhere (a LET value, a RETURN expression,
+    // an IF condition), and collecting per-statement both missed those
+    // and risked double-counting once containers started descending.
+    collect_function_references(root, text, &uri, &mut analysis);
 
     // Syntax diagnostics run after extraction so the keyword-typo
     // hint can skip names that are identifiers in this document
@@ -106,82 +111,61 @@ fn collect_statements(
                 }
             }
         }
-        collect_function_references(node, source, uri, analysis);
+        // A DEFINE FUNCTION body can hold nested statements worth
+        // indexing; every other DEFINE form is a leaf.
+        if define_form(node, source).as_deref() == Some("function")
+            && let Some(body) = k::find_child(node, k::BLOCK)
+        {
+            collect_statements(body, source, uri, origin, analysis);
+        }
         return;
     }
 
     match kind {
-        k::DEFINE_TABLE_STATEMENT => {
-            extract_table(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
-        k::DEFINE_FIELD_STATEMENT => {
-            extract_field(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
-        k::DEFINE_EVENT_STATEMENT => {
-            extract_event(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
-        k::DEFINE_FUNCTION_STATEMENT => {
-            extract_function(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
-        k::DEFINE_INDEX_STATEMENT => {
-            extract_index(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
-        k::DEFINE_PARAM_STATEMENT => {
-            extract_param(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
-        k::DEFINE_ACCESS_STATEMENT | k::DEFINE_SCOPE_STATEMENT => {
-            extract_access(node, source, uri, origin, analysis);
-            collect_function_references(node, source, uri, analysis);
-            return;
-        }
         k::SELECT_STATEMENT => {
             extract_query_fact(node, source, uri, QueryAction::Select, analysis);
-            collect_function_references(node, source, uri, analysis);
             return;
         }
         k::CREATE_STATEMENT => {
             extract_query_fact(node, source, uri, QueryAction::Create, analysis);
-            collect_function_references(node, source, uri, analysis);
             return;
         }
         k::UPDATE_STATEMENT | k::UPSERT_STATEMENT => {
             extract_query_fact(node, source, uri, QueryAction::Update, analysis);
-            collect_function_references(node, source, uri, analysis);
             return;
         }
         k::DELETE_STATEMENT => {
             extract_query_fact(node, source, uri, QueryAction::Delete, analysis);
-            collect_function_references(node, source, uri, analysis);
             return;
         }
         k::RELATE_STATEMENT => {
             extract_query_fact(node, source, uri, QueryAction::Relate, analysis);
-            collect_function_references(node, source, uri, analysis);
             return;
         }
-        // Other statements we still want symbol entries for.
-        // `subquery_statement` is a transparent wrapper — never treat it
-        // as a leaf statement; fall through so we descend into the real
-        // statement it wraps.
-        kind if (kind.ends_with("_statement") || kind.ends_with("Statement"))
-            && kind != "subquery_statement" =>
-        {
+        k::INSERT_STATEMENT => {
+            extract_query_fact(node, source, uri, QueryAction::Create, analysis);
+            return;
+        }
+        // Control-flow and binding statements are *containers*: their
+        // bodies hold the statements we actually care about. Record a
+        // symbol for the statement itself, then keep descending — the old
+        // catch-all returned here, which made every `LET`, `FOR`, `IF` and
+        // `RETURN` body invisible to the analyzer.
+        k::LET_STATEMENT
+        | k::FOR_STATEMENT
+        | k::IF_ELSE_STATEMENT
+        | k::RETURN_STATEMENT
+        | k::THROW_STATEMENT => {
             if let Some(symbol) = statement_symbol(node, source, uri) {
                 analysis.document_symbols.push(symbol);
             }
-            collect_function_references(node, source, uri, analysis);
+        }
+        // Any other leaf statement (USE, INFO, KILL, …) carries nothing
+        // nested that we index, so record it and stop.
+        kind if kind.ends_with("Statement") => {
+            if let Some(symbol) = statement_symbol(node, source, uri) {
+                analysis.document_symbols.push(symbol);
+            }
             return;
         }
         _ => {}
@@ -272,12 +256,7 @@ fn extract_field(
     // become `address.city` in our model.
     let Some(name) = children
         .iter()
-        .find(|child| {
-            matches!(
-                child.kind(),
-                k::INCLUSIVE_PREDICATE | k::IDIOM | k::PATH | k::IDENT
-            )
-        })
+        .find(|child| matches!(child.kind(), k::IDIOM | k::PATH | k::IDENT))
         .and_then(|child| k::dotted_name(source, *child))
     else {
         return;
@@ -296,8 +275,7 @@ fn extract_field(
         .iter()
         .find(|child| child.kind() == k::TYPE_CLAUSE)
         .and_then(|clause| second_type_payload(*clause))
-        .and_then(|payload| text_of(source, payload))
-        .map(|text| TypeExpr::parse(&text));
+        .and_then(|payload| type_expr_of(payload, source));
 
     let field = FieldDef {
         table: table.clone(),
@@ -368,25 +346,18 @@ fn extract_event(
         .and_then(|child| identifier_from_on_table_clause(*child, source))
         .unwrap_or_else(|| "unknown".to_string());
 
-    // The snake_case grammar wraps `WHEN ... THEN ...` in one node; the
-    // local PascalCase grammar emits separate WhenClause/ThenClause nodes.
-    let when_then = children
-        .iter()
-        .find(|child| child.kind() == k::WHEN_THEN_CLAUSE)
-        .copied();
+    // `WHEN ... THEN ...` arrives as two sibling clauses.
     let when_clause = children
         .iter()
         .find(|child| child.kind() == k::WHEN_CLAUSE)
         .copied()
-        .or(when_then)
-        .and_then(|clause| first_non_keyword_child(clause))
+        .and_then(first_non_keyword_child)
         .and_then(|child| text_of(source, child))
         .map(|text| compact_preview(&text));
     let then_clause = children
         .iter()
         .find(|child| child.kind() == k::THEN_CLAUSE)
         .copied()
-        .or(when_then)
         .and_then(|clause| k::find_child_any(clause, &[k::BLOCK, k::SUB_QUERY]))
         .and_then(|child| text_of(source, child))
         .map(|text| compact_preview(&text));
@@ -432,27 +403,15 @@ fn extract_function(
         return;
     };
 
-    // Parameters live inside a `param_list` node as `variable_name`
-    // followed by an optional `type`.
+    // Each parameter is its own `ParamDefinition` child of the DEFINE
+    // statement — the grammar has no wrapper list node.
     let params = children
         .iter()
-        .find(|child| child.kind() == k::PARAM_LIST)
-        .map(|list| parse_function_params(*list, source))
-        .unwrap_or_else(|| {
-            children
-                .iter()
-                .filter(|child| child.kind() == k::PARAM_DEFINITION)
-                .flat_map(|param| parse_function_params(*param, source))
-                .collect()
-        });
+        .filter(|child| child.kind() == k::PARAM_DEFINITION)
+        .filter_map(|param| parse_function_param(*param, source))
+        .collect();
 
-    // `-> type` is a `returns_clause` wrapping the return `type`.
-    let return_type = children
-        .iter()
-        .find(|child| child.kind() == k::RETURNS_CLAUSE)
-        .and_then(|clause| k::find_child_any(*clause, &[k::TYPE, k::TYPE_NAME]))
-        .and_then(|child| text_of(source, child))
-        .map(|text| TypeExpr::parse(text.trim_start_matches("->").trim()));
+    let return_type = function_return_type(&children, source);
 
     let language = detect_function_language(&children);
 
@@ -768,12 +727,7 @@ fn infer_fields_from_statement(
         let type_expr = children
             .iter()
             .rev()
-            .find(|child| {
-                !matches!(
-                    child.kind(),
-                    k::IDENT | k::OPERATOR | k::ASSIGNMENT_OPERATOR
-                )
-            })
+            .find(|child| !matches!(child.kind(), k::IDENT | k::OPERATOR))
             .map(|child| infer_type_from_value(*child, source));
 
         fields.push(inferred_field(
@@ -886,7 +840,7 @@ fn collect_function_references(
         if !name.starts_with("fn::") {
             continue; // builtin function reference – not user-defined.
         }
-        if is_function_being_defined(reference) {
+        if is_function_being_defined(reference, source) {
             continue;
         }
         let selection_range =
@@ -909,16 +863,22 @@ fn collect_called_functions(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 /// True when `node` is the `FunctionName` *being defined* by a
-/// `DefineStatement` — i.e. a direct named child of a
-/// `DEFINE FUNCTION` statement. Call sites inside the function's
-/// body live deeper in the tree (inside a `Block`/`FunctionCall`) and
-/// are kept.
-fn is_function_being_defined(node: Node<'_>) -> bool {
+/// `DEFINE FUNCTION` statement — i.e. a direct named child of a
+/// `DefineStatement` whose form is `function`. Call sites inside the
+/// function's body live deeper in the tree (inside a `Block`/
+/// `FunctionCall`) and are kept.
+///
+/// `extract_function` already records the declaration as a reference, so
+/// getting this wrong double-counts it: duplicate document highlights and
+/// overlapping rename edits at the definition site.
+fn is_function_being_defined(node: Node<'_>, source: &str) -> bool {
     if node.kind() != k::CUSTOM_FUNCTION_NAME {
         return false;
     }
-    node.parent()
-        .is_some_and(|parent| parent.kind() == k::DEFINE_FUNCTION_STATEMENT)
+    node.parent().is_some_and(|parent| {
+        parent.kind() == k::DEFINE_STATEMENT
+            && define_form(parent, source).as_deref() == Some("function")
+    })
 }
 
 fn infer_record_types_from_table(
@@ -930,32 +890,53 @@ fn infer_record_types_from_table(
     Vec::new()
 }
 
-/// Parse a `param_list` node. Parameters appear as a `variable_name`
-/// optionally followed by a `type` (`$a: int, $b` → `[($a, int), ($b, _)]`).
-fn parse_function_params(param_list: Node<'_>, source: &str) -> Vec<FunctionParam> {
-    let children = k::named_children(param_list);
-    let mut params = Vec::new();
-    let mut index = 0;
-    while index < children.len() {
-        let child = children[index];
-        if child.kind() != k::VARIABLE_NAME {
-            index += 1;
-            continue;
-        }
-        let Some(name) = text_of(source, child) else {
-            index += 1;
-            continue;
-        };
-        // A `type` immediately following the name is its declared type.
-        let type_expr = children
-            .get(index + 1)
-            .filter(|next| next.kind() == k::TYPE || next.kind() == k::TYPE_NAME)
-            .and_then(|next| text_of(source, *next))
-            .map(|text| TypeExpr::parse(&text));
-        params.push(FunctionParam { name, type_expr });
-        index += 1;
-    }
-    params
+/// Parse one `ParamDefinition` node.
+///
+/// The grammar rule is
+/// `ParamDefinition: seq($.VariableName, optional(seq($.Colon, alias($._safeType, $.Type))))`,
+/// so the declared type is **not** the immediate next sibling of the
+/// name — a named `Colon` node sits between them. Scanning for the first
+/// type-bearing child instead of relying on adjacency is what makes this
+/// work; the previous positional version silently produced `None` for
+/// every annotated parameter.
+fn parse_function_param(param: Node<'_>, source: &str) -> Option<FunctionParam> {
+    let children = k::named_children(param);
+    let name = children
+        .iter()
+        .find(|child| child.kind() == k::VARIABLE_NAME)
+        .and_then(|child| text_of(source, *child))?;
+    let type_expr = children
+        .iter()
+        .find(|child| k::TYPE_KINDS.contains(&child.kind()))
+        .and_then(|child| type_expr_of(*child, source));
+    Some(FunctionParam { name, type_expr })
+}
+
+/// Extract a function's `-> type` annotation.
+///
+/// The grammar splices `optional(seq($.LookupRight, $._type))` directly
+/// into the DEFINE statement's children — there is no `ReturnsClause`
+/// wrapper — so the return type is the first type-bearing sibling that
+/// follows the `->` (`LookupRight`) token.
+fn function_return_type(children: &[Node<'_>], source: &str) -> Option<TypeExpr> {
+    let arrow = children
+        .iter()
+        .position(|child| child.kind() == k::LOOKUP_RIGHT)?;
+    children
+        .iter()
+        .skip(arrow + 1)
+        .find(|child| k::TYPE_KINDS.contains(&child.kind()))
+        .and_then(|child| type_expr_of(*child, source))
+}
+
+/// Build a [`TypeExpr`] from a node that carries a type expression.
+///
+/// Reads the grammar's own type nodes. Going via the node's *source text*
+/// and re-parsing it looks equivalent but is not: the string parser has no
+/// object or tuple case, so `{ line: record<orderLine> }` would collapse to an
+/// opaque `Other(_)` and take its `record<>` links with it.
+fn type_expr_of(node: Node<'_>, source: &str) -> Option<TypeExpr> {
+    Some(TypeExpr::from_node(node, source))
 }
 
 fn parse_permission_rule(
@@ -1020,15 +1001,8 @@ fn parse_permission_rule(
 fn is_target_name_kind(kind: &str) -> bool {
     matches!(
         kind,
-        k::CREATE_TARGET
-            | k::VALUE
-            | k::IDENT
-            | k::RECORD_ID
-            | k::RECORD_ID_RANGE
-            | k::PATH
-            | k::ARRAY
-            | k::TYPE_CAST
-    ) || kind == k::RELATE_SUBJECT
+        k::IDENT | k::RECORD_ID | k::RANGE_RECORD_ID | k::PATH | k::ARRAY | k::TYPE_CAST
+    )
 }
 
 /// The subtrees that make up a statement's target region ("what comes
@@ -1046,16 +1020,9 @@ fn target_nodes_for_statement<'tree>(node: Node<'tree>, source: &str) -> Vec<Nod
     };
     match node.kind() {
         k::SELECT_STATEMENT => {
-            // Older grammar builds wrapped the targets in a
-            // `from_clause`; the current one lays them out as direct
-            // children after the `FROM` keyword, up to the first
-            // trailing clause (`WHERE`, `GROUP`, …).
-            if let Some(from) = children.iter().find(|child| child.kind() == k::FROM_CLAUSE) {
-                return k::named_children(*from)
-                    .into_iter()
-                    .filter(|child| !k::is_keyword(*child) && child.kind() != k::WHERE_CLAUSE)
-                    .collect();
-            }
+            // There is no `FromClause` node in the grammar: the targets
+            // are laid out as direct children after the `FROM` keyword,
+            // up to the first trailing clause (`WHERE`, `GROUP`, …).
             let mut after_from = false;
             let mut region = Vec::new();
             for child in &children {
@@ -1114,7 +1081,7 @@ fn target_refs_from_nodes(relevant_nodes: &[Node<'_>], source: &str) -> Vec<Name
         for candidate in descendants_of_kind(*relevant, k::IDENT)
             .into_iter()
             .chain(descendants_of_kind(*relevant, k::RECORD_ID))
-            .chain(descendants_of_kind(*relevant, k::RECORD_ID_RANGE))
+            .chain(descendants_of_kind(*relevant, k::RANGE_RECORD_ID))
         {
             let Some(raw) = candidate.utf8_text(source.as_bytes()).ok() else {
                 continue;
@@ -1193,27 +1160,25 @@ fn collect_field_refs(node: Node<'_>, source: &str) -> Vec<NamedRange> {
     fields
 }
 
+/// Coarse literal typing used by *schema inference* (`SET x = …`,
+/// `CONTENT { … }`), which materialises `FieldDef`s.
+///
+/// Deliberately lossy: `Int`/`Float`/`Decimal` all collapse to `number`,
+/// because an inferred field type is a guess about a column, not a claim
+/// about one expression.
 fn infer_type_from_value(node: Node<'_>, source: &str) -> TypeExpr {
-    // Unwrap the transparent `value`/`base_value` layers down to the
-    // concrete literal/record node.
-    let mut concrete = node;
-    while matches!(concrete.kind(), k::VALUE | k::BASE_VALUE) {
-        match first_named_descendant(concrete) {
-            Some(child) => concrete = child,
-            None => break,
-        }
-    }
-    match concrete.kind() {
-        k::STRING | k::PREFIXED_STRING => TypeExpr::Scalar("string".to_string()),
+    match node.kind() {
+        k::STRING | k::FORMAT_STRING => TypeExpr::Scalar("string".to_string()),
         k::INT | k::FLOAT | k::DECIMAL | k::NUMBER => TypeExpr::Scalar("number".to_string()),
         k::ARRAY => TypeExpr::Array(Box::new(TypeExpr::Unknown)),
         k::OBJECT => TypeExpr::Scalar("object".to_string()),
-        k::RECORD_ID => text_of(source, concrete)
+        k::DURATION => TypeExpr::Scalar("duration".to_string()),
+        k::RECORD_ID => text_of(source, node)
             .and_then(|value| normalize_table_name(&value))
-            .map(TypeExpr::Record)
+            .map(|table| TypeExpr::Record(vec![table]))
             .unwrap_or(TypeExpr::Unknown),
-        "Bool" | "keyword_true" | "keyword_false" => TypeExpr::Scalar("bool".to_string()),
-        "None" | "keyword_none" | "keyword_null" => TypeExpr::Scalar("null".to_string()),
+        k::BOOL => TypeExpr::Scalar("bool".to_string()),
+        k::NONE => TypeExpr::Scalar("null".to_string()),
         _ => TypeExpr::Unknown,
     }
 }
@@ -1737,7 +1702,7 @@ fn friendly_symbol_name(raw: &str) -> String {
     }
     match raw {
         k::IDENT | "RecordTbIdent" | "RecordIdIdent" | "KeyName" => "an identifier".to_string(),
-        k::STRING | k::PREFIXED_STRING => "a string".to_string(),
+        k::STRING | k::FORMAT_STRING => "a string".to_string(),
         k::NUMBER | k::INT | k::FLOAT | k::DECIMAL => "a number".to_string(),
         k::VARIABLE_NAME => "a `$parameter`".to_string(),
         k::DURATION => "a duration".to_string(),
@@ -1785,11 +1750,6 @@ fn collect_descendants<'tree>(node: Node<'tree>, kind: &str, matches: &mut Vec<N
     }
 }
 
-fn first_named_descendant(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
 fn first_non_keyword_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -1802,12 +1762,15 @@ fn text_of(source: &str, node: Node<'_>) -> Option<String> {
         .map(|text| text.trim().to_string())
 }
 
-/// The type payload of a `type_clause` — `(keyword_type, type)` or
-/// `(keyword_flexible, keyword_type, type)`. The `type` node wraps the
-/// concrete `type_name`/`parameterized_type`/union, so its text is the
-/// full type expression.
+/// The type payload of a `TypeClause` — `(Keyword[TYPE], <type>)` or
+/// `(Keyword[FLEXIBLE], Keyword[TYPE], <type>)`.
+///
+/// The payload is whichever type-bearing kind the grammar chose, which
+/// includes `UnionType` (`TYPE string | int`) and `LiteralType`
+/// (`TYPE [string, string]`, `TYPE 'a' | 'b'`, `TYPE { a: int }`).
+/// Matching only the scalar kinds dropped those on the floor.
 fn second_type_payload(clause: Node<'_>) -> Option<Node<'_>> {
-    k::find_child_any(clause, &[k::TYPE, k::TYPE_NAME, k::PARAMETERIZED_TYPE])
+    k::find_child_any(clause, k::TYPE_KINDS)
 }
 
 fn unquote(value: &str) -> String {
@@ -1859,10 +1822,14 @@ fn walk_inlay_hints(
         let name_node = node
             .children(&mut cursor)
             .find(|child| child.kind() == k::CUSTOM_FUNCTION_NAME);
+        // `model.functions` is keyed by the *full* name including the
+        // `fn::` prefix (see `merge_function`), so look up the raw text.
+        // Stripping the prefix first meant this never matched and custom
+        // function inlay hints never appeared.
         if let Some(name_node) = name_node
             && let Ok(raw) = name_node.utf8_text(source.as_bytes())
-            && let Some(stripped) = raw.strip_prefix("fn::")
-            && let Some(function) = model.functions.get(stripped)
+            && raw.starts_with("fn::")
+            && let Some(function) = model.functions.get(raw.trim())
         {
             let mut cursor = node.walk();
             let arg_list = node
@@ -1915,9 +1882,302 @@ mod tests {
 
     use ls_types::Uri;
 
-    use crate::semantic::types::SymbolOrigin;
+    use crate::semantic::type_expr::TypeExpr;
+    use crate::semantic::types::{DocumentAnalysis, QueryAction, SymbolOrigin};
 
     use super::analyze_document;
+
+    fn analyze(text: &str) -> DocumentAnalysis {
+        let uri = Uri::from_str("file:///workspace/test.surql").expect("valid uri");
+        analyze_document(uri, text, SymbolOrigin::Local).expect("analysis")
+    }
+
+    fn scalar(name: &str) -> TypeExpr {
+        TypeExpr::Scalar(name.to_string())
+    }
+
+    #[test]
+    fn extracts_declared_function_parameter_types() {
+        // `ParamDefinition` puts a named `Colon` between the name and the
+        // type, so positional adjacency never matched and every annotated
+        // parameter came back untyped.
+        let analysis = analyze(
+            r#"DEFINE FUNCTION fn::greet($name: string, $times: int, $extra) {
+                 RETURN $name;
+               };"#,
+        );
+
+        let function = analysis.functions.first().expect("one function");
+        let params: Vec<_> = function
+            .params
+            .iter()
+            .map(|param| (param.name.as_str(), param.type_expr.clone()))
+            .collect();
+
+        assert_eq!(
+            params,
+            vec![
+                ("$name", Some(scalar("string"))),
+                ("$times", Some(scalar("int"))),
+                ("$extra", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_structured_function_parameter_types() {
+        // A record union and an array of records.
+        let analysis = analyze(
+            r#"DEFINE FUNCTION fn::add($id: record<orderData | project>, $lines: array<record<orderLine>>) {
+                 RETURN $id;
+               };"#,
+        );
+
+        let function = analysis.functions.first().expect("one function");
+        assert_eq!(
+            function.params[0].type_expr,
+            Some(TypeExpr::Record(vec![
+                "orderData".to_string(),
+                "project".to_string()
+            ]))
+        );
+        assert_eq!(
+            function.params[1].type_expr,
+            Some(TypeExpr::Array(Box::new(TypeExpr::Record(vec![
+                "orderLine".to_string()
+            ]))))
+        );
+    }
+
+    #[test]
+    fn extracts_inline_object_parameter_type() {
+        // Reading the type node's *source text* and re-parsing it loses
+        // this entirely: the string parser has no object case, so the
+        // whole `{ … }` lands in `Other(_)` and the `record<>` links
+        // inside it disappear.
+        let analysis = analyze(
+            r#"DEFINE FUNCTION fn::add($user: record<user>, $doc: {
+                 line: record<orderLine>,
+                 asset: record<asset>
+               }) {
+                 RETURN $doc;
+               };"#,
+        );
+
+        let function = analysis.functions.first().expect("one function");
+        assert_eq!(
+            function.params[1].type_expr,
+            Some(TypeExpr::Object(vec![
+                (
+                    "line".to_string(),
+                    TypeExpr::Record(vec!["orderLine".to_string()])
+                ),
+                (
+                    "asset".to_string(),
+                    TypeExpr::Record(vec!["asset".to_string()])
+                ),
+            ]))
+        );
+        // The nested record links must survive, or implicit table
+        // registration and record-type navigation lose them.
+        assert_eq!(
+            function.params[1]
+                .type_expr
+                .as_ref()
+                .expect("typed")
+                .record_tables(),
+            vec!["orderLine".to_string(), "asset".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_tuple_and_literal_union_field_types() {
+        let analysis = analyze(
+            r#"DEFINE FIELD id ON task TYPE [string, string];
+               DEFINE FIELD status ON task TYPE 'open' | 'done';"#,
+        );
+
+        let id = analysis
+            .fields
+            .iter()
+            .find(|field| field.name == "id")
+            .expect("id field");
+        assert_eq!(
+            id.type_expr,
+            Some(TypeExpr::Tuple(vec![scalar("string"), scalar("string")]))
+        );
+
+        let status = analysis
+            .fields
+            .iter()
+            .find(|field| field.name == "status")
+            .expect("status field");
+        assert_eq!(
+            status.type_expr,
+            Some(TypeExpr::Union(vec![
+                TypeExpr::Literal("'open'".to_string()),
+                TypeExpr::Literal("'done'".to_string()),
+            ]))
+        );
+        // Hover renders this verbatim, so the quotes must round-trip.
+        assert_eq!(
+            status.type_expr.as_ref().unwrap().to_string(),
+            "'open' | 'done'"
+        );
+    }
+
+    #[test]
+    fn normalizes_none_union_into_option() {
+        // Remote `INFO FOR DB` spells optionals as `none | string`; local
+        // schemas write `option<string>`. They must compare equal.
+        let analysis = analyze(
+            r#"DEFINE FIELD a ON t TYPE option<string>;
+               DEFINE FIELD b ON t TYPE none | string;"#,
+        );
+
+        let of = |name: &str| {
+            analysis
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .and_then(|field| field.type_expr.clone())
+        };
+        assert_eq!(of("a"), of("b"));
+        assert_eq!(of("a"), Some(TypeExpr::Option(Box::new(scalar("string")))));
+    }
+
+    #[test]
+    fn extracts_function_return_type() {
+        // `-> type` is spliced straight into the DEFINE statement as
+        // `LookupRight` + a type node; there is no `ReturnsClause` wrapper.
+        let analysis = analyze(
+            r#"DEFINE FUNCTION fn::slug($input: string) -> string {
+                 RETURN string::slug($input);
+               };"#,
+        );
+
+        let function = analysis.functions.first().expect("one function");
+        assert_eq!(function.return_type, Some(scalar("string")));
+    }
+
+    #[test]
+    fn record_union_type_does_not_register_a_phantom_table() {
+        // `record<a | b>` used to parse as one table literally named
+        // "a | b", which the implicit-table pass then registered.
+        let analysis = analyze("DEFINE FIELD owner ON job TYPE record<person | company>;");
+
+        let mut tables: Vec<_> = analysis.tables.iter().map(|t| t.name.as_str()).collect();
+        tables.sort_unstable();
+        assert_eq!(tables, vec!["company", "person"]);
+    }
+
+    #[test]
+    fn extracts_union_and_literal_field_types() {
+        // `second_type_payload` matched only the scalar type kinds, so
+        // `UnionType` and `LiteralType` payloads were dropped entirely.
+        let analysis = analyze(
+            r#"DEFINE FIELD status ON task TYPE 'open' | 'done';
+               DEFINE FIELD id ON task TYPE [string, string];
+               DEFINE FIELD score ON task TYPE string | int;"#,
+        );
+
+        for name in ["status", "id", "score"] {
+            let field = analysis
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("field {name}"));
+            assert!(
+                field.type_expr.is_some(),
+                "field `{name}` should carry a type, got None"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_select_target_tables() {
+        // There is no `FromClause` node; targets follow the FROM keyword.
+        for (text, expected) in [
+            ("SELECT * FROM person;", vec!["person"]),
+            (
+                "SELECT name FROM person, company;",
+                vec!["person", "company"],
+            ),
+            ("SELECT * FROM ONLY person:tobie;", vec!["person"]),
+            ("SELECT * FROM person WHERE name = 'x';", vec!["person"]),
+            ("SELECT name AS n FROM person LIMIT 1;", vec!["person"]),
+        ] {
+            let analysis = analyze(text);
+            let fact = analysis
+                .query_facts
+                .iter()
+                .find(|fact| fact.action == QueryAction::Select)
+                .unwrap_or_else(|| panic!("select fact for {text}"));
+            assert_eq!(fact.target_tables, expected, "targets for {text}");
+            assert!(!fact.dynamic, "{text} should not be dynamic");
+        }
+    }
+
+    #[test]
+    fn descends_into_let_and_control_flow_bodies() {
+        // The old catch-all returned without descending, so statements
+        // nested in LET / FOR / IF bodies were invisible.
+        let analysis = analyze(
+            r#"LET $people = SELECT * FROM person;
+               FOR $p IN $people {
+                 UPDATE company SET seen = true;
+               };
+               IF $people { DELETE audit; };"#,
+        );
+
+        let actions: Vec<_> = analysis
+            .query_facts
+            .iter()
+            .map(|fact| (fact.action, fact.target_tables.clone()))
+            .collect();
+
+        assert!(
+            actions.contains(&(QueryAction::Select, vec!["person".to_string()])),
+            "SELECT inside LET missing, got {actions:?}"
+        );
+        assert!(
+            actions.contains(&(QueryAction::Update, vec!["company".to_string()])),
+            "UPDATE inside FOR missing, got {actions:?}"
+        );
+        assert!(
+            actions.contains(&(QueryAction::Delete, vec!["audit".to_string()])),
+            "DELETE inside IF missing, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn records_insert_statements_as_query_facts() {
+        let analysis = analyze("INSERT INTO person { name: 'Tobie' };");
+
+        let fact = analysis.query_facts.first().expect("insert fact");
+        assert_eq!(fact.action, QueryAction::Create);
+        assert_eq!(fact.target_tables, vec!["person".to_string()]);
+    }
+
+    #[test]
+    fn function_declaration_is_not_double_counted_as_a_reference() {
+        // `extract_function` already records the declaration; the
+        // reference sweep must skip it or rename emits overlapping edits.
+        let analysis = analyze(
+            r#"DEFINE FUNCTION fn::greet($name: string) { RETURN $name; };
+               RETURN fn::greet('x');"#,
+        );
+
+        let declarations = analysis
+            .references
+            .iter()
+            .filter(|reference| reference.name == "fn::greet")
+            .count();
+        assert_eq!(
+            declarations, 2,
+            "expected one declaration + one call site, got {declarations}"
+        );
+    }
 
     #[test]
     fn indexes_define_statements_and_queries() {

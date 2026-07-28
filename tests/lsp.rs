@@ -4,7 +4,9 @@ use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use surrealql_language_server::config::{AuthContext, ServerSettings};
 use surrealql_language_server::semantic::analyzer::analyze_document;
-use surrealql_language_server::semantic::model::is_record_type_context;
+use surrealql_language_server::semantic::model::{
+    function_signature, is_record_type_context, param_label,
+};
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
     DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, MergedSemanticModel, PermissionMode,
@@ -94,10 +96,17 @@ fn extracts_function_return_type_annotation() {
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     let func = &analysis.functions[0];
-    assert_eq!(func.params[0].name, "$n");
-    // Return type may or may not be extracted depending on grammar node name;
-    // at minimum we assert the function parses cleanly.
     assert_eq!(func.name, "fn::double");
+    assert_eq!(func.params[0].name, "$n");
+    assert_eq!(
+        func.params[0].type_expr,
+        Some(TypeExpr::Scalar("number".to_string()))
+    );
+    assert_eq!(
+        func.return_type,
+        Some(TypeExpr::Scalar("number".to_string())),
+        "`-> number` is `LookupRight` + a type node on the DefineStatement"
+    );
 }
 
 #[test]
@@ -108,9 +117,10 @@ fn function_without_return_type_has_none() {
     "#;
     let analysis = analyze_document(u, text, SymbolOrigin::Local).expect("analysis");
     assert_eq!(analysis.functions.len(), 1);
-    // Without a `->` annotation the return type should be absent.
-    // (May be Some if grammar exposes implicit type; we just ensure no panic.)
-    let _ = &analysis.functions[0].return_type;
+    assert_eq!(
+        analysis.functions[0].return_type, None,
+        "no `->` annotation means no declared return type"
+    );
 }
 
 #[test]
@@ -1698,5 +1708,1069 @@ fn semantic_tokens_range_limits_to_viewport() {
     assert!(
         find(&tokens, "1").is_none() && find(&tokens, "3").is_none(),
         "tokens outside the range are excluded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Real-world regression fixture
+// ---------------------------------------------------------------------------
+//
+// `tests/fixtures/adversarial.surql` is a 400-line production schema. It is the
+// best adversarial input available: densely typed `DEFINE FUNCTION`s, literal
+// union and array-literal field types, `record<a | b>`, inline object parameter
+// types, optional-chained method idioms, and `LET`s bound to queries nested
+// inside event blocks. Anything the analyzer gets wrong tends to show up here
+// first.
+
+fn adversarial_analysis() -> DocumentAnalysis {
+    let source = include_str!("fixtures/adversarial.surql");
+    analyze_document(uri("real_world.surql"), source, SymbolOrigin::Local)
+        .expect("fixture analyzes")
+}
+
+#[test]
+fn adversarial_fixture_syntax_error_budget() {
+    let analysis = adversarial_analysis();
+    let reported: Vec<String> = analysis
+        .syntax_diagnostics
+        .iter()
+        .map(|diagnostic| {
+            format!(
+                "line {}: {}",
+                diagnostic.range.start.line + 1,
+                diagnostic.message
+            )
+        })
+        .collect();
+
+    // These are *grammar* gaps, not analyzer bugs: a handful of
+    // constructs in this file the pinned tree-sitter grammar cannot
+    // parse. They truncate their enclosing statement, which is why not
+    // every `DEFINE FUNCTION` in the file is indexed. The budget exists
+    // so the number can only go down; drop it when the grammar catches
+    // up. Newer grammar revisions already fix most of them.
+    assert!(
+        reported.len() <= 6,
+        "syntax error budget exceeded ({}): {reported:#?}",
+        reported.len()
+    );
+}
+
+#[test]
+fn adversarial_fixture_extracts_declared_parameter_types() {
+    let analysis = adversarial_analysis();
+
+    let typed = analysis
+        .functions
+        .iter()
+        .flat_map(|function| &function.params)
+        .filter(|param| param.type_expr.is_some())
+        .count();
+    let total = analysis
+        .functions
+        .iter()
+        .map(|function| function.params.len())
+        .sum::<usize>();
+
+    assert!(
+        analysis.functions.len() >= 20,
+        "expected the fixture's fn:: definitions, got {}",
+        analysis.functions.len()
+    );
+    // Every parameter in this file is annotated, and extraction is
+    // all-or-nothing per parameter — so anything below 100% means the
+    // `ParamDefinition(VariableName, Colon, Type)` walk has regressed.
+    // Before the fix this was 0/49.
+    assert_eq!(
+        typed, total,
+        "every annotated parameter should carry a type"
+    );
+    assert!(
+        total >= 40,
+        "expected the fixture's annotated params, got {total}"
+    );
+}
+
+#[test]
+fn adversarial_fixture_registers_no_phantom_union_table() {
+    let analysis = adversarial_analysis();
+
+    // `record<orderData | project>` must register two tables, never one
+    // called "orderData | project".
+    let phantom: Vec<&str> = analysis
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .filter(|name| name.contains('|') || name.contains(' '))
+        .collect();
+    assert!(phantom.is_empty(), "phantom tables: {phantom:?}");
+}
+
+#[test]
+fn adversarial_fixture_resolves_select_targets() {
+    let analysis = adversarial_analysis();
+
+    let selects: Vec<_> = analysis
+        .query_facts
+        .iter()
+        .filter(|fact| fact.action == QueryAction::Select)
+        .collect();
+    let resolved = selects.iter().filter(|fact| !fact.dynamic).count();
+
+    assert!(!selects.is_empty(), "fixture contains SELECT statements");
+    assert!(
+        resolved > 0,
+        "no SELECT resolved a static target out of {} — FromClause regression?",
+        selects.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Argument type checking
+// ---------------------------------------------------------------------------
+
+/// Analyze `source`, build a one-document model, and return its semantic
+/// diagnostics.
+fn diagnostics_for(source: &str) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+    let analysis =
+        analyze_document(uri("check.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+    model.semantic_diagnostics(&analysis, &ServerSettings::default())
+}
+
+fn codes_of(diagnostics: &[tower_lsp_server::ls_types::Diagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .filter_map(|d| match &d.code {
+            Some(tower_lsp_server::ls_types::NumberOrString::String(code)) => Some(code.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+const DOC_ADD: &str = r#"
+DEFINE FUNCTION fn::doc::add($user: record<user>, $doc: {
+  line: record<orderLine>,
+  asset: record<asset>
+}) {
+  RETURN $doc;
+};
+"#;
+
+#[test]
+fn reports_a_string_literal_passed_to_a_record_parameter() {
+    // The motivating case: `fn::doc::add("", 9)`.
+    let source = format!("{DOC_ADD}\nfn::doc::add(\"\", 9);");
+    let diagnostics = diagnostics_for(&source);
+
+    let argument_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(&d.code,
+            Some(tower_lsp_server::ls_types::NumberOrString::String(c)) if c == "argument-type")
+        })
+        .collect();
+
+    let messages: Vec<&str> = argument_errors.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec![
+            "Argument 1 of `fn::doc::add` expects `record<user>`, found `string`.",
+            "Argument 2 of `fn::doc::add` expects `{ line: record<orderLine>, asset: record<asset> }`, found `int`.",
+        ],
+        "both arguments are definite mismatches"
+    );
+    assert!(
+        argument_errors
+            .iter()
+            .all(|d| d.severity == Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR))
+    );
+
+    // The squiggle must cover only the offending argument, not the whole
+    // statement — every other diagnostic in this server uses a
+    // statement-wide range, so this is the likeliest thing to regress.
+    let range = argument_errors[0].range;
+    assert_eq!(range.start.line, range.end.line);
+    assert_eq!(
+        range.end.character - range.start.character,
+        2,
+        "range should span exactly the `\"\"` literal"
+    );
+}
+
+#[test]
+fn reports_a_number_passed_to_a_record_parameter() {
+    let source = r#"
+        DEFINE FUNCTION fn::canUserEdit($user: record<user>, $target: record<orderLine>) -> bool {
+            RETURN true;
+        };
+        RETURN fn::canUserEdit(user:tobie, 42);
+    "#;
+    let diagnostics = diagnostics_for(source);
+    let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+    assert!(
+        messages
+            .contains(&"Argument 2 of `fn::canUserEdit` expects `record<orderLine>`, found `int`."),
+        "got {messages:?}"
+    );
+    // A correct `record<user>` argument must not be flagged.
+    assert!(
+        !messages.iter().any(|m| m.starts_with("Argument 1 of")),
+        "argument 1 is a valid record<user>, got {messages:?}"
+    );
+}
+
+#[test]
+fn reports_wrong_argument_count() {
+    let source = format!("{DOC_ADD}\nfn::doc::add(user:tobie);");
+    let diagnostics = diagnostics_for(&source);
+    let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+    assert!(
+        messages.contains(&"`fn::doc::add` expects 2 arguments, found 1."),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn trailing_optional_parameters_may_be_omitted() {
+    let source = r#"
+        DEFINE FUNCTION fn::update($id: record<orderLine>, $extra: option<object>) {
+            RETURN $id;
+        };
+        RETURN fn::update(orderLine:one);
+    "#;
+    assert!(
+        !codes_of(&diagnostics_for(source)).contains(&"argument-count".to_string()),
+        "a trailing option<T> parameter is not required"
+    );
+}
+
+#[test]
+fn correct_calls_produce_no_argument_diagnostics() {
+    let source = r#"
+        DEFINE FUNCTION fn::greet($name: string, $times: int) -> string {
+            RETURN $name;
+        };
+        RETURN fn::greet('hi', 3);
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.iter().any(|c| c.starts_with("argument-")),
+        "valid call flagged: {codes:?}"
+    );
+}
+
+#[test]
+fn uncertain_arguments_stay_silent() {
+    // Every one of these is a construct the typer cannot pin down. All
+    // must be silent rather than guessed at — a false positive here is
+    // far worse than a missed error.
+    let cases = [
+        // A variable: no scope table yet.
+        "RETURN fn::take($x);",
+        // A method idiom.
+        "RETURN fn::take($v.trim());",
+        // A builtin whose declared return type is itself unmodellable
+        // (`type::field(any) -> field`).
+        "RETURN fn::take(type::field('x'));",
+        // An arithmetic expression.
+        "RETURN fn::take(1 + 2);",
+        // NONE into a non-optional slot is a runtime concern.
+        "RETURN fn::take(NONE);",
+        // A nested function call whose return type is undeclared.
+        "RETURN fn::take(fn::other());",
+    ];
+
+    for case in cases {
+        let source =
+            format!("DEFINE FUNCTION fn::take($value: record<user>) {{ RETURN $value; }};\n{case}");
+        let codes = codes_of(&diagnostics_for(&source));
+        assert!(
+            !codes.contains(&"argument-type".to_string()),
+            "`{case}` should be silent, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn comments_between_arguments_are_not_counted_as_arguments() {
+    // Comment/BlockComment are named `extras` in this grammar, so a naive
+    // named-child count sees three arguments here.
+    let source = r#"
+        DEFINE FUNCTION fn::pair($a: string, $b: string) { RETURN $a; };
+        RETURN fn::pair('x', /* note */ 'y');
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-count".to_string()),
+        "a comment is not an argument: {codes:?}"
+    );
+}
+
+#[test]
+fn adversarial_fixture_reports_no_argument_diagnostics() {
+    // The strongest false-positive guard available: 22 typed functions
+    // and ~50 call sites of production code that must stay clean.
+    let source = include_str!("fixtures/adversarial.surql");
+    let codes = codes_of(&diagnostics_for(source));
+    let noisy: Vec<_> = codes
+        .iter()
+        .filter(|code| code.starts_with("argument-") || *code == "let-type")
+        .collect();
+    assert!(noisy.is_empty(), "false positives on real code: {noisy:?}");
+}
+
+#[test]
+fn builtin_return_types_flow_into_argument_checking() {
+    // `type::record(table, key) -> record` is in the builtin table as a
+    // signature *string*; parsing its `-> T` tail is what makes this work.
+    let source = r#"
+        DEFINE FUNCTION fn::take($value: record<user>) { RETURN $value; };
+        RETURN fn::take(type::record('user', 'beau'));
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "a bare `record` fits `record<user>`: {codes:?}"
+    );
+
+    // …and the same return type is rejected where it genuinely cannot fit.
+    let bad = r#"
+        DEFINE FUNCTION fn::take($value: int) { RETURN $value; };
+        RETURN fn::take(type::string(1));
+    "#;
+    let messages: Vec<String> = diagnostics_for(bad)
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("expects `int`, found `string`")),
+        "type::string(...) -> string should be caught: {messages:?}"
+    );
+}
+
+#[test]
+fn reports_each_bad_property_of_an_object_argument() {
+    // The reported case: `{ line: 15102, asset: 2 }` against
+    // `{ line: record<orderLine>, asset: record<asset> }`.
+    let source = format!(
+        "{DOC_ADD}\nLET $r = type::record(\"user\", \"beau\");\n\
+         fn::doc::add($r, {{ line: 15102, asset: 2 }});"
+    );
+    let diagnostics = diagnostics_for(&source);
+    let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+    assert!(
+        messages.contains(
+            &"Argument 2 of `fn::doc::add`: property `line` expects `record<orderLine>`, found `int`."
+        ),
+        "got {messages:?}"
+    );
+    assert!(
+        messages.contains(
+            &"Argument 2 of `fn::doc::add`: property `asset` expects `record<asset>`, found `int`."
+        ),
+        "got {messages:?}"
+    );
+
+    // Each squiggle covers just that property's value.
+    let line_error = diagnostics
+        .iter()
+        .find(|d| d.message.contains("property `line`"))
+        .expect("line error");
+    assert_eq!(
+        line_error.range.end.character - line_error.range.start.character,
+        5,
+        "range should span exactly `15102`"
+    );
+}
+
+#[test]
+fn reports_a_missing_required_object_property() {
+    let source = format!("{DOC_ADD}\nfn::doc::add(user:a, {{ line: orderLine:b }});");
+    let messages: Vec<String> = diagnostics_for(&source)
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+
+    assert!(
+        messages.contains(
+            &"Argument 2 of `fn::doc::add`: missing required property `asset`.".to_string()
+        ),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn object_argument_with_correct_properties_is_silent() {
+    let source =
+        format!("{DOC_ADD}\nfn::doc::add(user:a, {{ line: orderLine:b, asset: asset:c }});");
+    let codes = codes_of(&diagnostics_for(&source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "a correct object literal was flagged: {codes:?}"
+    );
+}
+
+#[test]
+fn optional_object_properties_may_be_omitted() {
+    let source = r#"
+        DEFINE FUNCTION fn::save($opts: { name: string, note: option<string> }) {
+            RETURN $opts;
+        };
+        RETURN fn::save({ name: 'x' });
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "an option<T> property is not required: {codes:?}"
+    );
+}
+
+#[test]
+fn extra_object_properties_are_not_reported() {
+    // Unconfirmed that SurrealQL seals object types, so this stays quiet.
+    let source = r#"
+        DEFINE FUNCTION fn::save($opts: { name: string }) { RETURN $opts; };
+        RETURN fn::save({ name: 'x', extra: 1 });
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "extra properties must stay silent: {codes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LET bindings and variable types
+// ---------------------------------------------------------------------------
+
+/// Hover markdown at the first occurrence of `needle` in `source`.
+fn hover_at(source: &str, needle: &str) -> Option<String> {
+    let analysis =
+        analyze_document(uri("hover.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    let offset = source.find(needle).expect("needle present");
+    let line = source[..offset].matches('\n').count() as u32;
+    let column = (offset - source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+
+    model.hover_markdown_at(&analysis, Position::new(line, column), needle, None)
+}
+
+#[test]
+fn let_bound_variable_reports_its_inferred_type() {
+    // `type::record`'s signature can only promise `-> record`, but the
+    // call names the table, so the binding should carry `record<user>`.
+    let source = "LET $r = type::record(\"user\", \"beau\");\nRETURN $r;";
+    let hover = hover_at(source, "$r").expect("hover for $r");
+
+    assert!(hover.contains("LET $r"), "got {hover}");
+    assert!(hover.contains("Type: `record<user>`"), "got {hover}");
+}
+
+#[test]
+fn record_constructors_are_narrowed_to_the_named_table() {
+    for (value, expected) in [
+        // Both argument orders the builtin accepts.
+        ("type::record('user', 'beau')", "record<user>"),
+        ("type::record(\"user\", \"beau\")", "record<user>"),
+        ("type::thing('user', 'beau')", "record<user>"),
+        // Single-argument form takes a whole record id.
+        ("type::record('user:beau')", "record<user>"),
+    ] {
+        let source = format!("LET $v = {value};\nRETURN $v;");
+        let hover = hover_at(&source, "$v").unwrap_or_default();
+        assert!(
+            hover.contains(&format!("Type: `{expected}`")),
+            "`{value}` should be `{expected}`, got {hover}"
+        );
+    }
+}
+
+#[test]
+fn record_constructors_stay_coarse_when_the_table_is_dynamic() {
+    // The table is only knowable when it is a literal. Anything else must
+    // fall back to the signature's bare `record`, which is assignable to
+    // any `record<T>` and so cannot cause a false positive.
+    for value in [
+        "type::record($table, 'beau')",
+        "type::record($id)",
+        "type::record(fn::pick(), 'beau')",
+    ] {
+        let source = format!("LET $v = {value};\nRETURN $v;");
+        let hover = hover_at(&source, "$v").unwrap_or_default();
+        assert!(
+            hover.contains("Type: `record`"),
+            "`{value}` should stay a bare `record`, got {hover}"
+        );
+    }
+}
+
+#[test]
+fn a_narrowed_record_is_checked_against_the_parameter_table() {
+    // The payoff: this used to pass silently, because a bare `record` is
+    // assignable to every `record<T>`.
+    let source = r#"
+        DEFINE FUNCTION fn::take($user: record<user>) { RETURN $user; };
+        LET $c = type::record('company', 'acme');
+        RETURN fn::take($c);
+    "#;
+    let messages: Vec<String> = diagnostics_for(source)
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("expects `record<user>`, found `record<company>`")),
+        "a mismatched table should now be caught: {messages:?}"
+    );
+}
+
+#[test]
+fn a_narrowed_record_matching_the_parameter_is_silent() {
+    let source = r#"
+        DEFINE FUNCTION fn::take($user: record<user>) { RETURN $user; };
+        LET $u = type::record('user', 'beau');
+        RETURN fn::take($u);
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "record<user> into record<user> must be silent: {codes:?}"
+    );
+}
+
+#[test]
+fn let_bound_variable_types_from_literals() {
+    for (value, expected) in [
+        ("'hello'", "string"),
+        ("42", "int"),
+        ("1.5", "float"),
+        ("true", "bool"),
+        ("user:beau", "record<user>"),
+        ("{ a: 1 }", "{ a: int }"),
+    ] {
+        let source = format!("LET $v = {value};\nRETURN $v;");
+        let hover = hover_at(&source, "$v").unwrap_or_default();
+        assert!(
+            hover.contains(&format!("Type: `{expected}`")),
+            "`{value}` should be `{expected}`, got {hover}"
+        );
+    }
+}
+
+#[test]
+fn a_typed_variable_satisfies_a_matching_parameter() {
+    let source = r#"
+        DEFINE FUNCTION fn::take($value: record<user>) { RETURN $value; };
+        LET $r = type::record('user', 'beau');
+        RETURN fn::take($r);
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "a bare `record` fits `record<user>`: {codes:?}"
+    );
+}
+
+#[test]
+fn a_typed_variable_is_checked_against_a_parameter() {
+    let source = r#"
+        DEFINE FUNCTION fn::take($value: record<user>) { RETURN $value; };
+        LET $name = 'beau';
+        RETURN fn::take($name);
+    "#;
+    let messages: Vec<String> = diagnostics_for(source)
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("expects `record<user>`, found `string`")),
+        "a string-typed variable should be caught: {messages:?}"
+    );
+}
+
+#[test]
+fn later_bindings_shadow_earlier_ones() {
+    let source = "LET $x = 1;\nLET $x = 'later';\nRETURN $x;";
+    let analysis =
+        analyze_document(uri("shadow.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    // On the `RETURN` line, the second binding wins.
+    let hover = model
+        .hover_markdown_at(&analysis, Position::new(2, 8), "$x", None)
+        .expect("hover");
+    assert!(hover.contains("Type: `string`"), "got {hover}");
+}
+
+#[test]
+fn a_binding_is_not_visible_before_its_declaration() {
+    let source = "RETURN $later;\nLET $later = 1;";
+    let hover = hover_at(source, "$later");
+    assert!(
+        hover.is_none(),
+        "a variable used before LET must not resolve, got {hover:?}"
+    );
+}
+
+#[test]
+fn block_scoped_bindings_do_not_leak() {
+    let source = r#"
+        DEFINE FUNCTION fn::wrap() {
+            LET $inner = 'hidden';
+            RETURN $inner;
+        };
+        RETURN $inner;
+    "#;
+    let analysis =
+        analyze_document(uri("scope.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    // The trailing `RETURN $inner;` is outside the function body.
+    let outer = source.rfind("$inner").expect("outer use");
+    let line = source[..outer].matches('\n').count() as u32;
+    let column = (outer - source[..outer].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    assert!(
+        model
+            .hover_markdown_at(&analysis, Position::new(line, column), "$inner", None)
+            .is_none(),
+        "a LET inside a function body must not escape it"
+    );
+}
+
+#[test]
+fn function_parameters_are_bound_inside_the_body() {
+    let source = r#"
+        DEFINE FUNCTION fn::greet($name: string) { RETURN $name; };
+    "#;
+    let hover = hover_at(source, "$name").unwrap_or_default();
+    // The first `$name` is the declaration site itself, which sits outside
+    // the body span; the binding is what the body sees.
+    let body_use = source.rfind("$name").expect("body use");
+    let analysis =
+        analyze_document(uri("params.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+    let line = source[..body_use].matches('\n').count() as u32;
+    let column = (body_use - source[..body_use].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+
+    let inside = model
+        .hover_markdown_at(&analysis, Position::new(line, column), "$name", None)
+        .expect("hover inside body");
+    assert!(inside.contains("Type: `string`"), "got {inside} / {hover}");
+}
+
+#[test]
+fn declared_let_type_is_checked_against_the_value() {
+    let messages: Vec<String> = diagnostics_for("LET $n: int = 'not a number';")
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages.contains(&"`$n` is declared `int` but the value is `string`.".to_string()),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn declared_let_type_is_silent_when_it_matches() {
+    let codes = codes_of(&diagnostics_for("LET $n: int = 42;"));
+    assert!(!codes.contains(&"let-type".to_string()), "{codes:?}");
+}
+
+#[test]
+fn unresolvable_initializers_leave_the_variable_untyped() {
+    // Must not guess. Each of these stays `Unknown`, so downstream uses
+    // of the variable stay silent too.
+    for value in ["$other", "$a.b", "$v.trim()", "1 + 2"] {
+        let source = format!(
+            "DEFINE FUNCTION fn::take($value: record<user>) {{ RETURN $value; }};\n\
+             LET $v = {value};\nRETURN fn::take($v);"
+        );
+        let codes = codes_of(&diagnostics_for(&source));
+        assert!(
+            !codes.contains(&"argument-type".to_string()),
+            "`{value}` should leave $v untyped, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn in_scope_variables_are_offered_for_completion() {
+    let source = "LET $total = 42;\nLET $name = 'x';\nRETURN ";
+    let analysis =
+        analyze_document(uri("complete.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    let items = model.variable_completion_items(&analysis, Position::new(2, 7), "");
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+    assert!(labels.contains(&"$total"), "got {labels:?}");
+    assert!(labels.contains(&"$name"), "got {labels:?}");
+    let total = items.iter().find(|i| i.label == "$total").expect("$total");
+    assert_eq!(total.detail.as_deref(), Some("int"));
+}
+
+#[test]
+fn out_of_scope_variables_are_not_offered() {
+    let source = "DEFINE FUNCTION fn::wrap() { LET $hidden = 1; RETURN $hidden; };\nRETURN ";
+    let analysis =
+        analyze_document(uri("complete.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    let items = model.variable_completion_items(&analysis, Position::new(1, 7), "");
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"$hidden"),
+        "a function-local binding leaked: {labels:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parameter types at the hover / signature-help surfaces
+// ---------------------------------------------------------------------------
+//
+// These assert the rendered strings a user actually reads. Parameter types
+// were previously only covered *indirectly*, through diagnostic message
+// text — so a regression in `function_signature` could have gone unnoticed
+// while every diagnostic test stayed green.
+
+#[test]
+fn function_hover_renders_full_generic_parameter_types() {
+    let source = r#"DEFINE FUNCTION fn::doc::add($user: record<user>, $doc: {
+  line: record<orderLine>,
+  asset: record<asset>
+}) -> record<orderDoc> {
+  RETURN $doc;
+};"#;
+    let analysis =
+        analyze_document(uri("sig.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    let hover = model
+        .hover_markdown_for_token("fn::doc::add", None)
+        .expect("hover for the function");
+
+    // The generic argument must survive all the way to the rendered string.
+    assert!(
+        hover.contains("$user: record<user>"),
+        "expected `$user: record<user>`, got:\n{hover}"
+    );
+    assert!(
+        hover.contains("$doc: { line: record<orderLine>, asset: record<asset> }"),
+        "expected the full inline object type, got:\n{hover}"
+    );
+    assert!(
+        hover.contains("-> record<orderDoc>"),
+        "expected the generic return type, got:\n{hover}"
+    );
+    // Guard against the specific regression reported: a bare `record`.
+    assert!(
+        !hover.contains("$user: record,") && !hover.contains("$user: record "),
+        "parameter type was flattened to a bare `record`:\n{hover}"
+    );
+}
+
+#[test]
+fn function_hover_keeps_other_generic_type_shapes() {
+    let source = r#"DEFINE FUNCTION fn::mix(
+  $ids: record<orderData | project>,
+  $piles: array<record<orderLine>>,
+  $note: option<string>,
+  $pair: [string, string]
+) { RETURN $ids; };"#;
+    let analysis =
+        analyze_document(uri("sig2.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    let hover = model
+        .hover_markdown_for_token("fn::mix", None)
+        .expect("hover");
+
+    for expected in [
+        "$ids: record<orderData | project>",
+        "$piles: array<record<orderLine>>",
+        "$note: option<string>",
+        "$pair: [string, string]",
+    ] {
+        assert!(
+            hover.contains(expected),
+            "missing `{expected}` in:\n{hover}"
+        );
+    }
+}
+
+#[test]
+fn signature_help_labels_match_the_hover_signature() {
+    // `signature_help` and function hover used to format parameters with
+    // two separate copies of the same code. They now share
+    // `param_label` / `function_signature`, so this pins the shared shape
+    // and the generics that flow through it.
+    let source = r#"DEFINE FUNCTION fn::doc::add($user: record<user>, $doc: {
+  line: record<orderLine>,
+  asset: record<asset>
+}) { RETURN $doc; };"#;
+    let analysis =
+        analyze_document(uri("sighelp.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+    let function = model
+        .functions
+        .get("fn::doc::add")
+        .expect("indexed function");
+
+    let labels: Vec<String> = function.params.iter().map(param_label).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "$user: record<user>".to_string(),
+            "$doc: { line: record<orderLine>, asset: record<asset> }".to_string(),
+        ]
+    );
+
+    // The overall signature is built from exactly those labels.
+    let signature = function_signature(function);
+    for label in &labels {
+        assert!(
+            signature.contains(label),
+            "signature `{signature}` is missing `{label}`"
+        );
+    }
+}
+
+#[test]
+fn unannotated_parameters_render_without_a_type() {
+    let source = "DEFINE FUNCTION fn::loose($a, $b) { RETURN $a; };";
+    let analysis =
+        analyze_document(uri("loose.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+    let function = model.functions.get("fn::loose").expect("indexed");
+
+    assert_eq!(function_signature(function), "fn::loose($a, $b)");
+}
+
+#[test]
+fn build_version_identifies_the_binary() {
+    // Exists so "is the editor running the binary I just built?" is a
+    // question you can answer by reading `serverInfo.version`, rather than
+    // by deducing it from behaviour.
+    let version = surrealql_language_server::core::server::build_version();
+
+    assert!(
+        version.starts_with(env!("CARGO_PKG_VERSION")),
+        "should lead with the crate version, got {version}"
+    );
+    assert!(
+        version.contains("grammar "),
+        "should name the grammar revision, got {version}"
+    );
+    // The bare crate version alone is what made this ambiguous.
+    assert_ne!(version, env!("CARGO_PKG_VERSION"));
+}
+
+// ---------------------------------------------------------------------------
+// Undefined variable references
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reports_an_undefined_variable_with_a_suggestion() {
+    // The reported case: a typo'd `$f` inside an object literal. SurrealDB
+    // substitutes NONE for an unset param rather than failing, so nothing
+    // at runtime would tell you either.
+    let source = r#"
+        LET $r = user:beau;
+        LET $x = orderLine:a;
+        LET $f = file:b;
+        RETURN { line: $x, asset: $fx };
+    "#;
+    let diagnostics = diagnostics_for(source);
+    let undefined: Vec<&str> = diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(&d.code,
+            Some(tower_lsp_server::ls_types::NumberOrString::String(c))
+                if c == "undefined-variable")
+        })
+        .map(|d| d.message.as_str())
+        .collect();
+
+    assert_eq!(
+        undefined,
+        vec!["`$fx` is not defined. Did you mean `$f`?"],
+        "all of {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let error = diagnostics
+        .iter()
+        .find(|d| d.message.starts_with("`$fx`"))
+        .expect("the error");
+    assert_eq!(
+        error.severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
+    );
+    // Squiggle covers exactly `$fx`.
+    assert_eq!(error.range.end.character - error.range.start.character, 3);
+}
+
+#[test]
+fn every_binding_form_counts_as_defined() {
+    let source = r#"
+        DEFINE PARAM $page_size VALUE 20;
+        DEFINE FUNCTION fn::use($param: int) {
+            LET $local = 1;
+            FOR $item IN [1, 2] {
+                RETURN $item + $local + $param + $page_size;
+            };
+            RETURN $local;
+        };
+        LET $top = 1;
+        RETURN $top + $page_size;
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"undefined-variable".to_string()),
+        "a legitimate binding was flagged: {codes:?}"
+    );
+}
+
+#[test]
+fn special_variables_are_never_undefined() {
+    let source = r#"
+        DEFINE FIELD name ON person TYPE string VALUE $value;
+        DEFINE EVENT audit ON TABLE person WHEN $event = 'UPDATE' THEN {
+            LET $id = ($after OR $before).id;
+            RETURN $id;
+        };
+        RETURN [$auth, $this, $session, $token, $request, $parent, $input];
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"undefined-variable".to_string()),
+        "a language-provided variable was flagged: {codes:?}"
+    );
+}
+
+#[test]
+fn bindings_inside_a_then_clause_block_are_visible() {
+    // `DEFINE EVENT … THEN { … }` nests its block in a `ThenClause`, so it
+    // is not a direct `Block` child of the DEFINE. Walking only direct
+    // children left every `LET` in there unbound.
+    let source = r#"
+        DEFINE EVENT lineUpdate ON TABLE orderLine WHEN $event != 'DELETE' THEN {
+            IF $event != 'DELETE' {
+                LET $bef = $before.id;
+                LET $aft = $after.id;
+                IF $bef != $aft {
+                    LET $who = $after.updatedBy;
+                    RETURN [$bef, $aft, $who];
+                };
+            };
+        };
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"undefined-variable".to_string()),
+        "a LET nested in a THEN block was flagged: {codes:?}"
+    );
+}
+
+#[test]
+fn out_of_scope_uses_are_reported() {
+    let source = r#"
+        DEFINE FUNCTION fn::wrap() { LET $inner = 1; RETURN $inner; };
+        RETURN $inner;
+    "#;
+    let messages: Vec<String> = diagnostics_for(source)
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages.contains(&"`$inner` is not defined.".to_string()),
+        "a function-local binding must not be visible outside: {messages:?}"
+    );
+}
+
+#[test]
+fn caller_bound_variables_can_be_declared_in_config() {
+    let source = "SELECT * FROM person WHERE id = $wanted;";
+    let analysis =
+        analyze_document(uri("bind.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    // Undeclared: reported, since nothing in the file binds it.
+    let strict = model.semantic_diagnostics(&analysis, &ServerSettings::default());
+    assert!(
+        strict.iter().any(|d| d.message.contains("`$wanted`")),
+        "expected a report by default"
+    );
+
+    // Declared as caller-bound: silent.
+    let mut settings = ServerSettings::default();
+    settings.analysis.external_params = vec!["wanted".to_string()];
+    let relaxed = model.semantic_diagnostics(&analysis, &settings);
+    assert!(
+        !relaxed.iter().any(|d| d.message.contains("`$wanted`")),
+        "externalParams should suppress it, got {:?}",
+        relaxed.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn syntax_errors_do_not_produce_invented_variable_errors() {
+    // A `LET` the parser choked on binds nothing, so every later use would
+    // look undefined. The syntax error is reported on its own; piling name
+    // errors on top of it is noise.
+    let source = "LET $ok = @@@ broken @@@;\nRETURN $ok;";
+    let analysis =
+        analyze_document(uri("broken.surql"), source, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        !analysis.syntax_diagnostics.is_empty(),
+        "fixture should actually fail to parse"
+    );
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"undefined-variable".to_string()),
+        "should stay quiet inside a broken parse: {codes:?}"
+    );
+}
+
+#[test]
+fn adversarial_fixture_reports_no_undefined_variables() {
+    let source = include_str!("fixtures/adversarial.surql");
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"undefined-variable".to_string()),
+        "false positives on real code: {codes:?}"
+    );
+}
+
+#[test]
+fn expression_bodied_closure_parameters_are_bound() {
+    // A closure body can be a bare expression with no `Block`, so scoping
+    // its parameters to a block child binds nothing.
+    let source = "LET $xs = ['a', 'b'];\nRETURN $xs.filter(|$item| $item != 'a');";
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"undefined-variable".to_string()),
+        "closure parameter was flagged: {codes:?}"
     );
 }

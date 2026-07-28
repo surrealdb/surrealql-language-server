@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+Type-inference release. Parameter annotations were being discarded
+wholesale — `FunctionParam.type_expr` was *always* `None` — so nothing
+could type-check a call. This release makes declared types real and uses
+them.
+
+The checker's failure mode is **silence**: anything the inference engine
+cannot pin down yields `Unknown`, and the assignability relation turns
+any doubt into a verdict that reports nothing. A noisy checker gets
+switched off and then protects nobody.
+
+### Added
+
+- **Argument type checking** on `fn::` calls (`argument-type`,
+  `argument-count`), ranged at the offending argument rather than the
+  whole statement. Object literals report per property, so one bad field
+  in six names that field:
+  ``Argument 2 of `fn::doc::add`: property `line` expects
+  `record<orderLine>`, found `int`.``
+- **`undefined-variable`** with a did-you-mean. SurrealDB substitutes
+  `NONE` for an unset parameter rather than failing, so a typo silently
+  changes what a query means and nothing at runtime tells you.
+  `analysis.externalParams` declares names the caller binds at runtime
+  (SDK `.bind(…)`, Surrealist's variables panel).
+- **`let-type`** when a `LET $x: T = v` value cannot satisfy `T`.
+- **A binding table** for `LET`, function/closure parameters and `FOR`
+  loop variables, with block scoping and shadowing. `$variable` hover
+  and completion, neither of which existed.
+- **Structural types**: `TypeExpr` gained `Object`, `Tuple`, `Set` and
+  `Literal`, read from the grammar's own nodes. Builtin return types are
+  parsed from the signature table, with `type::record`/`type::thing`
+  narrowed to the table their argument names.
+- **Build provenance** in `serverInfo.version`
+  (`0.4.0 (branch-sha, grammar rev)`). The bare crate version is
+  identical on a branch and on the published release, so it could not
+  identify which binary an editor was talking to.
+- `analysis.enableTypeChecking` (default on) and
+  `analysis.externalParams`.
+
+### Fixed
+
+Each of these was a silent no-op: a node-kind constant naming a node the
+grammar never emits compiles fine and simply disables whatever matches
+on it.
+
+- Function **parameter types** were always `None` — `ParamDefinition`
+  puts a named `Colon` between the name and the type, so positional
+  adjacency never matched. Measured on the test fixture: **0/64 → 64/64**
+  extracted.
+- **Return types** looked for a `ReturnsClause` node that does not exist.
+- **`TYPE 'a' | 'b'` and `TYPE [string, string]`** were dropped, because
+  the type-payload lookup omitted `UnionType` and `LiteralType`.
+- **`LET`/`FOR`/`IF`/`RETURN` bodies were never descended into**, so
+  nested statements and bindings were invisible to analysis. Combined
+  with 0.3.0's tight diagnostic ranges, those statements now get
+  diagnostics for the first time.
+- Bindings inside `DEFINE EVENT … THEN { }` were never registered — the
+  block sits inside a `ThenClause`, not as a direct child.
+- Expression-bodied closures (`|$x| $x != 'Done'`) bound no parameters.
+- **`record<a | b>`** parsed as one table literally named `a | b`, which
+  then registered a phantom table.
+- **Inlay hints** looked up `model.functions` with the `fn::` prefix
+  stripped from a map keyed *with* it, so they never fired.
+- 17 dead node-kind constants removed. `node_kind.rs` now documents that
+  every constant must exist in `node-types.json`.
+
+### Compatibility
+
+- LSP wire: capabilities unchanged (pinned by `tests/compat.rs`);
+  `Diagnostic.source` and the syntax `parse` code unchanged. The four new
+  codes are additions.
+- New diagnostics are ERROR severity and on by default; the kill switch
+  is `analysis.enableTypeChecking`.
+- Config: both new keys accept camelCase and snake_case, like every
+  existing key, and are registered in the unknown-key sweep.
+- `serverInfo.version` now carries a build suffix after the semver. No
+  test pinned it; clients parsing it strictly should read the leading
+  version.
+- **Still outstanding:** 0.3.0 promised the legacy message-text quick-fix
+  fallback in `unknown_table_payload` would be removed in 0.4. It is
+  still present — removing it changes behaviour for clients that strip
+  `Diagnostic.data`, and no test covers that path, so it wants a
+  deliberate decision rather than being folded into this release.
+
 ## 0.3.0 — 2026-07-24
 
 Error-handling and diagnostics release. Everything the server used to

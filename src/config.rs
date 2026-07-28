@@ -86,6 +86,21 @@ pub struct AnalysisSettings {
     pub enable_aggressive_schema_inference: bool,
     #[serde(default = "default_true", alias = "enable_code_actions")]
     pub enable_code_actions: bool,
+    /// Report call arguments whose type cannot satisfy the declared
+    /// parameter type. Only definite mismatches are reported — anything
+    /// the inference engine is unsure about stays silent.
+    #[serde(default = "default_true", alias = "enable_type_checking")]
+    pub enable_type_checking: bool,
+    /// Variable names the *caller* binds at runtime, without a `$` sigil —
+    /// e.g. `["id", "limit"]` for a script run as
+    /// `db.query(sql).bind(("id", id))`, or the names in Surrealist's
+    /// variables panel.
+    ///
+    /// Such names are legitimately absent from the file, so the
+    /// undefined-variable check would otherwise flag them. Declaring them
+    /// here keeps the check strict everywhere else.
+    #[serde(default, alias = "external_params")]
+    pub external_params: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,6 +147,8 @@ impl Default for AnalysisSettings {
             enable_permission_analysis: true,
             enable_aggressive_schema_inference: true,
             enable_code_actions: true,
+            enable_type_checking: true,
+            external_params: Vec::new(),
         }
     }
 }
@@ -389,6 +406,10 @@ const ANALYSIS_KEYS: &[&str] = &[
     "enable_aggressive_schema_inference",
     "enableCodeActions",
     "enable_code_actions",
+    "enableTypeChecking",
+    "enable_type_checking",
+    "externalParams",
+    "external_params",
 ];
 const AUTH_CONTEXT_KEYS: &[&str] = &[
     "name",
