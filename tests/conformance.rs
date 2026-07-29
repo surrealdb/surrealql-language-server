@@ -116,15 +116,20 @@ fn the_fixture_still_covers_the_breadth_it_was_built_for() {
     );
 }
 
-/// The SurrealDB checkout, when this machine has one.
+/// The SurrealDB corpus, when this machine has a checkout.
+///
+/// `SURREALDB_DIR` first, then the sibling layout the grammar already uses.
+/// `None` in continuous integration, where the sweep skips.
 fn corpus_dir() -> Option<PathBuf> {
-    let configured = std::env::var_os("SURREALDB_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/Users/beaudenheijer/Documents/Github/internal/surrealdb")
-        });
-    let tests = configured.join("language-tests/tests");
-    tests.is_dir().then_some(tests)
+    let candidates = [
+        std::env::var_os("SURREALDB_DIR").map(PathBuf::from),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../surrealdb")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|path| path.join("language-tests/tests"))
+        .find(|tests| tests.is_dir())
 }
 
 fn surql_files(dir: &Path, out: &mut Vec<PathBuf>) {

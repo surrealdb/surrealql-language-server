@@ -16,20 +16,20 @@ use surrealql_language_server::grammar_generated::{
 };
 
 /// The SurrealDB checkout, when this machine has one.
+///
+/// `SURREALDB_DIR` first, then the sibling layout the grammar already uses
+/// (`../surrealdb` beside this repository). Returns `None` when neither holds a
+/// checkout, which is the normal case in continuous integration — the tests
+/// that need one skip rather than fail.
 fn surrealdb_dir() -> Option<PathBuf> {
-    if let Some(configured) = std::env::var_os("SURREALDB_DIR") {
-        let path = PathBuf::from(configured);
-        return path
-            .join("surrealdb/core/src/fnc/mod.rs")
-            .exists()
-            .then_some(path);
-    }
-    // The sibling layout this repository is developed in.
-    let sibling = PathBuf::from("/Users/beaudenheijer/Documents/Github/internal/surrealdb");
-    sibling
-        .join("surrealdb/core/src/fnc/mod.rs")
-        .exists()
-        .then_some(sibling)
+    let candidates = [
+        std::env::var_os("SURREALDB_DIR").map(PathBuf::from),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../surrealdb")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.join("surrealdb/core/src/fnc/mod.rs").is_file())
 }
 
 #[test]

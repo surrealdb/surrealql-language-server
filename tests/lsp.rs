@@ -2410,13 +2410,18 @@ fn a_call_with_an_unparseable_argument_is_never_flagged() {
         );
     }
 
-    // Contrast: a closure the grammar *can* read leaves the count meaningful,
-    // and `set::reduce(Set, Box<Closure>)` really does take two arguments.
+    // Contrast, using a construct whose parse does not depend on the grammar
+    // revision: the guard suppresses a call it *cannot read*, not every call.
+    //
+    // A closure would be the natural contrast here, and an earlier version of
+    // this test used one — but whether `|$a, $b| $a + $b` parses depends on the
+    // grammar revision. The pinned `826d0c2` accepts only a block body, while
+    // later revisions add an expression body, so the assertion passed locally
+    // and failed in continuous integration. Never assert a diagnostic on a
+    // construct whose parse tree differs between grammar revisions.
     assert!(
-        codes_of(&diagnostics_for(
-            "RETURN set::reduce([1, 2], |$a, $b| $a + $b, 0);"
-        ))
-        .contains(&"argument-count".to_string()),
+        codes_of(&diagnostics_for("RETURN array::at([1, 2], 0, 3);"))
+            .contains(&"argument-count".to_string()),
         "three arguments to a two-argument function is a real error"
     );
 }
