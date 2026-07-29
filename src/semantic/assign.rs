@@ -318,10 +318,16 @@ pub fn assignable(actual: &TypeExpr, expected: &TypeExpr) -> Verdict {
         | (Set(_), Array(_) | Tuple(_))
         | (Array(_) | Tuple(_), Set(_)) => Verdict::Incompatible,
 
-        (Scalar(_), Set(_)) | (Set(_), Scalar(_)) => Verdict::Incompatible,
-        (Scalar(_), Array(_) | Tuple(_)) | (Array(_) | Tuple(_), Scalar(_)) => {
-            Verdict::Incompatible
-        }
+        // A scalar flowing into a collection slot is a runtime question, not an
+        // error. An aggregate supplies the whole group where the source text
+        // names one field, so `math::sum(<float> usage)` inside
+        // `AS SELECT … GROUP BY …` is valid SurrealQL even though the argument
+        // reads as a single float. Modelling that context is out of reach, and
+        // reporting it flagged SurrealDB's own view tests.
+        (Scalar(_), Set(_) | Array(_) | Tuple(_)) => Verdict::Unknown,
+        // The reverse stays an error: a collection where a scalar is wanted is
+        // wrong in any context, and `array::at([1, 2], [1, 2])` depends on it.
+        (Set(_), Scalar(_)) | (Array(_) | Tuple(_), Scalar(_)) => Verdict::Incompatible,
         (Scalar(_), Object(_)) | (Object(_), Scalar(_)) => Verdict::Incompatible,
         (Scalar(_), Record(_)) | (Record(_), Scalar(_)) => Verdict::Incompatible,
 
@@ -584,8 +590,17 @@ mod tests {
             assignable(&arr(s("any")), &arr(rec(&["user"]))),
             Verdict::Compatible
         );
+        // A scalar into a collection slot is a runtime question, not an error:
+        // an aggregate hands the function the whole group where the source text
+        // names a single field, so `math::sum(<float> usage)` in
+        // `AS SELECT … GROUP BY …` is valid. Reporting it flagged SurrealDB's
+        // own view tests. The reverse direction stays an error.
         assert_eq!(
             assignable(&s("string"), &arr(s("string"))),
+            Verdict::Unknown
+        );
+        assert_eq!(
+            assignable(&arr(s("string")), &s("string")),
             Verdict::Incompatible
         );
     }

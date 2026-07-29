@@ -1,0 +1,6 @@
+[alias]
+# Run the code generators. See `xtask/src/main.rs`.
+#
+#   cargo xtask generate-builtins --surrealdb <path-to-surrealdb-checkout>
+#   cargo xtask generate-builtins --surrealdb <path> --check
+xtask = 'run --package xtask --'

@@ -11,16 +11,16 @@ use strsim::jaro_winkler;
 use crate::config::{AuthContext, ServerSettings};
 use crate::grammar::{
     BUILTIN_FUNCTIONS, BUILTIN_NAMESPACES, BuiltinFunction, KEYWORDS, SPECIAL_VARIABLES,
-    builtin_function, builtin_namespace,
+    builtin_function, builtin_namespace, builtin_signature,
 };
 use crate::semantic::codes;
 use crate::semantic::text::compact_preview;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
-    AccessDef, AccessResult, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
-    FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel, NamedRange, ParamDef,
-    PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef,
-    TargetResolution, WorkspaceIndex,
+    AccessDef, AccessResult, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef,
+    FunctionLanguage, FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel,
+    NamedRange, ParamDef, PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin,
+    TableDef, TargetResolution, WorkspaceIndex,
 };
 
 impl MergedSemanticModel {
@@ -170,6 +170,31 @@ impl MergedSemanticModel {
                 ..CompletionItem::default()
             })
             .collect()
+    }
+
+    /// The `DEFINE ANALYZER` names, for the slots that reference one.
+    pub fn analyzer_completion_items(&self, prefix: &str) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = self
+            .analyzers
+            .values()
+            .filter(|analyzer| prefix.is_empty() || analyzer.name.starts_with(prefix))
+            .map(|analyzer| CompletionItem {
+                label: analyzer.name.clone(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some(format!(
+                    "Analyzer, source: {}",
+                    origin_label(analyzer.origin)
+                )),
+                sort_text: Some(format!(
+                    "0-{}-{}",
+                    symbol_priority(analyzer.origin),
+                    analyzer.name
+                )),
+                ..CompletionItem::default()
+            })
+            .collect();
+        items.sort_by(|left, right| left.label.cmp(&right.label));
+        items
     }
 
     pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
@@ -354,8 +379,15 @@ impl MergedSemanticModel {
         if let Some(function) = self.functions.get(trimmed) {
             return Some(format_function_hover(function));
         }
+        // The curated table first: its 79 entries carry prose and a docs link
+        // that no generator can produce.
         if let Some(function) = builtin_function(trimmed) {
             return Some(format_builtin_function_hover(function, trimmed));
+        }
+        // Then the generated catalogue, which covers the other 18 namespaces.
+        // Before this, hovering `math::abs` answered nothing at all.
+        if let Some(signature) = builtin_signature(trimmed) {
+            return Some(format_generated_function_hover(signature, trimmed));
         }
         if let Some(param) = self.params.get(trimmed) {
             return Some(format_param_hover(param));
@@ -583,6 +615,30 @@ impl MergedSemanticModel {
                         kind: MarkupKind::Markdown,
                         value: (*description).to_string(),
                     })),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+
+        // `DEFINE PARAM` names. The model has held these all along — hover and
+        // go-to-definition both resolve them — but nothing ever offered them,
+        // so a parameter defined in another file was invisible while typing.
+        for param in self.params.values() {
+            if prefix.is_empty() || param.name.starts_with(prefix) {
+                items.push(CompletionItem {
+                    label: param.name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(format!(
+                        "DEFINE PARAM, source: {}",
+                        origin_label(param.origin)
+                    )),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format_param_hover(param),
+                    })),
+                    // Above the special variables, which carry no sort text: a
+                    // parameter the author defined is likelier than `$before`.
+                    sort_text: Some(format!("0-1-{}", param.name)),
                     ..CompletionItem::default()
                 });
             }
@@ -856,6 +912,37 @@ impl MergedSemanticModel {
                     }));
                 }
             }
+
+            // A renamed builtin. The old name sits in the diagnostic's own
+            // range, and the engine records the replacement, so the fix needs no
+            // payload beyond the text already there.
+            if codes::has_code(diagnostic, codes::RENAMED_FUNCTION)
+                && let Some(old) = text_in_range(&analysis.text, diagnostic.range)
+                && let Some(current) = crate::grammar::renamed_builtin(old.trim())
+            {
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Rename `{}` to `{current}`", old.trim()),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    is_preferred: Some(true),
+                    edit: Some(WorkspaceEdit {
+                        document_changes: Some(DocumentChanges::Operations(vec![
+                            ls_types::DocumentChangeOperation::Edit(TextDocumentEdit {
+                                text_document: OptionalVersionedTextDocumentIdentifier {
+                                    uri: uri.clone(),
+                                    version: None,
+                                },
+                                edits: vec![OneOf::Left(TextEdit {
+                                    range: diagnostic.range,
+                                    new_text: current.to_string(),
+                                })],
+                            }),
+                        ])),
+                        ..WorkspaceEdit::default()
+                    }),
+                    ..CodeAction::default()
+                }));
+            }
         }
 
         for table in analysis
@@ -1053,6 +1140,9 @@ impl MergedSemanticModel {
         }
         for access in &analysis.accesses {
             merge_access(&mut self.accesses, access);
+        }
+        for analyzer in &analysis.analyzers {
+            merge_analyzer(&mut self.analyzers, analyzer);
         }
     }
 
@@ -1264,6 +1354,15 @@ fn merge_param(target: &mut HashMap<String, ParamDef>, candidate: &ParamDef) {
     target.insert(candidate.name.clone(), candidate.clone());
 }
 
+fn merge_analyzer(target: &mut HashMap<String, AnalyzerDef>, candidate: &AnalyzerDef) {
+    if let Some(current) = target.get(&candidate.name)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
+    }
+    target.insert(candidate.name.clone(), candidate.clone());
+}
+
 fn merge_access(target: &mut HashMap<String, AccessDef>, candidate: &AccessDef) {
     if let Some(current) = target.get(&candidate.name) {
         if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
@@ -1466,6 +1565,55 @@ fn format_builtin_function_hover(function: &BuiltinFunction, token: &str) -> Str
                 function.documentation_url
             )],
         )],
+    )
+}
+
+/// Hover for a builtin the curated table has no prose for.
+///
+/// Everything shown is derived from the engine's own source, so there is no
+/// summary to give — the signature and the namespace's documentation page are
+/// what we honestly have. Better than the nothing this used to return for 18 of
+/// the 20 advertised namespaces.
+/// The source text an LSP range covers.
+fn text_in_range(source: &str, range: ls_types::Range) -> Option<&str> {
+    let start = crate::semantic::text::position_to_offset(source, range.start);
+    let end = crate::semantic::text::position_to_offset(source, range.end);
+    source.get(start..end)
+}
+
+fn format_generated_function_hover(
+    signature: &crate::grammar::BuiltinSignature,
+    token: &str,
+) -> String {
+    let name = signature.generated.name;
+    let mut metadata = vec!["Source: builtin".to_string()];
+    if !token.eq_ignore_ascii_case(name) {
+        metadata.push(format!("Canonical name: `{name}`"));
+    }
+    if signature.generated.not_callable {
+        metadata.push(
+            "The parser accepts this name, but no implementation is reachable in call form."
+                .to_string(),
+        );
+    }
+
+    let mut sections = Vec::new();
+    if let Some(namespace) = name.split_once("::").map(|(namespace, _)| namespace) {
+        sections.push(list_section(
+            "Docs",
+            vec![format!(
+                "[SurrealDB reference](https://surrealdb.com/docs/surrealql/functions/database/{namespace})"
+            )],
+        ));
+    }
+
+    hover_block(
+        signature
+            .display_signature()
+            .unwrap_or_else(|| format!("{name}(…)")),
+        None,
+        metadata,
+        sections,
     )
 }
 
@@ -1832,6 +1980,7 @@ mod tests {
             functions: Vec::new(),
             params: Vec::new(),
             accesses: Vec::new(),
+            analyzers: Vec::new(),
             query_facts: Vec::new(),
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
@@ -1908,6 +2057,7 @@ mod tests {
                 functions: Vec::new(),
                 params: Vec::new(),
                 accesses: Vec::new(),
+                analyzers: Vec::new(),
                 query_facts: vec![fact],
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
@@ -1959,6 +2109,7 @@ mod tests {
                 functions: Vec::new(),
                 params: Vec::new(),
                 accesses: Vec::new(),
+                analyzers: Vec::new(),
                 query_facts: vec![crate::semantic::types::QueryFact {
                     action: QueryAction::Create,
                     target_tables: vec!["person".to_string()],
@@ -2055,6 +2206,7 @@ mod tests {
                 functions: Vec::new(),
                 params: Vec::new(),
                 accesses: Vec::new(),
+                analyzers: Vec::new(),
                 query_facts: vec![
                     make_fact(QueryAction::Select),
                     make_fact(QueryAction::Relate),
@@ -2098,6 +2250,7 @@ mod tests {
                 functions: Vec::new(),
                 params: Vec::new(),
                 accesses: Vec::new(),
+                analyzers: Vec::new(),
                 query_facts: Vec::new(),
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
@@ -2145,6 +2298,7 @@ mod tests {
                 functions: Vec::new(),
                 params: Vec::new(),
                 accesses: Vec::new(),
+                analyzers: Vec::new(),
                 query_facts: Vec::new(),
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
@@ -2203,6 +2357,7 @@ mod tests {
             functions: Vec::new(),
             params: Vec::new(),
             accesses: Vec::new(),
+            analyzers: Vec::new(),
             query_facts: Vec::new(),
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
@@ -2232,6 +2387,66 @@ mod tests {
             .expect("hover");
         assert!(hover.contains("type::is_record(any, table?: string) -> bool"));
         assert!(hover.contains("Canonical name: `type::is_record`"));
+    }
+
+    #[test]
+    fn hover_answers_for_the_namespaces_the_curated_table_never_covered() {
+        // 18 of the 20 advertised namespaces answered nothing at all before the
+        // generated catalogue existed.
+        let model = MergedSemanticModel::default();
+        for (token, expected) in [
+            (
+                "math::clamp",
+                "math::clamp(arg: number, min: number, max: number)",
+            ),
+            ("array::at", "array::at(array: array, i: int)"),
+            ("crypto::sha256", "crypto::sha256(arg: string)"),
+            (
+                "time::floor",
+                "time::floor(val: datetime, duration: duration)",
+            ),
+        ] {
+            let hover = model
+                .hover_markdown_for_token(token, None)
+                .unwrap_or_else(|| panic!("no hover for {token}"));
+            assert!(
+                hover.contains(expected),
+                "hover for {token} lacked `{expected}`:\n{hover}"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_for_a_generated_builtin_links_its_namespace_docs() {
+        let model = MergedSemanticModel::default();
+        let hover = model
+            .hover_markdown_for_token("math::clamp", None)
+            .expect("hover");
+        assert!(hover.contains("functions/database/math"), "{hover}");
+    }
+
+    #[test]
+    fn hover_still_prefers_the_curated_prose_where_it_exists() {
+        // The curated table carries a summary and a return type that no
+        // generator can produce; it must keep winning.
+        let model = MergedSemanticModel::default();
+        let hover = model
+            .hover_markdown_for_token("string::len", None)
+            .expect("hover");
+        assert!(hover.contains("Returns the length of a string"), "{hover}");
+        assert!(hover.contains("-> number"), "{hover}");
+    }
+
+    #[test]
+    fn hover_marks_a_name_that_parses_but_cannot_be_called() {
+        let model = MergedSemanticModel::default();
+        let hover = model
+            .hover_markdown_for_token("duration::set_day", None)
+            .expect("hover");
+        assert!(
+            hover.contains("no implementation is reachable"),
+            "the nine parse-but-not-callable names should say so:\n{hover}"
+        );
     }
 
     #[test]
@@ -2545,6 +2760,7 @@ mod tests {
             functions: Vec::new(),
             params: Vec::new(),
             accesses: Vec::new(),
+            analyzers: Vec::new(),
             query_facts: Vec::new(),
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),

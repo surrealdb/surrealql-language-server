@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use tree_sitter::Language;
 
+use crate::grammar_generated::{GENERATED_FUNCTIONS, RENAMED_FUNCTIONS};
 use crate::semantic::type_expr::TypeExpr;
 
 unsafe extern "C" {
@@ -24,6 +25,56 @@ pub struct BuiltinFunction {
     pub signature: &'static str,
     pub summary: &'static str,
     pub documentation_url: &'static str,
+}
+
+/// How many arguments one generated parameter accounts for.
+///
+/// Mirrors the engine's argument wrappers (`fnc/args.rs`). `Optional` is the
+/// engine's `Optional<T>`, which lowers the arity bound only — a supplied
+/// argument must still satisfy `ty`. It is *not* the SurrealQL type
+/// `option<T>`, which additionally permits `NONE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamForm {
+    Required,
+    Optional,
+    Variadic,
+}
+
+/// One parameter of a builtin function, as read from the engine's source.
+#[derive(Debug, Clone, Copy)]
+pub struct GeneratedParam {
+    /// The binding name in the engine's implementation, for parameter labels.
+    pub name: &'static str,
+    /// A SurrealQL type name, parsed into a `TypeExpr` on first use.
+    ///
+    /// `any` means "the generator could not model this", which silences the
+    /// argument check for the position rather than risking a false positive.
+    pub ty: &'static str,
+    pub form: ParamForm,
+}
+
+/// One entry of the generated catalogue.
+///
+/// Deliberately separate from [`BuiltinFunction`]: that table carries curated
+/// prose (`summary`, `documentation_url`) which no generator can produce, and
+/// this one carries argument types which no human should transcribe 434 times.
+/// Lookups read both.
+#[derive(Debug, Clone, Copy)]
+pub struct GeneratedFunction {
+    pub name: &'static str,
+    pub params: &'static [GeneratedParam],
+    pub is_async: bool,
+    /// The parser accepts this name but no dispatch arm implements it in call
+    /// form, so a query using it parses and then fails at run time.
+    pub not_callable: bool,
+    /// True when the generator read this function's implementation.
+    ///
+    /// Every argument check must consult this first. `params: &[]` with
+    /// `signature_known: false` means "we do not know", and an empty list is
+    /// indistinguishable from a genuinely zero-argument function without it —
+    /// so checking arity anyway would report "expects 0 arguments" for every
+    /// call to a function whose signature the generator could not read.
+    pub signature_known: bool,
 }
 
 pub const BUILTIN_NAMESPACES: &[&str] = &[
@@ -618,12 +669,264 @@ fn normalize_builtin_function_name(name: &str) -> String {
     if normalized.contains("::is::") {
         normalized = normalized.replace("::is::", "::is_");
     }
-    if normalized == "type::thing" {
-        normalized = "type::record".to_string();
+    // The engine records every rename itself, so resolve through its own table
+    // rather than hand-maintaining the special cases. `type::thing` →
+    // `type::record` is one of the 62 pairs.
+    if let Some((_, current)) = RENAMED_FUNCTIONS
+        .iter()
+        .find(|(previous, _)| previous.eq_ignore_ascii_case(&normalized))
+    {
+        normalized = (*current).to_string();
     }
     normalized
 }
 
+/// A builtin's argument types, from the generated catalogue.
+///
+/// Holds the generated entry next to one parsed [`TypeExpr`] per parameter, in
+/// the same order. Parsing happens once, in [`GENERATED_INDEX`], because a type
+/// checker looks a function up at every call site.
+#[derive(Debug)]
+pub struct BuiltinSignature {
+    pub generated: &'static GeneratedFunction,
+    /// One entry per element of `generated.params`, same order.
+    pub param_types: Vec<TypeExpr>,
+}
+
+impl BuiltinSignature {
+    /// The fewest arguments a caller may supply.
+    ///
+    /// Only a trailing run of optional and variadic parameters may be omitted.
+    pub fn required_arity(&self) -> usize {
+        self.generated
+            .params
+            .iter()
+            .rposition(|param| param.form == ParamForm::Required)
+            .map_or(0, |index| index + 1)
+    }
+
+    /// The most arguments a caller may supply, or `None` when a variadic
+    /// parameter makes the count unbounded.
+    pub fn maximum_arity(&self) -> Option<usize> {
+        if self
+            .generated
+            .params
+            .iter()
+            .any(|param| param.form == ParamForm::Variadic)
+        {
+            return None;
+        }
+        Some(self.generated.params.len())
+    }
+
+    /// One label per parameter, for signature help and inlay hints.
+    ///
+    /// `from: int`, `to?: int`, `value: any...` — the name and type come from
+    /// the engine's own implementation, and the suffix carries the arity.
+    pub fn param_labels(&self) -> Vec<String> {
+        self.generated
+            .params
+            .iter()
+            .map(|param| match param.form {
+                ParamForm::Required => format!("{}: {}", param.name, param.ty),
+                ParamForm::Optional => format!("{}?: {}", param.name, param.ty),
+                ParamForm::Variadic => format!("{}: {}...", param.name, param.ty),
+            })
+            .collect()
+    }
+
+    /// `math::clamp(arg: number, min: number, max: number)`.
+    ///
+    /// Rendered from the engine's parameters rather than from prose, so it
+    /// covers every function rather than the 79 with a curated signature
+    /// string. Returns `None` when the generator could not read the
+    /// implementation, because an invented signature is worse than none.
+    pub fn display_signature(&self) -> Option<String> {
+        if !self.generated.signature_known {
+            return None;
+        }
+        Some(format!(
+            "{}({})",
+            self.generated.name,
+            self.param_labels().join(", ")
+        ))
+    }
+
+    /// The declared type of the argument at `index`, following a trailing
+    /// variadic for every argument beyond it.
+    pub fn param_type_at(&self, index: usize) -> Option<&TypeExpr> {
+        if let Some(found) = self.param_types.get(index) {
+            return Some(found);
+        }
+        // A variadic absorbs the rest, so the last parameter types them all.
+        match self.generated.params.last() {
+            Some(last) if last.form == ParamForm::Variadic => self.param_types.last(),
+            _ => None,
+        }
+    }
+}
+
+/// The generated catalogue, indexed by name with parameter types parsed.
+static GENERATED_INDEX: LazyLock<HashMap<&'static str, BuiltinSignature>> = LazyLock::new(|| {
+    GENERATED_FUNCTIONS
+        .iter()
+        .map(|generated| {
+            let param_types = generated
+                .params
+                .iter()
+                .map(|param| TypeExpr::parse(param.ty))
+                .collect();
+            (
+                generated.name,
+                BuiltinSignature {
+                    generated,
+                    param_types,
+                },
+            )
+        })
+        .collect()
+});
+
+/// The argument types of a builtin function.
+///
+/// Returns `None` for a name the engine does not have. Callers must also check
+/// [`GeneratedFunction::signature_known`] before drawing any conclusion from an
+/// empty parameter list: an unread signature and a genuinely zero-argument
+/// function look identical without it.
+pub fn builtin_signature(name: &str) -> Option<&'static BuiltinSignature> {
+    let normalized = normalize_builtin_function_name(name);
+    GENERATED_INDEX.get(normalized.as_str())
+}
+
+/// True when the engine's parser accepts this name.
+///
+/// Wider than [`builtin_function`], which only knows the 79 hand-written
+/// entries that carry prose.
+pub fn is_builtin_function(name: &str) -> bool {
+    let normalized = normalize_builtin_function_name(name);
+    GENERATED_INDEX.contains_key(normalized.as_str())
+}
+
+/// The current spelling of a renamed function, when `name` is an old one.
+pub fn renamed_builtin(name: &str) -> Option<&'static str> {
+    let normalized = name.trim().to_ascii_lowercase();
+    RENAMED_FUNCTIONS
+        .iter()
+        .find(|(previous, _)| previous.eq_ignore_ascii_case(&normalized))
+        .map(|(_, current)| *current)
+}
+
 pub fn language() -> Language {
     unsafe { Language::from_raw(tree_sitter_surrealql()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature(name: &str) -> &'static BuiltinSignature {
+        builtin_signature(name).unwrap_or_else(|| panic!("`{name}` must be in the catalogue"))
+    }
+
+    #[test]
+    fn a_builtin_from_a_namespace_with_no_curated_prose_still_has_types() {
+        // `math::` is one of the 18 namespaces the hand-written table never
+        // covered, so this is the gap the generated catalogue closes.
+        let clamp = signature("math::clamp");
+        assert!(clamp.generated.signature_known);
+        assert_eq!(clamp.param_types.len(), 3);
+        for parsed in &clamp.param_types {
+            assert_eq!(*parsed, TypeExpr::Scalar("number".to_string()));
+        }
+    }
+
+    #[test]
+    fn parameter_types_are_parsed_not_left_as_strings() {
+        let sum = signature("math::sum");
+        assert_eq!(
+            sum.param_types[0],
+            TypeExpr::Array(Box::new(TypeExpr::Scalar("number".to_string()))),
+            "array<number> must reach the checker as an Array, not an Other"
+        );
+    }
+
+    #[test]
+    fn a_set_parameter_parses_as_a_set() {
+        // 28 parameters are typed `set`. Before the string parser learned it,
+        // every one degraded to silence.
+        let contains = signature("set::contains");
+        assert_eq!(contains.param_types[0], TypeExpr::Scalar("set".to_string()));
+    }
+
+    #[test]
+    fn required_arity_counts_only_the_leading_required_run() {
+        // `string::slice(string, from?, to?)`
+        let slice = signature("string::slice");
+        assert_eq!(slice.required_arity(), 1);
+        assert_eq!(slice.maximum_arity(), Some(3));
+    }
+
+    #[test]
+    fn a_variadic_makes_the_maximum_arity_unbounded() {
+        let concat = signature("string::concat");
+        assert_eq!(concat.maximum_arity(), None);
+        assert_eq!(
+            concat.required_arity(),
+            0,
+            "a self-validating variadic requires nothing"
+        );
+    }
+
+    #[test]
+    fn a_zero_argument_function_has_a_known_signature_and_no_parameters() {
+        // The distinction the argument checks depend on.
+        let now = signature("time::now");
+        assert!(now.generated.signature_known);
+        assert!(now.generated.params.is_empty());
+        assert_eq!(now.required_arity(), 0);
+        assert_eq!(now.maximum_arity(), Some(0));
+    }
+
+    #[test]
+    fn a_variadic_types_every_argument_beyond_its_position() {
+        let concat = signature("array::concat");
+        let first = concat.param_type_at(0).cloned();
+        assert_eq!(
+            concat.param_type_at(7).cloned(),
+            first,
+            "index 7 is covered"
+        );
+    }
+
+    #[test]
+    fn a_non_variadic_function_types_nothing_past_its_last_parameter() {
+        assert!(signature("array::at").param_type_at(5).is_none());
+    }
+
+    #[test]
+    fn an_old_function_name_resolves_to_its_current_spelling() {
+        // The engine's own rename table, rather than a hand-maintained case.
+        assert!(builtin_signature("type::thing").is_some());
+        assert_eq!(renamed_builtin("type::thing"), Some("type::record"));
+        assert_eq!(renamed_builtin("type::record"), None);
+    }
+
+    #[test]
+    fn the_catalogue_knows_names_the_curated_table_never_had() {
+        assert!(is_builtin_function("vector::distance::knn"));
+        assert!(is_builtin_function("crypto::argon2::compare"));
+        assert!(!is_builtin_function("string::definitely_not_a_function"));
+    }
+
+    #[test]
+    fn a_cast_parameter_is_permissive() {
+        // `string::matches(string, Cast<Regex>)` — the engine casts, so a
+        // string literal pattern is legal and must not be flagged.
+        let matches = signature("string::matches");
+        assert_eq!(
+            matches.param_types[1],
+            TypeExpr::Scalar("any".to_string()),
+            "a Cast parameter must stay permissive"
+        );
+    }
 }

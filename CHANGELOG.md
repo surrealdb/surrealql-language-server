@@ -1,5 +1,159 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+Engine-parity release. Two things the server claimed to do but did not:
+completion ignored where the cursor was, and the builtin functions were
+not type-checked at all. Both are now derived from the SurrealDB source
+rather than from a hand-maintained table, and validated against
+SurrealDB's own test corpus.
+
+The last tag is `v0.3.0`, so 0.4.0 below never shipped on its own and
+both sections land together. They are kept apart because 0.4.0 is a
+self-contained story — declared types becoming real — that this release
+builds directly on. The minor bump rather than a patch is required by the
+breaking changes listed below.
+
+The catalogue moves from 79 hand-written functions covering 2 of the 20
+advertised namespaces to **434 generated from the engine**, with argument
+types read from the implementations. `cargo xtask generate-builtins`
+rebuilds it; a test fails when the committed file is stale.
+
+The same doctrine as 0.4.0 applies, and mattered more here than
+anywhere: a diagnostic that fires on working code costs far more than one
+that never fires. Every new check was swept across all 1,897 files of
+`language-tests/` before shipping. That sweep found five distinct
+false-positive sources — four of them in code this release did not
+otherwise touch — and the release ships with **zero false positives** and
+51 diagnostics that match an error SurrealDB itself declares, in its own
+words.
+
+### Completion now respects the cursor
+
+- `INFO FOR ` returned about 375 items, of which nine were legal: every
+  keyword, every builtin and user function, and every table. It now
+  returns exactly the nine targets the engine accepts. The cause was a
+  single unguarded fallthrough in the completion handler, reached
+  whenever the three positive gates above it missed — which was every
+  statement form outside a nine-keyword allowlist.
+- New `core::statement_shape`: a flat table of literal keyword prefixes
+  covering the heads of `INFO FOR`, `USE`, `DEFINE`, `REMOVE`, `ALTER`,
+  `REBUILD`, `SHOW CHANGES`, `ACCESS`, and the `ON`/`TYPE`/`PERMISSIONS`
+  slots inside them, every entry transcribed from the parser that defines
+  it.
+- **No clause spine, deliberately.** Classifying a position inside
+  `SELECT` needs to tell a clause keyword from a field of the same name,
+  and SurrealQL accepts `SELECT order FROM t`. Guessing there hides
+  fields, variables and functions in `WHERE … AND `, the busiest position
+  in the language. Unrecognised positions keep the list they returned
+  before, so the set of changed positions equals the set of table rows.
+- `DEFINE PARAM` names and `DEFINE ANALYZER` names are offered. Both were
+  already in the model — hover and go-to-definition resolved them — but
+  nothing ever put them in the dropdown.
+
+### Builtin functions are type-checked
+
+- `string::len(42)` reports `argument-type`; `string::len('a', 'b')`
+  reports `argument-count`. Neither reported anything before: the checker
+  read `model.functions`, which holds only `DEFINE FUNCTION fn::…`, and
+  returned early for every other name.
+- Argument counts use the engine's own wording (`1 argument`,
+  `2 to 3 arguments`, `zero or more arguments`).
+- **An empty argument list is never reported.** `ArgumentList` is
+  `seq('(', optional(…), ')')`, so `string::len()` parses clean, and every
+  editor that closes brackets produces exactly that on the `(` keystroke.
+- Method syntax is checked too — `{ a: 9 }.extend('9')` was previously
+  invisible. The receiver counts as argument one, matching how the engine
+  numbers the error.
+- A signature the generator could not read is checked for nothing.
+  `signature_known` keeps "unknown" distinct from "takes no arguments";
+  without it every call to such a function would have been reported as
+  expecting zero.
+
+### What the structured parameters unlocked
+
+- Hover answers for all 20 namespaces. `math::abs` used to answer nothing.
+- Signature help covers all 434 functions, with parameters read from the
+  catalogue instead of recovered by splitting a prose string on `,` —
+  which covered 79 functions and broke on `array<string, 5>`.
+- Inlay hints name builtin arguments. Suppressed for single-parameter
+  calls, where `arg:` says nothing the reader cannot see.
+- New `renamed-function` **warning** plus a rename quick fix, from the
+  engine's own 62-pair table. `type::thing` → `type::record` is one.
+- New `not-callable` **warning** for the nine names the parser accepts
+  that no implementation backs in call form.
+
+### Fixed
+
+- **`DEFINE ACCESS` was never indexed.** The grammar wraps it in an
+  `AccessDefinition` node, so the "second keyword child" lookup returned
+  `None` and the extraction arm was unreachable — despite the arm, the
+  type and the merge path all existing. `DEFINE SCOPE` was dead the same
+  way.
+- **`MIDDLEWARE fn::x()` was reported as a wrong argument count.** It
+  registers a function; the API runtime supplies `(request, next)`. 33
+  occurrences in SurrealDB's own corpus.
+- **A parameter typed `any` was treated as required.** SurrealDB
+  substitutes `NONE` for a missing argument when the declared type admits
+  it, so `fn::any_arg()` is legal where `fn::one_arg()` is not.
+- **An unparseable argument was counted as an argument.** The pinned
+  grammar cannot read a closure (`|| 'x'`) or a signed decimal suffix
+  (`-1.5dec`), both valid SurrealQL, so an `ERROR` node inflated the
+  count. A call whose arguments contain a parse error is no longer
+  checked.
+- `TypeExpr::parse` had no `set<>` case, and read the length of
+  `array<string, 5>` as part of the element type. Both silently disabled
+  the check for those types.
+- `docs/pain-points.md` listed three gaps that commit 345cc7a had already
+  closed; corrected.
+
+### Breaking
+
+- `ColumnSlot::Loose` is removed. The completion handler never matched on
+  it, so `WHERE`, `AND`, `OR` and `BY` already behaved as `None` and
+  their behaviour is unchanged.
+- `DocumentAnalysis` and `MergedSemanticModel` each gained an `analyzers`
+  field. Both are constructed with struct-literal syntax, so downstream
+  code that builds one needs the new field.
+- `assign.rs` now reports a scalar flowing **into** a collection as
+  unknown rather than incompatible. An aggregate hands a function the
+  whole group where the source names one field, so `math::sum(price)`
+  inside `AS SELECT … GROUP BY …` is valid; reporting it flagged
+  SurrealDB's own view tests. The reverse direction is unchanged.
+- Two new diagnostic codes, `renamed-function` and `not-callable`. Codes
+  are wire-visible; clients matching on the existing set are unaffected.
+
+### Testing
+
+- `tests/conformance.rs` sweeps the whole SurrealDB corpus and asserts the
+  exact set of diagnostics in both directions, so a new false positive and
+  a check that silently stops working both fail. Ignored by default at
+  about two minutes: `cargo test --test conformance -- --ignored`.
+- `tests/fixtures/builtin_calls_valid.surql` holds 137 calls across 20
+  namespaces, lifted verbatim from corpus files that expect no error, and
+  runs everywhere — including where there is no SurrealDB checkout.
+- `tests/generated_catalogue.rs` pins the catalogue's freshness against
+  the generator, and the invariants the argument checks depend on.
+- The suite grew from 245 tests to 340 in the crate, plus 28 for the
+  generator and one ignored corpus sweep. That includes the first
+  end-to-end completion tests: the handler previously had none.
+
+### Known gaps
+
+- The pinned tree-sitter grammar cannot parse `DEFINE SEQUENCE` at all,
+  and has no `INFO FOR USER` or `INFO FOR INDEX` branch. Completion
+  follows the engine, so six offered keywords (`GRAPHQL_ALIAS`,
+  `GRAPHQL_DEPRECATED`, `SYSTEM`, `DISKANN`, `RETRY`, `MAXDEPTH`) draw a
+  syntax error from the grammar if selected. Declared in
+  `OFFERS_THE_GRAMMAR_CANNOT_PARSE`, with tests keeping the list honest.
+- Ten callable functions have no readable signature and are checked for
+  nothing: the seven `api::` middleware functions, whose leading arguments
+  the runtime supplies, and `rand::float`/`int`/`time`, whose
+  zero-or-two arity this catalogue cannot express.
+- Method calls resolve by the convention `<receiver type>::<method>`, so
+  the remapped ones (`<number>.round()` is `math::round`) are not checked.
+  Generating the engine's 11 receiver tables would widen this.
+
 ## 0.4.0 — unreleased
 
 Type-inference release. Parameter annotations were being discarded

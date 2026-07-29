@@ -1,0 +1,14 @@
+[package]
+name = 'xtask'
+version = '0.0.0'
+edition = '2024'
+publish = false
+
+# `full` gives us item/expression syntax, `parsing` the file parser, and
+# `extra-traits` the `Debug`/`PartialEq` impls the type mapper compares on.
+# `visit` is deliberately absent: the walk needs to track a module path, which
+# a hand-written recursion expresses more plainly than a visitor with state.
+[dependencies]
+proc-macro2 = '1.0'
+quote = '1.0'
+syn = { version = '2.0', features = ['full', 'parsing', 'printing', 'extra-traits'] }

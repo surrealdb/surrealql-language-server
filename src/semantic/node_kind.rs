@@ -85,6 +85,15 @@ pub const PREFIX_EXPRESSION: &str = "PrefixExpression";
 pub const PATH: &str = "Path";
 pub const SUBSCRIPT: &str = "Subscript";
 pub const ARGUMENT_LIST: &str = "ArgumentList";
+/// `DEFINE CONFIG API MIDDLEWARE fn::x()` — the parent of a function *reference*
+/// rather than a call. The API runtime supplies the arguments.
+pub const MIDDLEWARE_CLAUSE: &str = "MiddlewareClause";
+/// `DEFINE ACCESS …` wraps its own keyword and name in this node instead of
+/// leaving them as direct children of the `DefineStatement`, which is why
+/// [`crate::semantic::analyzer`] has to look inside it to name the form.
+pub const ACCESS_DEFINITION: &str = "AccessDefinition";
+/// `DEFINE SCOPE …`, the pre-3.x spelling of `DEFINE ACCESS`. Wraps identically.
+pub const SCOPE_DEFINITION: &str = "ScopeDefinition";
 pub const FUNCTION_CALL: &str = "FunctionCall";
 /// Method-call form of a function: `$text.trim()`, `$list.len()`.
 pub const IDIOM_FUNCTION: &str = "IdiomFunction";

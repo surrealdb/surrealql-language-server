@@ -412,6 +412,7 @@ fn hover_for_js_function_shows_javascript_badge() {
         }],
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -468,6 +469,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
         }],
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -521,6 +523,7 @@ fn hover_for_table_shows_schema_and_permissions() {
             functions: Vec::new(),
             params: Vec::new(),
             accesses: Vec::new(),
+            analyzers: Vec::new(),
             query_facts: Vec::new(),
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
@@ -595,6 +598,7 @@ fn completion_includes_user_js_function() {
             }],
             params: Vec::new(),
             accesses: Vec::new(),
+            analyzers: Vec::new(),
             query_facts: Vec::new(),
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
@@ -709,6 +713,7 @@ fn no_diagnostics_for_allowed_permission() {
         functions: Vec::new(),
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: vec![QueryFact {
             action: QueryAction::Select,
             target_tables: vec!["thing".to_string()],
@@ -762,6 +767,7 @@ fn error_diagnostic_for_denied_permission() {
         functions: Vec::new(),
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: vec![QueryFact {
             action: QueryAction::Create,
             target_tables: vec!["secret".to_string()],
@@ -804,6 +810,7 @@ fn warning_for_unknown_table_in_query() {
         functions: Vec::new(),
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: vec![QueryFact {
             action: QueryAction::Select,
             target_tables: vec!["totally_unknown_table".to_string()],
@@ -892,6 +899,7 @@ fn role_based_permission_allowed_for_matching_context() {
         functions: Vec::new(),
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: vec![QueryFact {
             action: QueryAction::Select,
             target_tables: vec!["orders".to_string()],
@@ -1070,6 +1078,7 @@ fn local_function_overrides_remote() {
         }],
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -1100,6 +1109,7 @@ fn local_function_overrides_remote() {
         }],
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -1180,6 +1190,7 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
             }],
             params: Vec::new(),
             accesses: Vec::new(),
+            analyzers: Vec::new(),
             query_facts: Vec::new(),
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
@@ -1224,6 +1235,7 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
         functions: Vec::new(),
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -1945,6 +1957,525 @@ fn trailing_optional_parameters_may_be_omitted() {
     assert!(
         !codes_of(&diagnostics_for(source)).contains(&"argument-count".to_string()),
         "a trailing option<T> parameter is not required"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Builtin argument count, against the generated catalogue
+// ──────────────────────────────────────────────────────────────────────
+
+fn messages_of(diagnostics: &[tower_lsp_server::ls_types::Diagnostic]) -> Vec<String> {
+    diagnostics.iter().map(|d| d.message.clone()).collect()
+}
+
+#[test]
+fn too_many_arguments_to_a_builtin_are_reported() {
+    // `string::len(string)` takes one. SurrealDB rejects this outright, so the
+    // check cannot fire on a query that runs.
+    let diagnostics = diagnostics_for("RETURN string::len('a', 'b');");
+    assert!(
+        codes_of(&diagnostics).contains(&"argument-count".to_string()),
+        "expected argument-count, got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn the_count_message_uses_the_engines_wording() {
+    let diagnostics = diagnostics_for("RETURN string::len('a', 'b');");
+    assert!(
+        messages_of(&diagnostics)
+            .iter()
+            .any(|message| message.contains("expects 1 argument, found 2")),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn an_optional_parameter_widens_the_accepted_count() {
+    // `string::slice(string, from?, to?)` — one, two and three all legal.
+    for source in [
+        "RETURN string::slice('abc');",
+        "RETURN string::slice('abc', 1);",
+        "RETURN string::slice('abc', 1, 2);",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-count".to_string()),
+            "{source} is legal, got {codes:?}"
+        );
+    }
+    let codes = codes_of(&diagnostics_for("RETURN string::slice('a', 1, 2, 3);"));
+    assert!(
+        codes.contains(&"argument-count".to_string()),
+        "four arguments exceeds the maximum"
+    );
+}
+
+#[test]
+fn a_variadic_builtin_accepts_any_number_of_arguments() {
+    for source in [
+        "RETURN string::concat('a');",
+        "RETURN string::concat('a', 'b', 'c', 'd', 'e', 'f');",
+        "RETURN array::concat([1], [2], [3]);",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-count".to_string()),
+            "{source} is legal, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_argument_list_is_never_reported() {
+    // `ArgumentList` is `seq('(', optional(…), ')')`, so this parses clean —
+    // and every editor that closes brackets produces it on the `(` keystroke.
+    // With no debounce and ERROR severity, reporting it would squiggle every
+    // call as it is typed.
+    for source in [
+        "RETURN string::len();",
+        "RETURN math::clamp();",
+        "RETURN array::at();",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-count".to_string()),
+            "{source} is a transient typing state, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_zero_argument_builtin_still_rejects_arguments() {
+    // `time::now()` takes none, and its signature *is* known — so unlike an
+    // unread signature, a wrong count here is real information.
+    let codes = codes_of(&diagnostics_for("RETURN time::now('extra');"));
+    assert!(
+        codes.contains(&"argument-count".to_string()),
+        "time::now takes no arguments, got {codes:?}"
+    );
+}
+
+#[test]
+fn a_name_that_parses_but_cannot_be_called_is_reported() {
+    // Nine names sit in the parser's table with no implementation behind them,
+    // so the query parses and then fails at run time.
+    let diagnostics = diagnostics_for("RETURN duration::set_day(1d, 3);");
+    let codes = codes_of(&diagnostics);
+    assert!(
+        codes.contains(&"not-callable".to_string()),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+    // A warning, not an error: the claim rests on reading the engine's dispatch
+    // tables rather than on the language definition.
+    assert!(
+        diagnostics
+            .iter()
+            .filter(|d| matches!(
+                &d.code,
+                Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                    if code == "not-callable"
+            ))
+            .all(|d| d.severity == Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)),
+        "not-callable must be a warning"
+    );
+}
+
+#[test]
+fn a_callable_function_is_never_reported_as_not_callable() {
+    for source in [
+        "RETURN time::day(d'2024-01-01T00:00:00Z');",
+        "RETURN duration::days(3w);",
+        "RETURN object::keys({ a: 1 });",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"not-callable".to_string()),
+            "{source} is callable, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_function_whose_signature_was_not_read_is_never_flagged() {
+    // The nine names the parser accepts and no dispatch arm implements. Their
+    // signatures are unknown, so any count must stay silent.
+    for source in [
+        "RETURN duration::set_day(1d, 3);",
+        "RETURN object::matches({}, {});",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-count".to_string()),
+            "{source} has an unknown signature, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_correct_builtin_call_is_never_flagged() {
+    // A sweep across namespaces the hand-written catalogue never covered.
+    for source in [
+        "RETURN math::clamp(5, 1, 10);",
+        "RETURN array::at([1, 2, 3], 0);",
+        "RETURN string::replace('a', 'b', 'c');",
+        "RETURN time::now();",
+        "RETURN rand::uuid();",
+        "RETURN crypto::sha256('x');",
+        "RETURN vector::add([1], [2]);",
+        "RETURN type::record('user', 'x');",
+        "RETURN object::keys({ a: 1 });",
+        "RETURN encoding::base64::encode('x');",
+        "RETURN duration::days(3w);",
+        "RETURN session::db();",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("argument-")),
+            "{source} is valid SurrealQL, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_function_name_is_not_an_argument_error() {
+    // Unrecognised names are somebody else's diagnostic, not this one's.
+    let codes = codes_of(&diagnostics_for("RETURN string::not_a_function('a', 'b');"));
+    assert!(
+        !codes.iter().any(|code| code.starts_with("argument-")),
+        "got {codes:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Method-call syntax
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_method_call_argument_is_type_checked() {
+    // `IdiomFunction` was never visited, so `$x.foo()` was checked for nothing.
+    // SurrealDB's own wording for this is
+    // `Incorrect arguments for method extend(). Argument 2 was the wrong type.`
+    let diagnostics = diagnostics_for("RETURN { a: 9 }.extend('9');");
+    assert!(
+        codes_of(&diagnostics).contains(&"argument-type".to_string()),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+    assert!(
+        messages_of(&diagnostics)
+            .iter()
+            .any(|message| message.contains("Argument 2 of `.extend()`")),
+        "the receiver is argument one, so the engine and the server must agree \
+         on the number: {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn a_valid_method_call_is_never_flagged() {
+    for source in [
+        "RETURN { a: 9 }.extend({ b: 10 });",
+        "RETURN 'abc'.len();",
+        "RETURN [1, 2, 3].at(0);",
+        "RETURN 'a,b'.split(',');",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("argument-")),
+            "{source} is valid, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_method_count_is_reported_excluding_the_receiver() {
+    // `array::at(array, int)` — one argument is written, so two is too many.
+    let diagnostics = diagnostics_for("RETURN [1, 2].at(0, 1);");
+    assert!(
+        codes_of(&diagnostics).contains(&"argument-count".to_string()),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+    assert!(
+        messages_of(&diagnostics)
+            .iter()
+            .any(|message| message.contains("`.at()` expects 1 argument, found 2")),
+        "the count is what the author writes: {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn a_method_on_an_unknown_receiver_stays_silent() {
+    // Nothing binds `$x`, so its type is unknown and no name can be resolved.
+    for source in [
+        "RETURN $unknown.extend('9');",
+        // A remapped method: `<number>.round()` is `math::round`, not
+        // `number::round`, so the convention finds nothing and says nothing.
+        "RETURN (1.5).round('nope');",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("argument-")),
+            "{source} must stay silent, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_method_further_along_a_path_is_not_attributed_to_the_first_link() {
+    // The receiver of `extend` is `{ a: 9 }.b`, whose type is unknown. Reading
+    // the type of `{ a: 9 }` instead would invent one and report against it.
+    let codes = codes_of(&diagnostics_for("RETURN { a: 9 }.b.extend('9');"));
+    assert!(
+        !codes.iter().any(|code| code.starts_with("argument-")),
+        "got {codes:?}"
+    );
+}
+
+#[test]
+fn the_reported_defect_is_fixed_an_int_where_a_string_belongs() {
+    let diagnostics = diagnostics_for("RETURN string::len(42);");
+    assert!(
+        codes_of(&diagnostics).contains(&"argument-type".to_string()),
+        "string::len takes a string, got {:?}",
+        messages_of(&diagnostics)
+    );
+    assert!(
+        messages_of(&diagnostics)
+            .iter()
+            .any(|message| message
+                .contains("Argument 1 of `string::len` expects `string`, found `int`")),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn argument_types_are_checked_across_namespaces_the_curated_table_never_had() {
+    for (source, function) in [
+        ("RETURN math::clamp('a', 1, 10);", "math::clamp"),
+        ("RETURN array::at('nope', 0);", "array::at"),
+        ("RETURN time::day(true);", "time::day"),
+        ("RETURN duration::days(true);", "duration::days"),
+        ("RETURN object::keys(42);", "object::keys"),
+    ] {
+        let diagnostics = diagnostics_for(source);
+        assert!(
+            codes_of(&diagnostics).contains(&"argument-type".to_string()),
+            "{function} must reject that argument, got {:?}",
+            messages_of(&diagnostics)
+        );
+    }
+}
+
+#[test]
+fn a_string_against_a_stringly_type_stays_silent() {
+    // `assign.rs` treats `string → datetime|duration|uuid|bytes|regex|file` as a
+    // runtime question, because a *specific* string may well coerce. That rule
+    // predates this work and must keep holding for builtins.
+    for source in [
+        "RETURN time::day('2024-01-01T00:00:00Z');",
+        "RETURN duration::days('1w');",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-type".to_string()),
+            "{source} may coerce at runtime, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_widening_numeric_argument_is_accepted() {
+    // `int` flows into `number`; only narrowing is a runtime question.
+    for source in [
+        "RETURN math::abs(3);",
+        "RETURN math::abs(3.5);",
+        "RETURN math::clamp(5, 1, 10);",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-type".to_string()),
+            "{source} is valid, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cast_parameter_accepts_a_string_pattern() {
+    // `string::matches(String, Cast<Regex>)` — the engine casts, so a string
+    // literal is legal even though the parameter is a regular expression.
+    let codes = codes_of(&diagnostics_for("RETURN string::matches('abc', 'a.*');"));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "a cast parameter must stay permissive, got {codes:?}"
+    );
+}
+
+#[test]
+fn a_geometry_parameter_accepts_every_shape_a_geometry_arrives_in() {
+    // A point tuple and an object literal are both geometries, but the lattice
+    // types them `point` and `object`. SurrealDB's own `geo::` tests use both.
+    for source in [
+        "RETURN geo::distance((-0.12, 51.5), (-0.14, 51.6));",
+        "RETURN geo::is_valid({ type: 'Point', coordinates: [-0.12, 51.5] });",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"argument-type".to_string()),
+            "{source} is valid, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_scalar_flowing_into_a_collection_parameter_is_not_reported() {
+    // An aggregate supplies the whole group where the text names one field, so
+    // this is valid inside `AS SELECT … GROUP BY …` and the checker cannot see
+    // the difference.
+    let codes = codes_of(&diagnostics_for("RETURN math::sum(<float> 1.5);"));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "a scalar against array<number> is a runtime question, got {codes:?}"
+    );
+    // The reverse stays an error.
+    assert!(
+        codes_of(&diagnostics_for("RETURN array::at([1, 2], [1, 2]);"))
+            .contains(&"argument-type".to_string()),
+        "an array where an int belongs is wrong in any context"
+    );
+}
+
+#[test]
+fn a_type_the_lattice_cannot_model_stays_silent() {
+    // `type::field` returns `field` and `type::range` returns `range<record>`;
+    // neither is modellable, and both must remain silent.
+    for source in [
+        "RETURN type::field('name');",
+        "RETURN string::len(type::field('name'));",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("argument-")),
+            "{source} must stay silent, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_count_suppresses_the_type_report() {
+    // Comparing positions is meaningless once the count is wrong, so exactly
+    // one diagnostic comes back.
+    let codes = codes_of(&diagnostics_for("RETURN string::len('a', 'b');"));
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| code.starts_with("argument-"))
+            .count(),
+        1,
+        "got {codes:?}"
+    );
+}
+
+#[test]
+fn a_variadic_types_every_argument_it_absorbs() {
+    // `array::concat(Rest<Array>)` — each argument must be an array.
+    let codes = codes_of(&diagnostics_for("RETURN array::concat([1], 'nope', [3]);"));
+    assert!(
+        codes.contains(&"argument-type".to_string()),
+        "a variadic still types what it absorbs, got {codes:?}"
+    );
+}
+
+#[test]
+fn a_call_with_an_unparseable_argument_is_never_flagged() {
+    // The pinned grammar cannot parse a closure or a signed decimal suffix, so
+    // the argument list holds an `ERROR` node. That node might stand for one
+    // argument or five, which makes the count meaningless — and both forms are
+    // valid SurrealQL, so counting it reported a wrong arity on working code.
+    for source in [
+        "RETURN math::ceil(-102023.1dec);",
+        "RETURN type::of(|| 'test');",
+        "RETURN array::map([1], || 1);",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("argument-")),
+            "{source} has an unparseable argument, got {codes:?}"
+        );
+    }
+
+    // Contrast: a closure the grammar *can* read leaves the count meaningful,
+    // and `set::reduce(Set, Box<Closure>)` really does take two arguments.
+    assert!(
+        codes_of(&diagnostics_for(
+            "RETURN set::reduce([1, 2], |$a, $b| $a + $b, 0);"
+        ))
+        .contains(&"argument-count".to_string()),
+        "three arguments to a two-argument function is a real error"
+    );
+}
+
+#[test]
+fn a_middleware_registration_is_not_a_call() {
+    // `MIDDLEWARE fn::x()` registers a function. The API runtime invokes it with
+    // `(request, next)` supplied, so the written list is always shorter than the
+    // declared parameters.
+    let source = r#"
+        DEFINE FUNCTION fn::mw($request: any, $next: any) { RETURN $next; };
+        DEFINE CONFIG API MIDDLEWARE fn::mw();
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.iter().any(|code| code.starts_with("argument-")),
+        "a middleware registration supplies no arguments, got {codes:?}"
+    );
+}
+
+#[test]
+fn a_parameter_whose_type_admits_none_may_be_omitted() {
+    // SurrealDB substitutes `NONE` for a missing argument when the declared type
+    // accepts it. Its own `custom_optional_args.surql` proves the distinction:
+    // `fn::any_arg()` returns a value, `fn::one_arg()` is an error.
+    let legal = r#"
+        DEFINE FUNCTION fn::any_arg($a: any) { RETURN $a; };
+        RETURN fn::any_arg();
+    "#;
+    assert!(
+        !codes_of(&diagnostics_for(legal))
+            .iter()
+            .any(|code| code.starts_with("argument-")),
+        "an `any` parameter may be omitted"
+    );
+
+    let illegal = r#"
+        DEFINE FUNCTION fn::one_arg($a: bool) { RETURN $a; };
+        RETURN fn::one_arg();
+    "#;
+    assert!(
+        codes_of(&diagnostics_for(illegal)).contains(&"argument-count".to_string()),
+        "a `bool` parameter may not be omitted"
+    );
+}
+
+#[test]
+fn a_user_function_still_takes_precedence_over_the_catalogue() {
+    // `fn::` is a separate namespace, so this only proves the split did not
+    // break the existing path.
+    let source = r#"
+        DEFINE FUNCTION fn::len($a: string, $b: string) -> int { RETURN 1; };
+        RETURN fn::len('a');
+    "#;
+    let diagnostics = diagnostics_for(source);
+    assert!(
+        codes_of(&diagnostics).contains(&"argument-count".to_string()),
+        "the user function expects two arguments, got {:?}",
+        messages_of(&diagnostics)
     );
 }
 

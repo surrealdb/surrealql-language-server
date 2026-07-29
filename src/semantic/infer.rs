@@ -27,7 +27,7 @@ use tree_sitter::Node;
 use crate::config::ServerSettings;
 use strsim::jaro_winkler;
 
-use crate::grammar::{SPECIAL_VARIABLES, builtin_return_type};
+use crate::grammar::{SPECIAL_VARIABLES, builtin_return_type, builtin_signature, renamed_builtin};
 use crate::semantic::assign::{ObjectFault, Verdict, assignable, object_faults};
 use crate::semantic::codes;
 use crate::semantic::node_kind as k;
@@ -604,6 +604,20 @@ fn callee_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
 /// can sit between arguments and a naive `is_named()` filter would count
 /// them as arguments — turning `f(a /* note */, b)` into a 3-argument
 /// call.
+/// True when any part of this subtree failed to parse.
+///
+/// The same reason [`collect_variable_references`] refuses to walk a broken
+/// subtree: a diagnostic derived from a guess about unparsed text is worse than
+/// no diagnostic.
+fn contains_parse_error(node: Node<'_>) -> bool {
+    if node.is_error() || node.is_missing() {
+        return true;
+    }
+    // `has_error` covers the whole subtree in one call, including unnamed
+    // children a manual walk over `named_children` would skip.
+    node.has_error()
+}
+
 fn argument_nodes<'tree>(arg_list: Node<'tree>) -> Vec<Node<'tree>> {
     let mut cursor = arg_list.walk();
     arg_list
@@ -614,14 +628,37 @@ fn argument_nodes<'tree>(arg_list: Node<'tree>) -> Vec<Node<'tree>> {
 
 /// How many arguments a call must supply.
 ///
-/// A trailing `option<T>` parameter may be omitted, so only the leading
-/// run of non-optional parameters is required.
+/// Only the leading run of parameters that cannot be omitted is required.
+///
+/// A parameter may be omitted when its declared type admits `NONE`, because
+/// SurrealDB substitutes `NONE` for a missing argument rather than failing.
+/// `option<T>` is the obvious case; `any` is the one that bites. SurrealDB's own
+/// `custom_optional_args.surql` proves it: `fn::any_arg($a: any)` called as
+/// `fn::any_arg()` returns a value, while `fn::one_arg($a: bool)` called the
+/// same way is an error.
 fn required_arity(params: &[crate::semantic::types::FunctionParam]) -> usize {
     params
         .iter()
-        .rposition(|param| !matches!(param.type_expr, Some(TypeExpr::Option(_))))
+        .rposition(|param| !admits_none(param.type_expr.as_ref()))
         .map(|index| index + 1)
         .unwrap_or(0)
+}
+
+/// True when a missing argument for this parameter is legal.
+fn admits_none(declared: Option<&TypeExpr>) -> bool {
+    match declared {
+        Some(TypeExpr::Option(_)) => true,
+        Some(TypeExpr::Scalar(name)) => {
+            name.eq_ignore_ascii_case("any") || name.eq_ignore_ascii_case("value")
+        }
+        Some(TypeExpr::Union(members)) => members.iter().any(|member| match member {
+            TypeExpr::Scalar(name) => {
+                name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("null")
+            }
+            _ => false,
+        }),
+        _ => false,
+    }
 }
 
 /// Type-check every resolvable call in the document.
@@ -812,6 +849,9 @@ fn check_calls(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
     if node.kind() == k::FUNCTION_CALL {
         check_one_call(node, ctx, out);
     }
+    if node.kind() == k::IDIOM_FUNCTION {
+        check_method_call(node, ctx, out);
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         check_calls(child, ctx, out);
@@ -822,15 +862,279 @@ fn check_one_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) 
     let Some(name) = callee_name(node, ctx.source) else {
         return;
     };
-    // Only user-defined functions carry structured parameter types today.
-    let Some(function) = ctx.model.functions.get(name) else {
+    // `MIDDLEWARE fn::x()` registers a function; it does not call it. The API
+    // runtime invokes it with `(request, next)` supplied, so the written
+    // argument list is always shorter than the declared parameter list.
+    // SurrealDB's own `language-tests/tests/api/` corpus has 33 of these, every
+    // one of which was reported as a wrong argument count.
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == k::MIDDLEWARE_CLAUSE)
+    {
+        return;
+    }
+    // A name SurrealDB has renamed. The engine records the replacement itself
+    // and still accepts the old spelling, so this is a warning with a quick fix
+    // (`code_action`), not an error.
+    if let Some(current) = renamed_builtin(name)
+        && let Some(name_node) = k::find_child(node, k::FUNCTION_NAME)
+    {
+        out.push(warning(
+            node_range(ctx.source, name_node),
+            codes::RENAMED_FUNCTION,
+            format!("`{name}` has been renamed to `{current}`."),
+        ));
+    }
+
+    let Some(arg_list) = k::find_child(node, k::ARGUMENT_LIST) else {
+        return;
+    };
+    // An argument the parser could not read makes the count meaningless: the
+    // `ERROR` node might stand for one argument or five. The pinned grammar
+    // cannot parse a closure (`|| 'x'`) or a signed decimal suffix
+    // (`-1.5dec`), and both are valid SurrealQL — so counting the error node
+    // reported a wrong arity on code the engine accepts. A syntax diagnostic
+    // already covers the position; do not pile an invented one on top.
+    if contains_parse_error(arg_list) {
+        return;
+    }
+    let args = argument_nodes(arg_list);
+
+    // A `DEFINE FUNCTION` shadows nothing — `fn::` is a separate namespace from
+    // the builtins — so the two paths are exclusive rather than ordered.
+    match ctx.model.functions.get(name) {
+        Some(function) => check_user_call(name, function, node, arg_list, &args, ctx, out),
+        None => check_builtin_call(name, arg_list, &args, ctx, out),
+    }
+}
+
+/// Method-call syntax: `'abc'.len()`, `[1, 2].at(0)`.
+///
+/// The receiver is the function's first argument, so `'abc'.len()` is
+/// `string::len('abc')` with nothing written. That makes the check the same one
+/// `check_builtin_call` runs, shifted by one position.
+///
+/// Deliberately narrow, in three ways, because the engine's mapping from method
+/// to function is a table this does not have:
+///
+/// * The canonical name is assumed to be `<receiver type>::<method>`. That holds
+///   for `string::`, `array::`, `set::`, `object::` and `duration::`, and fails
+///   for the remapped ones — `<number>.round()` is `math::round`, not
+///   `number::round`. A name that is not in the catalogue is simply not checked,
+///   so those stay silent rather than wrong. Generating the engine's 11 receiver
+///   tables would widen coverage; nothing here has to change when it does.
+/// * Only the first link of a path is a known receiver. In `'abc'.foo.trim()`
+///   the receiver of `trim` is `'abc'.foo`, whose type is unknown — reading the
+///   type of `'abc'` instead would invent one.
+/// * The receiver type must be concrete. Anything else is silent, as everywhere.
+fn check_method_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    let Some(method) =
+        k::find_child(node, k::FUNCTION_NAME).and_then(|name| k::text_of(ctx.source, name))
+    else {
         return;
     };
     let Some(arg_list) = k::find_child(node, k::ARGUMENT_LIST) else {
         return;
     };
-    let args = argument_nodes(arg_list);
+    if contains_parse_error(arg_list) {
+        return;
+    }
+    let Some(receiver) = method_receiver(node) else {
+        return;
+    };
 
+    let Some(namespace) = receiver_namespace(&infer_expr_type(receiver, ctx)) else {
+        return;
+    };
+    let name = format!("{namespace}::{method}");
+    let Some(signature) = builtin_signature(&name) else {
+        return;
+    };
+    if !signature.generated.signature_known || signature.generated.not_callable {
+        return;
+    }
+    // The receiver fills parameter one, so a method with no declared parameters
+    // cannot be the function this name resolves to.
+    if signature.generated.params.is_empty() {
+        return;
+    }
+
+    let args = argument_nodes(arg_list);
+    if args.is_empty() {
+        // The same transient-typing state `check_builtin_call` refuses to report.
+        return;
+    }
+
+    let required = signature.required_arity().saturating_sub(1);
+    let maximum = signature.maximum_arity().map(|max| max.saturating_sub(1));
+    if args.len() < required || maximum.is_some_and(|max| args.len() > max) {
+        out.push(diagnostic(
+            node_range(ctx.source, arg_list),
+            codes::ARGUMENT_COUNT,
+            format!(
+                "`.{method}()` expects {}, found {}.",
+                expected_arity_label(required, maximum),
+                args.len()
+            ),
+        ));
+        return;
+    }
+
+    for (index, argument) in args.iter().enumerate() {
+        // Shifted by one: the receiver already supplied parameter zero.
+        let Some(expected) = signature.param_type_at(index + 1) else {
+            continue;
+        };
+        let actual = infer_expr_type(*argument, ctx);
+        if assignable(&actual, expected) != Verdict::Incompatible {
+            continue;
+        }
+        out.push(diagnostic(
+            node_range(ctx.source, *argument),
+            codes::ARGUMENT_TYPE,
+            format!(
+                // Numbered as the engine numbers it: the receiver is argument
+                // one, so the first written argument is argument two. Matching
+                // that means the server and a runtime error agree.
+                "Argument {} of `.{method}()` expects `{expected}`, found `{actual}`.",
+                index + 2
+            ),
+        ));
+    }
+}
+
+/// The value a method is called on, when it is the first link of the path.
+fn method_receiver<'tree>(idiom: Node<'tree>) -> Option<Node<'tree>> {
+    let subscript = idiom.parent()?;
+    let path = subscript.parent()?;
+    let children = k::named_children(path);
+    // `[receiver, Subscript, …]` — anything else means the method is further
+    // along a chain, where the receiver's type is not this node's business.
+    if children.len() < 2 || children[1].id() != subscript.id() {
+        return None;
+    }
+    children.first().copied()
+}
+
+/// The function namespace a receiver of this type belongs to.
+fn receiver_namespace(ty: &TypeExpr) -> Option<&'static str> {
+    match ty {
+        TypeExpr::Array(_) => Some("array"),
+        TypeExpr::Set(_) => Some("set"),
+        TypeExpr::Object(_) => Some("object"),
+        TypeExpr::Scalar(name) => match name.to_ascii_lowercase().as_str() {
+            "string" => Some("string"),
+            "array" => Some("array"),
+            "set" => Some("set"),
+            "object" => Some("object"),
+            "duration" => Some("duration"),
+            "datetime" => Some("time"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Argument count for a builtin, against the generated catalogue.
+///
+/// SurrealDB rejects a wrong count outright (`fnc/args.rs:195-227`), so this
+/// cannot fire on a query that runs.
+fn check_builtin_call(
+    name: &str,
+    arg_list: Node<'_>,
+    args: &[Node<'_>],
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(signature) = builtin_signature(name) else {
+        return;
+    };
+    // The parser accepts the name, but nothing implements it in call form, so
+    // the query parses and then fails at run time. Nine names today, among them
+    // `duration::set_day` and `object::matches`.
+    if signature.generated.not_callable {
+        out.push(warning(
+            node_range(ctx.source, arg_list),
+            codes::NOT_CALLABLE,
+            format!(
+                "`{name}` parses, but SurrealDB has no implementation to call. \
+                 The query will fail at run time."
+            ),
+        ));
+        return;
+    }
+    // The generator could not read this implementation, so an empty parameter
+    // list means "unknown", not "takes nothing".
+    if !signature.generated.signature_known {
+        return;
+    }
+    // `ArgumentList` is `seq('(', optional(…), ')')`, so `string::len()` is a
+    // syntactically complete zero-argument call. Every editor that closes
+    // brackets produces exactly that on the `(` keystroke, and this server has
+    // no debounce — reporting it would squiggle every call while it is typed.
+    if args.is_empty() {
+        return;
+    }
+
+    let required = signature.required_arity();
+    let maximum = signature.maximum_arity();
+    let too_few = args.len() < required;
+    let too_many = maximum.is_some_and(|max| args.len() > max);
+    if too_few || too_many {
+        out.push(diagnostic(
+            node_range(ctx.source, arg_list),
+            codes::ARGUMENT_COUNT,
+            format!(
+                "`{name}` expects {}, found {}.",
+                expected_arity_label(required, maximum),
+                args.len()
+            ),
+        ));
+        // Comparing positions is meaningless once the count is wrong — the same
+        // reason the `fn::` path stops here.
+        return;
+    }
+
+    for (index, argument) in args.iter().enumerate() {
+        let Some(expected) = signature.param_type_at(index) else {
+            continue;
+        };
+        let actual = infer_expr_type(*argument, ctx);
+        if assignable(&actual, expected) != Verdict::Incompatible {
+            continue;
+        }
+        out.push(diagnostic(
+            node_range(ctx.source, *argument),
+            codes::ARGUMENT_TYPE,
+            format!(
+                "Argument {} of `{name}` expects `{expected}`, found `{actual}`.",
+                index + 1
+            ),
+        ));
+    }
+}
+
+/// The engine's own wording for an argument count (`fnc/args.rs:199-221`).
+fn expected_arity_label(required: usize, maximum: Option<usize>) -> String {
+    match maximum {
+        None if required == 0 => "zero or more arguments".to_string(),
+        None => format!("{required} or more arguments"),
+        Some(0) => "no arguments".to_string(),
+        Some(max) if max == required && max == 1 => "1 argument".to_string(),
+        Some(max) if max == required => format!("{max} arguments"),
+        Some(max) => format!("{required} to {max} arguments"),
+    }
+}
+
+fn check_user_call(
+    name: &str,
+    function: &crate::semantic::types::FunctionDef,
+    _node: Node<'_>,
+    arg_list: Node<'_>,
+    args: &[Node<'_>],
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
     let required = required_arity(&function.params);
     if args.len() < required || args.len() > function.params.len() {
         out.push(diagnostic(
@@ -979,5 +1283,13 @@ fn diagnostic(range: Range, code: &str, message: String) -> Diagnostic {
         source: Some(SOURCE.to_string()),
         message,
         ..Diagnostic::default()
+    }
+}
+
+/// A diagnostic for something the engine still accepts.
+fn warning(range: Range, code: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        severity: Some(DiagnosticSeverity::WARNING),
+        ..diagnostic(range, code, message)
     }
 }
