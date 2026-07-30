@@ -53,12 +53,15 @@ fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
     model.semantic_diagnostics(&analysis, &ServerSettings::default())
 }
 
-/// The `argument-count` / `argument-type` diagnostics only.
+/// The type checks this crate owns: argument counts, argument types, and
+/// declared function return types.
 fn argument_diagnostics(source: &str) -> Vec<(String, String)> {
     diagnostics_for(source)
         .into_iter()
         .filter_map(|diagnostic| match &diagnostic.code {
-            Some(NumberOrString::String(code)) if code.starts_with("argument-") => {
+            Some(NumberOrString::String(code))
+                if code.starts_with("argument-") || code == "return-type" =>
+            {
                 Some((code.clone(), diagnostic.message.clone()))
             }
             _ => None,

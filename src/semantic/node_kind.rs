@@ -27,6 +27,10 @@ pub const SOURCE_FILE: &str = "SurrealQL";
 pub const PREDICATE: &str = "Predicate";
 pub const SUB_QUERY: &str = "SubQuery";
 pub const BLOCK: &str = "Block";
+/// The braces of a [`BLOCK`]. Named nodes, so a walk over a block's children
+/// meets them alongside the statements.
+pub const BRACE_OPEN: &str = "BraceOpen";
+pub const BRACE_CLOSE: &str = "BraceClose";
 
 // ---- Statements ----------------------------------------------------------
 

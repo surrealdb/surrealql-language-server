@@ -70,6 +70,35 @@ words.
   without it every call to such a function would have been reported as
   expecting zero.
 
+### Declared function return types are checked
+
+`DEFINE FUNCTION … -> T` declared a return type that nothing verified, so
+this reported nothing:
+
+```surql
+DEFINE FUNCTION fn::beau::number($input: int) -> int {
+    RETURN "";
+};
+```
+
+It now reports ``fn::beau::number` returns `int`, but this value is
+`string`.`` under the `""`, with the new `return-type` code. The engine
+coerces a function's result to its declared type and fails with
+`Couldn't coerce return value from function …`
+(`expr/function.rs:330`), using the same coercion relation the argument
+checks already model — so this needed no new type machinery.
+
+- A body ending in a bare expression returns it, so
+  `DEFINE FUNCTION fn::x() -> int { '' }` is reported too.
+- Checked **only for `RETURN`s that are direct children of the function's
+  own block**. A `RETURN` nested deeper belongs to whichever construct
+  encloses it — a block bound by `LET $y = { RETURN 5 }` returns from that
+  block, not from the function — and misreading one would report against a
+  value the function never returns. Nested returns stay silent, which costs
+  coverage rather than correctness.
+- A body the parser could not read is not checked; a syntax diagnostic
+  already covers it.
+
 ### What the structured parameters unlocked
 
 - Hover answers for all 20 namespaces. `math::abs` used to answer nothing.
@@ -120,8 +149,9 @@ words.
   whole group where the source names one field, so `math::sum(price)`
   inside `AS SELECT … GROUP BY …` is valid; reporting it flagged
   SurrealDB's own view tests. The reverse direction is unchanged.
-- Two new diagnostic codes, `renamed-function` and `not-callable`. Codes
-  are wire-visible; clients matching on the existing set are unaffected.
+- Three new diagnostic codes: `renamed-function`, `not-callable` and
+  `return-type`. Codes are wire-visible; clients matching on the existing
+  set are unaffected.
 
 ### Testing
 
@@ -134,7 +164,7 @@ words.
   runs everywhere — including where there is no SurrealDB checkout.
 - `tests/generated_catalogue.rs` pins the catalogue's freshness against
   the generator, and the invariants the argument checks depend on.
-- The suite grew from 245 tests to 340 in the crate, plus 28 for the
+- The suite grew from 245 tests to 348 in the crate, plus 28 for the
   generator and one ignored corpus sweep. That includes the first
   end-to-end completion tests: the handler previously had none.
 

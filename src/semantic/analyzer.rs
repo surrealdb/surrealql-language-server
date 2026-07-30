@@ -190,7 +190,7 @@ fn collect_statements(
 ///
 /// That made the `Some("access" | "scope")` arm unreachable, so `extract_access`
 /// never ran and no `DEFINE ACCESS` was ever indexed. Look inside the wrapper.
-fn define_form(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn define_form(node: Node<'_>, source: &str) -> Option<String> {
     let children = k::named_children(node);
     if let Some(wrapper) = children
         .iter()
@@ -980,7 +980,7 @@ fn parse_function_param(param: Node<'_>, source: &str) -> Option<FunctionParam> 
 /// into the DEFINE statement's children — there is no `ReturnsClause`
 /// wrapper — so the return type is the first type-bearing sibling that
 /// follows the `->` (`LookupRight`) token.
-fn function_return_type(children: &[Node<'_>], source: &str) -> Option<TypeExpr> {
+pub(crate) fn function_return_type(children: &[Node<'_>], source: &str) -> Option<TypeExpr> {
     let arrow = children
         .iter()
         .position(|child| child.kind() == k::LOOKUP_RIGHT)?;

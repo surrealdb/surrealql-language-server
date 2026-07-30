@@ -681,8 +681,107 @@ pub fn type_diagnostics(
     let root = analysis.tree.root_node();
     check_calls(root, &ctx, &mut diagnostics);
     check_let_annotations(root, &ctx, &mut diagnostics);
+    check_function_returns(root, &ctx, &mut diagnostics);
     check_variables(root, &ctx, settings, &mut diagnostics);
     diagnostics
+}
+
+/// `DEFINE FUNCTION … -> T { RETURN … }` — the returned value must satisfy `T`.
+///
+/// The engine coerces a function's result to its declared return type and fails
+/// with `Couldn't coerce return value from function …`
+/// (`expr/function.rs:330`), using the same coercion relation
+/// [`assignable`] models for arguments. So a declared return type is checkable
+/// with what is already here.
+///
+/// Two things are checked, both **only as direct children of the function's own
+/// block**:
+///
+/// * every `RETURN <expr>`, and
+/// * the block's trailing expression, which is a function's result when it ends
+///   without a `RETURN`.
+///
+/// Staying at the top level is deliberate. A `RETURN` nested deeper belongs to
+/// whichever construct encloses it — a block bound by `LET $y = { RETURN 5 }`
+/// returns from that block, not from the function — and misreading one would
+/// report against a value the function never returns. Nested returns are
+/// therefore silent, which costs coverage rather than correctness.
+fn check_function_returns(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    if node.kind() == k::DEFINE_STATEMENT
+        && crate::semantic::analyzer::define_form(node, ctx.source).as_deref() == Some("function")
+    {
+        check_one_function_body(node, ctx, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        check_function_returns(child, ctx, out);
+    }
+}
+
+fn check_one_function_body(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    let children = k::named_children(node);
+    // No declared return type means nothing to check against.
+    let Some(declared) = crate::semantic::analyzer::function_return_type(&children, ctx.source)
+    else {
+        return;
+    };
+    let Some(body) = k::find_child(node, k::BLOCK) else {
+        return;
+    };
+    // A body the parser could not read says nothing reliable about what it
+    // returns, and a syntax diagnostic already covers it.
+    if contains_parse_error(body) {
+        return;
+    }
+    let name = k::find_child(node, k::FUNCTION_NAME)
+        .and_then(|node| k::text_of(ctx.source, node))
+        .unwrap_or("this function");
+
+    let statements = k::named_children(body);
+    for statement in &statements {
+        if statement.kind() != k::RETURN_STATEMENT {
+            continue;
+        }
+        // `RETURN` with no value yields NONE, which every optional type
+        // accepts and `assignable` already judges.
+        if let Some(value) = returned_expression(*statement) {
+            report_return_mismatch(value, &declared, name, ctx, out);
+        }
+    }
+
+    // A body that ends in a bare expression returns it. `{ 1 }` is
+    // `-> int`; `{ '' }` is not.
+    if let Some(tail) = statements.iter().rev().find(|child| {
+        !is_trivia(**child) && !matches!(child.kind(), k::BRACE_OPEN | k::BRACE_CLOSE)
+    }) && tail.kind() != k::RETURN_STATEMENT
+    {
+        report_return_mismatch(*tail, &declared, name, ctx, out);
+    }
+}
+
+/// The value a `RETURN` carries, if it carries one.
+fn returned_expression<'tree>(statement: Node<'tree>) -> Option<Node<'tree>> {
+    k::named_children(statement)
+        .into_iter()
+        .find(|child| !k::is_keyword(*child) && !is_trivia(*child))
+}
+
+fn report_return_mismatch(
+    value: Node<'_>,
+    declared: &TypeExpr,
+    name: &str,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let actual = infer_expr_type(value, ctx);
+    if assignable(&actual, declared) != Verdict::Incompatible {
+        return;
+    }
+    out.push(diagnostic(
+        node_range(ctx.source, value),
+        codes::RETURN_TYPE,
+        format!("`{name}` returns `{declared}`, but this value is `{actual}`."),
+    ));
 }
 
 /// True when this `VariableName` is a binding *site* rather than a use.

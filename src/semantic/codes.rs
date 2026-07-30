@@ -25,6 +25,10 @@ pub const ARGUMENT_TYPE: &str = "argument-type";
 pub const ARGUMENT_COUNT: &str = "argument-count";
 /// A `LET $x: T = …` value cannot satisfy the declared type `T`.
 pub const LET_TYPE: &str = "let-type";
+/// A `RETURN` inside `DEFINE FUNCTION … -> T` yields a value that cannot
+/// satisfy `T`. The engine coerces a function's result to its declared type and
+/// fails with `Couldn't coerce return value from function …`.
+pub const RETURN_TYPE: &str = "return-type";
 /// A `$variable` reference that nothing in scope binds.
 pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
 /// A builtin function called by a name SurrealDB has renamed. The engine still

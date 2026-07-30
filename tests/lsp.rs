@@ -2151,6 +2151,145 @@ fn an_unknown_function_name_is_not_an_argument_error() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Declared function return types
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_return_that_cannot_satisfy_the_declared_type_is_reported() {
+    // The reported case. The engine coerces a function's result to its declared
+    // return type and fails with `Couldn't coerce return value from function`.
+    let source = r#"
+        DEFINE FUNCTION fn::beau::number($input: int) -> int {
+            RETURN "";
+        };
+    "#;
+    let diagnostics = diagnostics_for(source);
+    assert!(
+        codes_of(&diagnostics).contains(&"return-type".to_string()),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+    assert!(
+        messages_of(&diagnostics).iter().any(|message| message
+            .contains("`fn::beau::number` returns `int`, but this value is `string`")),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn the_reported_return_range_covers_the_value_not_the_statement() {
+    // The squiggle belongs under `""`, not under the whole `RETURN "";`.
+    let source = "DEFINE FUNCTION fn::x() -> int { RETURN \"\"; };";
+    let diagnostic = diagnostics_for(source)
+        .into_iter()
+        .find(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    "return-type".to_string(),
+                ))
+        })
+        .expect("a return-type diagnostic");
+    let start = diagnostic.range.start.character as usize;
+    let end = diagnostic.range.end.character as usize;
+    assert_eq!(&source[start..end], "\"\"", "range should cover the value");
+}
+
+#[test]
+fn a_return_that_satisfies_the_declared_type_is_silent() {
+    for source in [
+        "DEFINE FUNCTION fn::x() -> int { RETURN 1; };",
+        // `int` widens into `number`.
+        "DEFINE FUNCTION fn::x() -> number { RETURN 1; };",
+        "DEFINE FUNCTION fn::x() -> string { RETURN 'ok'; };",
+        "DEFINE FUNCTION fn::x() -> array<int> { RETURN [1, 2]; };",
+        "DEFINE FUNCTION fn::x() -> option<int> { RETURN NONE; };",
+        // No declared type: nothing to check against.
+        "DEFINE FUNCTION fn::x() { RETURN ''; };",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"return-type".to_string()),
+            "{source} is valid, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn every_return_in_a_body_is_checked() {
+    let source = r#"
+        DEFINE FUNCTION fn::x($flag: bool) -> int {
+            RETURN 1;
+            RETURN 'nope';
+            RETURN 2;
+        };
+    "#;
+    let count = codes_of(&diagnostics_for(source))
+        .iter()
+        .filter(|code| *code == "return-type")
+        .count();
+    assert_eq!(count, 1, "only the string return is wrong");
+}
+
+#[test]
+fn a_body_ending_in_a_bare_expression_returns_it() {
+    // A function without a `RETURN` yields its trailing expression.
+    assert!(
+        codes_of(&diagnostics_for("DEFINE FUNCTION fn::x() -> int { '' };"))
+            .contains(&"return-type".to_string()),
+        "the trailing expression is the result"
+    );
+    assert!(
+        !codes_of(&diagnostics_for("DEFINE FUNCTION fn::x() -> int { 1 };"))
+            .contains(&"return-type".to_string()),
+    );
+}
+
+#[test]
+fn an_uncertain_return_value_stays_silent() {
+    // The rule that governs everything here: report only what is provably
+    // wrong. A field access, a call whose type is unmodellable, and a
+    // string against a stringly type are all runtime questions.
+    for source in [
+        "DEFINE FUNCTION fn::x($r: record<person>) -> string { RETURN $r.name; };",
+        "DEFINE FUNCTION fn::x() -> string { RETURN type::field('name'); };",
+        "DEFINE FUNCTION fn::x() -> datetime { RETURN '2024-01-01T00:00:00Z'; };",
+        "DEFINE FUNCTION fn::x() -> int { RETURN SELECT * FROM person; };",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"return-type".to_string()),
+            "{source} must stay silent, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_return_nested_deeper_than_the_body_is_not_attributed_to_the_function() {
+    // A block bound by `LET` returns from that block, not from the function, so
+    // attributing its value to the function would report against something the
+    // function never returns.
+    let source = r#"
+        DEFINE FUNCTION fn::x() -> int {
+            LET $y = { RETURN ''; };
+            RETURN 1;
+        };
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(!codes.contains(&"return-type".to_string()), "got {codes:?}");
+}
+
+#[test]
+fn a_broken_body_produces_no_return_diagnostic() {
+    // A syntax diagnostic already covers it; guessing what a body it could not
+    // read returns would pile an invented error on top.
+    let codes = codes_of(&diagnostics_for(
+        "DEFINE FUNCTION fn::x() -> int { RETURN @@@; };",
+    ));
+    assert!(!codes.contains(&"return-type".to_string()), "got {codes:?}");
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Method-call syntax
 // ──────────────────────────────────────────────────────────────────────
 
