@@ -149,6 +149,19 @@ pub struct AccessDef {
     pub location: Location,
 }
 
+/// A `DEFINE ANALYZER`.
+///
+/// Indexed because an analyzer name is referenced by name elsewhere —
+/// `DEFINE INDEX … FULLTEXT ANALYZER <name>` — and completion cannot offer a
+/// name that nothing extracts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyzerDef {
+    pub name: String,
+    pub comment: Option<String>,
+    pub origin: SymbolOrigin,
+    pub location: Location,
+}
+
 /// A name paired with the tight range of the token that produced it,
 /// so diagnostics can underline `prson` instead of the whole statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -219,6 +232,7 @@ pub struct DocumentAnalysis {
     pub functions: Vec<FunctionDef>,
     pub params: Vec<ParamDef>,
     pub accesses: Vec<AccessDef>,
+    pub analyzers: Vec<AnalyzerDef>,
     pub query_facts: Vec<QueryFact>,
     pub references: Vec<SymbolReference>,
     pub syntax_diagnostics: Vec<Diagnostic>,
@@ -263,6 +277,7 @@ pub struct MergedSemanticModel {
     pub functions: HashMap<String, FunctionDef>,
     pub params: HashMap<String, ParamDef>,
     pub accesses: HashMap<String, AccessDef>,
+    pub analyzers: HashMap<String, AnalyzerDef>,
     pub function_references: HashMap<String, Vec<Location>>,
     pub function_callers: HashMap<String, Vec<String>>,
     pub workspace_symbols: Vec<DocumentSymbol>,

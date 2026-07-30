@@ -7,9 +7,10 @@ mod common;
 use common::{core_with, uri};
 use serde_json::json;
 use tower_lsp_server::ls_types::{
-    DiagnosticSeverity, DidChangeConfigurationParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, MessageType, NumberOrString,
-    TextDocumentIdentifier, TextDocumentItem,
+    CompletionItem, CompletionParams, CompletionResponse, DiagnosticSeverity,
+    DidChangeConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    InitializeParams, MessageType, NumberOrString, Position, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams,
 };
 
 fn text_document(path: &str, text: &str) -> TextDocumentItem {
@@ -26,6 +27,492 @@ async fn open(core: &common::TestCore, path: &str, text: &str) {
         text_document: text_document(path, text),
     })
     .await;
+}
+
+/// Drive the real `textDocument/completion` handler at one cursor position.
+async fn complete(
+    core: &common::TestCore,
+    path: &str,
+    line: u32,
+    character: u32,
+) -> Vec<CompletionItem> {
+    let response = core
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(path) },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .expect("the handler must answer for an open document");
+    match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    }
+}
+
+fn labels(items: &[CompletionItem]) -> Vec<&str> {
+    items.iter().map(|item| item.label.as_str()).collect()
+}
+
+/// A document that registers one table, then leaves the cursor on line 1.
+const WITH_TABLE: &str = "DEFINE TABLE person SCHEMAFULL;\n";
+
+// ──────────────────────────────────────────────────────────────────────
+// What structured builtin parameters unlock
+// ──────────────────────────────────────────────────────────────────────
+
+async fn signature_help_at(
+    core: &common::TestCore,
+    path: &str,
+    line: u32,
+    character: u32,
+) -> tower_lsp_server::ls_types::SignatureHelp {
+    core.signature_help(tower_lsp_server::ls_types::SignatureHelpParams {
+        context: None,
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            position: Position { line, character },
+        },
+        work_done_progress_params: Default::default(),
+    })
+    .await
+    .expect("signature help for a builtin call")
+}
+
+#[tokio::test]
+async fn signature_help_covers_a_namespace_the_curated_table_never_had() {
+    // `math::` was one of the 18 namespaces with no curated entry, so this
+    // position used to answer nothing.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN math::clamp(";
+    open(&core, "a.surql", text).await;
+
+    let help = signature_help_at(&core, "a.surql", 0, text.len() as u32).await;
+
+    let signature = &help.signatures[0];
+    let labels: Vec<String> = signature
+        .parameters
+        .as_ref()
+        .expect("parameters")
+        .iter()
+        .map(|param| match &param.label {
+            tower_lsp_server::ls_types::ParameterLabel::Simple(label) => label.clone(),
+            tower_lsp_server::ls_types::ParameterLabel::LabelOffsets(_) => String::new(),
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["arg: number", "min: number", "max: number"],
+        "parameters come from the engine's own implementation"
+    );
+}
+
+#[tokio::test]
+async fn signature_help_marks_optional_and_variadic_parameters() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN array::insert(";
+    open(&core, "a.surql", text).await;
+
+    let help = signature_help_at(&core, "a.surql", 0, text.len() as u32).await;
+    let rendered = format!("{:?}", help.signatures[0].parameters);
+    assert!(
+        rendered.contains("index?: int"),
+        "an omittable parameter carries `?`: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn signature_help_keeps_the_curated_prose_where_it_exists() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN string::len(";
+    open(&core, "a.surql", text).await;
+
+    let help = signature_help_at(&core, "a.surql", 0, text.len() as u32).await;
+    assert!(
+        help.signatures[0].documentation.is_some(),
+        "one of the 79 curated entries must keep its summary"
+    );
+}
+
+#[tokio::test]
+async fn inlay_hints_name_the_arguments_of_a_multi_parameter_builtin() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN math::clamp(5, 1, 10);";
+    open(&core, "a.surql", text).await;
+
+    let hints = core
+        .inlay_hint(tower_lsp_server::ls_types::InlayHintParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("a.surql"),
+            },
+            range: tower_lsp_server::ls_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, text.len() as u32),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await;
+
+    let labels: Vec<String> = hints
+        .iter()
+        .map(|hint| match &hint.label {
+            tower_lsp_server::ls_types::InlayHintLabel::String(label) => label.clone(),
+            tower_lsp_server::ls_types::InlayHintLabel::LabelParts(_) => String::new(),
+        })
+        .collect();
+    assert_eq!(labels, vec!["arg:", "min:", "max:"]);
+}
+
+#[tokio::test]
+async fn a_single_parameter_builtin_gets_no_inlay_hint() {
+    // `arg:` next to the only argument is noise, and most builtins take one.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN string::len('abc');";
+    open(&core, "a.surql", text).await;
+
+    let hints = core
+        .inlay_hint(tower_lsp_server::ls_types::InlayHintParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("a.surql"),
+            },
+            range: tower_lsp_server::ls_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, text.len() as u32),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await;
+
+    assert!(hints.is_empty(), "got {hints:?}");
+}
+
+#[tokio::test]
+async fn a_renamed_builtin_warns_and_offers_the_current_spelling() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", "RETURN type::thing('person', 'one');").await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("a.surql"))
+        .expect("diagnostics");
+    let renamed: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code == Some(NumberOrString::String("renamed-function".to_string()))
+        })
+        .collect();
+    assert_eq!(renamed.len(), 1, "got {diagnostics:?}");
+    assert_eq!(
+        renamed[0].severity,
+        Some(DiagnosticSeverity::WARNING),
+        "the engine still accepts the old name"
+    );
+    assert!(renamed[0].message.contains("renamed to `type::record`"));
+
+    // And the quick fix rewrites it.
+    let actions = core
+        .code_action(tower_lsp_server::ls_types::CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("a.surql"),
+            },
+            range: renamed[0].range,
+            context: tower_lsp_server::ls_types::CodeActionContext {
+                diagnostics: vec![renamed[0].clone()],
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("code actions");
+    let rendered = format!("{actions:?}");
+    assert!(
+        rendered.contains("Rename `type::thing` to `type::record`"),
+        "expected a rename fix, got {rendered}"
+    );
+    assert!(rendered.contains("type::record"), "the edit must apply it");
+}
+
+#[tokio::test]
+async fn a_current_function_name_produces_no_rename_warning() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", "RETURN type::record('person', 'one');").await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("a.surql"))
+        .expect("diagnostics");
+    assert!(
+        !diagnostics.iter().any(|diagnostic| diagnostic.code
+            == Some(NumberOrString::String("renamed-function".to_string()))),
+        "got {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_analyzer_name_is_offered_where_an_index_references_one() {
+    // Nothing extracted `DEFINE ANALYZER` before, so this slot had nothing to
+    // offer no matter how it was classified.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let second = "DEFINE INDEX i ON person FIELDS name FULLTEXT ANALYZER ";
+    let text = format!("DEFINE ANALYZER my_an TOKENIZERS BLANK;\n{second}");
+    open(&core, "a.surql", &text).await;
+
+    let items = complete(&core, "a.surql", 1, second.len() as u32).await;
+
+    assert!(
+        labels(&items).contains(&"my_an"),
+        "expected the defined analyzer, got {:?}",
+        labels(&items)
+    );
+    assert!(
+        !labels(&items).iter().any(|label| label.contains("::")),
+        "no function is legal in an analyzer slot: {:?}",
+        labels(&items)
+    );
+}
+
+#[tokio::test]
+async fn remove_analyzer_offers_the_existing_names() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        "DEFINE ANALYZER my_an TOKENIZERS BLANK;\nREMOVE ANALYZER ",
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 1, "REMOVE ANALYZER ".len() as u32).await;
+    assert_eq!(labels(&items), vec!["my_an"]);
+}
+
+#[tokio::test]
+async fn a_define_param_name_is_offered_in_an_expression() {
+    // The model has always held these — hover and go-to-definition resolve them
+    // — but nothing ever offered them.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", "DEFINE PARAM $rate VALUE 0.2;\nRETURN $r").await;
+
+    let items = complete(&core, "a.surql", 1, 9).await;
+    assert!(
+        labels(&items).contains(&"$rate"),
+        "expected the defined parameter, got {:?}",
+        labels(&items)
+    );
+}
+
+#[tokio::test]
+async fn a_define_access_is_indexed() {
+    // The grammar wraps `DEFINE ACCESS` in an `AccessDefinition` node, so the
+    // second-keyword lookup returned `None` and the extraction arm never ran.
+    // Hover is the observable proof that it does now.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        "DEFINE ACCESS api ON DATABASE TYPE RECORD;",
+    )
+    .await;
+
+    let hover = core
+        .hover(tower_lsp_server::ls_types::HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("a.surql"),
+                },
+                position: Position::new(0, 15),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await;
+
+    let rendered = format!("{hover:?}");
+    assert!(
+        rendered.contains("api"),
+        "DEFINE ACCESS must reach the model: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn info_for_offers_only_the_nine_engine_targets() {
+    // The reported defect: this position used to return the whole catalogue.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{WITH_TABLE}INFO FOR ")).await;
+
+    let items = complete(&core, "a.surql", 1, 9).await;
+
+    assert_eq!(
+        labels(&items),
+        vec![
+            "ROOT",
+            "NAMESPACE",
+            "NS",
+            "DATABASE",
+            "DB",
+            "TABLE",
+            "TB",
+            "USER",
+            "INDEX"
+        ],
+        "INFO FOR accepts exactly these targets"
+    );
+}
+
+#[tokio::test]
+async fn info_for_offers_no_function_and_no_foreign_keyword() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{WITH_TABLE}INFO FOR ")).await;
+
+    let items = complete(&core, "a.surql", 1, 9).await;
+
+    for label in labels(&items) {
+        assert!(
+            !label.contains("::"),
+            "no builtin or user function is legal after INFO FOR, got `{label}`"
+        );
+    }
+    for illegal in ["SELECT", "CREATE", "WHERE", "ALLINSIDE", "person"] {
+        assert!(
+            !labels(&items).contains(&illegal),
+            "`{illegal}` is not legal after INFO FOR"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_partial_target_filters_the_head_list_case_insensitively() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{WITH_TABLE}INFO FOR ro")).await;
+
+    let items = complete(&core, "a.surql", 1, 11).await;
+
+    assert_eq!(labels(&items), vec!["ROOT"], "lowercase must still match");
+}
+
+#[tokio::test]
+async fn info_for_table_offers_the_known_tables() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{WITH_TABLE}INFO FOR TABLE ")).await;
+
+    let items = complete(&core, "a.surql", 1, 15).await;
+
+    assert!(
+        labels(&items).contains(&"person"),
+        "expected the defined table, got {:?}",
+        labels(&items)
+    );
+}
+
+#[tokio::test]
+async fn define_offers_the_sixteen_sub_forms_and_nothing_else() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{WITH_TABLE}DEFINE ")).await;
+
+    let items = complete(&core, "a.surql", 1, 7).await;
+
+    assert_eq!(items.len(), 16, "got {:?}", labels(&items));
+    assert!(labels(&items).contains(&"ANALYZER"));
+    assert!(
+        !labels(&items).contains(&"MODEL"),
+        "SurrealDB 3.x has no DEFINE MODEL"
+    );
+}
+
+#[tokio::test]
+async fn a_where_clause_keeps_the_full_list() {
+    // The busiest completion position in the language. Narrowing it would hide
+    // fields, variables and functions, so it must stay untouched.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{WITH_TABLE}SELECT * FROM person WHERE "),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 1, 27).await;
+
+    assert!(
+        labels(&items).iter().any(|label| label.contains("::")),
+        "functions must still be offered inside WHERE"
+    );
+}
+
+#[tokio::test]
+async fn an_unclosed_call_keeps_the_full_list() {
+    // `(` is a trigger character, so this fires on every keystroke inside a
+    // call. The head table must not answer here.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{WITH_TABLE}RETURN string::len("),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 1, 19).await;
+
+    assert!(
+        items.len() > 20,
+        "an argument position keeps the full list, got {} items",
+        items.len()
+    );
+}
+
+#[tokio::test]
+async fn select_from_still_offers_only_tables() {
+    // Regression guard: the head table must not shadow the existing
+    // table-name scanner.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{WITH_TABLE}SELECT * FROM ")).await;
+
+    let items = complete(&core, "a.surql", 1, 14).await;
+
+    assert!(labels(&items).contains(&"person"));
+    assert!(
+        !labels(&items).contains(&"SELECT"),
+        "a table slot offers no keyword, got {:?}",
+        labels(&items)
+    );
+}
+
+#[tokio::test]
+async fn a_statement_after_a_semicolon_is_classified_on_its_own() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "SELECT * FROM person; INFO FOR ";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+
+    assert_eq!(
+        labels(&items),
+        vec![
+            "ROOT",
+            "NAMESPACE",
+            "NS",
+            "DATABASE",
+            "DB",
+            "TABLE",
+            "TB",
+            "USER",
+            "INDEX"
+        ],
+        "the earlier statement must not leak into the word list"
+    );
+}
+
+#[tokio::test]
+async fn a_half_typed_keyword_is_the_prefix_not_a_committed_word() {
+    // Cursor immediately after `FOR` with no space: the author is still typing
+    // that word, so the slot is the one `INFO` opens and `FOR` filters it.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", "INFO FOR").await;
+
+    let items = complete(&core, "a.surql", 0, 8).await;
+
+    assert_eq!(labels(&items), vec!["FOR"]);
 }
 
 #[tokio::test]

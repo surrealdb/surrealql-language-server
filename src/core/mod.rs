@@ -11,6 +11,7 @@ pub mod completion_context;
 pub mod dispatch;
 pub mod server;
 pub mod state;
+pub mod statement_shape;
 
 pub use client::{LspNotifier, MetadataProvider, WorkspaceLoader};
 pub use server::LanguageServerCore;

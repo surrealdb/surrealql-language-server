@@ -10,10 +10,10 @@ use crate::semantic::node_kind as k;
 use crate::semantic::text::{byte_range_to_lsp, compact_preview, offset_to_position};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
-    AccessDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage, FunctionParam,
-    IndexDef, InferenceFact, MergedSemanticModel, NamedRange, ParamDef, PermissionMode,
-    PermissionRule, QueryAction, QueryFact, SymbolOrigin, SymbolReference, TableDef,
-    TargetResolution,
+    AccessDef, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
+    FunctionParam, IndexDef, InferenceFact, MergedSemanticModel, NamedRange, ParamDef,
+    PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin, SymbolReference,
+    TableDef, TargetResolution,
 };
 
 pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<DocumentAnalysis> {
@@ -35,6 +35,7 @@ pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<Do
         functions: Vec::new(),
         params: Vec::new(),
         accesses: Vec::new(),
+        analyzers: Vec::new(),
         query_facts: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
@@ -105,6 +106,7 @@ fn collect_statements(
             Some("index") => extract_index(node, source, uri, origin, analysis),
             Some("param") => extract_param(node, source, uri, origin, analysis),
             Some("access" | "scope") => extract_access(node, source, uri, origin, analysis),
+            Some("analyzer") => extract_analyzer(node, source, uri, origin, analysis),
             _ => {
                 if let Some(symbol) = statement_symbol(node, source, uri) {
                     analysis.document_symbols.push(symbol);
@@ -178,8 +180,29 @@ fn collect_statements(
     }
 }
 
-fn define_form(node: Node<'_>, source: &str) -> Option<String> {
-    k::named_children(node)
+/// Which `DEFINE` this is — `table`, `field`, `access`, and so on.
+///
+/// Normally the sub-form keyword is the second direct keyword child. `ACCESS`
+/// and `SCOPE` are the exceptions: the grammar wraps each one's keyword and name
+/// in an `AccessDefinition` / `ScopeDefinition` node
+/// (`grammar.js:520`), so the `DefineStatement` has only *one* direct keyword
+/// child and the second-keyword lookup returned `None`.
+///
+/// That made the `Some("access" | "scope")` arm unreachable, so `extract_access`
+/// never ran and no `DEFINE ACCESS` was ever indexed. Look inside the wrapper.
+pub(crate) fn define_form(node: Node<'_>, source: &str) -> Option<String> {
+    let children = k::named_children(node);
+    if let Some(wrapper) = children
+        .iter()
+        .find(|child| matches!(child.kind(), k::ACCESS_DEFINITION | k::SCOPE_DEFINITION))
+        && let Some(keyword) = k::named_children(*wrapper)
+            .into_iter()
+            .find(|child| k::is_keyword(*child))
+        && let Some(text) = text_of(source, keyword)
+    {
+        return Some(text.to_ascii_lowercase());
+    }
+    children
         .into_iter()
         .filter(|child| k::is_keyword(*child))
         .nth(1)
@@ -601,6 +624,40 @@ fn extract_param(
     });
 }
 
+/// `DEFINE ANALYZER <name> …`
+///
+/// Indexed so completion can offer the name where one is referenced —
+/// `DEFINE INDEX … FULLTEXT ANALYZER <name>`. Before this, nothing extracted
+/// analyzers, so that slot had nothing to offer.
+fn extract_analyzer(
+    node: Node<'_>,
+    source: &str,
+    uri: &Uri,
+    origin: SymbolOrigin,
+    analysis: &mut DocumentAnalysis,
+) {
+    let Some(name) = k::named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == k::IDENT)
+        .and_then(|child| text_of(source, child))
+    else {
+        return;
+    };
+
+    analysis.document_symbols.push(definition_symbol(
+        &format!("ANALYZER {name}"),
+        SymbolKind::OBJECT,
+        source,
+        node,
+    ));
+    analysis.analyzers.push(AnalyzerDef {
+        name,
+        comment: None,
+        origin,
+        location: location(uri, source, node),
+    });
+}
+
 fn extract_access(
     node: Node<'_>,
     source: &str,
@@ -608,9 +665,14 @@ fn extract_access(
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
 ) {
-    // `DEFINE ACCESS x ...` / `DEFINE SCOPE x ...` name the access as the
-    // first `identifier` child of the statement.
-    let Some(name) = k::named_children(node)
+    // `DEFINE ACCESS x …` / `DEFINE SCOPE x …` name the access inside the
+    // `AccessDefinition` / `ScopeDefinition` wrapper, not as a direct child of
+    // the statement — so search the wrapper when there is one.
+    let scope = k::named_children(node)
+        .into_iter()
+        .find(|child| matches!(child.kind(), k::ACCESS_DEFINITION | k::SCOPE_DEFINITION))
+        .unwrap_or(node);
+    let Some(name) = k::named_children(scope)
         .into_iter()
         .find(|child| child.kind() == k::IDENT)
         .and_then(|child| text_of(source, child))
@@ -918,7 +980,7 @@ fn parse_function_param(param: Node<'_>, source: &str) -> Option<FunctionParam> 
 /// into the DEFINE statement's children — there is no `ReturnsClause`
 /// wrapper — so the return type is the first type-bearing sibling that
 /// follows the `->` (`LookupRight`) token.
-fn function_return_type(children: &[Node<'_>], source: &str) -> Option<TypeExpr> {
+pub(crate) fn function_return_type(children: &[Node<'_>], source: &str) -> Option<TypeExpr> {
     let arrow = children
         .iter()
         .position(|child| child.kind() == k::LOOKUP_RIGHT)?;
@@ -1822,21 +1884,35 @@ fn walk_inlay_hints(
         let name_node = node
             .children(&mut cursor)
             .find(|child| child.kind() == k::CUSTOM_FUNCTION_NAME);
-        // `model.functions` is keyed by the *full* name including the
-        // `fn::` prefix (see `merge_function`), so look up the raw text.
-        // Stripping the prefix first meant this never matched and custom
-        // function inlay hints never appeared.
         if let Some(name_node) = name_node
             && let Ok(raw) = name_node.utf8_text(source.as_bytes())
-            && raw.starts_with("fn::")
-            && let Some(function) = model.functions.get(raw.trim())
         {
-            let mut cursor = node.walk();
-            let arg_list = node
-                .children(&mut cursor)
-                .find(|child| child.kind() == k::ARGUMENT_LIST);
-            if let Some(arg_list) = arg_list {
-                emit_argument_hints(arg_list, source, function, hints);
+            let name = raw.trim();
+            // `model.functions` is keyed by the *full* name including the
+            // `fn::` prefix (see `merge_function`), so look up the raw text.
+            // Stripping the prefix first meant this never matched and custom
+            // function inlay hints never appeared.
+            let names = if name.starts_with("fn::") {
+                model.functions.get(name).map(|function| {
+                    function
+                        .params
+                        .iter()
+                        .map(|param| param.name.clone())
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                builtin_parameter_names(name)
+            };
+            if let Some(names) = names
+                && !names.is_empty()
+            {
+                let mut cursor = node.walk();
+                let arg_list = node
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == k::ARGUMENT_LIST);
+                if let Some(arg_list) = arg_list {
+                    emit_argument_hints(arg_list, source, &names, hints);
+                }
             }
         }
     }
@@ -1847,10 +1923,33 @@ fn walk_inlay_hints(
     }
 }
 
+/// The parameter names of a builtin, when a hint would earn its space.
+///
+/// Two rules, both about noise rather than correctness:
+///
+/// * A signature the generator could not read has no names to show.
+/// * A single-parameter call gains nothing from `arg:` — the reader can already
+///   see there is one argument. Most builtins take one, so without this the
+///   viewport fills with hints that say nothing.
+fn builtin_parameter_names(name: &str) -> Option<Vec<String>> {
+    let signature = crate::grammar::builtin_signature(name)?;
+    if !signature.generated.signature_known || signature.generated.params.len() < 2 {
+        return None;
+    }
+    Some(
+        signature
+            .generated
+            .params
+            .iter()
+            .map(|param| param.name.to_string())
+            .collect(),
+    )
+}
+
 fn emit_argument_hints(
     arg_list: Node<'_>,
     source: &str,
-    function: &FunctionDef,
+    param_names: &[String],
     hints: &mut Vec<InlayHint>,
 ) {
     let mut cursor = arg_list.walk();
@@ -1860,12 +1959,12 @@ fn emit_argument_hints(
         .collect();
 
     for (index, argument) in arguments.iter().enumerate() {
-        let Some(param) = function.params.get(index) else {
+        let Some(name) = param_names.get(index) else {
             break;
         };
         hints.push(InlayHint {
             position: offset_to_position(source, argument.start_byte()),
-            label: InlayHintLabel::String(format!("{}:", param.name)),
+            label: InlayHintLabel::String(format!("{name}:")),
             kind: Some(InlayHintKind::PARAMETER),
             text_edits: None,
             tooltip: None,

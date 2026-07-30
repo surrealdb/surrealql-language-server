@@ -27,6 +27,10 @@ pub const SOURCE_FILE: &str = "SurrealQL";
 pub const PREDICATE: &str = "Predicate";
 pub const SUB_QUERY: &str = "SubQuery";
 pub const BLOCK: &str = "Block";
+/// The braces of a [`BLOCK`]. Named nodes, so a walk over a block's children
+/// meets them alongside the statements.
+pub const BRACE_OPEN: &str = "BraceOpen";
+pub const BRACE_CLOSE: &str = "BraceClose";
 
 // ---- Statements ----------------------------------------------------------
 
@@ -44,6 +48,9 @@ pub const INSERT_STATEMENT: &str = "InsertStatement";
 pub const LET_STATEMENT: &str = "LetStatement";
 pub const FOR_STATEMENT: &str = "ForStatement";
 pub const IF_ELSE_STATEMENT: &str = "IfElseStatement";
+/// The brace form of `IF`: wraps the condition and every branch block of an
+/// [`IF_ELSE_STATEMENT`], so a walk looking for the branches passes through it.
+pub const MODERN: &str = "Modern";
 pub const RETURN_STATEMENT: &str = "ReturnStatement";
 pub const THROW_STATEMENT: &str = "ThrowStatement";
 
@@ -85,6 +92,15 @@ pub const PREFIX_EXPRESSION: &str = "PrefixExpression";
 pub const PATH: &str = "Path";
 pub const SUBSCRIPT: &str = "Subscript";
 pub const ARGUMENT_LIST: &str = "ArgumentList";
+/// `DEFINE CONFIG API MIDDLEWARE fn::x()` — the parent of a function *reference*
+/// rather than a call. The API runtime supplies the arguments.
+pub const MIDDLEWARE_CLAUSE: &str = "MiddlewareClause";
+/// `DEFINE ACCESS …` wraps its own keyword and name in this node instead of
+/// leaving them as direct children of the `DefineStatement`, which is why
+/// [`crate::semantic::analyzer`] has to look inside it to name the form.
+pub const ACCESS_DEFINITION: &str = "AccessDefinition";
+/// `DEFINE SCOPE …`, the pre-3.x spelling of `DEFINE ACCESS`. Wraps identically.
+pub const SCOPE_DEFINITION: &str = "ScopeDefinition";
 pub const FUNCTION_CALL: &str = "FunctionCall";
 /// Method-call form of a function: `$text.trim()`, `$list.len()`.
 pub const IDIOM_FUNCTION: &str = "IdiomFunction";

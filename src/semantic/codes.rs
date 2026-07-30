@@ -25,8 +25,20 @@ pub const ARGUMENT_TYPE: &str = "argument-type";
 pub const ARGUMENT_COUNT: &str = "argument-count";
 /// A `LET $x: T = …` value cannot satisfy the declared type `T`.
 pub const LET_TYPE: &str = "let-type";
+/// A `RETURN` inside `DEFINE FUNCTION … -> T` yields a value that cannot
+/// satisfy `T`. The engine coerces a function's result to its declared type and
+/// fails with `Couldn't coerce return value from function …`.
+pub const RETURN_TYPE: &str = "return-type";
 /// A `$variable` reference that nothing in scope binds.
 pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
+/// A builtin function called by a name SurrealDB has renamed. The engine still
+/// accepts it and records the replacement itself, so this is a warning with a
+/// quick fix rather than an error.
+pub const RENAMED_FUNCTION: &str = "renamed-function";
+/// A builtin the parser accepts that no implementation backs in call form, so
+/// the query parses and then fails at run time. A warning rather than an error,
+/// because the claim rests on reading the engine's dispatch tables.
+pub const NOT_CALLABLE: &str = "not-callable";
 
 /// Wrap a code constant in the LSP `Diagnostic.code` representation.
 pub fn as_code(value: &str) -> Option<NumberOrString> {

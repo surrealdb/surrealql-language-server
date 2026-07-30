@@ -70,7 +70,15 @@ impl TypeExpr {
             return Self::Record(tables);
         }
         if let Some(inner) = unwrap_generic(trimmed, "array") {
-            return Self::Array(Box::new(Self::parse(inner)));
+            return Self::Array(Box::new(Self::parse(element_of(inner))));
+        }
+        // `set<T>` reaches this path from the generated builtin catalogue and
+        // from any declared type that arrives as text rather than as a grammar
+        // node. Without a case here it fell through to `Other`, which the
+        // checker treats exactly like `Unknown` — so a `set` parameter or field
+        // silently checked nothing.
+        if let Some(inner) = unwrap_generic(trimmed, "set") {
+            return Self::Set(Box::new(Self::parse(element_of(inner))));
         }
         if let Some(inner) = unwrap_generic(trimmed, "option") {
             return Self::Option(Box::new(Self::parse(inner)));
@@ -326,6 +334,19 @@ fn object_type_fields(node: Node<'_>, source: &str) -> Vec<(String, TypeExpr)> {
         .collect()
 }
 
+/// The element type of an `array<…>` or `set<…>` argument list.
+///
+/// `array<string, 5>` declares a fixed length, and the arity is not a type —
+/// the same reason [`TypeExpr::from_parameterized`] keeps only the first
+/// argument. Without this, the trailing `, 5` made the whole thing an `Other`
+/// and silenced the element check.
+fn element_of(inner: &str) -> &str {
+    match split_top_level(inner, ',') {
+        Some(parts) => parts.first().copied().unwrap_or(inner).trim(),
+        None => inner.trim(),
+    }
+}
+
 fn unwrap_generic<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("{name}<");
     if !input.starts_with(&prefix) || !input.ends_with('>') {
@@ -365,6 +386,38 @@ fn split_top_level(input: &str, delimiter: char) -> Option<Vec<&str>> {
 #[cfg(test)]
 mod tests {
     use super::TypeExpr;
+
+    #[test]
+    fn parses_set_from_a_string() {
+        // The string path had no `set<>` case, so this degraded to `Other`,
+        // which the checker treats as unknown — a `set` field or parameter
+        // silently checked nothing.
+        assert_eq!(
+            TypeExpr::parse("set<string>"),
+            TypeExpr::Set(Box::new(TypeExpr::Scalar("string".to_string())))
+        );
+        assert_eq!(TypeExpr::parse("set<string>").to_string(), "set<string>");
+    }
+
+    #[test]
+    fn parses_set_of_records_and_keeps_the_link() {
+        let expr = TypeExpr::parse("set<record<person>>");
+        assert_eq!(expr.record_tables(), vec!["person".to_string()]);
+    }
+
+    #[test]
+    fn drops_the_arity_argument_of_a_sized_collection() {
+        // `array<string, 5>` declares a length, and a length is not a type. The
+        // whole thing used to become an `Other`, silencing the element check.
+        assert_eq!(
+            TypeExpr::parse("array<string, 5>"),
+            TypeExpr::Array(Box::new(TypeExpr::Scalar("string".to_string())))
+        );
+        assert_eq!(
+            TypeExpr::parse("set<int, 3>"),
+            TypeExpr::Set(Box::new(TypeExpr::Scalar("int".to_string())))
+        );
+    }
 
     #[test]
     fn parses_nested_record_types() {

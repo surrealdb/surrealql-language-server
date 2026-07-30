@@ -19,14 +19,15 @@ use std::sync::Arc;
 
 use ls_types::*;
 
-use crate::config::ServerSettings;
+use crate::config::{AuthContext, ServerSettings};
 use crate::core::client::{LspNotifier, MetadataProvider, WorkspaceLoader};
 use crate::core::completion_context::{
     ColumnSlot, active_query_fact, column_completion_context, completion_prefix,
-    completion_table_qualifier, is_table_name_context,
+    completion_table_qualifier, head_slot_at, is_table_name_context,
 };
 use crate::core::state::{ServerState, merged_workspace, workspace_signature};
-use crate::grammar::{BuiltinFunction, builtin_function};
+use crate::core::statement_shape::SlotYield;
+use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
 use crate::semantic::analyzer::analyze_document;
 use crate::semantic::model::{
@@ -507,9 +508,31 @@ where
             return Some(CompletionResponse::Array(items));
         }
 
+        let trimmed_prefix = prefix.trim_matches(|ch: char| ch == ':');
+
+        // A statement head whose legal continuations are a closed set —
+        // `INFO FOR `, `USE `, `DEFINE `, `REMOVE `, `ALTER `, `SHOW `. Offering
+        // the whole catalogue in those positions is the reported defect: an
+        // empty prefix disables every filter below, so `INFO FOR ` returned ~375
+        // items of which nine were legal.
+        //
+        // The table answers `Expression` for anything it does not model, which
+        // falls through to the behaviour this handler had before, so no working
+        // position can regress.
+        if !record_type_context {
+            let slot = head_slot_at(&analysis.text, position);
+            if slot != SlotYield::Expression {
+                return Some(CompletionResponse::Array(head_slot_items(
+                    slot,
+                    trimmed_prefix,
+                    &model,
+                    settings.active_auth_context(),
+                )));
+            }
+        }
+
         let statement_fact = active_query_fact(&analysis, position);
         let qualifier = completion_table_qualifier(&analysis.text, position);
-        let trimmed_prefix = prefix.trim_matches(|ch: char| ch == ':');
 
         // Decide whether the cursor is in a column-name slot. A `tbl.`
         // qualifier is always treated as a strict slot (the only legal
@@ -740,9 +763,15 @@ where
             });
         }
 
-        let function = builtin_function(function_name)?;
+        // The generated catalogue supplies parameters for every builtin; the
+        // curated table adds prose for the 79 that have it. Before this, help
+        // came only from the curated table, so `math::clamp(` offered nothing.
+        let signature = builtin_signature(function_name)?;
         Some(SignatureHelp {
-            signatures: vec![builtin_signature_information(function)],
+            signatures: vec![builtin_signature_information(
+                signature,
+                builtin_function(function_name),
+            )],
             active_signature: Some(0),
             active_parameter: Some(active_parameter),
         })
@@ -1088,6 +1117,55 @@ where
 // Free helpers
 // ──────────────────────────────────────────────────────────────────────
 
+/// The completion items for one closed-vocabulary statement-head slot.
+///
+/// Keyword order follows the engine's own parser arms rather than the
+/// alphabet, because `INFO FOR ` reads better as `ROOT NAMESPACE NS …` than as
+/// `DATABASE DB INDEX …`. The `sort_text` preserves that order and keeps every
+/// keyword above the table names, which sort under `0-{priority}-{name}` with
+/// a priority of at least 1 (`crate::semantic::model`).
+fn head_slot_items(
+    slot: SlotYield,
+    prefix: &str,
+    model: &MergedSemanticModel,
+    active_context: Option<&AuthContext>,
+) -> Vec<CompletionItem> {
+    // Analyzer names come from the model rather than from a keyword list.
+    if slot == SlotYield::Analyzers {
+        return model.analyzer_completion_items(prefix);
+    }
+
+    let (keywords, with_tables) = match slot {
+        SlotYield::Keywords(list) => (list, false),
+        SlotYield::KeywordsAndTables(list) => (list, true),
+        SlotYield::Tables => (&[] as &[&str], true),
+        SlotYield::Analyzers => unreachable!("handled above"),
+        // The caller must not reach this arm: `Expression` means "keep the
+        // list you already build".
+        SlotYield::Expression => return Vec::new(),
+    };
+
+    let upper = prefix.to_ascii_uppercase();
+    let mut items: Vec<CompletionItem> = keywords
+        .iter()
+        .enumerate()
+        .filter(|(_, keyword)| upper.is_empty() || keyword.starts_with(&upper))
+        .map(|(index, keyword)| CompletionItem {
+            label: (*keyword).to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some("SurrealQL keyword".to_string()),
+            insert_text: Some((*keyword).to_string()),
+            sort_text: Some(format!("0-0-{index:02}-{keyword}")),
+            ..CompletionItem::default()
+        })
+        .collect();
+
+    if with_tables {
+        items.extend(model.table_completion_items(prefix, active_context));
+    }
+    items
+}
+
 fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
     params
         .workspace_folders
@@ -1114,33 +1192,44 @@ fn call_hierarchy_item(function: &FunctionDef) -> CallHierarchyItem {
     }
 }
 
-fn builtin_signature_information(function: &BuiltinFunction) -> SignatureInformation {
-    let parameters = function
-        .signature
-        .split_once('(')
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .map(|(params, _)| {
-            params
-                .split(',')
-                .map(str::trim)
-                .filter(|param| !param.is_empty())
-                .map(|param| ParameterInformation {
-                    label: ParameterLabel::Simple(param.to_string()),
-                    documentation: None,
-                })
-                .collect::<Vec<_>>()
+/// Signature help for a builtin.
+///
+/// Parameters come from the generated catalogue, so every function has them.
+/// They used to be recovered by splitting the curated signature string on `(`
+/// and `,`, which broke on a parameter type containing a comma
+/// (`array<string, 5>`) and covered only the 79 curated entries.
+///
+/// `curated` supplies the summary and documentation link when the function is
+/// one of those 79.
+fn builtin_signature_information(
+    signature: &BuiltinSignature,
+    curated: Option<&'static BuiltinFunction>,
+) -> SignatureInformation {
+    let parameters = signature
+        .param_labels()
+        .into_iter()
+        .map(|label| ParameterInformation {
+            label: ParameterLabel::Simple(label),
+            documentation: None,
         })
-        .unwrap_or_default();
+        .collect();
 
     SignatureInformation {
-        label: function.signature.to_string(),
-        documentation: Some(Documentation::MarkupContent(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: format!(
-                "{}\n\n[Docs]({})",
-                function.summary, function.documentation_url
-            ),
-        })),
+        // Prefer the curated signature string: it is written for a reader,
+        // including a return type the Rust source does not express.
+        label: curated
+            .map(|function| function.signature.to_string())
+            .or_else(|| signature.display_signature())
+            .unwrap_or_else(|| signature.generated.name.to_string()),
+        documentation: curated.map(|function| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!(
+                    "{}\n\n[Docs]({})",
+                    function.summary, function.documentation_url
+                ),
+            })
+        }),
         parameters: Some(parameters),
         active_parameter: None,
     }
