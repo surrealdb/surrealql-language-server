@@ -90,12 +90,17 @@ checks already model — so this needed no new type machinery.
 
 - A body ending in a bare expression returns it, so
   `DEFINE FUNCTION fn::x() -> int { '' }` is reported too.
-- Checked **only for `RETURN`s that are direct children of the function's
-  own block**. A `RETURN` nested deeper belongs to whichever construct
-  encloses it — a block bound by `LET $y = { RETURN 5 }` returns from that
-  block, not from the function — and misreading one would report against a
-  value the function never returns. Nested returns stay silent, which costs
-  coverage rather than correctness.
+- **`RETURN`s inside `IF` branches and `FOR` bodies are checked**, at any
+  nesting depth. A `RETURN` there returns from the enclosing function, not
+  from the branch — SurrealDB's own `fn::fib($n: int) -> int` is written
+  that way, and its recursion would not terminate otherwise.
+- The walk descends only through constructs that propagate a return, as an
+  allowlist rather than a blocklist: the two directions do not cost the
+  same. Descending somewhere it should not reports against a value the
+  function never returns, while failing to descend merely misses one. So a
+  `RETURN` inside a closure, inside a nested `DEFINE FUNCTION`, or inside a
+  block bound as a value (`LET $y = { RETURN 5 }`, which returns from that
+  block) is not the function's return and is left alone.
 - A body the parser could not read is not checked; a syntax diagnostic
   already covers it.
 
@@ -164,7 +169,7 @@ checks already model — so this needed no new type machinery.
   runs everywhere — including where there is no SurrealDB checkout.
 - `tests/generated_catalogue.rs` pins the catalogue's freshness against
   the generator, and the invariants the argument checks depend on.
-- The suite grew from 245 tests to 348 in the crate, plus 28 for the
+- The suite grew from 245 tests to 354 in the crate, plus 28 for the
   generator and one ignored corpus sweep. That includes the first
   end-to-end completion tests: the handler previously had none.
 

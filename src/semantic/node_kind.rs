@@ -48,6 +48,9 @@ pub const INSERT_STATEMENT: &str = "InsertStatement";
 pub const LET_STATEMENT: &str = "LetStatement";
 pub const FOR_STATEMENT: &str = "ForStatement";
 pub const IF_ELSE_STATEMENT: &str = "IfElseStatement";
+/// The brace form of `IF`: wraps the condition and every branch block of an
+/// [`IF_ELSE_STATEMENT`], so a walk looking for the branches passes through it.
+pub const MODERN: &str = "Modern";
 pub const RETURN_STATEMENT: &str = "ReturnStatement";
 pub const THROW_STATEMENT: &str = "ThrowStatement";
 

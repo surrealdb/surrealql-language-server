@@ -694,18 +694,29 @@ pub fn type_diagnostics(
 /// [`assignable`] models for arguments. So a declared return type is checkable
 /// with what is already here.
 ///
-/// Two things are checked, both **only as direct children of the function's own
-/// block**:
+/// Two things are checked:
 ///
-/// * every `RETURN <expr>`, and
+/// * every `RETURN <expr>` that returns from *this* function, including the ones
+///   inside `IF` branches and `FOR` bodies, and
 /// * the block's trailing expression, which is a function's result when it ends
 ///   without a `RETURN`.
 ///
-/// Staying at the top level is deliberate. A `RETURN` nested deeper belongs to
-/// whichever construct encloses it — a block bound by `LET $y = { RETURN 5 }`
-/// returns from that block, not from the function — and misreading one would
-/// report against a value the function never returns. Nested returns are
-/// therefore silent, which costs coverage rather than correctness.
+/// A `RETURN` inside an `IF` really does return from the enclosing function —
+/// SurrealDB's own `fn::fib($n: int) -> int` is written that way, and recursion
+/// would not terminate otherwise:
+///
+/// ```surql
+/// DEFINE FUNCTION fn::fib($n: int) -> int {
+///     IF $n < 2 { RETURN $n; };
+///     RETURN fn::fib($n - 1) + fn::fib($n - 2);
+/// };
+/// ```
+///
+/// So the walk descends, but only through constructs that propagate a return
+/// ([`propagates_return`]). It is an allowlist rather than a blocklist, because
+/// the cost of the two directions is not symmetric: descending somewhere it
+/// should not reports against a value the function never returns, while failing
+/// to descend merely misses one.
 fn check_function_returns(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
     if node.kind() == k::DEFINE_STATEMENT
         && crate::semantic::analyzer::define_form(node, ctx.source).as_deref() == Some("function")
@@ -737,17 +748,17 @@ fn check_one_function_body(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diag
         .and_then(|node| k::text_of(ctx.source, node))
         .unwrap_or("this function");
 
-    let statements = k::named_children(body);
-    for statement in &statements {
-        if statement.kind() != k::RETURN_STATEMENT {
-            continue;
-        }
+    let mut returns = Vec::new();
+    collect_function_returns(body, &mut returns);
+    for statement in &returns {
         // `RETURN` with no value yields NONE, which every optional type
         // accepts and `assignable` already judges.
         if let Some(value) = returned_expression(*statement) {
             report_return_mismatch(value, &declared, name, ctx, out);
         }
     }
+
+    let statements = k::named_children(body);
 
     // A body that ends in a bare expression returns it. `{ 1 }` is
     // `-> int`; `{ '' }` is not.
@@ -757,6 +768,47 @@ fn check_one_function_body(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diag
     {
         report_return_mismatch(*tail, &declared, name, ctx, out);
     }
+}
+
+/// Every `RETURN` that returns from the function whose body is `node`.
+///
+/// Descends only through [`propagates_return`], so a `RETURN` belonging to some
+/// other construct is never collected.
+fn collect_function_returns<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
+    for child in k::named_children(node) {
+        if child.kind() == k::RETURN_STATEMENT {
+            out.push(child);
+            continue;
+        }
+        if propagates_return(child.kind()) {
+            collect_function_returns(child, out);
+        }
+    }
+}
+
+/// True when a `RETURN` inside this construct returns from the enclosing
+/// function rather than from the construct itself.
+///
+/// An allowlist, and short on purpose. Everything absent from it stops the
+/// walk, which is the safe direction:
+///
+/// * `LET $y = { RETURN 5 }` — the block is a *value*; its `RETURN` sets `$y`.
+///   `LetStatement` is absent, so the walk never reaches that block.
+/// * `Closure` and a nested `DefineStatement` — a `RETURN` inside either returns
+///   from *it*, not from the function around it.
+/// * `SubQuery` — an `IF` condition lives in one, and it is not a return path.
+fn propagates_return(kind: &str) -> bool {
+    matches!(
+        kind,
+        // A branch body, or a plain nested statement block.
+        k::BLOCK
+            // `IF … { … } ELSE IF … { … } ELSE { … }`, whose condition and
+            // branches are wrapped in a `Modern` node.
+            | k::IF_ELSE_STATEMENT
+            | k::MODERN
+            // `FOR $i IN … { RETURN … }` returns from the function, not the loop.
+            | k::FOR_STATEMENT
+    )
 }
 
 /// The value a `RETURN` carries, if it carries one.

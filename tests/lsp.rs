@@ -2265,6 +2265,118 @@ fn an_uncertain_return_value_stays_silent() {
 }
 
 #[test]
+fn a_return_inside_an_if_branch_is_checked() {
+    // A `RETURN` inside an `IF` returns from the *function* — SurrealDB's own
+    // `fn::fib` relies on it — so it must satisfy the declared type.
+    let source = r#"
+        DEFINE FUNCTION fn::beau::number($input: int) -> int {
+            IF ($input == 69) {
+                RETURN "";
+            };
+            RETURN 0;
+        };
+    "#;
+    let diagnostics = diagnostics_for(source);
+    let reported: Vec<String> = messages_of(&diagnostics)
+        .into_iter()
+        .filter(|message| message.contains("returns `int`"))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        1,
+        "only the string return is wrong, got {reported:?}"
+    );
+    assert!(
+        reported[0].contains("`fn::beau::number` returns `int`, but this value is `string`"),
+        "got {reported:?}"
+    );
+}
+
+#[test]
+fn every_branch_of_an_if_chain_is_checked() {
+    let source = r#"
+        DEFINE FUNCTION fn::x($n: int) -> int {
+            IF $n = 1 {
+                RETURN 'a';
+            } ELSE IF $n = 2 {
+                RETURN 'b';
+            } ELSE {
+                RETURN 'c';
+            };
+        };
+    "#;
+    let count = codes_of(&diagnostics_for(source))
+        .iter()
+        .filter(|code| *code == "return-type")
+        .count();
+    assert_eq!(count, 3, "each branch returns from the function");
+}
+
+#[test]
+fn a_return_inside_a_nested_if_is_checked() {
+    let source = r#"
+        DEFINE FUNCTION fn::x($n: int) -> int {
+            IF $n > 0 {
+                IF $n > 10 {
+                    RETURN 'deep';
+                };
+            };
+            RETURN 0;
+        };
+    "#;
+    assert!(
+        codes_of(&diagnostics_for(source)).contains(&"return-type".to_string()),
+        "nesting does not change which function a RETURN leaves"
+    );
+}
+
+#[test]
+fn a_return_inside_a_for_body_is_checked() {
+    let source = r#"
+        DEFINE FUNCTION fn::x() -> int {
+            FOR $i IN [1, 2] {
+                RETURN 'nope';
+            };
+            RETURN 0;
+        };
+    "#;
+    assert!(
+        codes_of(&diagnostics_for(source)).contains(&"return-type".to_string()),
+        "a RETURN in a FOR body returns from the function, not the loop"
+    );
+}
+
+#[test]
+fn the_recursion_pattern_from_surrealdbs_own_tests_stays_silent() {
+    // Verbatim shape of `fn::fib` in
+    // `language-tests/tests/bench/util/recursion-functions.surql`. If widening
+    // the walk ever starts reporting this, the widening is wrong.
+    let source = r#"
+        DEFINE FUNCTION fn::fib($n: int) -> int {
+            IF $n < 2 {
+                RETURN $n;
+            };
+            RETURN fn::fib($n - 1) + fn::fib($n - 2);
+        };
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(!codes.contains(&"return-type".to_string()), "got {codes:?}");
+}
+
+#[test]
+fn a_return_inside_a_closure_in_the_body_is_not_the_functions_return() {
+    // The closure's `RETURN` returns from the closure.
+    let source = r#"
+        DEFINE FUNCTION fn::x() -> int {
+            LET $f = || { RETURN 'inner'; };
+            RETURN 0;
+        };
+    "#;
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(!codes.contains(&"return-type".to_string()), "got {codes:?}");
+}
+
+#[test]
 fn a_return_nested_deeper_than_the_body_is_not_attributed_to_the_function() {
     // A block bound by `LET` returns from that block, not from the function, so
     // attributing its value to the function would report against something the
