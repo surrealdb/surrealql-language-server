@@ -29,6 +29,16 @@ pub const LET_TYPE: &str = "let-type";
 /// satisfy `T`. The engine coerces a function's result to its declared type and
 /// fails with `Couldn't coerce return value from function …`.
 pub const RETURN_TYPE: &str = "return-type";
+/// An arithmetic operator whose operand types SurrealDB rejects, such as
+/// `"a" + 1`. The engine fails with `Cannot perform addition with …`
+/// (`err/mod.rs`), and the operand tables it checks against are transcribed in
+/// [`crate::semantic::operate`].
+pub const OPERATOR_TYPE: &str = "operator-type";
+/// A method the receiver's type does not have, such as `"abc".nonsense()`. The
+/// engine refuses it with `no such method found for the string type`. Only
+/// reported when the receiver's type is certain — see
+/// [`crate::semantic::method::receiver_kind`].
+pub const UNKNOWN_METHOD: &str = "unknown-method";
 /// A `$variable` reference that nothing in scope binds.
 pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
 /// A builtin function called by a name SurrealDB has renamed. The engine still

@@ -2454,7 +2454,7 @@ fn a_method_count_is_reported_excluding_the_receiver() {
     assert!(
         messages_of(&diagnostics)
             .iter()
-            .any(|message| message.contains("`.at()` expects 1 argument, found 2")),
+            .any(|message| message.contains("`.at()` (`array::at`) expects 1 argument, found 2")),
         "the count is what the author writes: {:?}",
         messages_of(&diagnostics)
     );
@@ -2462,12 +2462,13 @@ fn a_method_count_is_reported_excluding_the_receiver() {
 
 #[test]
 fn a_method_on_an_unknown_receiver_stays_silent() {
-    // Nothing binds `$x`, so its type is unknown and no name can be resolved.
+    // Nothing binds `$unknown`, so no table applies and nothing is reported.
+    // This is the gate, and it is why a wrong receiver kind is worse than none:
+    // `String` and the catch-all disagree about four arities.
     for source in [
         "RETURN $unknown.extend('9');",
-        // A remapped method: `<number>.round()` is `math::round`, not
-        // `number::round`, so the convention finds nothing and says nothing.
-        "RETURN (1.5).round('nope');",
+        "DEFINE FUNCTION fn::f($x: any) { RETURN $x.extend('9'); };",
+        "DEFINE FUNCTION fn::f($x: option<string>) { RETURN $x.len(); };",
     ] {
         let codes = codes_of(&diagnostics_for(source));
         assert!(
@@ -2475,6 +2476,26 @@ fn a_method_on_an_unknown_receiver_stays_silent() {
             "{source} must stay silent, got {codes:?}"
         );
     }
+}
+
+#[test]
+fn a_remapped_method_is_now_resolved_and_checked() {
+    // This case used to sit in `a_method_on_an_unknown_receiver_stays_silent`.
+    // `<number>.round()` is `math::round`, so the old `<receiver>::<method>`
+    // guess looked for `number::round`, found nothing, and said nothing. The
+    // generated receiver tables resolve it, so a bad call is now a diagnostic.
+    let diagnostics = diagnostics_for("RETURN (1.5).round('nope');");
+    let messages = messages_of(&diagnostics);
+    assert!(
+        !codes_of(&diagnostics).is_empty(),
+        "a remapped method must now be checked: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("math::round")),
+        "the message must name the function it resolved to: {messages:?}"
+    );
 }
 
 #[test]
@@ -2763,8 +2784,6 @@ fn uncertain_arguments_stay_silent() {
         // A builtin whose declared return type is itself unmodellable
         // (`type::field(any) -> field`).
         "RETURN fn::take(type::field('x'));",
-        // An arithmetic expression.
-        "RETURN fn::take(1 + 2);",
         // NONE into a non-optional slot is a runtime concern.
         "RETURN fn::take(NONE);",
         // A nested function call whose return type is undeclared.
@@ -2780,6 +2799,24 @@ fn uncertain_arguments_stay_silent() {
             "`{case}` should be silent, got {codes:?}"
         );
     }
+}
+
+#[test]
+fn an_arithmetic_argument_is_now_typed_and_checked() {
+    // `1 + 2` used to sit in `uncertain_arguments_stay_silent`, because
+    // `BinaryExpression` had no arm and every operator expression was
+    // `unknown`. It types as `int` now, and `int` into a `record<user>`
+    // parameter is a mismatch SurrealDB rejects too — so the silence that test
+    // pinned was a miss, not a policy.
+    let source = "DEFINE FUNCTION fn::take($value: record<user>) { RETURN $value; };\n\
+                  RETURN fn::take(1 + 2);";
+    let messages = messages_of(&diagnostics_for(source));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("expects `record<user>`, found `int`")),
+        "got {messages:?}"
+    );
 }
 
 #[test]
@@ -3182,7 +3219,7 @@ fn declared_let_type_is_silent_when_it_matches() {
 fn unresolvable_initializers_leave_the_variable_untyped() {
     // Must not guess. Each of these stays `Unknown`, so downstream uses
     // of the variable stay silent too.
-    for value in ["$other", "$a.b", "$v.trim()", "1 + 2"] {
+    for value in ["$other", "$a.b", "$v.trim()"] {
         let source = format!(
             "DEFINE FUNCTION fn::take($value: record<user>) {{ RETURN $value; }};\n\
              LET $v = {value};\nRETURN fn::take($v);"
@@ -3560,4 +3597,755 @@ fn expression_bodied_closure_parameters_are_bound() {
         !codes.contains(&"undefined-variable".to_string()),
         "closure parameter was flagged: {codes:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Inferred function return types
+// ---------------------------------------------------------------------------
+//
+// A `DEFINE FUNCTION` with no `-> T` used to make every call site `unknown`.
+// The return type is now read from the body. These tests come in pairs: one for
+// what the inference now knows, one pinning what it deliberately refuses to
+// guess. The refusals matter more — an inferred type feeds the argument check,
+// so a type narrower than the truth reports against code that works.
+
+/// Hover markdown at the first occurrence of `needle`, across a workspace of
+/// `(path, source)` documents. Hover is taken in the *last* document.
+///
+/// The single-document `hover_at` cannot express the case this feature exists
+/// for: a `fn::` definition in one file and the call in another.
+fn hover_across(documents: &[(&str, &str)], needle: &str) -> Option<String> {
+    let analyses: Vec<DocumentAnalysis> = documents
+        .iter()
+        .map(|(path, source)| {
+            analyze_document(uri(path), source, SymbolOrigin::Local).expect("analysis")
+        })
+        .collect();
+    let workspace = workspace_from(analyses.clone());
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+
+    let target = analyses.last().expect("a document");
+    let source = &target.text;
+    let offset = source.find(needle).expect("needle present");
+    let line = source[..offset].matches('\n').count() as u32;
+    let column = (offset - source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    model.hover_markdown_at(target, Position::new(line, column), needle, None)
+}
+
+/// The type hover reports for `needle`, as a bare string.
+fn inferred_type_of(source: &str, needle: &str) -> String {
+    let hover = hover_at(source, needle).unwrap_or_default();
+    hover
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- Type: "))
+        .unwrap_or("<no type line>")
+        .trim_matches('`')
+        .to_string()
+}
+
+#[test]
+fn a_body_with_one_return_gives_the_call_site_its_type() {
+    // The reported case. `string::slug` returns a string, so the function does
+    // too, and nothing had to be written to say so.
+    let source = "DEFINE FUNCTION fn::custom::slug($input: string) {\n\
+                  RETURN string::slug($input);\n\
+                  };\n\
+                  LET $slug = fn::custom::slug('some random string');\n\
+                  RETURN $slug;";
+    assert_eq!(inferred_type_of(source, "$slug"), "string");
+}
+
+#[test]
+fn a_trailing_expression_body_gives_the_call_site_its_type() {
+    // A body with no `RETURN` yields its last expression.
+    let source = "DEFINE FUNCTION fn::one() { 1 };\nLET $n = fn::one();";
+    assert_eq!(inferred_type_of(source, "$n"), "int");
+}
+
+#[test]
+fn a_declared_return_type_still_wins_over_the_body() {
+    // The annotation is what the author promised and what the engine coerces
+    // to. Never override it, even when the body disagrees.
+    let source = "DEFINE FUNCTION fn::f() -> any { RETURN 1; };\nLET $v = fn::f();";
+    assert_eq!(inferred_type_of(source, "$v"), "any");
+}
+
+#[test]
+fn a_throwing_tail_does_not_block_inference() {
+    // `THROW` always raises, so no value passes through it. Without this the
+    // validate-or-throw shape could never be inferred.
+    let source = "DEFINE FUNCTION fn::must($ok: bool) {\n\
+                  IF $ok { RETURN 1; };\n\
+                  THROW 'not ok';\n\
+                  };\n\
+                  LET $n = fn::must(true);";
+    assert_eq!(inferred_type_of(source, "$n"), "int");
+}
+
+#[test]
+fn inference_resolves_a_chain_across_rounds() {
+    // `fn::outer` can only be typed once `fn::inner` is, which takes a second
+    // round. A one-pass implementation, or one that cached the first round's
+    // failure, leaves this `unknown`.
+    let source = "DEFINE FUNCTION fn::inner() { RETURN 1; };\n\
+                  DEFINE FUNCTION fn::outer() { RETURN fn::inner(); };\n\
+                  LET $n = fn::outer();";
+    assert_eq!(inferred_type_of(source, "$n"), "int");
+}
+
+#[test]
+fn inference_crosses_documents() {
+    // The whole reason this runs in `MergedSemanticModel::build` rather than
+    // per document: a `fn::` definition routinely lives in another file.
+    let hover = hover_across(
+        &[
+            (
+                "functions.surql",
+                "DEFINE FUNCTION fn::custom::slug($input: string) { RETURN string::slug($input); };",
+            ),
+            ("query.surql", "LET $slug = fn::custom::slug('x');\nRETURN $slug;"),
+        ],
+        "$slug",
+    )
+    .expect("hover for $slug");
+    assert!(hover.contains("Type: `string`"), "got {hover}");
+}
+
+#[test]
+fn divergent_return_paths_infer_a_union() {
+    let source = "DEFINE FUNCTION fn::f($c: bool) { IF $c { RETURN 'a' }; RETURN 1; };\n\
+                  LET $v = fn::f(true);";
+    assert_eq!(inferred_type_of(source, "$v"), "string | int");
+}
+
+#[test]
+fn repeated_return_types_are_not_repeated_in_the_union() {
+    // `TypeExpr::union` does not deduplicate, so without a guard the commonest
+    // multi-return shape hovers as `string | string`.
+    let source = "DEFINE FUNCTION fn::label($n: int) {\n\
+                  IF $n > 0 { RETURN 'pos'; };\n\
+                  RETURN 'neg';\n\
+                  };\n\
+                  LET $v = fn::label(1);";
+    assert_eq!(inferred_type_of(source, "$v"), "string");
+}
+
+#[test]
+fn a_union_of_inferred_returns_reports_nothing() {
+    // A union on the value side of `assignable` can never come back
+    // `Incompatible`, so a divergent body is informative in hover and silent in
+    // the checker. This pins that property — the union case is only safe
+    // because of it.
+    let source = "DEFINE FUNCTION fn::mixed($c: bool) { IF $c { RETURN 's' }; RETURN 0; };\n\
+                  DEFINE FUNCTION fn::take($n: int) -> int { RETURN $n; };\n\
+                  LET $x: string = fn::mixed(true);\n\
+                  RETURN fn::take(fn::mixed(false));";
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()) && !codes.contains(&"let-type".to_string()),
+        "a union must stay silent: {codes:?}"
+    );
+}
+
+// --- What the inference refuses to guess -----------------------------------
+
+#[test]
+fn an_unresolvable_body_leaves_the_call_untyped() {
+    // Every one of these must stay `unknown`. Each comment is the reason.
+    for body in [
+        // No statement kind has a type yet.
+        "{ SELECT * FROM person }",
+        "{ CREATE person CONTENT {} }",
+        // The tail is the `IF`, whose own type is unknown.
+        "{ IF $c { RETURN 1 } ELSE { RETURN 2 }; }",
+        // `THROW` alone never produces a value.
+        "{ THROW 'no' }",
+        // `BinaryExpression` has no arm.
+        "{ RETURN $c + 1; }",
+        // Field access has no arm.
+        "{ RETURN $c.field; }",
+        // `IF … THEN … END` hides its returns from the walk, so refuse.
+        "{ IF $c THEN RETURN 1 END; RETURN 'a'; }",
+        // An empty body contributes nothing.
+        "{ }",
+    ] {
+        let source =
+            format!("DEFINE FUNCTION fn::f($c: any) {body};\nLET $v = fn::f(1);\nRETURN $v;");
+        assert_eq!(
+            inferred_type_of(&source, "$v"),
+            "unknown",
+            "`{body}` must not be inferred"
+        );
+        // Only the type checks are this feature's business. `CREATE person`
+        // also draws an `unknown-table` warning, which is unrelated and
+        // pre-existing.
+        let noisy: Vec<String> = codes_of(&diagnostics_for(&source))
+            .into_iter()
+            .filter(|code| {
+                code.starts_with("argument-") || code == "let-type" || code == "return-type"
+            })
+            .collect();
+        assert!(noisy.is_empty(), "`{body}` must stay silent: {noisy:?}");
+    }
+}
+
+#[test]
+fn a_missing_return_path_prevents_inference() {
+    // `fn::maybe` yields NONE when the branch does not fire, so `string` would
+    // be a lie — and the narrow answer is the one that fires a diagnostic. The
+    // trailing-statement contribution is what keeps this honest.
+    let source = "DEFINE FUNCTION fn::maybe($n: int) { IF $n > 0 { RETURN 'positive'; }; };\n\
+                  LET $v = fn::maybe(1);";
+    assert_eq!(inferred_type_of(source, "$v"), "unknown");
+}
+
+#[test]
+fn inference_does_not_see_document_level_lets() {
+    // A function body sees only its own parameters. `$greeting` is unset inside
+    // the body and the engine yields NONE, so resolving it against the whole
+    // document would infer a type the function cannot produce.
+    let source = "LET $greeting = 'hello';\n\
+                  DEFINE FUNCTION fn::f() { RETURN $greeting; };\n\
+                  LET $v = fn::f();";
+    assert_eq!(inferred_type_of(source, "$v"), "unknown");
+}
+
+#[test]
+fn a_recursive_function_without_an_annotation_stays_unknown() {
+    // Also the termination test: nothing here may loop or recurse.
+    let source = "DEFINE FUNCTION fn::fib($n: int) {\n\
+                  IF $n < 2 { RETURN $n; };\n\
+                  RETURN fn::fib($n - 1) + fn::fib($n - 2);\n\
+                  };\n\
+                  LET $v = fn::fib(10);";
+    assert_eq!(inferred_type_of(source, "$v"), "unknown");
+}
+
+#[test]
+fn mutually_recursive_functions_stay_unknown() {
+    let source = "DEFINE FUNCTION fn::a() { RETURN fn::b(); };\n\
+                  DEFINE FUNCTION fn::b() { RETURN fn::a(); };\n\
+                  LET $v = fn::a();";
+    assert_eq!(inferred_type_of(source, "$v"), "unknown");
+}
+
+#[test]
+fn a_javascript_body_is_not_inferred() {
+    let source = "DEFINE FUNCTION fn::js() { function() { return 1; } };\n\
+                  LET $v = fn::js();";
+    assert_eq!(inferred_type_of(source, "$v"), "unknown");
+}
+
+#[test]
+fn a_broken_return_annotation_is_not_replaced_by_an_inference() {
+    // `function_return_type` answers `None` for a half-typed `-> ` exactly as
+    // it does for an absent one. Substituting a guess for the annotation the
+    // author is mid-way through writing would be the wrong move.
+    let source = "DEFINE FUNCTION fn::f() -> { RETURN 1; };\nLET $v = fn::f();";
+    assert_eq!(inferred_type_of(source, "$v"), "unknown");
+}
+
+// --- Where the inference becomes visible -----------------------------------
+
+#[test]
+fn an_inferred_return_type_reaches_the_argument_check() {
+    let source = "DEFINE FUNCTION fn::give() { RETURN 'x'; };\n\
+                  DEFINE FUNCTION fn::take($n: int) -> int { RETURN $n; };\n\
+                  RETURN fn::take(fn::give());";
+    let messages: Vec<String> = diagnostics_for(source)
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("expects `int`, found `string`")),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn a_matching_inferred_return_type_reaches_nothing() {
+    let source = "DEFINE FUNCTION fn::give() { RETURN 'x'; };\n\
+                  DEFINE FUNCTION fn::take($s: string) -> string { RETURN $s; };\n\
+                  RETURN fn::take(fn::give());";
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "got {codes:?}"
+    );
+}
+
+#[test]
+fn an_inferred_return_type_reaches_the_declared_return_check() {
+    // The new capability in the other direction: a wrapper that declares a
+    // type its unannotated callee cannot satisfy.
+    let source = "DEFINE FUNCTION fn::n() { RETURN 1; };\n\
+                  DEFINE FUNCTION fn::g() -> string { RETURN fn::n(); };";
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(codes.contains(&"return-type".to_string()), "got {codes:?}");
+}
+
+#[test]
+fn function_hover_marks_an_inferred_return_type() {
+    let source =
+        "DEFINE FUNCTION fn::custom::slug($input: string) { RETURN string::slug($input); };";
+    let hover = hover_at(source, "fn::custom::slug").expect("hover");
+    assert!(hover.contains("-> string"), "got {hover}");
+    assert!(
+        hover.contains("Return type inferred from the body."),
+        "an inferred arrow must say so: {hover}"
+    );
+}
+
+#[test]
+fn function_hover_does_not_claim_a_declared_type_was_inferred() {
+    let source = "DEFINE FUNCTION fn::x() -> int { RETURN 1; };";
+    let hover = hover_at(source, "fn::x").expect("hover");
+    assert!(hover.contains("-> int"), "got {hover}");
+    assert!(
+        !hover.contains("inferred from the body"),
+        "a declared type is not an inference: {hover}"
+    );
+}
+
+#[test]
+fn repeated_builds_infer_the_same_type() {
+    // `model.functions` is a `HashMap`, so candidate order varies. A round is
+    // computed in full before it is written precisely so the answer cannot
+    // depend on that order.
+    let source = "DEFINE FUNCTION fn::a() { RETURN 'x'; };\n\
+                  DEFINE FUNCTION fn::b() { RETURN fn::a(); };\n\
+                  DEFINE FUNCTION fn::c() { RETURN fn::b(); };\n\
+                  LET $v = fn::c();";
+    let first = inferred_type_of(source, "$v");
+    assert_eq!(first, "string");
+    for _ in 0..20 {
+        assert_eq!(inferred_type_of(source, "$v"), first, "unstable inference");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic operand types
+// ---------------------------------------------------------------------------
+//
+// SurrealDB rejects `"" + "222" + 3` at run time, and the server used to say
+// nothing: `BinaryExpression` had no arm in `infer_expr_type`. The operand rules
+// now come from the engine's own tables (`semantic::operate`), which are
+// irregular per operator — `+` concatenates two strings but rejects a string and
+// an int, `*` scales a duration in one direction only, and `/` never fails.
+//
+// Half of these tests pin what stays silent. That half matters more: an operand
+// pair the checker misjudges squiggles a query that runs.
+
+/// The `operator-type` messages `source` produces.
+fn operator_messages(source: &str) -> Vec<String> {
+    diagnostics_for(source)
+        .into_iter()
+        .filter(|diagnostic| {
+            matches!(
+                &diagnostic.code,
+                Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                    if code == "operator-type"
+            )
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn the_reported_addition_is_caught() {
+    // `"" + "222"` concatenates to a string, and `string + int` is the pair
+    // SurrealDB rejects.
+    let messages = operator_messages(r#"RETURN "" + "222" + 3;"#);
+    assert_eq!(
+        messages,
+        vec!["Cannot perform addition with `string` and `int`.".to_string()],
+        "one diagnostic, naming both operand types"
+    );
+}
+
+#[test]
+fn casting_either_side_silences_the_reported_addition() {
+    // Both corrections from the report. These are the whole point: a cast must
+    // not merely avoid a wrong answer, it must produce the right one.
+    for source in [
+        r#"RETURN "" + "222" + <string>3;"#,
+        r#"RETURN <int>"0" + <int>"222" + 3;"#,
+    ] {
+        assert!(
+            operator_messages(source).is_empty(),
+            "`{source}` is valid SurrealQL"
+        );
+    }
+}
+
+#[test]
+fn a_cast_gives_the_expression_its_type() {
+    // Proves the cast is *typed*, not just tolerated.
+    assert_eq!(
+        inferred_type_of(r#"LET $v = "" + "222" + <string>3;"#, "$v"),
+        "string"
+    );
+    assert_eq!(
+        inferred_type_of(r#"LET $v = <int>"0" + <int>"222" + 3;"#, "$v"),
+        "int"
+    );
+}
+
+#[test]
+fn each_rejected_arm_of_the_engine_tables_is_caught() {
+    // One case per shape the engine's `TryAdd`/`TrySub`/`TryMul`/`TryPow` impls
+    // send to their catch-all. The first four are pinned by SurrealDB's own
+    // corpus files.
+    for (source, expected) in [
+        ("RETURN [1,2,3] - 1;", "Cannot perform subtraction"),
+        ("RETURN {1,} + 1;", "Cannot perform addition"),
+        ("RETURN 1s * 1s;", "Cannot perform multiplication"),
+        ("RETURN 1s ** 1s;", "Cannot raise the value"),
+        // Multiplication is one-directional in the engine.
+        ("RETURN 2 * 1s;", "Cannot perform multiplication"),
+        // A concrete kind that appears in no arm at all.
+        ("RETURN true + 1;", "Cannot perform addition"),
+        ("RETURN 1s - 1;", "Cannot perform subtraction"),
+    ] {
+        let messages = operator_messages(source);
+        assert!(
+            messages.iter().any(|message| message.starts_with(expected)),
+            "`{source}` should report `{expected}`, got {messages:?}"
+        );
+    }
+}
+
+#[test]
+fn every_accepted_arm_of_the_engine_tables_is_silent() {
+    // The other half of the same tables. Each of these runs.
+    for source in [
+        // Collections combine in all four array/set pairings.
+        "RETURN [1,2] + [3,4];",
+        "RETURN {1,2} + [3];",
+        "RETURN [1,2] + {3,};",
+        "RETURN [1,2,3] - [1];",
+        // Numeric promotion across the whole chain.
+        "RETURN 8 + 3dec;",
+        "RETURN 8 + 3.5;",
+        "RETURN 2 ** 8;",
+        // Durations and datetimes.
+        "RETURN 1s + 1s;",
+        "RETURN 1s * 2;",
+        r#"RETURN d"2024-01-01T00:00:00Z" + 1h;"#,
+        r#"RETURN d"2024-01-02T00:00:00Z" - d"2024-01-01T00:00:00Z";"#,
+        // Objects merge.
+        "RETURN {a:1} + {b:2};",
+        // Strings concatenate.
+        r#"RETURN "a" + "b" + "c";"#,
+    ] {
+        assert!(
+            operator_messages(source).is_empty(),
+            "`{source}` is valid SurrealQL, got {:?}",
+            operator_messages(source)
+        );
+    }
+}
+
+#[test]
+fn division_is_never_reported() {
+    // `fnc::operate::div` wraps a failure as `unwrap_or(f64::NAN)`, so
+    // `[1,2,3] / 1` evaluates to NaN rather than failing. There is no error to
+    // surface, and inventing one would squiggle a query that runs.
+    for source in [
+        "RETURN [1,2,3] / 1;",
+        r#"RETURN "abc" / 2;"#,
+        "RETURN {a:1} / 2;",
+        "RETURN 1d / 24;",
+    ] {
+        assert!(
+            operator_messages(source).is_empty(),
+            "`{source}` yields NaN, not an error"
+        );
+    }
+}
+
+#[test]
+fn a_comparison_is_never_reported() {
+    // No comparison, containment, or logical operator can fail: `=` answers
+    // `false` for a mismatched pair and `Value` derives `PartialOrd`, so
+    // `1 < "a"` has a defined answer.
+    for source in [
+        r#"RETURN 1 = "1";"#,
+        r#"RETURN 1 < "a";"#,
+        r#"RETURN 1 != "1";"#,
+        r#"RETURN [1] CONTAINS "a";"#,
+        r#"RETURN 1 && "a";"#,
+        r#"RETURN 1 ?? "a";"#,
+    ] {
+        assert!(
+            operator_messages(source).is_empty(),
+            "`{source}` cannot fail in the engine"
+        );
+    }
+}
+
+// --- Precedence -------------------------------------------------------------
+
+#[test]
+fn a_mixed_chain_is_regrouped_to_the_engines_precedence() {
+    // The grammar puts every operator on one left-associative level, so it
+    // parses this as `(1 + 1) * 3`. SurrealDB reads `1 + (1 * 3)` and answers
+    // `4` — its own `precedence.surql` asserts that. Both groupings are silent
+    // here, so the type is what proves the re-grouping ran.
+    assert!(operator_messages("RETURN 1 + 1 * 3;").is_empty());
+    assert_eq!(inferred_type_of("LET $v = 1 + 1 * 3;", "$v"), "int");
+}
+
+#[test]
+fn a_regrouped_chain_names_the_operands_the_engine_pairs() {
+    // Read as parsed this is `("" + 1) * 2`, which would report `string` against
+    // `int` for *multiplication*. Re-grouped it is `"" + (1 * 2)`, so the report
+    // must name addition — and `int`, the type of `1 * 2`.
+    let messages = operator_messages(r#"RETURN "" + 1 * 2;"#);
+    assert_eq!(
+        messages,
+        vec!["Cannot perform addition with `string` and `int`.".to_string()],
+        "the diagnostic must describe the pair the engine forms"
+    );
+}
+
+#[test]
+fn a_parenthesised_group_is_respected() {
+    // A `SubQuery` ends the chain, so the written grouping stands.
+    assert!(operator_messages("RETURN (1 + 1) * 3;").is_empty());
+    assert_eq!(inferred_type_of("LET $v = (1 + 1) * 3;", "$v"), "int");
+}
+
+#[test]
+fn a_long_chain_reports_once() {
+    // The check acts at the root of a chain only. Every node on the left spine
+    // is itself a `BinaryExpression`, so folding from each would report the same
+    // pair once per level.
+    assert_eq!(operator_messages(r#"RETURN 1 + 2 + 3 + "a";"#).len(), 1);
+}
+
+// --- What the gate refuses to judge ----------------------------------------
+
+#[test]
+fn an_operand_that_is_not_provably_one_kind_is_silent() {
+    // `value_kind` is the gate for the whole feature. Every one of these must
+    // stay silent, and a diagnostic here is a false positive.
+    for source in [
+        // A parameter with no annotation.
+        "DEFINE FUNCTION fn::f($x) { RETURN $x + 1; };",
+        // The top type accepts anything.
+        "DEFINE FUNCTION fn::f($x: any) { RETURN $x + 1; };",
+        // An optional may hold NONE *or* a number, so nothing is provable.
+        "DEFINE FUNCTION fn::f($x: option<int>) { RETURN $x + 1; };",
+        // A union is the same argument.
+        "DEFINE FUNCTION fn::f($x: int | string) { RETURN $x + 1; };",
+        // Field access and method calls have no arm in `infer_expr_type`.
+        "DEFINE FUNCTION fn::f($x: object) { RETURN $x.count + 1; };",
+        // A statement result is untyped.
+        "RETURN (SELECT * FROM person) + 1;",
+    ] {
+        assert!(
+            operator_messages(source).is_empty(),
+            "`{source}` is not provable, got {:?}",
+            operator_messages(source)
+        );
+    }
+}
+
+#[test]
+fn an_unparseable_chain_is_silent() {
+    // A chain the parser could not read says nothing about its operands, and a
+    // syntax diagnostic already covers the position.
+    let codes = codes_of(&diagnostics_for(r#"RETURN "a" + ;"#));
+    assert!(
+        !codes.contains(&"operator-type".to_string()),
+        "got {codes:?}"
+    );
+}
+
+#[test]
+fn an_assignment_operator_is_silent() {
+    // `+=` parses as a `BinaryExpression` in this grammar but goes through the
+    // engine's looser `increment` path, which accepts more than `+` does.
+    //
+    // Bind `$a` first, so both operands are provably typed and the operator is
+    // the only reason this stays silent.
+    assert!(operator_messages("LET $a = [1];\nRETURN $a += 1;").is_empty());
+    // The same operands with a real `+` are reported, which is what proves the
+    // test above is testing the operator and not the gate.
+    assert_eq!(operator_messages("LET $a = [1];\nRETURN $a + 1;").len(), 1);
+}
+
+// --- Where the new type flows ----------------------------------------------
+
+#[test]
+fn an_arithmetic_result_reaches_the_other_checks() {
+    // The payoff beyond the operator check itself: an arithmetic expression now
+    // has a type, so every check downstream of `infer_expr_type` can see it.
+    let messages = messages_of(&diagnostics_for(r#"LET $n: string = 1 + 2;"#));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("declared `string` but the value is `int`")),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn an_arithmetic_body_is_now_inferrable() {
+    // This closes the first gap the return-type-inference change recorded under
+    // Known gaps: `RETURN $a + $b` used to leave the function untyped.
+    let source = "DEFINE FUNCTION fn::add($a: int, $b: int) { RETURN $a + $b; };\n\
+                  LET $v = fn::add(1, 2);";
+    assert_eq!(inferred_type_of(source, "$v"), "int");
+}
+
+#[test]
+fn the_right_side_of_a_short_circuit_is_not_reported() {
+    // SurrealDB's own `precedence.surql` asserts `2 + 1 ?: true + 1` is `3`:
+    // `?:` returns its truthy left side and never evaluates `true + 1`. A
+    // failure that cannot run is not a failure.
+    for source in [
+        "RETURN 2 + 1 ?: true + 1;",
+        "RETURN 2 + 1 ?? true + 1;",
+        "RETURN false && true + 1;",
+        "RETURN true || true + 1;",
+    ] {
+        assert!(
+            operator_messages(source).is_empty(),
+            "`{source}` never evaluates its right side, got {:?}",
+            operator_messages(source)
+        );
+    }
+    // The left side always runs, so it is still reported.
+    assert_eq!(operator_messages("RETURN true + 1 ?: 2;").len(), 1);
+}
+
+#[test]
+fn a_fragment_beside_a_parse_error_is_not_reported() {
+    // The pinned grammar cannot parse mock syntax, and it fails by leaving
+    // `ERROR` nodes *beside* a `BinaryExpression` rather than inside it. The
+    // fragment `test:..=-9223372036854775806` then looks like a record id minus
+    // an int, which is neither operand anyone wrote.
+    let codes = codes_of(&diagnostics_for("|test:..=-9223372036854775806|;"));
+    assert!(
+        !codes.contains(&"operator-type".to_string()),
+        "a parse failure must not become a type error: {codes:?}"
+    );
+}
+
+#[test]
+fn the_engines_own_method_fixture_reports_nothing() {
+    // `language/functions/method_syntax.surql`, copied verbatim from SurrealDB.
+    // Its own front matter says: "Asserts that no errors are produced when every
+    // function registered for method syntax is called in that way", and it
+    // expects `NONE`. 198 calls covering 93% of the 252 method names.
+    //
+    // This is the strongest guard this change has. Every diagnostic here is a
+    // false positive by the engine's own declaration.
+    let source = include_str!("fixtures/method_syntax.surql");
+    let noisy: Vec<String> = diagnostics_for(source)
+        .into_iter()
+        .filter(|diagnostic| match &diagnostic.code {
+            Some(tower_lsp_server::ls_types::NumberOrString::String(code)) => {
+                code.starts_with("argument-") || code == "unknown-method"
+            }
+            _ => false,
+        })
+        .map(|diagnostic| {
+            format!(
+                "line {}: {}",
+                diagnostic.range.start.line + 1,
+                diagnostic.message
+            )
+        })
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "{} false positives on the engine's own fixture:\n  {}",
+        noisy.len(),
+        noisy.join("\n  ")
+    );
+}
+
+#[test]
+fn an_object_method_the_tables_do_not_hold_is_not_reported() {
+    // When method dispatch fails on an object the engine retries the name as a
+    // closure-valued field, so `{ a: |$x| $x }.a(1)` is legal and the field may
+    // be named anything. Three files in SurrealDB's own corpus rely on it.
+    for source in [
+        "LET $obj = { a: |$a: int| $a };\nRETURN $obj.a(1);",
+        "RETURN { fnc: |$x| $x }.fnc(1);",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.contains(&"unknown-method".to_string()),
+            "`{source}` calls a closure-valued field, got {codes:?}"
+        );
+    }
+    // A receiver with no such fallback still reports.
+    let codes = codes_of(&diagnostics_for("RETURN 'abc'.nonsense();"));
+    assert!(
+        codes.contains(&"unknown-method".to_string()),
+        "a string has no closure-field fallback: {codes:?}"
+    );
+}
+
+#[test]
+fn a_method_hover_names_the_function_it_resolves_to() {
+    let hover = hover_at("RETURN (5).round();", "round").expect("hover for .round()");
+    assert!(hover.contains("math::round"), "got {hover}");
+    assert!(hover.contains(".round()"), "got {hover}");
+}
+
+#[test]
+fn a_method_hover_no_longer_answers_with_a_keyword() {
+    // `AT` and `SPLIT` are both SurrealQL keywords, and `token_at` treats `.` as
+    // a boundary — so hovering these used to describe the *keyword*. A wrong
+    // answer, not a missing one.
+    let at = hover_at("RETURN [1, 2].at(0);", "at").expect("hover for .at()");
+    assert!(at.contains("array::at"), "got {at}");
+    assert!(!at.contains("SurrealQL keyword"), "got {at}");
+
+    let split = hover_at("RETURN 'a,b'.split(',');", "split").expect("hover for .split()");
+    assert!(split.contains("string::split"), "got {split}");
+    assert!(!split.contains("SurrealQL keyword"), "got {split}");
+}
+
+#[test]
+fn a_method_hover_states_a_derived_return_type() {
+    let hover = hover_at("RETURN 'abc'.is_alphanum();", "is_alphanum").expect("hover");
+    assert!(hover.contains("string::is_alphanum"), "got {hover}");
+}
+
+#[test]
+fn an_optional_chained_method_resolves() {
+    // `$v.?.trim()` reads the same value as `$v.trim()`. The receiver search used
+    // to insist the method be the first link, so this shape — six occurrences
+    // across the two fixtures — resolved to nothing.
+    let source = "LET $v = 'abc';\nRETURN $v.?.len('nope');";
+    let messages = messages_of(&diagnostics_for(source));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("string::len")),
+        "an optional chain must still resolve: {messages:?}"
+    );
+}
+
+#[test]
+fn a_method_chain_carries_its_type_forward() {
+    // `to_uuid` hands a `uuid` to the next link, so the chain types as `bool`.
+    assert_eq!(
+        inferred_type_of(
+            "LET $v = '019535d9-3df7-79fb-b466-fa907fa17f9e'.to_uuid().is_uuid();",
+            "$v"
+        ),
+        "bool"
+    );
+    // And a single link types too.
+    assert_eq!(inferred_type_of("LET $v = (5).round();", "$v"), "number");
+    assert_eq!(inferred_type_of("LET $v = 'abc'.to_int();", "$v"), "int");
 }

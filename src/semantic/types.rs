@@ -280,6 +280,17 @@ pub struct MergedSemanticModel {
     pub analyzers: HashMap<String, AnalyzerDef>,
     pub function_references: HashMap<String, Vec<Location>>,
     pub function_callers: HashMap<String, Vec<String>>,
+    /// The return type read out of a function *body*, for the functions that
+    /// declare none. Keyed by full name, `fn::` prefix included.
+    ///
+    /// A derived cross-document fact, so it belongs here rather than on
+    /// [`FunctionDef`] — the same reason [`Self::function_callers`] does.
+    /// `FunctionDef` stays a faithful record of what the source says, and
+    /// `FunctionDef::return_type` keeps meaning "the author wrote this".
+    ///
+    /// Filled by
+    /// [`crate::semantic::infer::infer_function_return_types`].
+    pub inferred_function_returns: HashMap<String, TypeExpr>,
     pub workspace_symbols: Vec<DocumentSymbol>,
     pub query_facts: HashMap<Uri, Vec<QueryFact>>,
     /// True when the live-metadata fetch reported errors while this

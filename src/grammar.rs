@@ -53,6 +53,34 @@ pub struct GeneratedParam {
     pub form: ParamForm,
 }
 
+/// One method, and the function `fnc::idiom` dispatches it to.
+///
+/// Generated from the engine's receiver tables. See
+/// [`crate::grammar_generated::GENERATED_RECEIVERS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedMethod {
+    /// The name written after the dot.
+    pub method: &'static str,
+    /// The function this resolves to, ready for [`builtin_signature`].
+    ///
+    /// Where several names share one implementation — `array::all` and
+    /// `array::every` do — this is whichever sorts first. They have identical
+    /// parameters by construction, so only the name shown in hover differs.
+    pub function: &'static str,
+    /// The experimental target this method sits behind, when it has one. Every
+    /// `file::` method is behind `Files`.
+    pub experimental: Option<&'static str>,
+}
+
+/// The methods one receiver kind accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct GeneratedReceiver {
+    /// The engine `Value` variant, or `""` for the catch-all table that serves
+    /// `bool`, `uuid`, `regex`, `range`, `none` and the rest.
+    pub kind: &'static str,
+    pub methods: &'static [GeneratedMethod],
+}
+
 /// One entry of the generated catalogue.
 ///
 /// Deliberately separate from [`BuiltinFunction`]: that table carries curated
@@ -77,28 +105,30 @@ pub struct GeneratedFunction {
     pub signature_known: bool,
 }
 
-pub const BUILTIN_NAMESPACES: &[&str] = &[
-    "array::",
-    "crypto::",
-    "duration::",
-    "encoding::",
-    "geo::",
-    "http::",
-    "math::",
-    "meta::",
-    "not::",
-    "object::",
-    "parse::",
-    "rand::",
-    "record::",
-    "search::",
-    "session::",
-    "sleep::",
-    "string::",
-    "time::",
-    "type::",
-    "vector::",
-];
+/// Every namespace SurrealDB actually implements, read from its own function
+/// table by `cargo xtask generate-builtins`.
+///
+/// This replaced a hand-written list that had drifted: it offered `not::` and
+/// `sleep::`, which are *bare* functions and not namespaces at all, and it hid
+/// eight real ones — `api::`, `bytes::`, `eval::`, `file::`, `schema::`,
+/// `sequence::`, `set::` and `value::`. `set::` was the costly omission: 24
+/// functions that the method checker already resolved but completion never
+/// offered. `tests/generated_catalogue.rs` has asserted the generated list is
+/// the correct one since the catalogue was first generated; nothing consumed it.
+pub use crate::grammar_generated::GENERATED_NAMESPACES;
+
+/// The method tables, one per receiver `Value` variant plus the engine's
+/// catch-all. Read by [`crate::semantic::method`].
+pub use crate::grammar_generated::GENERATED_RECEIVERS;
+
+/// Every function name the parser accepts, with the argument types its
+/// implementation declares. Completion reads this as well as
+/// [`BUILTIN_FUNCTIONS`]: the curated table covers two namespaces, and this one
+/// covers all 26.
+pub use crate::grammar_generated::GENERATED_FUNCTIONS as GENERATED_FUNCTION_TABLE;
+
+/// Constants such as `math::PI`, which take no arguments and are not called.
+pub use crate::grammar_generated::GENERATED_CONSTANTS;
 
 pub const BUILTIN_NAMESPACE_DOCS: &[BuiltinNamespace] = &[
     BuiltinNamespace {

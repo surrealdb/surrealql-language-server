@@ -9,7 +9,9 @@
 //! argument check for that position. That is deliberate: a wrong type here would
 //! invent a diagnostic against valid SurrealQL.
 
-use crate::grammar::{GeneratedFunction, GeneratedParam, ParamForm};
+use crate::grammar::{
+    GeneratedFunction, GeneratedMethod, GeneratedParam, GeneratedReceiver, ParamForm,
+};
 
 /// The SurrealDB revision this catalogue was generated from.
 pub const SURREALDB_REVISION: &str = "9d9a5b069";
@@ -6091,4 +6093,4178 @@ pub const PARSES_BUT_NOT_CALLABLE: &[&str] = &[
     "duration::set_nanosecond",
     "object::matches",
     "value::chain",
+];
+/// Which function a `value.method()` call dispatches to, per receiver.
+///
+/// Read from `fnc::idiom` in `fnc/mod.rs`. The mapping is **not**
+/// `<receiver>::<method>`: `Number` dispatches into `math::`, `Geometry` into
+/// `geo::` and `Datetime` into `time::`, and 52 names flatten a path, so that
+/// `is_alphanum` is `string::is::alphanum`.
+///
+/// Each receiver's list is complete rather than layered over a shared block.
+/// `String` shadows four of the common arms with different arities and drops
+/// `is_set` altogether, so a default-plus-overrides model would be wrong.
+///
+/// 12 receivers, 820 arms.
+pub const GENERATED_RECEIVERS: &[GeneratedReceiver] = &[
+    GeneratedReceiver {
+        kind: "Set",
+        methods: &[
+            GeneratedMethod {
+                method: "add",
+                function: "set::add",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "all",
+                function: "set::all",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "any",
+                function: "set::any",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "at",
+                function: "set::at",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "complement",
+                function: "set::complement",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "contains",
+                function: "set::contains",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "difference",
+                function: "set::difference",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "filter",
+                function: "set::filter",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "find",
+                function: "set::find",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "first",
+                function: "set::first",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "flatten",
+                function: "set::flatten",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "fold",
+                function: "set::fold",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "intersect",
+                function: "set::intersect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_empty",
+                function: "set::is_empty",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "join",
+                function: "set::join",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "last",
+                function: "set::last",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "len",
+                function: "set::len",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "map",
+                function: "set::map",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "max",
+                function: "set::max",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "min",
+                function: "set::min",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "reduce",
+                function: "set::reduce",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "remove",
+                function: "set::remove",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "slice",
+                function: "set::slice",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "union",
+                function: "set::union",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Array",
+        methods: &[
+            GeneratedMethod {
+                method: "add",
+                function: "array::add",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "all",
+                function: "array::all",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "any",
+                function: "array::any",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "append",
+                function: "array::append",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "at",
+                function: "array::at",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "boolean_and",
+                function: "array::boolean_and",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "boolean_not",
+                function: "array::boolean_not",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "boolean_or",
+                function: "array::boolean_or",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "boolean_xor",
+                function: "array::boolean_xor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "clump",
+                function: "array::clump",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "combine",
+                function: "array::combine",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "complement",
+                function: "array::complement",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "concat",
+                function: "array::concat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "difference",
+                function: "array::difference",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distinct",
+                function: "array::distinct",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "every",
+                function: "array::all",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "fill",
+                function: "array::fill",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "filter",
+                function: "array::filter",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "filter_index",
+                function: "array::filter_index",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "find",
+                function: "array::find",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "find_index",
+                function: "array::find_index",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "first",
+                function: "array::first",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "flatten",
+                function: "array::flatten",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "fold",
+                function: "array::fold",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "group",
+                function: "array::group",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "includes",
+                function: "array::any",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "index_of",
+                function: "array::find_index",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "insert",
+                function: "array::insert",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "intersect",
+                function: "array::intersect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_empty",
+                function: "array::is_empty",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "join",
+                function: "array::join",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "last",
+                function: "array::last",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "len",
+                function: "array::len",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "logical_and",
+                function: "array::logical_and",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "logical_or",
+                function: "array::logical_or",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "logical_xor",
+                function: "array::logical_xor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "map",
+                function: "array::map",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "matches",
+                function: "array::matches",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "max",
+                function: "array::max",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "min",
+                function: "array::min",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "pop",
+                function: "array::pop",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "prepend",
+                function: "array::prepend",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "push",
+                function: "array::push",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "reduce",
+                function: "array::reduce",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "remove",
+                function: "array::remove",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "reverse",
+                function: "array::reverse",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "shuffle",
+                function: "array::shuffle",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "slice",
+                function: "array::slice",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "some",
+                function: "array::any",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sort",
+                function: "array::sort",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sort_asc",
+                function: "array::sort::asc",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sort_desc",
+                function: "array::sort::desc",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sort_lexical",
+                function: "array::sort_lexical",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sort_natural",
+                function: "array::sort_natural",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sort_natural_lexical",
+                function: "array::sort_natural_lexical",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "swap",
+                function: "array::swap",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "transpose",
+                function: "array::transpose",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "union",
+                function: "array::union",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_add",
+                function: "vector::add",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_angle",
+                function: "vector::angle",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_cross",
+                function: "vector::cross",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_chebyshev",
+                function: "vector::distance::chebyshev",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_euclidean",
+                function: "vector::distance::euclidean",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_hamming",
+                function: "vector::distance::hamming",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_knn",
+                function: "vector::distance::knn",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_mahalanobis",
+                function: "vector::distance::mahalanobis",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_manhattan",
+                function: "vector::distance::manhattan",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_distance_minkowski",
+                function: "vector::distance::minkowski",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_divide",
+                function: "vector::divide",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_dot",
+                function: "vector::dot",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_magnitude",
+                function: "vector::magnitude",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_multiply",
+                function: "vector::multiply",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_normalize",
+                function: "vector::normalize",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_project",
+                function: "vector::project",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_scale",
+                function: "vector::scale",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_similarity_cosine",
+                function: "vector::similarity::cosine",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_similarity_jaccard",
+                function: "vector::similarity::jaccard",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_similarity_pearson",
+                function: "vector::similarity::pearson",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_similarity_spearman",
+                function: "vector::similarity::spearman",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "vector_subtract",
+                function: "vector::subtract",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "windows",
+                function: "array::windows",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Bytes",
+        methods: &[
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "len",
+                function: "bytes::len",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Duration",
+        methods: &[
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "days",
+                function: "duration::days",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "hours",
+                function: "duration::hours",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "micros",
+                function: "duration::micros",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "millis",
+                function: "duration::millis",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "mins",
+                function: "duration::mins",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "nanos",
+                function: "duration::nanos",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "secs",
+                function: "duration::secs",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "weeks",
+                function: "duration::weeks",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "years",
+                function: "duration::years",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Geometry",
+        methods: &[
+            GeneratedMethod {
+                method: "area",
+                function: "geo::area",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "bearing",
+                function: "geo::bearing",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "centroid",
+                function: "geo::centroid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distance",
+                function: "geo::distance",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "hash_decode",
+                function: "geo::hash::decode",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "hash_encode",
+                function: "geo::hash::encode",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_valid",
+                function: "geo::is_valid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "RecordId",
+        methods: &[
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "exists",
+                function: "record::exists",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "id",
+                function: "record::id",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_edge",
+                function: "record::is_edge",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "table",
+                function: "record::tb",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "tb",
+                function: "record::tb",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Object",
+        methods: &[
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "entries",
+                function: "object::entries",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "extend",
+                function: "object::extend",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_empty",
+                function: "object::is_empty",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "keys",
+                function: "object::keys",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "len",
+                function: "object::len",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "remove",
+                function: "object::remove",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "values",
+                function: "object::values",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Number",
+        methods: &[
+            GeneratedMethod {
+                method: "abs",
+                function: "math::abs",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "acos",
+                function: "math::acos",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "acot",
+                function: "math::acot",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "asin",
+                function: "math::asin",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "atan",
+                function: "math::atan",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "ceil",
+                function: "math::ceil",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "cos",
+                function: "math::cos",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "cot",
+                function: "math::cot",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "deg2rad",
+                function: "math::deg2rad",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "floor",
+                function: "math::floor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "ln",
+                function: "math::ln",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "log",
+                function: "math::log",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "log10",
+                function: "math::log10",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "log2",
+                function: "math::log2",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "rad2deg",
+                function: "math::rad2deg",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "round",
+                function: "math::round",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sign",
+                function: "math::sign",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "sin",
+                function: "math::sin",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "tan",
+                function: "math::tan",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "String",
+        methods: &[
+            GeneratedMethod {
+                method: "capitalize",
+                function: "string::capitalize",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "concat",
+                function: "string::concat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "contains",
+                function: "string::contains",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distance_damerau_levenshtein",
+                function: "string::distance::damerau_levenshtein",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distance_hamming",
+                function: "string::distance::hamming",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distance_levenshtein",
+                function: "string::distance::levenshtein",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distance_normalized_damerau_levenshtein",
+                function: "string::distance::normalized_damerau_levenshtein",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "distance_normalized_levenshtein",
+                function: "string::distance::normalized_levenshtein",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "ends_with",
+                function: "string::ends_with",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "html_encode",
+                function: "string::html::encode",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "html_sanitize",
+                function: "string::html::sanitize",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_alpha",
+                function: "string::is_alpha",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_alphanum",
+                function: "string::is_alphanum",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_ascii",
+                function: "string::is_ascii",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "string::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_domain",
+                function: "string::is_domain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_email",
+                function: "string::is_email",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_hexadecimal",
+                function: "string::is_hexadecimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_ip",
+                function: "string::is_ip",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_ipv4",
+                function: "string::is_ipv4",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_ipv6",
+                function: "string::is_ipv6",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_latitude",
+                function: "string::is_latitude",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_longitude",
+                function: "string::is_longitude",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_numeric",
+                function: "string::is_numeric",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "string::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_semver",
+                function: "string::is_semver",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_ulid",
+                function: "string::is_ulid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_url",
+                function: "string::is_url",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "string::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "join",
+                function: "string::join",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "len",
+                function: "string::len",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "lowercase",
+                function: "string::lowercase",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "matches",
+                function: "string::matches",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "string::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "replace",
+                function: "string::replace",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "reverse",
+                function: "string::reverse",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_compare",
+                function: "string::semver::compare",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_inc_major",
+                function: "string::semver::inc::major",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_inc_minor",
+                function: "string::semver::inc::minor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_inc_patch",
+                function: "string::semver::inc::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_major",
+                function: "string::semver::major",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_minor",
+                function: "string::semver::minor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_patch",
+                function: "string::semver::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_set_major",
+                function: "string::semver::set::major",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_set_minor",
+                function: "string::semver::set::minor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "semver_set_patch",
+                function: "string::semver::set::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "similarity_fuzzy",
+                function: "string::similarity::fuzzy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "similarity_jaro",
+                function: "string::similarity::jaro",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "similarity_jaro_winkler",
+                function: "string::similarity::jaro_winkler",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "similarity_smithwaterman",
+                function: "string::similarity::smithwaterman",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "similarity_sorensen_dice",
+                function: "string::similarity::sorensen_dice",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "slice",
+                function: "string::slice",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "slug",
+                function: "string::slug",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "split",
+                function: "string::split",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "starts_with",
+                function: "string::starts_with",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "trim",
+                function: "string::trim",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "uppercase",
+                function: "string::uppercase",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "words",
+                function: "string::words",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "Datetime",
+        methods: &[
+            GeneratedMethod {
+                method: "ceil",
+                function: "time::ceil",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "day",
+                function: "time::day",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "floor",
+                function: "time::floor",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "format",
+                function: "time::format",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "group",
+                function: "time::group",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "hour",
+                function: "time::hour",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_leap_year",
+                function: "time::is_leap_year",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "micros",
+                function: "time::micros",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "millis",
+                function: "time::millis",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "minute",
+                function: "time::minute",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "month",
+                function: "time::month",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "nano",
+                function: "time::nano",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "round",
+                function: "time::round",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "second",
+                function: "time::second",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_day",
+                function: "time::set_day",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_hour",
+                function: "time::set_hour",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_minute",
+                function: "time::set_minute",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_month",
+                function: "time::set_month",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_nanosecond",
+                function: "time::set_nanosecond",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_second",
+                function: "time::set_second",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "set_year",
+                function: "time::set_year",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "unix",
+                function: "time::unix",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "wday",
+                function: "time::wday",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "week",
+                function: "time::week",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "yday",
+                function: "time::yday",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "year",
+                function: "time::year",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "File",
+        methods: &[
+            GeneratedMethod {
+                method: "bucket",
+                function: "file::bucket",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "copy",
+                function: "file::copy",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "copy_if_not_exists",
+                function: "file::copy_if_not_exists",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "delete",
+                function: "file::delete",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "exists",
+                function: "file::exists",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "get",
+                function: "file::get",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "head",
+                function: "file::head",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "key",
+                function: "file::key",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "put",
+                function: "file::put",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "put_if_not_exists",
+                function: "file::put_if_not_exists",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "rename",
+                function: "file::rename",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "rename_if_not_exists",
+                function: "file::rename_if_not_exists",
+                experimental: Some("Files"),
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+        ],
+    },
+    GeneratedReceiver {
+        kind: "",
+        methods: &[
+            GeneratedMethod {
+                method: "chain",
+                function: "value::chain",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "diff",
+                function: "value::diff",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "expect",
+                function: "value::expect",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_array",
+                function: "type::is_array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bool",
+                function: "type::is_bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_bytes",
+                function: "type::is_bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_collection",
+                function: "type::is_collection",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_datetime",
+                function: "type::is_datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_decimal",
+                function: "type::is_decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_duration",
+                function: "type::is_duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_float",
+                function: "type::is_float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_geometry",
+                function: "type::is_geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_int",
+                function: "type::is_int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_line",
+                function: "type::is_line",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multiline",
+                function: "type::is_multiline",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipoint",
+                function: "type::is_multipoint",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_multipolygon",
+                function: "type::is_multipolygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_none",
+                function: "type::is_none",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_null",
+                function: "type::is_null",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_number",
+                function: "type::is_number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_object",
+                function: "type::is_object",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_point",
+                function: "type::is_point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_polygon",
+                function: "type::is_polygon",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_range",
+                function: "type::is_range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_record",
+                function: "type::is_record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_set",
+                function: "type::is_set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_string",
+                function: "type::is_string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "is_uuid",
+                function: "type::is_uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "patch",
+                function: "value::patch",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "repeat",
+                function: "array::repeat",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_array",
+                function: "type::array",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bool",
+                function: "type::bool",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_bytes",
+                function: "type::bytes",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_datetime",
+                function: "type::datetime",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_decimal",
+                function: "type::decimal",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_duration",
+                function: "type::duration",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_float",
+                function: "type::float",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_geometry",
+                function: "type::geometry",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_int",
+                function: "type::int",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_number",
+                function: "type::number",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_point",
+                function: "type::point",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_range",
+                function: "type::range",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_record",
+                function: "type::record",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_set",
+                function: "type::set",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string",
+                function: "type::string",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_string_lossy",
+                function: "type::string_lossy",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "to_uuid",
+                function: "type::uuid",
+                experimental: None,
+            },
+            GeneratedMethod {
+                method: "type_of",
+                function: "type::of",
+                experimental: None,
+            },
+        ],
+    },
 ];

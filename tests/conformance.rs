@@ -53,14 +53,22 @@ fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
     model.semantic_diagnostics(&analysis, &ServerSettings::default())
 }
 
-/// The type checks this crate owns: argument counts, argument types, and
-/// declared function return types.
+/// The type checks this crate owns: argument counts, argument types, declared
+/// function return types, `LET` annotations, and arithmetic operands.
+///
+/// `let-type` and `operator-type` are here because a false positive in either
+/// would otherwise be structurally invisible to this sweep — the one test that
+/// reads real-world SurrealQL at scale.
 fn argument_diagnostics(source: &str) -> Vec<(String, String)> {
     diagnostics_for(source)
         .into_iter()
         .filter_map(|diagnostic| match &diagnostic.code {
             Some(NumberOrString::String(code))
-                if code.starts_with("argument-") || code == "return-type" =>
+                if code.starts_with("argument-")
+                    || code == "return-type"
+                    || code == "let-type"
+                    || code == "operator-type"
+                    || code == "unknown-method" =>
             {
                 Some((code.clone(), diagnostic.message.clone()))
             }
@@ -224,6 +232,31 @@ const EXPECTED: &[(&str, &str)] = &[
         "language/statements/define/function/custom_optional_args.surql",
         "argument-count",
     ),
+    // Both declare `error = "Tried to set `$bar`, but couldn't coerce value:
+    // Expected `int` but found `'hello'`"`, which is this check in the engine's
+    // own words.
+    ("language/statements/let/typed.surql", "let-type"),
+    (
+        "language/statements/let/typed_let_in_block.surql",
+        "let-type",
+    ),
+    // Arithmetic on an operand pair the engine has no arm for. Every one of
+    // these files declares the matching `error = "Cannot perform …"` or
+    // `error = "Cannot raise …"` in its own front matter.
+    (
+        "language/primitive/array/arithmic_operations.surql",
+        "operator-type",
+    ),
+    (
+        "language/primitive/duration/arithmatic_operations.surql",
+        "operator-type",
+    ),
+    (
+        "language/primitive/set/set_array_common_behaviour.surql",
+        "operator-type",
+    ),
+    // `1 + "1"`, declared as `error = true`.
+    ("self_tests/multi_line.surql", "operator-type"),
 ];
 
 /// The exhaustive oracle. Ignored by default because it re-analyses ~1,900

@@ -10,8 +10,9 @@ use strsim::jaro_winkler;
 
 use crate::config::{AuthContext, ServerSettings};
 use crate::grammar::{
-    BUILTIN_FUNCTIONS, BUILTIN_NAMESPACES, BuiltinFunction, KEYWORDS, SPECIAL_VARIABLES,
-    builtin_function, builtin_namespace, builtin_signature,
+    BUILTIN_FUNCTIONS, BuiltinFunction, GENERATED_CONSTANTS, GENERATED_FUNCTION_TABLE,
+    GENERATED_NAMESPACES, KEYWORDS, SPECIAL_VARIABLES, builtin_function, builtin_namespace,
+    builtin_signature,
 };
 use crate::semantic::codes;
 use crate::semantic::text::compact_preview;
@@ -63,6 +64,24 @@ impl MergedSemanticModel {
                 }
             }
         }
+
+        // Derive a return type for every `DEFINE FUNCTION` that omits `-> T`.
+        // Must run last: it judges each definition against the one that won the
+        // merge, so every document has to be absorbed first.
+        //
+        // Live documents are included deliberately. `INFO FOR DB` returns the
+        // engine's own `DEFINE FUNCTION` text, body and all, and
+        // `SurrealDbMetadataProvider` re-parses it through `analyze_document` —
+        // so a remote function is as inferrable as a local one, and excluding
+        // them would make a remote `fn::x` hover `unknown` while a byte-identical
+        // local one hovers `string`.
+        let documents: Vec<&DocumentAnalysis> = workspace
+            .documents
+            .values()
+            .chain(live.documents.values())
+            .map(|analysis| analysis.as_ref())
+            .collect();
+        crate::semantic::infer::infer_function_return_types(&documents, &mut model);
 
         model
     }
@@ -282,6 +301,106 @@ impl MergedSemanticModel {
             .collect()
     }
 
+    /// Completion items for a `value.` position: the methods that receiver
+    /// accepts.
+    ///
+    /// SurrealQL admits both a field and a method after a `.`, so these are meant
+    /// to be *added* to whatever the position already offers, never to replace
+    /// it.
+    ///
+    /// When the receiver's type is known, only that receiver's methods are
+    /// offered and they sort alongside the fields. When it is not — which is
+    /// still common, since a field access or a statement result types as
+    /// `unknown` — every method is offered, sorted below everything else. An
+    /// empty list would read as "this feature is broken" in exactly the positions
+    /// people use most.
+    pub fn method_completion_items(
+        &self,
+        analysis: &DocumentAnalysis,
+        position: Position,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
+        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let Some(dot) = method_dot_offset(&analysis.text, offset) else {
+            return Vec::new();
+        };
+
+        // Type whatever sits immediately left of the dot.
+        let receiver = analysis
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(dot.saturating_sub(1), dot);
+        let receiver_type = match receiver {
+            Some(node) => {
+                let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+                let ctx = crate::semantic::infer::TypeCtx {
+                    model: self,
+                    source: &analysis.text,
+                    bindings: &bindings,
+                };
+                crate::semantic::infer::infer_expr_type(node, &ctx)
+            }
+            None => TypeExpr::Unknown,
+        };
+
+        let known = crate::semantic::method::receiver_kind(&receiver_type);
+        let (methods, rank): (Vec<_>, &str) = match known {
+            Some(kind) => (
+                crate::semantic::method::methods_for(kind).iter().collect(),
+                "0-mtd",
+            ),
+            None => (
+                crate::grammar::GENERATED_RECEIVERS
+                    .iter()
+                    .flat_map(|receiver| receiver.methods.iter())
+                    .collect(),
+                "3-mtd",
+            ),
+        };
+
+        let mut seen: Vec<&str> = Vec::new();
+        let mut items = Vec::new();
+        for method in methods {
+            if !prefix.is_empty() && !method.method.starts_with(prefix) {
+                continue;
+            }
+            // The fallback list draws from twelve tables, and `to_string` is on
+            // all of them.
+            if seen.contains(&method.method) {
+                continue;
+            }
+            seen.push(method.method);
+
+            let signature = builtin_signature(method.function);
+            let mut detail = method.function.to_string();
+            if let Some(rendered) = signature
+                .as_ref()
+                .and_then(|found| found.display_signature())
+            {
+                detail = rendered;
+            }
+            if let Some(target) = method.experimental {
+                detail.push_str(&format!(" (experimental: {target})"));
+            }
+
+            items.push(CompletionItem {
+                label: method.method.to_string(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some(detail),
+                documentation: builtin_function(method.function).map(|curated| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format_builtin_function_hover(curated, method.function),
+                    })
+                }),
+                insert_text: Some(method.method.to_string()),
+                sort_text: Some(format!("{rank}-{}", method.method)),
+                ..CompletionItem::default()
+            });
+        }
+        items
+    }
+
     /// Position-aware hover.
     ///
     /// A `$variable` can only be resolved with a position: the same name
@@ -296,14 +415,61 @@ impl MergedSemanticModel {
         token: &str,
         active_context: Option<&AuthContext>,
     ) -> Option<String> {
+        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+
+        // A method resolves through its receiver, not through the global function
+        // tables. This must run before `hover_markdown_for_token`, which sees only
+        // the bare word and would answer with the `AT` / `SPLIT` keyword.
+        if let Some(hover) = self.method_hover(analysis, offset) {
+            return Some(hover);
+        }
+
         if token.starts_with('$') {
-            let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
             let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
             if let Some(binding) = bindings.at(token, offset) {
                 return Some(format_binding_hover(binding));
             }
         }
         self.hover_markdown_for_token(token, active_context)
+    }
+
+    /// Hover for a method call, resolved through the engine's receiver tables.
+    fn method_hover(&self, analysis: &DocumentAnalysis, offset: usize) -> Option<String> {
+        let (idiom, method) = method_at(analysis, offset)?;
+        let receiver = crate::semantic::infer::method_receiver(idiom)?;
+
+        let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+        let ctx = crate::semantic::infer::TypeCtx {
+            model: self,
+            source: &analysis.text,
+            bindings: &bindings,
+        };
+        let receiver_type = crate::semantic::infer::infer_expr_type(receiver, &ctx);
+        let resolved = crate::semantic::method::resolve(&receiver_type, &method)?;
+
+        let mut metadata = vec![format!("Resolves to `{}`", resolved.function)];
+        if let Some(target) = resolved.experimental {
+            metadata.push(format!("Experimental: requires `{target}`"));
+        }
+        if let Some(returns) = crate::semantic::method::return_type(resolved.function) {
+            metadata.push(format!("Returns: `{returns}`"));
+        }
+
+        let title = builtin_signature(resolved.function)
+            .and_then(|signature| signature.display_signature())
+            .unwrap_or_else(|| format!("{}()", resolved.function));
+        let summary =
+            builtin_function(resolved.function).map(|curated| curated.summary.to_string());
+        let sections = builtin_function(resolved.function)
+            .map(|curated| vec![format!("[Docs]({})", curated.documentation_url)])
+            .unwrap_or_default();
+
+        Some(hover_block(
+            format!(".{method}() — {title}"),
+            summary,
+            metadata,
+            sections,
+        ))
     }
 
     /// Like [`Self::find_nearest_table`], but only explicitly defined
@@ -377,7 +543,10 @@ impl MergedSemanticModel {
             return Some(format_table_hover(table, self, active_context));
         }
         if let Some(function) = self.functions.get(trimmed) {
-            return Some(format_function_hover(function));
+            return Some(format_function_hover(
+                function,
+                self.inferred_function_returns.get(trimmed),
+            ));
         }
         // The curated table first: its 79 entries carry prose and a docs link
         // that no generator can produce.
@@ -429,7 +598,7 @@ impl MergedSemanticModel {
                 vec![format!("[Docs]({})", namespace.documentation_url)],
             ));
         }
-        if BUILTIN_NAMESPACES
+        if GENERATED_NAMESPACES
             .iter()
             .any(|namespace| namespace.eq_ignore_ascii_case(trimmed))
         {
@@ -479,7 +648,7 @@ impl MergedSemanticModel {
                 }
             }
 
-            for namespace in BUILTIN_NAMESPACES {
+            for namespace in GENERATED_NAMESPACES {
                 if prefix.is_empty() || namespace.starts_with(&normalized_builtin) {
                     items.push(CompletionItem {
                         label: namespace.to_string(),
@@ -496,10 +665,16 @@ impl MergedSemanticModel {
                     items.push(CompletionItem {
                         label: function.name.clone(),
                         kind: Some(CompletionItemKind::FUNCTION),
-                        detail: Some(function_signature(function)),
+                        detail: Some(function_signature_with_return(
+                            function,
+                            self.inferred_function_returns.get(&function.name),
+                        )),
                         documentation: Some(Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: format_function_hover(function),
+                            value: format_function_hover(
+                                function,
+                                self.inferred_function_returns.get(&function.name),
+                            ),
                         })),
                         sort_text: Some(format!("1-{}", function.name)),
                         ..CompletionItem::default()
@@ -507,6 +682,8 @@ impl MergedSemanticModel {
                 }
             }
 
+            // The curated table first: its 79 entries carry prose and a docs
+            // link that no generator can produce.
             for function in BUILTIN_FUNCTIONS {
                 if prefix.is_empty() || function.name.starts_with(&normalized_builtin) {
                     items.push(CompletionItem {
@@ -518,6 +695,59 @@ impl MergedSemanticModel {
                             value: format_builtin_function_hover(function, function.name),
                         })),
                         sort_text: Some(format!("2-{}", function.name)),
+                        ..CompletionItem::default()
+                    });
+                }
+            }
+
+            // Then the generated catalogue, which is the other 355. Without this
+            // the dropdown only ever held `string::` and `type::` — the two
+            // namespaces the curated table happens to cover — so typing `rand::`
+            // offered the namespace and then nothing inside it, and the same for
+            // `array::` (62 functions), `math::` (42) and `time::` (37).
+            //
+            // Curated entries win, so a function with prose keeps it.
+            for function in GENERATED_FUNCTION_TABLE {
+                if !prefix.is_empty() && !function.name.starts_with(&normalized_builtin) {
+                    continue;
+                }
+                if builtin_function(function.name).is_some() {
+                    continue;
+                }
+                let signature = builtin_signature(function.name);
+                let detail = signature
+                    .as_ref()
+                    .and_then(|found| found.display_signature())
+                    .unwrap_or_else(|| format!("{}(…)", function.name));
+                items.push(CompletionItem {
+                    label: function.name.to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail: Some(detail),
+                    // A name the parser accepts that nothing implements. Offering
+                    // it silently would hand the user a query that parses and
+                    // then fails.
+                    deprecated: Some(function.not_callable),
+                    sort_text: Some(format!("2-{}", function.name)),
+                    ..CompletionItem::default()
+                });
+            }
+
+            // Constants such as `math::PI`. They take no arguments, so they are
+            // not in `GENERATED_FUNCTIONS` at all.
+            for constant in GENERATED_CONSTANTS {
+                // Compared case-insensitively: a constant is spelled in upper
+                // case (`math::PI`) while `normalized_builtin` is lowered, so a
+                // `starts_with` on the raw names never matches.
+                if prefix.is_empty()
+                    || constant
+                        .to_ascii_lowercase()
+                        .starts_with(&normalized_builtin)
+                {
+                    items.push(CompletionItem {
+                        label: constant.to_string(),
+                        kind: Some(CompletionItemKind::CONSTANT),
+                        detail: Some("Builtin constant".to_string()),
+                        sort_text: Some(format!("2-{constant}")),
                         ..CompletionItem::default()
                     });
                 }
@@ -1531,18 +1761,23 @@ fn format_table_hover(
     )
 }
 
-fn format_function_hover(function: &FunctionDef) -> String {
+fn format_function_hover(function: &FunctionDef, inferred_return: Option<&TypeExpr>) -> String {
     let mut metadata = vec![format!("Source: {}", origin_label(function.origin))];
     match function.language {
         FunctionLanguage::JavaScript => metadata.push("Language: JavaScript".to_string()),
         FunctionLanguage::SurrealQL => {}
+    }
+    // Say it plainly, so the `->` in the signature above cannot be read as an
+    // annotation the author wrote. Same convention as `format_binding_hover`.
+    if function.return_type.is_none() && inferred_return.is_some() {
+        metadata.push("Return type inferred from the body.".to_string());
     }
     let mut sections = Vec::new();
     if !function.called_functions.is_empty() {
         sections.push(list_section("Calls", function.called_functions.clone()));
     }
     hover_block(
-        function_signature(function),
+        function_signature_with_return(function, inferred_return),
         function.comment.clone(),
         metadata,
         sections,
@@ -1688,7 +1923,26 @@ pub fn param_label(param: &FunctionParam) -> String {
 }
 
 /// `fn::name($a: type, …) -> type`, as rendered in hover and signature help.
+///
+/// Renders only what the source declares. Use
+/// [`function_signature_with_return`] where a body-inferred return type should
+/// show too.
 pub fn function_signature(function: &FunctionDef) -> String {
+    function_signature_with_return(function, None)
+}
+
+/// [`function_signature`], but falling back to a body-inferred return type.
+///
+/// `inferred` comes from [`MergedSemanticModel::inferred_function_returns`], so
+/// only a caller holding the model can supply it. A declared type always wins.
+///
+/// The arrow alone cannot distinguish the two, so every caller that passes
+/// `Some` is responsible for saying so nearby — [`format_function_hover`] adds a
+/// line for exactly that reason.
+pub fn function_signature_with_return(
+    function: &FunctionDef,
+    inferred: Option<&TypeExpr>,
+) -> String {
     let params = function
         .params
         .iter()
@@ -1696,7 +1950,7 @@ pub fn function_signature(function: &FunctionDef) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let base = format!("{}({params})", function.name);
-    match &function.return_type {
+    match function.return_type.as_ref().or(inferred) {
         Some(ret) => format!("{base} -> {ret}"),
         None => base,
     }
@@ -1919,6 +2173,47 @@ pub fn is_record_type_context(source: &str, position: Position) -> bool {
         .rsplit_once("record<")
         .map(|(_, suffix)| !suffix.contains('>'))
         .unwrap_or(false)
+}
+
+/// The byte offset of the `.` that opens the method position at `offset`, if
+/// there is one.
+///
+/// Accepts a partially typed name after the dot (`"abc".sl|`), because `.` is not
+/// a token character and the completion prefix therefore arrives empty.
+fn method_dot_offset(source: &str, offset: usize) -> Option<usize> {
+    let before = source.get(..offset)?;
+    let trailing = before
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+        .count();
+    let (at, ch) = before.char_indices().rev().nth(trailing)?;
+    if ch == '.' { Some(at) } else { None }
+}
+
+/// The method a cursor sits on: the `IdiomFunction` node and the method name.
+///
+/// `token_at` treats `.` as a boundary, so hover on `'abc'.len()` only ever sees
+/// the bare word `len`. That is why this works from the tree instead: the bare
+/// word route answers with the SurrealQL *keyword* `AT` for `.at(0)` and `SPLIT`
+/// for `.split(',')` — a wrong answer rather than a missing one.
+pub(crate) fn method_at<'tree>(
+    analysis: &'tree DocumentAnalysis,
+    offset: usize,
+) -> Option<(tree_sitter::Node<'tree>, String)> {
+    let node = analysis
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)?;
+    if node.kind() != crate::semantic::node_kind::FUNCTION_NAME {
+        return None;
+    }
+    let idiom = node.parent()?;
+    if idiom.kind() != crate::semantic::node_kind::IDIOM_FUNCTION {
+        return None;
+    }
+    let name = crate::semantic::node_kind::text_of(&analysis.text, node)?;
+    Some((idiom, name.to_string()))
 }
 
 #[cfg(test)]

@@ -51,6 +51,15 @@ pub const IF_ELSE_STATEMENT: &str = "IfElseStatement";
 /// The brace form of `IF`: wraps the condition and every branch block of an
 /// [`IF_ELSE_STATEMENT`], so a walk looking for the branches passes through it.
 pub const MODERN: &str = "Modern";
+/// The `IF … THEN … END` form, the other half of [`IF_ELSE_STATEMENT`].
+///
+/// Its branches admit a `Block`, so a `RETURN` can hide inside one, and
+/// `crate::semantic::infer::propagates_return` does *not* descend through it.
+/// That is harmless for the declared-return check — a missed `RETURN` costs one
+/// report — but it is not harmless for return-type *inference*, where a missed
+/// `RETURN` yields a type narrower than the truth. Return-type inference
+/// therefore refuses a body containing one.
+pub const LEGACY: &str = "Legacy";
 pub const RETURN_STATEMENT: &str = "ReturnStatement";
 pub const THROW_STATEMENT: &str = "ThrowStatement";
 

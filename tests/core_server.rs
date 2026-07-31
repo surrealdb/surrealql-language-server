@@ -1240,3 +1240,226 @@ async fn unknown_metadata_mode_warns_and_repairs_to_default() {
         "unknown mode must repair to the default instead of disabling all metadata"
     );
 }
+
+#[tokio::test]
+async fn namespace_completion_comes_from_the_generated_catalogue() {
+    // The hand-written list this replaced offered `not::` and `sleep::`, which
+    // are bare functions and not namespaces, and hid eight real ones. `set::`
+    // was the costly omission: 24 functions the method checker already resolved
+    // but completion never offered.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN ";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+    let offered = labels(&items);
+
+    for real in [
+        "set::",
+        "file::",
+        "bytes::",
+        "api::",
+        "value::",
+        "eval::",
+        "schema::",
+        "sequence::",
+    ] {
+        assert!(offered.contains(&real), "`{real}` must be offered");
+    }
+    for phantom in ["not::", "sleep::"] {
+        assert!(
+            !offered.contains(&phantom),
+            "`{phantom}` is a bare function, not a namespace"
+        );
+    }
+    // The ones that already worked must keep working.
+    for kept in ["string::", "array::", "math::", "type::"] {
+        assert!(offered.contains(&kept), "`{kept}` regressed");
+    }
+}
+
+#[tokio::test]
+async fn a_dot_on_a_typed_value_offers_that_receivers_methods() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN \"abc\".";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+    let offered = labels(&items);
+
+    for string_method in ["len", "slug", "uppercase", "split", "is_alphanum"] {
+        assert!(
+            offered.contains(&string_method),
+            "`{string_method}` missing"
+        );
+    }
+    // A method that belongs to another receiver must not be offered.
+    for foreign in ["area", "centroid", "days"] {
+        assert!(
+            !offered.contains(&foreign),
+            "`{foreign}` is not a string method"
+        );
+    }
+    // The shared block reaches every receiver, so these are string methods too.
+    for shared in ["to_string", "is_number", "chain"] {
+        assert!(offered.contains(&shared), "`{shared}` missing");
+    }
+}
+
+#[tokio::test]
+async fn a_dot_on_a_number_offers_the_math_methods() {
+    // The gap the CHANGELOG named: `<number>.round()` is `math::round`, so the
+    // old `<receiver>::<method>` guess offered nothing here.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "LET $n = 5;\nRETURN $n.";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 1, 10).await;
+    let offered = labels(&items);
+    for numeric in ["round", "abs", "floor", "ceil"] {
+        assert!(offered.contains(&numeric), "`{numeric}` missing");
+    }
+}
+
+#[tokio::test]
+async fn a_dot_on_a_variable_no_longer_answers_with_an_empty_list() {
+    // `$s.` used to read `s` as a *table* name, find no fields on it, and return
+    // an empty popup — the sharpest completion defect in the server.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "LET $s = \"abc\";\nRETURN $s.";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 1, 10).await;
+    assert!(!items.is_empty(), "the popup must not be empty");
+    assert!(labels(&items).contains(&"len"), "got {:?}", labels(&items));
+}
+
+#[tokio::test]
+async fn a_dot_on_an_untyped_receiver_falls_back_to_every_method() {
+    // Field access types as `unknown`, which is common. An empty list there would
+    // read as a broken feature, so every method is offered instead.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN $row.field.";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+    let offered = labels(&items);
+    assert!(
+        offered.contains(&"len"),
+        "got {:?}",
+        &offered[..offered.len().min(12)]
+    );
+    assert!(
+        offered.contains(&"round"),
+        "the fallback spans every receiver"
+    );
+}
+
+#[tokio::test]
+async fn signature_help_works_for_a_method() {
+    // `'abc'.slice(` reads as one whitespace-delimited token, so this used to
+    // match nothing in either function table.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN 'abc'.slice(";
+    open(&core, "a.surql", text).await;
+
+    let help = signature_help_at(&core, "a.surql", 0, text.len() as u32).await;
+    let label = help.signatures[0].label.clone();
+    assert!(label.starts_with(".slice("), "got {label}");
+    // The receiver fills parameter zero, so it must not be listed.
+    assert!(
+        !label.contains("string,"),
+        "the receiver must be dropped: {label}"
+    );
+}
+
+#[tokio::test]
+async fn a_namespace_prefix_offers_the_functions_inside_it() {
+    // The reported defect: typing `rand::` offered the namespace and then
+    // nothing inside it. Completion iterated only the 79 *curated* builtins,
+    // which cover `string::` and `type::` alone — so 355 of the 434 functions
+    // the parser accepts were invisible, and every other namespace resolved
+    // empty.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN rand::";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+    let offered = labels(&items);
+    for name in [
+        "rand::uuid::v4",
+        "rand::uuid::v7",
+        "rand::uuid",
+        "rand::bool",
+        "rand::int",
+        "rand::time",
+    ] {
+        assert!(offered.contains(&name), "`{name}` missing from {offered:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_namespace_resolves_to_its_functions() {
+    // Not just `rand::` — the same hole emptied every namespace outside the two
+    // the curated table happens to cover.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    for (prefix, expected) in [
+        ("array::", "array::distinct"),
+        ("math::", "math::round"),
+        ("time::", "time::now"),
+        ("crypto::", "crypto::sha256"),
+        ("vector::", "vector::dot"),
+        ("duration::", "duration::days"),
+        ("set::", "set::union"),
+    ] {
+        let text = format!("RETURN {prefix}");
+        open(&core, "a.surql", &text).await;
+        let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+        assert!(
+            labels(&items).contains(&expected),
+            "`{expected}` missing after typing `{prefix}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_builtin_constant_is_offered() {
+    // `math::PI` takes no arguments, so it is not a function entry at all.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN math::P";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+    assert!(
+        labels(&items).contains(&"math::PI"),
+        "got {:?}",
+        labels(&items)
+    );
+}
+
+#[tokio::test]
+async fn a_curated_function_keeps_its_prose() {
+    // The generated catalogue must not shadow the 79 entries that carry a
+    // summary and a docs link.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "RETURN string::len";
+    open(&core, "a.surql", text).await;
+
+    let items = complete(&core, "a.surql", 0, text.len() as u32).await;
+    let entry = items
+        .iter()
+        .find(|item| item.label == "string::len")
+        .expect("string::len offered");
+    assert!(
+        entry.documentation.is_some(),
+        "a curated entry keeps its prose"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.label == "string::len")
+            .count(),
+        1,
+        "and is offered exactly once"
+    );
+}
