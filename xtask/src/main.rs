@@ -13,6 +13,7 @@
 mod emit;
 mod engine_tables;
 mod kinds;
+mod methods;
 mod signatures;
 
 use std::path::{Path, PathBuf};
@@ -103,7 +104,15 @@ fn generate(surrealdb: &Path) -> Result<String, String> {
     let namespaces = engine_tables::namespaces(&paths);
     let revision = git_revision(surrealdb).unwrap_or_else(|| "unknown".to_string());
 
-    let catalogue = emit::build(&paths, &dispatch, &implementations, revision, namespaces);
+    let receivers = methods::parse(&fnc_mod_rs)?;
+    let catalogue = emit::build(
+        &paths,
+        &dispatch,
+        &implementations,
+        revision,
+        namespaces,
+        &receivers,
+    );
 
     // A catastrophic parse failure must not quietly emit a catalogue of unknown
     // signatures that then silences every argument check.

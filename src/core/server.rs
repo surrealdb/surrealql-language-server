@@ -31,7 +31,7 @@ use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builti
 use crate::runtime;
 use crate::semantic::analyzer::analyze_document;
 use crate::semantic::model::{
-    field_completion_tables, function_signature, is_record_type_context, param_label,
+    field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
 use crate::semantic::text::{position_to_offset, token_at, word_range};
 use crate::semantic::types::{
@@ -534,6 +534,10 @@ where
         let statement_fact = active_query_fact(&analysis, position);
         let qualifier = completion_table_qualifier(&analysis.text, position);
 
+        // A `.` admits a field *and* a method, so these are added to whatever the
+        // position already offers rather than replacing it.
+        let method_items = model.method_completion_items(&analysis, position, trimmed_prefix);
+
         // Decide whether the cursor is in a column-name slot. A `tbl.`
         // qualifier is always treated as a strict slot (the only legal
         // continuations are field names of `tbl`).
@@ -568,6 +572,7 @@ where
                         },
                     );
                 }
+                items.extend(method_items);
                 return Some(CompletionResponse::Array(items));
             }
         }
@@ -586,6 +591,14 @@ where
                 model.variable_completion_items(&analysis, position, trimmed_prefix);
             variables.append(&mut items);
             items = variables;
+        }
+        // Methods first: at a `.` position they are what the user is reaching
+        // for, and their `sort_text` already ranks a type-matched method above
+        // the untyped fallback.
+        if !method_items.is_empty() {
+            let mut merged = method_items;
+            merged.append(&mut items);
+            items = merged;
         }
         Some(CompletionResponse::Array(items))
     }
@@ -736,10 +749,74 @@ where
             .filter(|ch| *ch == ',')
             .count() as u32;
 
+        // A method: `'abc'.slice(` reads as one whitespace-delimited token, so the
+        // tail after the last `.` is the method name. It resolves through the
+        // receiver's table, and parameter zero is dropped because the receiver
+        // already fills it.
+        //
+        // The receiver is found from the text rather than from an `IdiomFunction`
+        // node, because on the `(` keystroke there is no such node yet: with an
+        // empty argument list the grammar reads `.slice` as a *field access* and
+        // leaves the `(` as an ERROR sibling. Signature help is most useful at
+        // exactly that moment, so it cannot wait for the tree to agree.
+        if let Some((_, method)) = function_name.rsplit_once('.')
+            && !method.is_empty()
+            && let Some(dot) = open_paren.checked_sub(method.len() + 1)
+            && analysis.text.as_bytes().get(dot) == Some(&b'.')
+        {
+            let receiver = analysis
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(dot.saturating_sub(1), dot);
+            if let Some(receiver) = receiver {
+                let bindings = crate::semantic::infer::resolve_bindings(&analysis, &model);
+                let ctx = crate::semantic::infer::TypeCtx {
+                    model: &model,
+                    source: &analysis.text,
+                    bindings: &bindings,
+                };
+                let receiver_type = crate::semantic::infer::infer_expr_type(receiver, &ctx);
+                if let Some(resolved) = crate::semantic::method::resolve(&receiver_type, method)
+                    && let Some(signature) = crate::grammar::builtin_signature(resolved.function)
+                {
+                    let labels = signature.param_labels();
+                    let written: Vec<String> = labels.iter().skip(1).cloned().collect();
+                    return Some(SignatureHelp {
+                        signatures: vec![SignatureInformation {
+                            label: format!(".{method}({})", written.join(", ")),
+                            documentation: crate::grammar::builtin_function(resolved.function).map(
+                                |curated| {
+                                    Documentation::MarkupContent(MarkupContent {
+                                        kind: MarkupKind::Markdown,
+                                        value: curated.summary.to_string(),
+                                    })
+                                },
+                            ),
+                            parameters: Some(
+                                written
+                                    .into_iter()
+                                    .map(|label| ParameterInformation {
+                                        label: ParameterLabel::Simple(label),
+                                        documentation: None,
+                                    })
+                                    .collect(),
+                            ),
+                            active_parameter: Some(active_parameter),
+                        }],
+                        active_signature: Some(0),
+                        active_parameter: Some(active_parameter),
+                    });
+                }
+            }
+        }
+
         if let Some(function) = model.functions.get(function_name) {
             return Some(SignatureHelp {
                 signatures: vec![SignatureInformation {
-                    label: function_signature(function),
+                    label: function_signature_with_return(
+                        function,
+                        model.inferred_function_returns.get(function_name),
+                    ),
                     documentation: function.comment.clone().map(|value| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,

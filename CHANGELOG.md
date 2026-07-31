@@ -104,6 +104,261 @@ checks already model — so this needed no new type machinery.
 - A body the parser could not read is not checked; a syntax diagnostic
   already covers it.
 
+### Undeclared function return types are inferred
+
+The other half of the same problem. `DEFINE FUNCTION` without `-> T` made
+every call site `unknown`, which switched off every downstream check and left
+hover with nothing to say — and most functions carry no annotation. Of the 29
+definitions in `tests/fixtures/adversarial.surql`, 25 declare no return type.
+
+```surql
+DEFINE FUNCTION fn::custom::slug($input: string) {
+    RETURN string::slug($input);
+};
+
+LET $slug = fn::custom::slug("some random string");
+```
+
+`$slug` now hovers as `string`, completes with `string` as its detail, and is
+checked wherever it flows. The return type is read from the body — every
+`RETURN` plus the block's trailing expression — and it reaches the argument
+check exactly as a declared type does.
+
+- **Across files, and along chains.** The pass runs in
+  `MergedSemanticModel::build`, the only place holding every document's tree
+  *and* every symbol, and a `fn::` definition routinely lives in another file.
+  A body returning another unannotated function's result resolves on the next
+  round, up to eight deep.
+- **It cannot recurse.** A round reads what earlier rounds wrote out of a map;
+  it never descends into a callee. An unannotated `fn::fib`, or a mutually
+  recursive pair, simply never resolves and stays silent — no visited set, no
+  depth guard, no stack risk. A whole round is computed before it is written,
+  so the answer does not depend on `HashMap` order.
+- **A declared type always wins**, and an inferred one is never checked
+  against the body it came from: `check_one_function_body` reads the
+  annotation from the tree, not from `FunctionDef`.
+- **One unresolvable return path makes the whole answer unknown.** An inferred
+  type feeds a diagnostic, so a type *narrower* than the truth would report
+  against a value the function really returns.
+  `{ IF $n > 0 { RETURN 'yes'; }; }` yields NONE when the branch does not
+  fire, so it infers nothing rather than `string`.
+- **Return paths that disagree infer a union.** A union on the value side of
+  the assignability relation can never come back incompatible, so it informs
+  hover and stays silent in the checker.
+- **A body sees only its own parameters**, which is a correctness requirement
+  and not an optimisation. Given `LET $g = 'hi';` then
+  `DEFINE FUNCTION fn::f() { RETURN $g; }`, `$g` is unset inside the body and
+  the engine yields NONE — so resolving bindings over the whole document would
+  infer a type the function cannot produce.
+- Hover writes `Return type inferred from the body.` beside the signature. The
+  `->` alone cannot distinguish an inference from an annotation.
+- No new diagnostic code and no new configuration key. The new reports go out
+  under the existing `argument-type`, `let-type` and `return-type` codes —
+  which makes the blast radius *wider* than a new code would be, not narrower.
+  Swept across all 1,897 files of `language-tests/` with **zero** new
+  diagnostics.
+- `tests/conformance.rs` now sweeps `let-type` too. It was outside the filter,
+  so this feature's likeliest false positive would have been invisible to the
+  one test that reads real SurrealQL at scale. Widening it surfaced two true
+  positives, both matching an `error =` those corpus files declare themselves.
+
+### Arithmetic operands are checked
+
+`RETURN "" + "222" + 3;` fails in SurrealDB with `Cannot perform addition
+with 'string' and 'int'`, and the server said nothing: `infer_expr_type`
+had no `BinaryExpression` arm, so every operator expression was `unknown`
+and every check downstream of it stayed silent.
+
+```surql
+RETURN "" + "222" + 3;            -- reported
+RETURN "" + "222" + <string>3;    -- silent, gives "2223"
+RETURN <int>"0" + <int>"222" + 3; -- silent, gives 225
+```
+
+The operand rules are transcribed from the engine's own `TryAdd` /
+`TrySub` / `TryMul` / `TryDiv` / `TryPow` impls for `Value` into the new
+`semantic::operate`, with the file and lines cited on each table. They had
+to be read rather than reasoned about, because they are irregular per
+operator: `+` concatenates two strings but rejects a string and an int,
+`*` scales a duration in one direction only (`1s * 2` works, `2 * 1s`
+does not), `array + set` yields an array while `set + array` yields a
+set, and `/` never fails at all.
+
+**The documentation cannot answer this.** It never states a rule for
+`string + int`, and never states one for numeric promotion in arithmetic —
+its operators page shows same-type examples only. It also puts `??`/`?:`
+*above* `**` in precedence, which the engine's own
+`language/expression/operators/precedence.surql` disproves.
+
+- **The tree is re-grouped before it is checked.** The pinned grammar puts
+  every binary operator on one left-associative precedence level, so it
+  parses `1 + 1 * 3` as `(1 + 1) * 3` while SurrealDB answers `4`. Reading
+  the tree as parsed would name operand pairs the engine never formed, so
+  the chain is flattened back to its written sequence and re-grouped with
+  the engine's binding powers. `RETURN "" + 1 * 2;` reports `string` and
+  `int`, not `int` and `int`.
+- **Three operators are excluded, each for a different reason.** `/` and
+  `÷` because the engine wraps their failures as
+  `unwrap_or(f64::NAN.into())`, so `[1,2,3] / 1` evaluates to `NaN`;
+  `+=`/`-=` because they take the looser `increment` path; and every
+  comparison, containment and logical operator because none of them can
+  fail — `1 < "a"` has a defined answer.
+- **The right side of a short circuit is never reported.** `?:`, `??`,
+  `&&` and `||` may leave it unevaluated, and `precedence.surql` relies on
+  it: `2 + 1 ?: true + 1` is `3`, so the `true + 1` that would fail never
+  runs.
+- **`value_kind` is the gate**, and it is the only way this can produce a
+  false positive. It answers "not provably one concrete kind" for
+  `unknown`, `any`, `value`, an `option<T>`, a union, and any type name it
+  has not been taught, and a single such operand silences the pair. An
+  `option<int>` is deliberately *not* treated as a number: it may hold
+  NONE.
+- **A concrete kind that appears in no arm is reported**, which is what
+  makes `true + 1` and `person:tobie + 1` errors rather than shrugs.
+- The message follows the engine's wording, with the operand's type where
+  the engine prints a value. Note `**` has its own sentence there:
+  `Cannot raise the value …`.
+- No new configuration key. One new wire-visible code, `operator-type`.
+- **An arithmetic expression now has a type**, so this closes the first
+  gap the return-type-inference change above recorded: a body of
+  `RETURN $a + $b` is inferrable, and `LET $n: string = 1 + 2` is caught.
+  Two existing tests asserted that `1 + 2` stays untyped; both were pinning
+  a miss rather than a policy, and both now assert the opposite.
+- Swept across all 1,897 files of `language-tests/`. It found **two** false
+  positives, both now fixed and both regression-tested: the short circuit
+  above, and a fragment left beside `ERROR` nodes by mock syntax
+  (`|test:1..4|`) that the grammar cannot parse, where
+  `test:..=-9223372036854775806` looks like a record id minus an int.
+  `tests/conformance.rs` also sweeps `operator-type` now, and four corpus
+  files gained expected entries — every one of them declaring the matching
+  `Cannot perform …` in its own front matter.
+
+### Method calls resolve against the engine's own receiver tables
+
+SurrealQL lets most builtins be called as a method, and the mapping is **not**
+`<receiver type>::<method>`. The server guessed that convention, which is right
+for the eight receivers whose namespace happens to be their type name and wrong
+for everything else. Of the 236 distinct method names SurrealDB's own
+`method_syntax.surql` exercises, it resolved **124**.
+
+```surql
+RETURN (5).round();          -- math::round
+RETURN 123.to_float();       -- type::float
+RETURN "abc".is_alphanum();  -- string::is_alphanum
+RETURN $point.area();        -- geo::area
+```
+
+`cargo xtask generate-builtins` now also reads `fnc::idiom` — one engine function
+holding a `match` on the receiver's `Value` variant, **11 typed tables plus a
+catch-all, 820 arms**. The receiver grouping sits outside the `dispatch!` macro,
+so `syn` reads the twelve keys as typed patterns and the scrape depends on no
+indentation. Each table is emitted in full rather than layered over the shared
+block, because layering would be wrong — see below.
+
+- **Three receivers use a foreign namespace**: `Number` (which covers int, float
+  and decimal) dispatches into `math::`, `Geometry` into `geo::`, `Datetime` into
+  `time::`.
+- **52 method names flatten a path**, so `is_alphanum` is `string::is::alphanum`
+  and `sort_asc` is `array::sort::asc`. Another 42 in the shared block do the
+  same, such as `to_string_lossy` for `type::string_lossy`.
+- **`String` shadows four shared arms and drops one.** `.repeat()` is
+  `string::repeat`, not `array::repeat`, and `.is_datetime()` /`.is_uuid()` /
+  `.is_record()` come from `string::is::…` with a *different arity* —
+  `string::is::datetime` takes an optional format argument. `.is_set()` is absent
+  from `String` and is a hard error there. This is why the tables are emitted
+  whole.
+- **The catch-all table is emitted too.** It serves `bool`, `uuid`, `regex`,
+  `range`, `none` and `null` with 48 methods, and without it `true.to_string()`
+  would report a false error.
+- **A method past link one still resolves nothing**, except an optional chain.
+  `$v.?.trim()` reads the same value as `$v.trim()`, and that shape appears six
+  times across the two test fixtures; `$a.b.trim()` needs field resolution the
+  server does not have.
+- **An unknown method is now reported**, under the new `unknown-method` code.
+  `"abc".nonsense()` was silent, because a miss in the old name guess was
+  indistinguishable from a remapped name.
+- **An object is exempt from that report.** When method dispatch fails on an
+  object the engine retries the name as a *closure-valued field*
+  (`val/value/get.rs`), so `{ a: |$x| $x }.a(1)` is legal and the field can be
+  called anything. Three corpus files rely on it.
+- **A GeoJSON object literal reaches the geometry table too.**
+  `{ type: "Point", coordinates: […] }` is a `Value::Geometry` to the engine but
+  an object to the lattice. `Object` and `Geometry` share no method name outside
+  the shared block, so both tables are tried rather than one guessed — the same
+  resolution `xtask/src/kinds.rs` already records for geometry *parameters*.
+- **`value::chain` is method-only.** It is in the parser's `PATHS` but has no
+  callable dispatch arm, so `value::chain(x, f)` parses and then fails while
+  `x.chain(f)` works. The method path deliberately does not check `not_callable`.
+- **A method call now has a type**, folded link by link, so
+  `"019535d9-…".to_uuid().is_uuid()` is `bool`. Return types stay **partial**:
+  the catalogue holds none, because every builtin returns `Value` in Rust. Three
+  sources fill the gap — the 79 curated signatures, the `type::is_*` predicates,
+  and an explicit list of the `type::` conversions plus the `math::` and
+  `duration::`/`time::` accessors. Everything else stays `unknown`.
+- Swept across all 1,897 files of `language-tests/`. It found **one** false
+  positive — the closure-field fallback above — now fixed and regression-tested.
+  `tests/conformance.rs` also sweeps `unknown-method`, and
+  `language/functions/method_syntax.surql` is committed as a fixture: 198 calls
+  the engine itself declares error-free.
+
+### Completion offers every builtin, not just the curated 79
+
+Reported from the Surrealist query editor: typing `rand::` completed the
+namespace and then nothing inside it, and the same for every other namespace.
+
+The cause was that completion iterated `BUILTIN_FUNCTIONS`, the **curated**
+table, which carries prose and a docs link for 79 entries and covers exactly two
+namespaces — `string::` and `type::`. The 434-entry generated catalogue, added in
+this release for type checking, was never wired into the dropdown. So **355 of
+the 434 functions the parser accepts were invisible**: all 62 of `array::`, 42 of
+`math::`, 37 of `time::`, 24 each of `set::`, `string::` and `duration::`, and
+all 12 of `rand::` including `rand::uuid::v4`.
+
+- Completion now reads both tables, and a curated entry wins so it keeps its
+  summary and docs link. `rand::` offers 15 items, `rand::uuid::` narrows to
+  three, `math::` offers 66.
+- **Constants are offered too.** `math::PI` and the other 26 take no arguments,
+  so they are not function entries at all and nothing had ever suggested them.
+  They are matched case-insensitively, since a constant is spelled in upper case
+  while the prefix is lowered.
+- A name the parser accepts but nothing implements — the nine such names,
+  `object::matches` among them — is marked deprecated rather than offered
+  silently, so the dropdown cannot hand out a query that parses and then fails.
+
+### Three wrong answers this replaced
+
+- **`$s.` returned an empty completion popup.** `$` is not a table-qualifier
+  character, so the scan stopped just after it and `$s.` yielded the *table* name
+  `s`; no fields were found on a table called `s`, and the handler answered with
+  an empty list rather than falling through. This was the sharpest completion
+  defect in the server.
+- **`.at()` and `.split()` hovered as the `AT` and `SPLIT` keywords.** `token_at`
+  treats `.` as a boundary, so hover saw the bare word and fell through to the
+  keyword table. Method hover now runs first and resolves through the receiver.
+- **Namespace completion offered `not::` and `sleep::`**, which are bare
+  functions and not namespaces, and hid eight real ones: `api::`, `bytes::`,
+  `eval::`, `file::`, `schema::`, `sequence::`, `set::` and `value::`. `set::`
+  was the costly one — 24 functions the method checker already resolved but
+  completion never suggested. The correct list had been generated as
+  `GENERATED_NAMESPACES` all along, with a test in
+  `tests/generated_catalogue.rs` describing the defect; no code ever read it.
+
+### Methods reach the rest of the LSP
+
+- **Completion after a `.`** offers that receiver's methods, with the resolved
+  function and its parameters as the detail, and marks the twelve `file::`
+  methods experimental. When the receiver's type is unknown — still common, since
+  a field access types as `unknown` — every method is offered instead, ranked
+  below the type-matched ones. An empty list there would read as a broken
+  feature. Field names the position already offered are kept: a `.` admits both.
+- **Hover** names the function a method resolves to, its return type where one is
+  known, and its experimental target.
+- **Signature help** works inside a method's argument list and drops parameter
+  zero, since the receiver fills it. It resolves the receiver from the text
+  rather than from the tree, because on the `(` keystroke there is no
+  `IdiomFunction` node yet — with an empty argument list the grammar reads
+  `.slice` as a field access and leaves the `(` as an ERROR sibling.
+
 ### What the structured parameters unlocked
 
 - Hover answers for all 20 namespaces. `math::abs` used to answer nothing.
@@ -185,9 +440,39 @@ checks already model — so this needed no new type machinery.
   nothing: the seven `api::` middleware functions, whose leading arguments
   the runtime supplies, and `rand::float`/`int`/`time`, whose
   zero-or-two arity this catalogue cannot express.
-- Method calls resolve by the convention `<receiver type>::<method>`, so
-  the remapped ones (`<number>.round()` is `math::round`) are not checked.
-  Generating the engine's 11 receiver tables would widen this.
+- A method past link one of a path resolves nothing, apart from an optional
+  chain: in `$a.b.trim()` the receiver is `$a.b`, which needs field resolution.
+- A method's return type is known only for the 79 curated signatures, the
+  `type::is_*` predicates, the `type::` conversions, and the `math::` and
+  `duration::`/`time::` accessors. Everything else types as `unknown`, because
+  the engine's Rust signature returns `Value` and carries no SurrealQL type.
+- Too few arguments on a method is never reported. The check bails on an empty
+  argument list, because an editor that closes brackets writes `.at()` on the
+  `(` keystroke and this server has no debounce.
+- Nine names parse but have no implementation, `object::matches` and the seven
+  `duration::set_*` among them. They are recorded but not flagged in method form.
+- Return-type inference reaches a body only as far as expression typing does,
+  so it declines more often than it succeeds. A body returning a `SELECT`,
+  `CREATE`, `UPDATE` or `DELETE` result infers nothing, because no statement
+  kind has a type yet; nor does a `BinaryExpression` (`RETURN $a + $b`) or
+  field access (`RETURN $x.name`). Those three arms are where the remaining
+  value is — every unannotated function in `adversarial.surql` returns a CRUD
+  result and so infers nothing today.
+- The arithmetic check cannot reach `%` or unary minus, because the pinned
+  grammar parses neither (see [`docs/grammar-gaps.md`](docs/grammar-gaps.md)).
+  The engine rejects `"8" % "3"` and `-[1,2,3]`, and a grammar bump would
+  unlock both with no change to the tables.
+- An arithmetic operand is judged only when its type is provably one
+  concrete kind, so field access (`$x.count + 1`), a method call, and any
+  statement result still type as `unknown` and stay silent.
+- Return-type inference also declines a body containing `IF … THEN … END`.
+  The return walk does not descend through that form, and a `RETURN` it cannot
+  see would make the inferred type too narrow. The brace form of `IF` is
+  handled.
+- `MergedSemanticModel::build` takes no `ServerSettings`, so return-type
+  inference runs even when `analysis.enableTypeChecking` is false. It only
+  feeds hover and completion in that case, which is the intent, but the work
+  is still done.
 
 ## 0.4.0 — unreleased
 

@@ -353,14 +353,20 @@ pub fn completion_table_qualifier(source: &str, position: Position) -> Option<St
         return None;
     }
 
-    let qualifier = left
+    let raw: String = left
         .chars()
         .rev()
         .take_while(|ch| is_table_qualifier_char(*ch))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+        .collect();
+    // A `$variable` is not a table. `$` is not a qualifier character, so the scan
+    // stops just after it and `$s.` used to yield the table name `s` — whereupon
+    // `column_completion_items` found no fields on a table called `s` and the
+    // handler answered with an *empty* popup rather than letting the global list
+    // through. That was the sharpest completion defect in the server.
+    if left.chars().rev().nth(raw.chars().count()) == Some('$') {
+        return None;
+    }
+    let qualifier: String = raw.chars().rev().collect();
     let qualifier = qualifier.trim_matches('`');
     if qualifier.is_empty() {
         return None;

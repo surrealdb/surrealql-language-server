@@ -31,6 +31,34 @@ constants together.
   statements produce no query facts (see
   [`docs/pain-points.md`](pain-points.md)).
 
+- **All binary operators share one precedence level.** `BinaryExpression`
+  is `prec.left('binary', seq($._value, $.Operator, $._value))` and
+  `binary` is a single entry in `precedences`, so the tree carries no
+  operator precedence at all: `1 + 1 * 3` parses as `(1 + 1) * 3`, while
+  SurrealDB evaluates `1 + (1 * 3)` and answers `4` (its own
+  `language/expression/operators/precedence.surql` asserts that).
+  `semantic::infer` works around this for the arithmetic type check by
+  flattening the left spine and re-grouping it with the engine's binding
+  powers; semantic tokens and completion read the tree as parsed.
+- **No `%` operator.** Nothing in `grammar.js` holds `'%'`, so `8 % 3`
+  does not parse. The engine supports it at `MulDiv` precedence and
+  rejects `"8" % "3"`, which the arithmetic check therefore cannot reach.
+- **No unary minus.** A sign belongs to the `Number` token
+  (`optional(choice('-', '+'))`) and `PrefixExpression` accepts `!`
+  alone, so `-[1,2,3]` does not parse. The engine rejects it with
+  `Cannot negate the value 'array'`.
+- **Mock syntax does not parse.** `|test:1..4|` yields `ERROR` nodes
+  *around* a `BinaryExpression` rather than inside one, so a guard that
+  only inspects a subtree sees a well-formed fragment. `has_broken_sibling`
+  in `semantic::infer` exists for exactly this shape.
+
+- **An empty argument list is a field access.** `'abc'.slice(` parses as
+  `Path(String, Subscript(Ident))` with the `(` left over as an `ERROR`
+  sibling; only once an argument is typed does it become
+  `Subscript(IdiomFunction(FunctionName, ArgumentList))`. Signature help is
+  most useful on the `(` keystroke, so it resolves the receiver from the text
+  rather than waiting for the tree — see `signature_help` in `core/server.rs`.
+
 ## Tracking tests
 
 `cargo test --test lsp` carries the guard tests that pin known-good

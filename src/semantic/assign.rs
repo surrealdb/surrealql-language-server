@@ -103,7 +103,10 @@ fn literal_family(raw: &str) -> Option<&'static str> {
 }
 
 /// Widen a type one step for comparison: a literal becomes its family.
-fn widen(ty: &TypeExpr) -> Option<TypeExpr> {
+///
+/// `pub(crate)` so [`crate::semantic::operate::value_kind`] can share the one
+/// definition rather than growing a second, divergent copy.
+pub(crate) fn widen(ty: &TypeExpr) -> Option<TypeExpr> {
     match ty {
         TypeExpr::Literal(raw) => {
             literal_family(raw).map(|name| TypeExpr::Scalar(name.to_string()))

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine_tables::PathEntry;
 use crate::kinds::ParamForm;
+use crate::methods::Receiver;
 use crate::signatures::Implementation;
 
 pub struct Catalogue {
@@ -13,6 +14,15 @@ pub struct Catalogue {
     pub renames: Vec<(String, String)>,
     pub not_callable: Vec<String>,
     pub namespaces: BTreeSet<String>,
+    /// The method tables, one per receiver `Value` variant plus the catch-all.
+    pub receivers: Vec<ReceiverEntry>,
+}
+
+pub struct ReceiverEntry {
+    /// The engine `Value` variant, or empty for the catch-all table.
+    pub kind: String,
+    /// `(method, function, experimental target)`, sorted by method.
+    pub methods: Vec<(String, String, Option<String>)>,
 }
 
 pub struct CatalogueEntry {
@@ -58,6 +68,7 @@ pub fn build(
     implementations: &BTreeMap<String, Implementation>,
     revision: String,
     namespaces: BTreeSet<String>,
+    receivers: &[Receiver],
 ) -> Catalogue {
     let mut functions = Vec::new();
     let mut constants = Vec::new();
@@ -99,6 +110,34 @@ pub fn build(
 
     renames.sort();
     renames.dedup();
+
+    // Pair each method with the name an author would write for the same
+    // implementation. A path with no dispatch entry is method-only, and keeps
+    // its Rust path so the reader still learns where it lives.
+    let names = crate::methods::surrealql_names(dispatch);
+    let receivers = receivers
+        .iter()
+        .map(|receiver| {
+            let mut methods: Vec<(String, String, Option<String>)> = receiver
+                .methods
+                .iter()
+                .map(|arm| {
+                    let function = names
+                        .get(&arm.path)
+                        .cloned()
+                        .unwrap_or_else(|| arm.path.clone());
+                    (arm.method.clone(), function, arm.experimental.clone())
+                })
+                .collect();
+            methods.sort();
+            methods.dedup();
+            ReceiverEntry {
+                kind: receiver.kind.clone(),
+                methods,
+            }
+        })
+        .collect();
+
     Catalogue {
         revision,
         functions,
@@ -106,6 +145,7 @@ pub fn build(
         renames,
         not_callable,
         namespaces,
+        receivers,
     }
 }
 
@@ -124,7 +164,7 @@ pub fn render(catalogue: &Catalogue) -> String {
          //! argument check for that position. That is deliberate: a wrong type here would\n\
          //! invent a diagnostic against valid SurrealQL.\n\
          \n\
-         use crate::grammar::{{GeneratedFunction, GeneratedParam, ParamForm}};\n\
+         use crate::grammar::{{GeneratedFunction, GeneratedMethod, GeneratedParam, GeneratedReceiver, ParamForm}};\n\
          \n\
          /// The SurrealDB revision this catalogue was generated from.\n\
          pub const SURREALDB_REVISION: &str = \"{revision}\";\n\n",
@@ -185,6 +225,46 @@ pub fn render(catalogue: &Catalogue) -> String {
         out.push_str(&format!("    \"{name}\",\n"));
     }
     out.push_str("];\n");
+
+    let arms: usize = catalogue
+        .receivers
+        .iter()
+        .map(|receiver| receiver.methods.len())
+        .sum();
+    out.push_str(&format!(
+        "/// Which function a `value.method()` call dispatches to, per receiver.\n\
+         ///\n\
+         /// Read from `fnc::idiom` in `fnc/mod.rs`. The mapping is **not**\n\
+         /// `<receiver>::<method>`: `Number` dispatches into `math::`, `Geometry` into\n\
+         /// `geo::` and `Datetime` into `time::`, and 52 names flatten a path, so that\n\
+         /// `is_alphanum` is `string::is::alphanum`.\n\
+         ///\n\
+         /// Each receiver's list is complete rather than layered over a shared block.\n\
+         /// `String` shadows four of the common arms with different arities and drops\n\
+         /// `is_set` altogether, so a default-plus-overrides model would be wrong.\n\
+         ///\n\
+         /// {receivers} receivers, {arms} arms.\n\
+         pub const GENERATED_RECEIVERS: &[GeneratedReceiver] = &[\n",
+        receivers = catalogue.receivers.len(),
+        arms = arms
+    ));
+    for receiver in &catalogue.receivers {
+        out.push_str("    GeneratedReceiver {\n");
+        out.push_str(&format!("        kind: \"{}\",\n", receiver.kind));
+        out.push_str("        methods: &[\n");
+        for (method, function, experimental) in &receiver.methods {
+            let experimental = match experimental {
+                Some(target) => format!("Some(\"{target}\")"),
+                None => "None".to_string(),
+            };
+            out.push_str(&format!(
+                "            GeneratedMethod {{ method: \"{method}\", function: \"{function}\", experimental: {experimental} }},\n"
+            ));
+        }
+        out.push_str("        ],\n");
+        out.push_str("    },\n");
+    }
+    out.push_str("];\n\n");
 
     out
 }
