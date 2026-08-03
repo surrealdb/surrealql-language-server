@@ -2,7 +2,7 @@
   "name": "@surrealdb/surrealql-language-server",
   "type": "module",
   "description": "Language Server Protocol implementation for SurrealQL",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://github.com/surrealdb/surrealql-language-server",
   "repository": {
