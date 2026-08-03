@@ -12,3 +12,19 @@ publish = false
 proc-macro2 = '1.0'
 quote = '1.0'
 syn = { version = '2.0', features = ['full', 'parsing', 'printing', 'extra-traits'] }
+
+# `verify-returns` only. The engine never runs its own return-type table, so the
+# one way to prove a declaration right is to call the function and look at what
+# comes back. That needs the whole engine, which is a minute of compiling and has
+# no business in `generate-builtins` — hence the feature.
+#
+# `default-features = false` drops GraphQL, which the probe never reaches.
+# Nothing here enters the library's dependency graph: `xtask` is a separate
+# package, is never a dependency of the library, and this feature is off by
+# default.
+surrealdb-core = { version = '3.0.5', default-features = false, features = ['kv-mem'], optional = true }
+surrealdb-types = { version = '3.0.5', optional = true }
+tokio = { version = '1.48.0', features = ['rt-multi-thread', 'macros', 'time'], optional = true }
+
+[features]
+probe = ['dep:surrealdb-core', 'dep:surrealdb-types', 'dep:tokio']

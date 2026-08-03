@@ -145,116 +145,19 @@ pub fn kind_label(kind: &str) -> &'static str {
 
 /// The type a resolved function returns, when that is knowable.
 ///
-/// # Why this is partial
+/// One line, because there is one answer. This used to hold three hand-written
+/// tables — the `type::` conversions, the `math::` functions and the
+/// `duration::`/`time::` accessors — because the generated catalogue carried no
+/// return types and every builtin is `-> Result<Value>` in Rust. The engine's
+/// own registry declares them (`exec/function/builtin/`), the generator now
+/// reads it, and all three tables became a second opinion on data the engine
+/// states itself. A second opinion can only drift.
 ///
-/// The generated catalogue holds **no** return types: every builtin returns
-/// `Value` in Rust, so the signature carries no SurrealQL type. Three sources
-/// fill the gap, in order of confidence:
-///
-/// 1. The curated table, whose 79 entries spell a real `-> T` and cover
-///    `string::` and `type::`.
-/// 2. The `type::is_*` predicates, which return `bool` by definition.
-/// 3. The conversions and accessors listed below, each of which returns the
-///    thing its name says.
-///
-/// Everything else answers `None`, which reads as `unknown` and is silent.
+/// `None` reads as `unknown` and is silent. See [`builtin_return_type`] for
+/// which of the two tables answers.
 pub fn return_type(function: &str) -> Option<TypeExpr> {
-    if let Some(curated) = builtin_return_type(function) {
-        return Some(curated.clone());
-    }
-
-    let scalar = |name: &str| Some(TypeExpr::Scalar(name.to_string()));
-
-    // `type::is_record`, `type::is_number`, … — 25 predicates.
-    if let Some(rest) = function.strip_prefix("type::")
-        && rest.starts_with("is_")
-    {
-        return scalar("bool");
-    }
-
-    // `type::float`, `type::int`, … — a conversion returns what it names, which
-    // is the same rule a `<type>` cast follows.
-    if let Some(target) = function.strip_prefix("type::") {
-        let target = match target {
-            "string_lossy" => "string",
-            other => other,
-        };
-        if CONVERSION_TARGETS.contains(&target) {
-            return scalar(target);
-        }
-    }
-
-    if NUMERIC_METHODS.contains(&function) {
-        return scalar("number");
-    }
-    if INT_ACCESSORS.contains(&function) {
-        return scalar("int");
-    }
-    if function == "time::is_leap_year" {
-        return scalar("bool");
-    }
-
-    None
+    builtin_return_type(function)
 }
-
-/// The `type::` conversions whose name is the type they produce.
-const CONVERSION_TARGETS: &[&str] = &[
-    "array", "bool", "bytes", "datetime", "decimal", "duration", "float", "geometry", "int",
-    "number", "point", "range", "record", "set", "string", "table", "uuid",
-];
-
-/// The `math::` functions reachable as a method on a number.
-///
-/// Listed rather than matched on `math::*` on purpose: `math::top` and
-/// `math::bottom` return an *array*, and neither is a method, so a wildcard here
-/// would type them wrongly the day one becomes reachable.
-const NUMERIC_METHODS: &[&str] = &[
-    "math::abs",
-    "math::acos",
-    "math::acot",
-    "math::asin",
-    "math::atan",
-    "math::ceil",
-    "math::cos",
-    "math::cot",
-    "math::deg2rad",
-    "math::floor",
-    "math::ln",
-    "math::log",
-    "math::log10",
-    "math::log2",
-    "math::rad2deg",
-    "math::round",
-    "math::sign",
-    "math::sin",
-    "math::tan",
-];
-
-/// Component accessors on a duration or a datetime. Each returns a whole number.
-const INT_ACCESSORS: &[&str] = &[
-    "duration::days",
-    "duration::hours",
-    "duration::micros",
-    "duration::millis",
-    "duration::mins",
-    "duration::nanos",
-    "duration::secs",
-    "duration::weeks",
-    "duration::years",
-    "time::day",
-    "time::hour",
-    "time::micros",
-    "time::millis",
-    "time::minute",
-    "time::month",
-    "time::nano",
-    "time::second",
-    "time::unix",
-    "time::wday",
-    "time::week",
-    "time::yday",
-    "time::year",
-];
 
 #[cfg(test)]
 mod tests {
@@ -435,7 +338,10 @@ mod tests {
     }
 
     #[test]
-    fn the_derived_return_types_are_right() {
+    fn the_return_types_that_were_hand_written_are_still_right() {
+        // These ten were three const tables in this module until the generator
+        // learned to read the engine's registry. The engine declares every one
+        // of them, so the answers must not have moved.
         for (function, expected) in [
             ("type::is_record", "bool"),
             ("type::is_number", "bool"),
@@ -457,10 +363,38 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_return_type_stays_unknown() {
-        // Honest about the limit: outside the curated table and the derived
-        // families there is nothing to read, and a guess would be worse.
-        for function in ["array::group", "geo::area", "object::values", "vector::dot"] {
+    fn a_namespace_the_hand_written_tables_never_had_now_answers() {
+        // The gap those tables left. Each of these typed as unknown before the
+        // engine's registry was read, in call form and in method form alike.
+        for (function, expected) in [
+            ("geo::area", "float"),
+            ("vector::dot", "float"),
+            ("crypto::sha256", "string"),
+            ("rand::uuid::v4", "uuid"),
+            ("time::now", "datetime"),
+            ("array::len", "int"),
+        ] {
+            assert_eq!(
+                return_type(function),
+                Some(TypeExpr::Scalar(expected.to_string())),
+                "{function}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_return_type_that_follows_an_argument_stays_unknown() {
+        // Honest about the limit, and the limit is now the right one: these
+        // return whatever they were given, so no single type is correct and a
+        // guess would report against valid SurrealQL. The engine says `Any` for
+        // each, and the overlay deliberately leaves them alone.
+        for function in [
+            "array::group",
+            "array::first",
+            "object::values",
+            "object::entries",
+            "array::at",
+        ] {
             assert_eq!(return_type(function), None, "{function}");
         }
     }

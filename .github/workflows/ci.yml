@@ -21,6 +21,19 @@ jobs:
               run: |
                   git clone https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
                   git -C ../surrealql-tree-sitter checkout 826d0c2ca6733a1c201ea7015dd91f439f67b573
+            # The revision `src/grammar_generated.rs` was generated from, in full
+            # so a shallow fetch can ask for it by name. Its 9-character
+            # abbreviation `9d9a5b069` is what the catalogue header records.
+            #
+            # Without this checkout the catalogue freshness test skips, and it
+            # skipped for the whole life of the generator: the return types and
+            # argument types could drift from the engine with nothing failing.
+            - name: Check out SurrealDB
+              run: |
+                  git init ../surrealdb
+                  git -C ../surrealdb remote add origin https://github.com/surrealdb/surrealdb
+                  git -C ../surrealdb fetch --depth 1 origin 9d9a5b0693e499e0d030cac6b618062ec02cd2bc
+                  git -C ../surrealdb checkout FETCH_HEAD
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
                   toolchain: 1.94.0
@@ -31,6 +44,11 @@ jobs:
               run: cargo fmt --check
             - name: Run tests
               run: cargo test
+            # `cargo test` acts on the root package alone, so the generator's own
+            # tests need naming. They cover the engine-source parsers, which is
+            # where a SurrealDB layout change shows up first.
+            - name: Run generator tests
+              run: cargo test -p xtask
 
     release:
         if: startsWith(github.ref, 'refs/tags/v')

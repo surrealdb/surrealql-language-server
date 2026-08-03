@@ -85,8 +85,8 @@ pub struct GeneratedReceiver {
 ///
 /// Deliberately separate from [`BuiltinFunction`]: that table carries curated
 /// prose (`summary`, `documentation_url`) which no generator can produce, and
-/// this one carries argument types which no human should transcribe 434 times.
-/// Lookups read both.
+/// this one carries the argument and return types which no human should
+/// transcribe 434 times. Lookups read both.
 #[derive(Debug, Clone, Copy)]
 pub struct GeneratedFunction {
     pub name: &'static str,
@@ -103,6 +103,14 @@ pub struct GeneratedFunction {
     /// so checking arity anyway would report "expects 0 arguments" for every
     /// call to a function whose signature the generator could not read.
     pub signature_known: bool,
+    /// A SurrealQL type name, parsed into a `TypeExpr` on first use.
+    ///
+    /// `any` means "the engine declared nothing usable here", which reads as
+    /// unknown and silences every check downstream of it. That covers two cases
+    /// worth keeping apart in your head: a return type the engine's macros
+    /// cannot spell, and a return type that genuinely follows an argument
+    /// (`array::first` returns whatever the array holds). Both must stay quiet.
+    pub returns: &'static str,
 }
 
 /// Every namespace SurrealDB actually implements, read from its own function
@@ -464,7 +472,10 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     },
     BuiltinFunction {
         name: "type::table",
-        signature: "type::table(record|string) -> string",
+        // A table value, not a string: the implementation is
+        // `val.cast_to::<Table>()`, and `type::of(type::table('a'))` answers
+        // `'table'`. The old `-> string` could report a wrong argument type.
+        signature: "type::table(record|string) -> table",
         summary: "Extracts or coerces a table name.",
         documentation_url: "https://surrealdb.com/docs/surrealql/functions/database/type",
     },
@@ -681,17 +692,37 @@ pub fn builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
         .map(|(function, _)| *function)
 }
 
-/// The declared return type of a builtin, from its signature string.
+/// The type a builtin returns, from the two tables that record one.
 ///
-/// Types the table spells in ways [`TypeExpr::parse`] cannot model
-/// (`field`, `range<record>`) come back as a non-primitive `Scalar` or
-/// `Other`, which the assignability rules treat as unknown — so a fuzzy
-/// entry here can only ever silence a diagnostic, never invent one.
-pub fn builtin_return_type(name: &str) -> Option<&'static TypeExpr> {
+/// This is the only answer to "what does this call evaluate to", and both the
+/// call form and the method form read it. They used to disagree:
+/// `math::abs(-1)` was unknown while `(-1).abs()` was a number, because the two
+/// paths consulted different tables.
+///
+/// The curated table is read first. It is narrower — 79 entries against 434 —
+/// but a human wrote each one against the documentation, and where it is more
+/// specific than the engine it stays more specific: the engine's macros cannot
+/// spell `array<string>`, so `string::split` declares `Any` there and
+/// `array<string>` here. A curated entry that [`TypeExpr::parse`] cannot model
+/// (`field`, `array<field>`) yields `Unknown` or `Other`, which carries no
+/// information, so those fall through to the engine rather than shadowing it.
+///
+/// Both tables can only ever silence a diagnostic when they are vague, never
+/// invent one: the assignability rules treat `Unknown`, `Other` and `any` as
+/// "no information".
+pub fn builtin_return_type(name: &str) -> Option<TypeExpr> {
     let normalized = normalize_builtin_function_name(name);
-    BUILTIN_INDEX
+
+    if let Some((_, curated)) = BUILTIN_INDEX.get(normalized.as_str())
+        && !matches!(curated, TypeExpr::Unknown | TypeExpr::Other(_))
+    {
+        return Some(curated.clone());
+    }
+
+    GENERATED_INDEX
         .get(normalized.as_str())
-        .map(|(_, returns)| returns)
+        .and_then(|signature| signature.declared_return())
+        .cloned()
 }
 
 fn normalize_builtin_function_name(name: &str) -> String {
@@ -721,6 +752,10 @@ pub struct BuiltinSignature {
     pub generated: &'static GeneratedFunction,
     /// One entry per element of `generated.params`, same order.
     pub param_types: Vec<TypeExpr>,
+    /// `generated.returns`, parsed. `any` parses to `Scalar("any")`, which the
+    /// assignability rules treat as the top type, so callers that want "we know
+    /// nothing" must read [`Self::declared_return`] rather than this field.
+    pub return_type: TypeExpr,
 }
 
 impl BuiltinSignature {
@@ -765,21 +800,49 @@ impl BuiltinSignature {
             .collect()
     }
 
-    /// `math::clamp(arg: number, min: number, max: number)`.
+    /// `math::clamp(arg: number, min: number, max: number) -> number`.
     ///
     /// Rendered from the engine's parameters rather than from prose, so it
     /// covers every function rather than the 79 with a curated signature
     /// string. Returns `None` when the generator could not read the
     /// implementation, because an invented signature is worse than none.
+    ///
+    /// The return type is appended only when one is known. A reader who sees no
+    /// arrow learns that too, which is why nothing is written in its place.
+    ///
+    /// It comes from [`builtin_return_type`], not from
+    /// [`Self::declared_return`], so what a reader sees is what the type checker
+    /// uses. The two differ wherever the curated table is more specific than the
+    /// engine — `string::split` is `array<string>` there and `any` in the
+    /// registry — and a signature that disagreed with the diagnostics would be
+    /// worse than no signature.
     pub fn display_signature(&self) -> Option<String> {
         if !self.generated.signature_known {
             return None;
         }
-        Some(format!(
+        let rendered = format!(
             "{}({})",
             self.generated.name,
             self.param_labels().join(", ")
-        ))
+        );
+        match builtin_return_type(self.generated.name) {
+            Some(returns) => Some(format!("{rendered} -> {returns}")),
+            None => Some(rendered),
+        }
+    }
+
+    /// The return type, when the engine declared one worth reading.
+    ///
+    /// `None` where the catalogue says `any`, which is the engine's way of
+    /// saying it cannot express the type — either because its macros take a bare
+    /// identifier, or because the type follows an argument. `None` reads as
+    /// unknown and stays silent; `Some(Scalar("any"))` would read as the top
+    /// type and claim the call can go anywhere.
+    pub fn declared_return(&self) -> Option<&TypeExpr> {
+        if self.generated.returns == "any" {
+            return None;
+        }
+        Some(&self.return_type)
     }
 
     /// The declared type of the argument at `index`, following a trailing
@@ -811,6 +874,7 @@ static GENERATED_INDEX: LazyLock<HashMap<&'static str, BuiltinSignature>> = Lazy
                 BuiltinSignature {
                     generated,
                     param_types,
+                    return_type: TypeExpr::parse(generated.returns),
                 },
             )
         })

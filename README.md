@@ -101,7 +101,8 @@ cargo test
 ├── src/
 │   ├── main.rs               # LSP stdio entry point (+ panic hook)
 │   ├── config.rs             # workspace settings (+ validation warnings)
-│   ├── grammar.rs            # tree-sitter language binding, builtin catalog
+│   ├── grammar.rs            # tree-sitter language binding, curated builtin prose
+│   ├── grammar_generated.rs  # @generated builtin catalogue — do not edit by hand
 │   ├── core/
 │   │   ├── server.rs         # transport-agnostic request handlers
 │   │   ├── dispatch.rs       # JSON-RPC dispatch table (shared with WASM)
@@ -117,10 +118,20 @@ cargo test
 │       ├── types.rs          # DocumentAnalysis, TableDef, FunctionDef, ...
 │       ├── type_expr.rs      # SurrealQL type expression parser
 │       └── text.rs           # LSP range utilities
+├── xtask/                    # code generator (see Builtin Function Catalogue)
+│   └── src/
+│       ├── engine_tables.rs  # names, dispatch and rename tables
+│       ├── signatures.rs     # argument types, from the `fnc/` implementations
+│       ├── returns.rs        # return types, from the function registry
+│       ├── methods.rs        # method receiver tables
+│       ├── probe.rs          # `verify-returns`: checks the engine by running it
+│       └── emit.rs           # joins them and renders the catalogue
 ├── tests/
 │   ├── lsp.rs                # analyzer/model integration tests
 │   ├── core_server.rs        # end-to-end server tests (mock notifier)
 │   ├── dispatch.rs           # JSON-RPC wire tests
+│   ├── conformance.rs        # silence sweep over SurrealDB's own corpus
+│   ├── generated_catalogue.rs # catalogue freshness + shape invariants
 │   ├── compat.rs             # backwards-compatibility tripwires
 │   └── common/               # shared mocks for the three boundary traits
 ├── docs/
@@ -147,9 +158,32 @@ npx tree-sitter test
 
 The `src/parser.c` is auto-generated and should not be edited directly. JavaScript scripting function bodies (`function() { ... }`) are handled by an external C scanner at `src/scanner.c` which tracks brace depth, strings, template literals, and comments.
 
+## Builtin Function Catalogue
+
+`src/grammar_generated.rs` holds every builtin SurrealDB accepts — 434 functions with their argument types, return types, arity and method receivers. It is committed, and generated from a SurrealDB checkout rather than written by hand:
+
+```bash
+make builtins            # or: cargo xtask generate-builtins --surrealdb ../surrealdb
+make builtins-check      # compare without writing
+```
+
+Pass `--surrealdb <path>` or set `SURREALDB_DIR` (`make builtins SURREALDB=/path/to/surrealdb`). The checkout must be at the revision the catalogue header records. `--check` is what `tests/generated_catalogue.rs` runs. Never edit the generated file by hand.
+
+These targets do not need the grammar checkout: `cargo run --package xtask` never builds the root package, so `build.rs` does not run.
+
+The generator reads four places in the engine: `syn/parser/builtin.rs` for the names, `fnc/mod.rs` for the dispatch and method tables, the `pub fn` signatures under `fnc/` for the argument types, and `exec/function/builtin/` for the return types.
+
+SurrealDB never reads its own return-type registry, so a wrong declaration there would compile and ship. To check them by running them:
+
+```bash
+make verify-returns      # or: cargo run -p xtask --features probe -- verify-returns --surrealdb ../surrealdb
+```
+
+This boots an in-memory engine, calls every function with synthesised arguments, and compares the answer with what the catalogue records. It compiles the whole engine, hence the feature flag and the few minutes on a cold build. Run it after a SurrealDB version bump.
+
 ## CI
 
-GitHub Actions runs `cargo fmt --check` and `cargo test` on every push and pull request. The grammar sibling repo is cloned automatically during CI.
+GitHub Actions runs `cargo fmt --check`, `cargo test` and `cargo test -p xtask` on every push and pull request. The grammar and SurrealDB sibling repos are cloned automatically, both pinned, so the catalogue freshness check runs in CI.
 
 ## Releases
 

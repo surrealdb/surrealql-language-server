@@ -451,13 +451,19 @@ impl MergedSemanticModel {
         if let Some(target) = resolved.experimental {
             metadata.push(format!("Experimental: requires `{target}`"));
         }
-        if let Some(returns) = crate::semantic::method::return_type(resolved.function) {
+
+        let signature = builtin_signature(resolved.function)
+            .and_then(|signature| signature.display_signature());
+        // The signature ends in `-> type` whenever one is known, so saying it
+        // again here would only repeat the title. State it when there is no
+        // signature to carry it.
+        if signature.is_none()
+            && let Some(returns) = crate::semantic::method::return_type(resolved.function)
+        {
             metadata.push(format!("Returns: `{returns}`"));
         }
 
-        let title = builtin_signature(resolved.function)
-            .and_then(|signature| signature.display_signature())
-            .unwrap_or_else(|| format!("{}()", resolved.function));
+        let title = signature.unwrap_or_else(|| format!("{}()", resolved.function));
         let summary =
             builtin_function(resolved.function).map(|curated| curated.summary.to_string());
         let sections = builtin_function(resolved.function)
@@ -1832,6 +1838,17 @@ fn format_generated_function_hover(
         );
     }
 
+    // `display_signature` carries the return type in its arrow, so this states
+    // it only when there is no signature to carry it. `rand::int` is the case
+    // that needs it: its arity cannot be read from the engine's argument
+    // wrappers, but the registry still declares that it returns an `int`.
+    let title = signature.display_signature();
+    if title.is_none()
+        && let Some(returns) = crate::grammar::builtin_return_type(name)
+    {
+        metadata.push(format!("Returns: `{returns}`"));
+    }
+
     let mut sections = Vec::new();
     if let Some(namespace) = name.split_once("::").map(|(namespace, _)| namespace) {
         sections.push(list_section(
@@ -1843,9 +1860,7 @@ fn format_generated_function_hover(
     }
 
     hover_block(
-        signature
-            .display_signature()
-            .unwrap_or_else(|| format!("{name}(…)")),
+        title.unwrap_or_else(|| format!("{name}(…)")),
         None,
         metadata,
         sections,

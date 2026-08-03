@@ -543,9 +543,7 @@ fn call_return_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
     if let Some(refined) = refine_builtin_return(name, node, ctx) {
         return refined;
     }
-    builtin_return_type(name)
-        .cloned()
-        .unwrap_or(TypeExpr::Unknown)
+    builtin_return_type(name).unwrap_or(TypeExpr::Unknown)
 }
 
 /// Narrow a builtin's return type using its actual arguments.

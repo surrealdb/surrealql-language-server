@@ -1292,8 +1292,10 @@ fn builtin_signature_information(
         .collect();
 
     SignatureInformation {
-        // Prefer the curated signature string: it is written for a reader,
-        // including a return type the Rust source does not express.
+        // Prefer the curated signature string: it is written for a reader, with
+        // parameter names chosen for the documentation rather than taken from
+        // the implementation's bindings. The generated fallback now carries a
+        // return type too, read from the engine's registry.
         label: curated
             .map(|function| function.signature.to_string())
             .or_else(|| signature.display_signature())

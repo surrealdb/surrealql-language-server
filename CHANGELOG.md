@@ -16,8 +16,10 @@ breaking changes listed below.
 
 The catalogue moves from 79 hand-written functions covering 2 of the 20
 advertised namespaces to **434 generated from the engine**, with argument
-types read from the implementations. `cargo xtask generate-builtins`
-rebuilds it; a test fails when the committed file is stale.
+types read from the implementations and return types read from the function
+registry. `cargo xtask generate-builtins` rebuilds it; a test fails when
+the committed file is stale, and that test finally runs in continuous
+integration.
 
 The same doctrine as 0.4.0 applies, and mattered more here than
 anywhere: a diagnostic that fires on working code costs far more than one
@@ -69,6 +71,81 @@ words.
   `signature_known` keeps "unknown" distinct from "takes no arguments";
   without it every call to such a function would have been reported as
   expecting zero.
+
+### Builtin return types come from the engine
+
+A call to a namespaced builtin had no type. `rand::uuid::v4()` inferred
+`unknown`, and the checker is required to stay silent on `unknown`, so
+everything downstream of such a call went unchecked. Return types existed
+for **79 of 434** functions, all of them hand-written, all of them in
+`string::` and `type::`.
+
+The engine turned out to declare them after all. Not in `fnc/`, where
+every implementation is `-> Result<Value>` and carries no SurrealQL type,
+but in the function registry at `exec/function/builtin/`, one line each:
+
+```rust
+define_pure_function!(RandUuidV4, "rand::uuid::v4", () -> Uuid, crate::fnc::rand::uuid::v4);
+```
+
+`cargo xtask generate-builtins` reads that registry, and
+`GeneratedFunction` gained a `returns` field. **286 of the 425 callable
+functions now carry a return type**, against about 124 before.
+
+- `LET $x = rand::uuid::v4();` types `$x` as `uuid`. Using it as a number
+  reports `argument-type`, `let-type` or `return-type` as the position
+  demands, and none of those fired before.
+- `time::now()` is a `datetime`, which reaches the arithmetic check for
+  the first time. `$t + 1h` stays silent and `$t + 1` does not, because
+  the engine has a `(Datetime, Duration)` arm for `+` and no
+  `(Datetime, Int)` one.
+- **One resolver answers both call forms.** `math::abs(-1)` and
+  `(-1).abs()` gave different types before this release: the call path
+  read the curated table and the method path read three hand-written
+  tables covering `math::` and the `duration::`/`time::` accessors. The
+  engine declares all of them, so those tables are gone —
+  `semantic::method::return_type` is now one line.
+- A signature carries its return type: `math::clamp(arg: number, min:
+  number, max: number) -> number` in hover, signature help, completion
+  detail and inlay hints. A function whose arity could not be read still
+  states the type as a fact, which is how `rand::int` reports `int`.
+- Where the curated table is more specific it still wins. The registry's
+  macros take the return kind as a bare identifier, so no kind carrying a
+  payload fits through them and `string::split` declares `Any` there
+  against `array<string>` in the curated table.
+- **139 return types are `any`, and that is the right answer for most of
+  them.** `array::first` returns whatever the array holds. A hand-written
+  overlay fills in the ~25 that are certain and payload-shaped anyway
+  (`object::keys` is `array<string>`, the `vector::` arithmetic is
+  `array<number>`, the `type::` constructors return what they name).
+- `type::table(…)` was curated as `-> string`. It returns a table value,
+  and the old entry could report a wrong argument type.
+
+#### The registry is unverified, so it is verified here
+
+SurrealDB never reads its own return types: `ScalarFunction::signature`
+carries `#[allow(unused)]` and no engine test asserts on it. A wrong kind
+there compiles, ships, and would make this server report against working
+SurrealQL.
+
+So `cargo run -p xtask --features probe -- verify-returns` boots an
+in-memory datastore, calls every function with arguments built from the
+parameter types the catalogue already holds, and asks `type::of` what came
+back. It probes twice with different argument types, because a function
+whose answer changes with its input has no single return type and must be
+recorded as `any`.
+
+It found one wrong declaration on its first run. `crypto::joaat` is
+declared `-> String`, but `fnc/crypto.rs:12` hashes to a `u32` and returns
+an `int`. The corpus sweep did **not** catch this — the corpus never
+composes `crypto::joaat` into a numeric position — so nothing but running
+the function would have. It is corrected in `CORRECTIONS`, an override
+table that matches on the declared value as well as the name, so a fix
+upstream retires the entry loudly instead of leaving it to rot.
+
+302 functions were probed and 77 gave no usable answer, either because
+they need a context the probe cannot build or because they answer `NONE`
+for synthesised input.
 
 ### Declared function return types are checked
 
@@ -419,14 +496,25 @@ all 12 of `rand::` including `rand::uuid::v4`.
   exact set of diagnostics in both directions, so a new false positive and
   a check that silently stops working both fail. Ignored by default at
   about two minutes: `cargo test --test conformance -- --ignored`.
-- `tests/fixtures/builtin_calls_valid.surql` holds 137 calls across 20
+- `tests/fixtures/builtin_calls_valid.surql` holds 151 calls across 20
   namespaces, lifted verbatim from corpus files that expect no error, and
-  runs everywhere — including where there is no SurrealDB checkout.
+  runs everywhere — including where there is no SurrealDB checkout. The
+  last 14 are composed rather than lifted: one function's return type
+  feeding another's argument is the surface the return types opened, and
+  the corpus sweep that would otherwise cover it is ignored by default.
 - `tests/generated_catalogue.rs` pins the catalogue's freshness against
-  the generator, and the invariants the argument checks depend on.
-- The suite grew from 245 tests to 354 in the crate, plus 28 for the
-  generator and one ignored corpus sweep. That includes the first
-  end-to-end completion tests: the handler previously had none.
+  the generator, and the invariants the argument checks depend on. Among
+  them: the curated and generated return types may not contradict each
+  other, and the curated table may only be *wider*.
+- **Continuous integration now checks the catalogue.** The freshness test
+  skipped for the whole life of the generator, because the runner had no
+  SurrealDB checkout, so the catalogue could have drifted from the engine
+  with nothing failing. The `rust` job pins one the way it already pins the
+  grammar, and runs `cargo test -p xtask` — those tests never ran in CI
+  either, since `cargo test` acts on the root package alone.
+- The suite is 456 tests in the crate and 43 for the generator, plus one
+  ignored corpus sweep. That includes the first end-to-end completion
+  tests: the handler previously had none.
 
 ### Known gaps
 
@@ -436,16 +524,24 @@ all 12 of `rand::` including `rand::uuid::v4`.
   `GRAPHQL_DEPRECATED`, `SYSTEM`, `DISKANN`, `RETRY`, `MAXDEPTH`) draw a
   syntax error from the grammar if selected. Declared in
   `OFFERS_THE_GRAMMAR_CANNOT_PARSE`, with tests keeping the list honest.
-- Ten callable functions have no readable signature and are checked for
-  nothing: the seven `api::` middleware functions, whose leading arguments
-  the runtime supplies, and `rand::float`/`int`/`time`, whose
-  zero-or-two arity this catalogue cannot express.
+- Ten callable functions have no readable signature, so their *arguments* are
+  checked for nothing: the seven `api::` middleware functions, whose leading
+  arguments the runtime supplies, and `rand::float`/`int`/`time`, whose
+  zero-or-two arity this catalogue cannot express. Their return types are
+  known — the registry declares those separately from the arity.
 - A method past link one of a path resolves nothing, apart from an optional
   chain: in `$a.b.trim()` the receiver is `$a.b`, which needs field resolution.
-- A method's return type is known only for the 79 curated signatures, the
-  `type::is_*` predicates, the `type::` conversions, and the `math::` and
-  `duration::`/`time::` accessors. Everything else types as `unknown`, because
-  the engine's Rust signature returns `Value` and carries no SurrealQL type.
+- 139 of the 434 functions have no return type, so a call to one types as
+  `unknown` and stays silent. The engine's registry declares `Kind::Any` for
+  each: its macros take the kind as a bare identifier, so `array<string>` and
+  `record` cannot be written there. For many of them `any` is also the true
+  answer — `array::first` returns whatever the array holds — and the overlay
+  fills in only the ones a reader can be sure of.
+- The probe cannot reach every function. 77 of the 379 it tries give no usable
+  answer: `http::`, `search::`, `session::`, `sequence::`, `schema::`, `file::`,
+  `eval::`, `api::` and `sleep` are skipped outright, and others answer `NONE`
+  for synthesised arguments. Those return types rest on the engine's
+  declaration alone.
 - Too few arguments on a method is never reported. The check bails on an empty
   argument list, because an editor that closes brackets writes `.at()` on the
   `(` keystroke and this server has no debounce.
