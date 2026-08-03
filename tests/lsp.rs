@@ -4349,3 +4349,209 @@ fn a_method_chain_carries_its_type_forward() {
     assert_eq!(inferred_type_of("LET $v = (5).round();", "$v"), "number");
     assert_eq!(inferred_type_of("LET $v = 'abc'.to_int();", "$v"), "int");
 }
+
+// ---------------------------------------------------------------------------
+// Builtin return types, read from the engine's registry
+// ---------------------------------------------------------------------------
+
+// The catalogue used to carry argument types and nothing else, so a call to any
+// of the 24 namespaces outside `string::` and `type::` typed as `unknown` and
+// silenced every check downstream of it. These cover the namespaces that gained
+// a type, and — more importantly — the places that must stay silent.
+
+#[test]
+fn a_namespaced_call_now_has_a_type() {
+    // The reported case. `rand::uuid::v4` is declared `() -> Uuid` in the
+    // engine's registry; nothing had to be hand-written to say so.
+    assert_eq!(inferred_type_of("LET $x = rand::uuid::v4();", "$x"), "uuid");
+    for (source, expected) in [
+        ("LET $x = time::now();", "datetime"),
+        ("LET $x = array::len([1, 2, 3]);", "int"),
+        ("LET $x = math::abs(-1);", "number"),
+        ("LET $x = crypto::sha256('a');", "string"),
+        ("LET $x = duration::secs(1h);", "int"),
+        ("LET $x = rand::bool();", "bool"),
+        ("LET $x = object::keys({ a: 1 });", "array<string>"),
+        ("LET $x = vector::add([1], [2]);", "array<number>"),
+    ] {
+        assert_eq!(inferred_type_of(source, "$x"), expected, "{source}");
+    }
+}
+
+#[test]
+fn a_type_from_a_namespaced_call_reaches_the_argument_check() {
+    // The point of typing the call at all: the type has to travel.
+    let messages = messages_of(&diagnostics_for(
+        "LET $x = rand::uuid::v4();\nRETURN string::len($x);",
+    ));
+    assert!(
+        messages.iter().any(|message| message
+            .contains("Argument 1 of `string::len` expects `string`, found `uuid`")),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn a_type_from_a_namespaced_call_reaches_the_let_check() {
+    let messages = messages_of(&diagnostics_for("LET $x: int = rand::uuid::v4();"));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("declared `int` but the value is `uuid`")),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn a_type_from_a_namespaced_call_reaches_the_return_check() {
+    let messages = messages_of(&diagnostics_for(
+        "DEFINE FUNCTION fn::f() -> int { RETURN rand::uuid::v4(); };",
+    ));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("returns `int`")),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn a_datetime_from_the_engine_follows_the_engines_own_arithmetic() {
+    // `time::now()` types as `datetime` now, which reaches the operator check
+    // for the first time. The engine has a `(Datetime, Duration)` arm for `+`
+    // and none for `(Datetime, Int)`, and the check must match it exactly —
+    // this is where a new type is most likely to invent a false positive.
+    assert!(
+        operator_messages("LET $t = time::now();\nRETURN $t + 1h;").is_empty(),
+        "datetime + duration is legal: {:?}",
+        operator_messages("LET $t = time::now();\nRETURN $t + 1h;")
+    );
+    assert_eq!(
+        operator_messages("LET $t = time::now();\nRETURN $t + 1;").len(),
+        1,
+        "datetime + int is not"
+    );
+    // `datetime - datetime` is the one arm that changes category.
+    assert_eq!(
+        inferred_type_of("LET $d = time::now() - time::now();", "$d"),
+        "duration"
+    );
+}
+
+#[test]
+fn the_call_form_and_the_method_form_agree() {
+    // These disagreed before: the call path read the curated table and the
+    // method path read three hand-written tables that covered `math::` and the
+    // `time::`/`duration::` accessors. One resolver now answers both.
+    for (call, method) in [
+        ("LET $x = math::abs(-1);", "LET $x = (-1).abs();"),
+        (
+            "LET $x = time::year(time::now());",
+            "LET $x = time::now().year();",
+        ),
+        ("LET $x = string::len('a');", "LET $x = 'a'.len();"),
+    ] {
+        assert_eq!(
+            inferred_type_of(call, "$x"),
+            inferred_type_of(method, "$x"),
+            "`{call}` and `{method}` must agree"
+        );
+    }
+}
+
+#[test]
+fn a_return_type_that_follows_an_argument_stays_silent() {
+    // The half of the engine's declarations that say `Kind::Any`. These return
+    // whatever they were handed, so no single type is right and the checker must
+    // report nothing rather than guess. A regression here is a false positive on
+    // working code, which costs more than the silence it replaced.
+    for source in [
+        "LET $x = array::first([1, 2]);",
+        "LET $x = array::at([1, 2], 0);",
+        "LET $x = object::values({ a: 1 });",
+        "LET $x = array::group([[1], [2]]);",
+    ] {
+        assert_eq!(inferred_type_of(source, "$x"), "unknown", "{source}");
+    }
+}
+
+#[test]
+fn the_curated_table_still_wins_where_it_is_more_specific() {
+    // The engine's macros take a bare identifier, so they cannot spell
+    // `array<string>` and `string::split` declares `Any` there. The curated
+    // entry is more specific and must not be overwritten by it.
+    assert_eq!(
+        inferred_type_of("LET $x = string::split('a,b', ',');", "$x"),
+        "array<string>"
+    );
+    // And where the curated table has no entry, the engine answers.
+    assert_eq!(
+        inferred_type_of("LET $x = string::semver::major('1.2.3');", "$x"),
+        "int"
+    );
+}
+
+#[test]
+fn an_unreadable_argument_signature_still_reports_its_return_type() {
+    // `rand::int` takes `NoneOrRange<i64>`, whose arity the catalogue cannot
+    // express, so `signature_known` is false and there is no signature to hang
+    // an arrow on. The registry still declares the return type.
+    assert_eq!(inferred_type_of("LET $x = rand::int(1, 10);", "$x"), "int");
+    let model = MergedSemanticModel::default();
+    let hover = model
+        .hover_markdown_for_token("rand::int", None)
+        .expect("hover");
+    assert!(
+        hover.contains("Returns: `int`"),
+        "a function with no readable signature must still state its return type: {hover}"
+    );
+}
+
+#[test]
+fn hover_on_a_namespaced_call_shows_the_return_type() {
+    let model = MergedSemanticModel::default();
+    let hover = model
+        .hover_markdown_for_token("rand::uuid::v4", None)
+        .expect("hover");
+    assert!(
+        hover.contains("rand::uuid::v4() -> uuid"),
+        "the signature must carry the return type: {hover}"
+    );
+    // And it is said once, not twice.
+    assert!(
+        !hover.contains("Returns:"),
+        "the arrow already says it: {hover}"
+    );
+}
+
+#[test]
+fn a_wrong_engine_declaration_is_corrected() {
+    // `crypto::joaat` is declared `-> String` in the engine's registry, but its
+    // implementation hashes to a `u32` and returns an `int`. The registry is
+    // never read by SurrealDB itself, so nothing upstream caught it;
+    // `cargo run -p xtask --features probe -- verify-returns` did, by calling
+    // the function and looking at the answer.
+    //
+    // Believing the declaration would report this composition as a type error on
+    // code the engine runs happily, so this test is the guard on that.
+    assert_eq!(
+        inferred_type_of("LET $h = crypto::joaat('tobie');", "$h"),
+        "int"
+    );
+    assert!(
+        operator_messages("LET $h = crypto::joaat('tobie');\nRETURN $h + 1;").is_empty(),
+        "an int may be added to an int"
+    );
+    let codes = codes_of(&diagnostics_for(
+        "RETURN math::abs(crypto::joaat('tobie'));",
+    ));
+    assert!(
+        !codes.contains(&"argument-type".to_string()),
+        "a hash is a number, so `math::abs` accepts it: {codes:?}"
+    );
+    // And the sibling hashes really are strings, so the correction is narrow.
+    assert_eq!(
+        inferred_type_of("LET $h = crypto::sha256('tobie');", "$h"),
+        "string"
+    );
+}

@@ -180,3 +180,22 @@ SELECT id, score FROM item WHERE score > type::int("25") ORDER BY score ASC LIMI
 -- value::
 RETURN value::diff({ a: 1, b: 2 }, { c: 3, b: 2 });
 
+
+-- Composed calls, where one function's return type feeds another's argument.
+-- Not verbatim from the corpus: written here because this is the surface the
+-- return types opened. Each inner call's declared return type satisfies the
+-- outer parameter, so every line must stay silent.
+RETURN string::len(rand::string(5));
+RETURN string::uppercase(crypto::sha256('tobie'));
+RETURN time::day(time::now());
+RETURN time::floor(time::now(), 1h);
+RETURN duration::secs(rand::duration(1s, 2s));
+RETURN duration::days(time::now() - time::now());
+RETURN math::abs(array::len([1, 2]));
+RETURN array::len(object::keys({ a: 1 }));
+RETURN array::len(string::split('a,b', ','));
+RETURN math::sum(vector::add([1, 2], [3, 4]));
+RETURN string::concat(type::string(rand::int(1, 9)), 'x');
+RETURN type::is_uuid(rand::uuid::v7(time::now()));
+RETURN string::len(type::string(time::now()));
+RETURN time::unix(rand::time(d'2024-01-01T00:00:00Z', d'2025-01-01T00:00:00Z'));

@@ -14,6 +14,7 @@ use surrealql_language_server::grammar_generated::{
     GENERATED_CONSTANTS, GENERATED_FUNCTIONS, GENERATED_NAMESPACES, PARSES_BUT_NOT_CALLABLE,
     RENAMED_FUNCTIONS, SURREALDB_REVISION,
 };
+use surrealql_language_server::semantic::type_expr::TypeExpr;
 
 /// The SurrealDB checkout, when this machine has one.
 ///
@@ -218,11 +219,6 @@ fn every_parameter_type_is_a_name_the_checker_understands() {
     // A type the language server's lattice cannot place degrades to silence, so
     // this is not a correctness risk — but a typo would silence a whole
     // parameter, so it should be visible.
-    const KNOWN: &[&str] = &[
-        "any", "array", "bool", "bytes", "datetime", "decimal", "duration", "file", "float",
-        "function", "geometry", "int", "number", "object", "range", "record", "regex", "set",
-        "string", "table", "uuid",
-    ];
     for function in GENERATED_FUNCTIONS {
         for param in function.params {
             let base = param
@@ -230,7 +226,7 @@ fn every_parameter_type_is_a_name_the_checker_understands() {
                 .split_once('<')
                 .map_or(param.ty, |(outer, _)| outer);
             assert!(
-                KNOWN.contains(&base),
+                KNOWN_TYPES.contains(&base),
                 "`{}` parameter `{}` has type `{}`, which the checker does not know",
                 function.name,
                 param.name,
@@ -245,4 +241,136 @@ fn a_rename_never_maps_a_name_onto_itself() {
     for (previous, current) in RENAMED_FUNCTIONS {
         assert_ne!(previous, current, "`{previous}` renames to itself");
     }
+}
+
+// --- Return types -----------------------------------------------------------
+
+/// The type names the checker's lattice can place.
+///
+/// Shared by the parameter and return-type guards: both feed `TypeExpr::parse`,
+/// and a name outside this list degrades to silence there.
+/// Kept in step with `PRIMITIVES` in `src/semantic/assign.rs`, which is the list
+/// the assignability rules actually consult. `point` is on that list and appears
+/// only as a return type, never as a parameter.
+const KNOWN_TYPES: &[&str] = &[
+    "any", "array", "bool", "bytes", "datetime", "decimal", "duration", "file", "float",
+    "function", "geometry", "int", "none", "null", "number", "object", "point", "range", "record",
+    "regex", "set", "string", "table", "uuid",
+];
+
+#[test]
+fn every_return_type_is_a_name_the_checker_understands() {
+    for function in GENERATED_FUNCTIONS {
+        let base = function
+            .returns
+            .split_once('<')
+            .map_or(function.returns, |(outer, _)| outer);
+        assert!(
+            KNOWN_TYPES.contains(&base),
+            "`{}` returns `{}`, which the checker does not know",
+            function.name,
+            function.returns
+        );
+    }
+}
+
+#[test]
+fn the_catalogue_types_the_majority_of_callable_returns() {
+    // A floor, not a target. The ceiling is set by the engine: its registry
+    // declares the return kind as a bare identifier, so no kind carrying a
+    // payload can be written and about a third arrive as `Any`. Some of those
+    // are right — `array::first` returns whatever the array holds.
+    let typed = GENERATED_FUNCTIONS
+        .iter()
+        .filter(|function| !function.not_callable && function.returns != "any")
+        .count();
+    let callable = GENERATED_FUNCTIONS
+        .iter()
+        .filter(|function| !function.not_callable)
+        .count();
+    assert!(
+        typed * 100 >= callable * 55,
+        "only {typed} of {callable} callable functions have a return type"
+    );
+}
+
+#[test]
+fn a_name_that_cannot_be_called_is_never_given_a_return_type() {
+    // The engine refuses to run these nine, so a return type for one of them
+    // would describe a call that always fails.
+    for function in GENERATED_FUNCTIONS {
+        if function.not_callable {
+            assert_eq!(
+                function.returns, "any",
+                "`{}` cannot be called but declares a return type",
+                function.name
+            );
+        }
+    }
+}
+
+#[test]
+fn the_two_return_type_tables_never_contradict_each_other() {
+    // The guard that matters most in this file. The curated table was written by
+    // hand against the documentation; the generated one is read out of the
+    // engine. Where both are specific they must agree, because one of them is
+    // wrong otherwise — and a wrong return type reports against valid SurrealQL.
+    //
+    // Widening is allowed in one direction only: the curated table may name a
+    // wider numeric type than the engine (`string::len` is `number` there and
+    // `int` in the registry), because the checker treats narrowing as unknown
+    // and stays silent. The reverse would be a claim the engine does not make.
+    fn numeric_rank(name: &str) -> Option<u8> {
+        match name {
+            "int" => Some(0),
+            "float" => Some(1),
+            "decimal" => Some(2),
+            "number" => Some(3),
+            _ => None,
+        }
+    }
+
+    let mut compared = 0usize;
+    for curated in surrealql_language_server::grammar::BUILTIN_FUNCTIONS {
+        let Some((_, declared)) = curated.signature.rsplit_once("->") else {
+            continue;
+        };
+        let declared = declared.trim();
+        let Some(generated) = GENERATED_FUNCTIONS
+            .iter()
+            .find(|function| function.name == curated.name)
+        else {
+            panic!("curated `{}` is not in the catalogue", curated.name);
+        };
+        if generated.returns == "any" || declared == "any" {
+            // The engine could not spell it, or the curated table would not
+            // commit. Either way there is nothing to contradict.
+            continue;
+        }
+        // A curated type the lattice cannot model — `range<record>`,
+        // `array<field>` — carries no information and loses to the engine inside
+        // `builtin_return_type`, so it cannot contradict anything either. This
+        // mirrors the resolver's own rule rather than comparing raw text.
+        if matches!(
+            TypeExpr::parse(declared),
+            TypeExpr::Unknown | TypeExpr::Other(_)
+        ) {
+            continue;
+        }
+        compared += 1;
+        if declared == generated.returns {
+            continue;
+        }
+        match (numeric_rank(declared), numeric_rank(generated.returns)) {
+            (Some(curated_rank), Some(engine_rank)) if curated_rank > engine_rank => {}
+            _ => panic!(
+                "`{}` returns `{}` in the curated table and `{}` in the engine's registry",
+                curated.name, declared, generated.returns
+            ),
+        }
+    }
+    assert!(
+        compared >= 60,
+        "only {compared} entries were comparable, so this guard proved little"
+    );
 }
