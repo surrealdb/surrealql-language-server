@@ -410,9 +410,100 @@ fn object_verdict(actual: &[(String, TypeExpr)], expected: &[(String, TypeExpr)]
     }
 }
 
+/// What is wrong with one element of a collection literal.
+///
+/// The element analogue of [`ObjectFault`], and returned separately from the
+/// [`Verdict`] for the same reason: so the diagnostic layer can point at the
+/// element the author wrote rather than at the whole literal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElementFault {
+    /// An element whose type cannot fit the declared element type.
+    Element {
+        index: usize,
+        expected: TypeExpr,
+        actual: TypeExpr,
+    },
+    /// A declared tuple type the literal has the wrong number of elements for.
+    Arity { expected: usize, actual: usize },
+}
+
+/// Compare the elements of a collection literal against a declared type.
+///
+/// `actual` is a slice of **per-element** types, not one [`TypeExpr`]. That is
+/// the whole point of this function: `infer::join_types` collapses a mixed
+/// literal to `any` before [`assignable`] ever sees it, so `["20", 30]` against
+/// `array<int>` reads as `array<any>` and passes. The elements have to be handed
+/// in separately because the joined type cannot carry them.
+///
+/// Consequently this runs *independently* of the whole-value verdict rather than
+/// refining an already-`Incompatible` one, which is how [`object_faults`] is
+/// used. That widens the silence rule at the top of this module, and the
+/// justification is narrow: every escape hatch there exists because the **type**
+/// was uncertain, and an element the author wrote out is not uncertain. Each
+/// element is still judged three ways — only `Incompatible` speaks.
+pub fn element_faults(actual: &[TypeExpr], expected: &TypeExpr) -> Vec<ElementFault> {
+    // An empty literal is never punished. `[]` types as `array<any>` and fits
+    // any collection type, and `DEFAULT ALWAYS []` against
+    // `TYPE array<record<user>>` is production SurrealQL — see
+    // `tests/fixtures/adversarial.surql`. The cost is one report we decline to
+    // make: `[]` against a declared `[int, string]`.
+    if actual.is_empty() {
+        return Vec::new();
+    }
+
+    match expected {
+        // One declared element type, applied to every element.
+        TypeExpr::Array(inner) | TypeExpr::Set(inner) => actual
+            .iter()
+            .enumerate()
+            .filter(|(_, have)| assignable(have, inner).is_incompatible())
+            .map(|(index, have)| ElementFault::Element {
+                index,
+                expected: (**inner).clone(),
+                actual: have.clone(),
+            })
+            .collect(),
+
+        // A declared tuple is positional, and its length is part of the type:
+        // the engine refuses both `[int, string] = [1]` and `= [1, "a", 2]`.
+        TypeExpr::Tuple(members) => {
+            if actual.len() != members.len() {
+                // Arity alone. Once the lengths disagree the pairing is
+                // meaningless, the same reason an argument-count fault stops
+                // before comparing argument types.
+                return vec![ElementFault::Arity {
+                    expected: members.len(),
+                    actual: actual.len(),
+                }];
+            }
+            actual
+                .iter()
+                .zip(members)
+                .enumerate()
+                .filter(|(_, (have, want))| assignable(have, want).is_incompatible())
+                .map(|(index, (have, want))| ElementFault::Element {
+                    index,
+                    expected: want.clone(),
+                    actual: have.clone(),
+                })
+                .collect()
+        }
+
+        // A collection literal is never NONE, so `option<array<int>>` asks
+        // exactly what `array<int>` asks.
+        TypeExpr::Option(inner) => element_faults(actual, inner),
+
+        // Everything else, deliberately. A bare `array`/`set` and `array<any>`
+        // declare no element type (`TYPE array DEFAULT [0, 0]` is valid), and a
+        // `Union` needs *every* member to fail before `assignable` will speak —
+        // reasoning a per-element walk cannot reproduce.
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ObjectFault, Verdict, assignable, object_faults};
+    use super::{ElementFault, ObjectFault, Verdict, assignable, element_faults, object_faults};
     use crate::semantic::type_expr::TypeExpr;
 
     fn s(name: &str) -> TypeExpr {
@@ -605,6 +696,150 @@ mod tests {
         assert_eq!(
             assignable(&arr(s("string")), &s("string")),
             Verdict::Incompatible
+        );
+    }
+
+    fn set(inner: TypeExpr) -> TypeExpr {
+        TypeExpr::Set(Box::new(inner))
+    }
+    fn tup(members: &[TypeExpr]) -> TypeExpr {
+        TypeExpr::Tuple(members.to_vec())
+    }
+
+    #[test]
+    fn an_empty_literal_is_never_a_fault() {
+        // `DEFAULT ALWAYS []` against `array<record<user>>` is real SurrealQL.
+        for expected in [
+            arr(s("int")),
+            set(s("int")),
+            tup(&[s("int"), s("string")]),
+            opt(arr(s("int"))),
+        ] {
+            assert_eq!(element_faults(&[], &expected), Vec::new(), "{expected}");
+        }
+    }
+
+    #[test]
+    fn a_uniform_element_type_reports_each_bad_index() {
+        // The reported bug: `set<int> = { "20", "30" }`.
+        assert_eq!(
+            element_faults(&[s("string"), s("string")], &set(s("int"))),
+            vec![
+                ElementFault::Element {
+                    index: 0,
+                    expected: s("int"),
+                    actual: s("string")
+                },
+                ElementFault::Element {
+                    index: 1,
+                    expected: s("int"),
+                    actual: s("string")
+                },
+            ]
+        );
+        // A mixed literal, which the joined type hides as `array<any>`.
+        assert_eq!(
+            element_faults(&[s("string"), s("int")], &arr(s("int"))),
+            vec![ElementFault::Element {
+                index: 0,
+                expected: s("int"),
+                actual: s("string")
+            }]
+        );
+        assert_eq!(
+            element_faults(&[s("int"), s("int")], &arr(s("int"))),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_tuple_checks_its_length_in_both_directions() {
+        // The engine refuses `[int, string] = [1]` and `= [1, "a", 2]`.
+        assert_eq!(
+            element_faults(&[s("int")], &tup(&[s("int"), s("string")])),
+            vec![ElementFault::Arity {
+                expected: 2,
+                actual: 1
+            }]
+        );
+        assert_eq!(
+            element_faults(
+                &[s("int"), s("string"), s("int")],
+                &tup(&[s("int"), s("string")])
+            ),
+            vec![ElementFault::Arity {
+                expected: 2,
+                actual: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tuple_of_the_right_length_is_checked_by_position() {
+        assert_eq!(
+            element_faults(&[s("string"), s("int")], &tup(&[s("int"), s("string")])),
+            vec![
+                ElementFault::Element {
+                    index: 0,
+                    expected: s("int"),
+                    actual: s("string")
+                },
+                ElementFault::Element {
+                    index: 1,
+                    expected: s("string"),
+                    actual: s("int")
+                },
+            ]
+        );
+        assert_eq!(
+            element_faults(&[s("int"), s("string")], &tup(&[s("int"), s("string")])),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn an_option_is_unwrapped_because_a_literal_is_never_none() {
+        assert_eq!(
+            element_faults(&[s("string")], &opt(arr(s("int")))),
+            vec![ElementFault::Element {
+                index: 0,
+                expected: s("int"),
+                actual: s("string")
+            }]
+        );
+    }
+
+    #[test]
+    fn a_type_that_names_no_element_type_stays_quiet() {
+        // `TYPE array DEFAULT [0, 0]` is valid, `array<any>` accepts anything,
+        // and a union needs every member to fail before `assignable` speaks.
+        for expected in [
+            s("array"),
+            s("set"),
+            s("any"),
+            arr(s("any")),
+            TypeExpr::Union(vec![s("int"), s("string")]),
+            TypeExpr::Unknown,
+        ] {
+            assert_eq!(
+                element_faults(&[s("string"), s("int")], &expected),
+                Vec::new(),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_element_we_cannot_type_stays_quiet() {
+        // Only `Incompatible` speaks. An `Unknown` element, and a nullish one,
+        // are both runtime questions.
+        assert_eq!(
+            element_faults(&[TypeExpr::Unknown, s("int")], &arr(s("int"))),
+            Vec::new()
+        );
+        assert_eq!(
+            element_faults(&[s("none"), s("int")], &arr(s("int"))),
+            Vec::new()
         );
     }
 

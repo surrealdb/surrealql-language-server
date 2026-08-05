@@ -88,6 +88,20 @@ pub const TEMPFILES_CLAUSE: &str = "TempfilesClause";
 pub const WHEN_CLAUSE: &str = "WhenClause";
 pub const THEN_CLAUSE: &str = "ThenClause";
 
+// `DEFINE FIELD` clauses that carry a value coerced to the field's declared
+// type. `AssertClause` is deliberately absent: an `ASSERT` is a predicate over
+// `$value`, not a value coerced to the type, so nothing may compare it against
+// the `TypeClause` — see `infer::check_field_clauses`.
+pub const DEFAULT_CLAUSE: &str = "DefaultClause";
+pub const VALUE_CLAUSE: &str = "ValueClause";
+pub const COMPUTED_CLAUSE: &str = "ComputedClause";
+/// The `ALWAYS` of `DEFAULT ALWAYS <value>`.
+///
+/// It has its **own** node kind rather than being a `Keyword`, so
+/// [`is_keyword`] does not filter it and a "first non-keyword child" search
+/// returns this marker instead of the value.
+pub const DEFAULT_ALWAYS: &str = "DefaultAlways";
+
 pub const FIELDS_COLUMNS_CLAUSE: &str = "FieldsColumnsClause";
 pub const UNIQUE_CLAUSE: &str = "UniqueClause";
 
