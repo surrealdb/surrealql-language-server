@@ -49,6 +49,22 @@ pub const RENAMED_FUNCTION: &str = "renamed-function";
 /// the query parses and then fails at run time. A warning rather than an error,
 /// because the claim rests on reading the engine's dispatch tables.
 pub const NOT_CALLABLE: &str = "not-callable";
+/// A `DEFINE FIELD … TYPE T` whose `DEFAULT`, `VALUE` or `COMPUTED` expression cannot
+/// satisfy `T`. The engine coerces all three to the declared type and fails with
+/// `Couldn't coerce value for field …`.
+///
+/// `ASSERT` is deliberately **absent**: it is a predicate over `$value`, not a value
+/// coerced to `T`, so nothing may compare it against the declared type. Kept separate
+/// from [`LET_TYPE`] because this is the first check that fires on `DEFINE FIELD` at
+/// all, and a client must be able to suppress it alone.
+pub const FIELD_TYPE: &str = "field-type";
+/// A type position holds a word SurrealDB's kind grammar does not have, such as
+/// `LET $x: xxx = 2`. Unlike every other code here this is a *syntax* fault, not a
+/// judgement about a value: the engine refuses to parse it at all
+/// (`syn/parser/kind.rs:218`, `expected a kind name`), so the query never runs. It is
+/// therefore reported from the syntax pass and is not gated by
+/// `analysis.enable_type_checking` — see [`crate::semantic::type_name`].
+pub const UNKNOWN_TYPE: &str = "unknown-type";
 
 /// Wrap a code constant in the LSP `Diagnostic.code` representation.
 pub fn as_code(value: &str) -> Option<NumberOrString> {

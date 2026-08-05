@@ -28,7 +28,9 @@ use crate::config::ServerSettings;
 use strsim::jaro_winkler;
 
 use crate::grammar::{SPECIAL_VARIABLES, builtin_return_type, builtin_signature, renamed_builtin};
-use crate::semantic::assign::{ObjectFault, Verdict, assignable, object_faults};
+use crate::semantic::assign::{
+    ElementFault, ObjectFault, Verdict, assignable, element_faults, object_faults,
+};
 use crate::semantic::codes;
 use crate::semantic::node_kind as k;
 use crate::semantic::text::byte_range_to_lsp;
@@ -177,16 +179,14 @@ pub fn infer_expr_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
             .unwrap_or(TypeExpr::Unknown),
 
         k::ARRAY => TypeExpr::Array(Box::new(join_types(
-            k::named_children(node)
+            literal_elements(node)
                 .into_iter()
-                .filter(|child| !is_trivia(*child))
                 .map(|child| infer_expr_type(child, ctx))
                 .collect(),
         ))),
         k::SET => TypeExpr::Set(Box::new(join_types(
-            k::named_children(node)
+            literal_elements(node)
                 .into_iter()
-                .filter(|child| !is_trivia(*child))
                 .map(|child| infer_expr_type(child, ctx))
                 .collect(),
         ))),
@@ -472,6 +472,31 @@ fn string_kind(text: &str) -> &'static str {
 
 fn is_trivia(node: Node<'_>) -> bool {
     matches!(node.kind(), k::COMMENT | k::BLOCK_COMMENT)
+}
+
+/// Trivia, plus the brace nodes that carry no value.
+///
+/// `BraceOpen`/`BraceClose` are *named* children of a `Set` (and of a `Block`),
+/// while the brackets of an `Array` are anonymous and never appear at all.
+/// Filtering only trivia therefore leaked two braces into every set literal's
+/// element list, so [`join_types`] saw more than one type and answered
+/// `Scalar("any")` — making **every** set literal `set<any>`, which
+/// [`crate::semantic::assign`]'s top rule then accepted against every `set<T>`.
+fn is_structural(node: Node<'_>) -> bool {
+    is_trivia(node) || matches!(node.kind(), k::BRACE_OPEN | k::BRACE_CLOSE)
+}
+
+/// The value-bearing elements of a collection literal, in source order.
+///
+/// Shared by the `Array` and `Set` arms of [`infer_expr_type`] and by the
+/// element walk, so the nodes a fault points at are exactly the nodes whose
+/// types were inferred. Two enumerations would let an element be checked but not
+/// inferred, or the reverse.
+pub(crate) fn literal_elements<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    k::named_children(node)
+        .into_iter()
+        .filter(|child| !is_structural(*child))
+        .collect()
 }
 
 /// The element type of a collection literal.
@@ -1199,6 +1224,7 @@ pub fn type_diagnostics(
     let root = analysis.tree.root_node();
     check_calls(root, &ctx, &mut diagnostics);
     check_let_annotations(root, &ctx, &mut diagnostics);
+    check_field_clauses(root, &ctx, &mut diagnostics);
     check_function_returns(root, &ctx, &mut diagnostics);
     check_variables(root, &ctx, settings, &mut diagnostics);
     check_binary_expressions(root, &ctx, &mut diagnostics);
@@ -1342,12 +1368,13 @@ fn body_results<'tree>(body: Node<'tree>) -> Vec<BodyResult<'tree>> {
 /// neither trivia nor a brace.
 ///
 /// `BraceOpen`/`BraceClose` are *named* nodes in this grammar and have to be
-/// filtered explicitly. `;` is anonymous, so it never appears here.
+/// filtered explicitly — see [`is_structural`], which owns that rule. `;` is
+/// anonymous, so it never appears here.
 fn body_tail<'tree>(body: Node<'tree>) -> Option<Node<'tree>> {
     k::named_children(body)
         .into_iter()
         .rev()
-        .find(|child| !is_trivia(*child) && !matches!(child.kind(), k::BRACE_OPEN | k::BRACE_CLOSE))
+        .find(|child| !is_structural(*child))
 }
 
 /// The type a function body produces, or `None` when we are not certain.
@@ -1467,6 +1494,24 @@ fn report_return_mismatch(
 ) {
     let actual = infer_expr_type(value, ctx);
     if assignable(&actual, declared) != Verdict::Incompatible {
+        // Silent as a whole, but an individual element may still be wrong. See
+        // the note in `check_let_annotations` on why this is not nested.
+        report_element_faults(
+            value,
+            declared,
+            codes::RETURN_TYPE,
+            ctx,
+            out,
+            &|fault, label| match fault {
+                ElementFault::Element { actual, .. } => {
+                    format!("`{name}` returns `{declared}`, but {label} is `{actual}`.")
+                }
+                ElementFault::Arity { expected, actual } => format!(
+                    "`{name}` returns `{declared}`, which has {expected} elements, but this \
+                     value has {actual}."
+                ),
+            },
+        );
         return;
     }
     out.push(diagnostic(
@@ -1621,12 +1666,39 @@ fn check_let_annotations(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagno
             })
         {
             let actual = infer_expr_type(*value, ctx);
+            // The whole-value verdict wins when it speaks: its message already
+            // says the whole truth, so element messages would only repeat it.
+            //
+            // NOTE this branch is INVERTED against `report_object_faults`, which
+            // nests inside an `is_incompatible()` early return. It has to be:
+            // `join_types` collapses a mixed literal to `any`, so
+            // `array<int> = ["20", 30]` reads as `Compatible` and a refinement
+            // nested inside the fault could never fire. Do not "tidy" this back
+            // into the object shape — that silently kills every mixed literal
+            // and every declared tuple.
             if assignable(&actual, &declared).is_incompatible() {
                 out.push(diagnostic(
                     node_range(ctx.source, *value),
                     codes::LET_TYPE,
                     format!("`{name}` is declared `{declared}` but the value is `{actual}`."),
                 ));
+            } else {
+                report_element_faults(
+                    *value,
+                    &declared,
+                    codes::LET_TYPE,
+                    ctx,
+                    out,
+                    &|fault, label| match fault {
+                        ElementFault::Element { actual, .. } => {
+                            format!("`{name}` is declared `{declared}` but {label} is `{actual}`.")
+                        }
+                        ElementFault::Arity { expected, actual } => format!(
+                            "`{name}` is declared `{declared}`, which has {expected} elements, \
+                             but the value has {actual}."
+                        ),
+                    },
+                );
             }
         }
     }
@@ -1634,6 +1706,114 @@ fn check_let_annotations(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagno
     for child in node.named_children(&mut cursor) {
         check_let_annotations(child, ctx, out);
     }
+}
+
+/// `DEFINE FIELD f ON t TYPE T DEFAULT <value>` — the value must satisfy `T`.
+///
+/// The engine coerces a field's `DEFAULT`, `VALUE` and `COMPUTED` expressions to
+/// the declared type and fails with `Couldn't coerce value for field …`. All
+/// three were verified against a live engine.
+///
+/// `ASSERT` is deliberately **not** checked. An `ASSERT` is a predicate over
+/// `$value` that must be truthy, not a value coerced to the type, so comparing
+/// `ASSERT $value >= 0` against `TYPE option<decimal>` would report a `bool`
+/// where a `decimal` is declared. That is a false positive on seven lines of
+/// `tests/fixtures/adversarial.surql` alone. `PERMISSIONS` is a predicate too,
+/// for the same reason.
+fn check_field_clauses(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    if node.kind() == k::DEFINE_STATEMENT
+        && crate::semantic::analyzer::define_form(node, ctx.source).as_deref() == Some("field")
+    {
+        check_one_field(node, ctx, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        check_field_clauses(child, ctx, out);
+    }
+}
+
+fn check_one_field(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    // Guarded on the WHOLE statement rather than on the payload: the pinned
+    // grammar cannot read `array<number, 2>`, and SurrealDB's own corpus pairs
+    // that type with a perfectly clean `DEFAULT`. A payload-scoped guard would
+    // miss it and then compare against a half-read type.
+    if contains_parse_error(node) {
+        return;
+    }
+    let children = k::named_children(node);
+    // Read the declared type from the *tree*, not from `model.fields`: a field
+    // can be defined in more than one document, so the merged record may be a
+    // different definition — the same reason `check_one_function_body` reads its
+    // annotation from the tree.
+    let Some(declared) = children
+        .iter()
+        .find(|child| child.kind() == k::TYPE_CLAUSE)
+        .and_then(|clause| k::find_child_any(*clause, k::TYPE_KINDS))
+        .map(|payload| TypeExpr::from_node(payload, ctx.source))
+    else {
+        return;
+    };
+    let name = children
+        .iter()
+        .find(|child| matches!(child.kind(), k::IDIOM | k::PATH | k::IDENT))
+        .and_then(|child| k::dotted_name(ctx.source, *child))
+        .unwrap_or_else(|| "this field".to_string());
+
+    // A block, a subquery, an `IF … ELSE` and a `$value` reference all reach
+    // `infer_expr_type`'s fallback and answer `Unknown`, which is silent. That
+    // silence is load bearing: `$value` is a special variable outside the binding
+    // table, so if inference ever learns to type it as the field type, every
+    // `VALUE` clause becomes self-referential and this pass needs revisiting.
+    for clause in children.iter().filter(|child| {
+        matches!(
+            child.kind(),
+            k::DEFAULT_CLAUSE | k::VALUE_CLAUSE | k::COMPUTED_CLAUSE
+        )
+    }) {
+        let Some(payload) = clause_payload(*clause) else {
+            continue;
+        };
+        let actual = infer_expr_type(payload, ctx);
+        // Same shape as `check_let_annotations`: the whole-value verdict wins
+        // when it speaks, and the element walk runs only when it stays silent.
+        if assignable(&actual, &declared).is_incompatible() {
+            out.push(diagnostic(
+                node_range(ctx.source, payload),
+                codes::FIELD_TYPE,
+                format!("`{name}` is declared `{declared}` but this value is `{actual}`."),
+            ));
+        } else {
+            report_element_faults(
+                payload,
+                &declared,
+                codes::FIELD_TYPE,
+                ctx,
+                out,
+                &|fault, label| match fault {
+                    ElementFault::Element { actual, .. } => {
+                        format!("`{name}` is declared `{declared}` but {label} is `{actual}`.")
+                    }
+                    ElementFault::Arity { expected, actual } => format!(
+                        "`{name}` is declared `{declared}`, which has {expected} elements, but \
+                         this value has {actual}."
+                    ),
+                },
+            );
+        }
+    }
+}
+
+/// The value a `DEFAULT` / `VALUE` / `COMPUTED` clause carries.
+///
+/// `DefaultClause: seq(Keyword[DEFAULT], optional(DefaultAlways), _value)`, and
+/// `_value` is hidden, so the payload is a direct child. `DefaultAlways` has to
+/// be filtered **by kind**: it is not a `Keyword` node, so `is_keyword` lets it
+/// through and a naive "first non-keyword child" returns the `ALWAYS` marker
+/// instead of the value.
+fn clause_payload<'tree>(clause: Node<'tree>) -> Option<Node<'tree>> {
+    k::named_children(clause).into_iter().find(|child| {
+        !k::is_keyword(*child) && child.kind() != k::DEFAULT_ALWAYS && !is_structural(*child)
+    })
 }
 
 fn check_calls(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
@@ -1812,6 +1992,18 @@ fn check_method_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic
         };
         let actual = infer_expr_type(*argument, ctx);
         if assignable(&actual, expected) != Verdict::Incompatible {
+            // Silent as a whole, but an element may still be wrong. See the note
+            // in `check_let_annotations` on why this is not nested inside the
+            // fault.
+            let callee = format!("`.{method}()` (`{}`)", resolved.function);
+            report_element_faults(
+                *argument,
+                expected,
+                codes::ARGUMENT_TYPE,
+                ctx,
+                out,
+                &argument_element_message(index + 2, &callee),
+            );
             continue;
         }
         out.push(diagnostic(
@@ -1934,6 +2126,18 @@ fn check_builtin_call(
         };
         let actual = infer_expr_type(*argument, ctx);
         if assignable(&actual, expected) != Verdict::Incompatible {
+            // Silent as a whole, but an element may still be wrong. See the note
+            // in `check_let_annotations` on why this is not nested inside the
+            // fault.
+            let callee = format!("`{name}`");
+            report_element_faults(
+                *argument,
+                expected,
+                codes::ARGUMENT_TYPE,
+                ctx,
+                out,
+                &argument_element_message(index + 1, &callee),
+            );
             continue;
         }
         out.push(diagnostic(
@@ -1993,6 +2197,20 @@ fn check_user_call(
         };
         let actual = infer_expr_type(*argument, ctx);
         if assignable(&actual, expected) != Verdict::Incompatible {
+            // Silent as a whole, but an element may still be wrong. This is the
+            // element counterpart of the object drill-down below, and it sits on
+            // the other side of the verdict — see the note in
+            // `check_let_annotations`. The two never collide: a collection
+            // literal is never an `Object` node.
+            let callee = format!("`{name}`");
+            report_element_faults(
+                *argument,
+                expected,
+                codes::ARGUMENT_TYPE,
+                ctx,
+                out,
+                &argument_element_message(index + 1, &callee),
+            );
             continue;
         }
 
@@ -2101,6 +2319,114 @@ fn arity_label(required: usize, total: usize) -> String {
         total.to_string()
     } else {
         format!("{required} to {total}")
+    }
+}
+
+/// The message for an element fault inside call argument `position`.
+///
+/// `callee` arrives already wrapped in backticks, because a method call names
+/// both the method and the builtin it resolved to. The wording mirrors the
+/// per-property form in [`report_object_faults`], so the two drill-downs read
+/// alike.
+fn argument_element_message<'a>(
+    position: usize,
+    callee: &'a str,
+) -> impl Fn(&ElementFault, &str) -> String + 'a {
+    move |fault, label| match fault {
+        ElementFault::Element {
+            expected, actual, ..
+        } => format!(
+            "Argument {position} of {callee}: {label} expects `{expected}`, found `{actual}`."
+        ),
+        ElementFault::Arity { expected, actual } => {
+            format!("Argument {position} of {callee} expects {expected} elements, found {actual}.")
+        }
+    }
+}
+
+/// Peel `option<…>` so a shape test sees the collection underneath.
+fn without_option(ty: &TypeExpr) -> &TypeExpr {
+    match ty {
+        TypeExpr::Option(inner) => without_option(inner),
+        other => other,
+    }
+}
+/// The elements of a collection literal to check, or `None` when the walk must
+/// not run.
+///
+/// Three guards, and every one of them keeps a false positive out:
+///
+/// * **A literal only.** A variable, a call, a subquery or a cast has no element
+///   nodes to point at and no per-element types the joined type did not already
+///   carry. This is what keeps `VALUE array::distinct($value OR [])` silent.
+/// * **The container shapes must agree.** A `Set` literal against `array<T>` is a
+///   *shape* fault that [`assignable`] already reports; walking it would add a
+///   second, worse message for the same mistake.
+/// * **No parse error.** A subtree the parser could not read says nothing about
+///   what the author wrote, and a `parse` diagnostic already covers it. Load
+///   bearing: the pinned grammar cannot read a unary minus, so
+///   `[$w, -$h]` is an `ERROR` subtree whose fragments must not be walked.
+fn element_nodes<'tree>(literal: Node<'tree>, expected: &TypeExpr) -> Option<Vec<Node<'tree>>> {
+    let shapes_agree = matches!(
+        (literal.kind(), without_option(expected)),
+        (k::ARRAY, TypeExpr::Array(_) | TypeExpr::Tuple(_)) | (k::SET, TypeExpr::Set(_))
+    );
+    if !shapes_agree || contains_parse_error(literal) {
+        return None;
+    }
+    Some(literal_elements(literal))
+}
+
+/// How to name the faulty element in a message.
+///
+/// A set carries **no index**. The engine sorts and deduplicates a set before it
+/// coerces, so `{ "20", "30" }` fails at index 0 while `{ "20", 30 }` fails at
+/// index 1 — both verified against a live engine. A source-order index would
+/// therefore contradict the runtime message.
+fn element_label(literal: Node<'_>, index: usize) -> String {
+    if literal.kind() == k::SET {
+        "this element".to_string()
+    } else {
+        format!("element {index}")
+    }
+}
+
+/// Walk the elements of `value` against `declared` and report each fault.
+///
+/// Callers reach this only when the **whole-value** verdict stayed silent, so at
+/// most one of the two ever speaks for a given value.
+fn report_element_faults(
+    value: Node<'_>,
+    declared: &TypeExpr,
+    code: &str,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+    message: &dyn Fn(&ElementFault, &str) -> String,
+) {
+    let Some(elements) = element_nodes(value, declared) else {
+        return;
+    };
+    // One enumeration, shared: the nodes a fault points at are exactly the nodes
+    // whose types were inferred. Two would let an element be checked but not
+    // inferred, or the reverse.
+    let types: Vec<TypeExpr> = elements
+        .iter()
+        .map(|element| infer_expr_type(*element, ctx))
+        .collect();
+
+    for fault in element_faults(&types, declared) {
+        let (range, label) = match &fault {
+            ElementFault::Element { index, .. } => (
+                elements
+                    .get(*index)
+                    .map(|node| node_range(ctx.source, *node))
+                    .unwrap_or_else(|| node_range(ctx.source, value)),
+                element_label(value, *index),
+            ),
+            // A wrong length is about the whole literal, not one element.
+            ElementFault::Arity { .. } => (node_range(ctx.source, value), String::new()),
+        };
+        out.push(diagnostic(range, code, message(&fault, &label)));
     }
 }
 

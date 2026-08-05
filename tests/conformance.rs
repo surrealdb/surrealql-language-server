@@ -40,7 +40,15 @@ fn uri(path: &str) -> Uri {
     format!("file:///workspace/{path}").parse().expect("uri")
 }
 
-/// Every diagnostic the pipeline publishes for one document.
+/// Every diagnostic this sweep judges for one document.
+///
+/// The semantic diagnostics, plus the one syntax diagnostic this crate reasons
+/// about rather than merely relays: `unknown-type`. The other syntax codes are
+/// left out on purpose — `parse` reports whatever the tree-sitter grammar cannot
+/// read, including two shapes it rejects although SurrealDB accepts them
+/// (a union in a `ParamDefinition`, and `array<float, 10>`). Those are grammar
+/// defects tracked separately, and pulling them in would bury a real regression
+/// in known noise.
 fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
     let Some(analysis) = analyze_document(uri("q.surql"), source, SymbolOrigin::Local) else {
         return Vec::new();
@@ -50,15 +58,27 @@ fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
         .documents
         .insert(uri("q.surql"), std::sync::Arc::new(analysis.clone()));
     let model = MergedSemanticModel::build(&workspace, &Default::default());
-    model.semantic_diagnostics(&analysis, &ServerSettings::default())
+    let mut diagnostics = model.semantic_diagnostics(&analysis, &ServerSettings::default());
+    diagnostics.extend(
+        analysis
+            .syntax_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unknown-type".to_string()))
+            })
+            .cloned(),
+    );
+    diagnostics
 }
 
 /// The type checks this crate owns: argument counts, argument types, declared
-/// function return types, `LET` annotations, and arithmetic operands.
+/// function return types, `LET` annotations, arithmetic operands, and type names.
 ///
 /// `let-type` and `operator-type` are here because a false positive in either
 /// would otherwise be structurally invisible to this sweep — the one test that
-/// reads real-world SurrealQL at scale.
+/// reads real-world SurrealQL at scale. `unknown-type` is here for the same
+/// reason, and it needs the sweep more than most: it fires on a closed keyword
+/// list, so a name SurrealDB adds in a later release shows up here first.
 fn argument_diagnostics(source: &str) -> Vec<(String, String)> {
     diagnostics_for(source)
         .into_iter()
@@ -68,7 +88,9 @@ fn argument_diagnostics(source: &str) -> Vec<(String, String)> {
                     || code == "return-type"
                     || code == "let-type"
                     || code == "operator-type"
-                    || code == "unknown-method" =>
+                    || code == "unknown-method"
+                    || code == "unknown-type"
+                    || code == "field-type" =>
             {
                 Some((code.clone(), diagnostic.message.clone()))
             }
@@ -257,6 +279,31 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
     // `1 + "1"`, declared as `error = true`.
     ("self_tests/multi_line.surql", "operator-type"),
+    // `math::top([[], {}], 2)` / `math::bottom(…)` against `array<number>`. Both
+    // files declare it: "Expected `number` but found `[]` when coercing element
+    // at index 0 of `array<number>`".
+    ("language/functions/math/top.surql", "argument-type"),
+    ("language/functions/math/bottom.surql", "argument-type"),
+    // `DEFINE FIELD … TYPE T DEFAULT/VALUE <value>` where the value cannot
+    // coerce to `T`. Each file declares the engine's own refusal:
+    //   `TYPE string DEFAULT 0`   -> "Expected `string` but found `0`"
+    //   `TYPE int DEFAULT 'notanint'` -> "Expected `int` but found `'notanint'`"
+    //   `TYPE record<layout> VALUE type::string($value)`
+    //       -> "Expected `record<layout>` but found `'layout:one'`"
+    // The last is a bug reproduction whose own comment says it "should error at
+    // write time" — the server now catches it before the write.
+    (
+        "language/statements/define/field/default_value_does_not_match_type.surql",
+        "field-type",
+    ),
+    (
+        "language/statements/define/field/id_default.surql",
+        "field-type",
+    ),
+    (
+        "reproductions/value_clause_type_validation.surql",
+        "field-type",
+    ),
 ];
 
 /// The exhaustive oracle. Ignored by default because it re-analyses ~1,900

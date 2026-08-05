@@ -17,6 +17,7 @@ use crate::grammar::{
 use crate::semantic::codes;
 use crate::semantic::text::compact_preview;
 use crate::semantic::type_expr::TypeExpr;
+use crate::semantic::type_name;
 use crate::semantic::types::{
     AccessDef, AccessResult, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef,
     FunctionLanguage, FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel,
@@ -1179,6 +1180,37 @@ impl MergedSemanticModel {
                     ..CodeAction::default()
                 }));
             }
+
+            // A type SurrealQL does not have. `type_name::nearest` is a pure
+            // function of the name, so the suggestion can be re-derived when a
+            // client strips the `data` payload *and* the message carries none.
+            if let Some((name, suggestion)) = unknown_type_payload(diagnostic)
+                && let Some(replacement) =
+                    suggestion.or_else(|| type_name::nearest(&name).map(str::to_string))
+            {
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Replace `{name}` with `{replacement}`"),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    is_preferred: Some(true),
+                    edit: Some(WorkspaceEdit {
+                        document_changes: Some(DocumentChanges::Operations(vec![
+                            ls_types::DocumentChangeOperation::Edit(TextDocumentEdit {
+                                text_document: OptionalVersionedTextDocumentIdentifier {
+                                    uri: uri.clone(),
+                                    version: None,
+                                },
+                                edits: vec![OneOf::Left(TextEdit {
+                                    range: diagnostic.range,
+                                    new_text: replacement.clone(),
+                                })],
+                            }),
+                        ])),
+                        ..WorkspaceEdit::default()
+                    }),
+                    ..CodeAction::default()
+                }));
+            }
         }
 
         for table in analysis
@@ -1524,6 +1556,37 @@ fn unknown_table_payload(diagnostic: &Diagnostic) -> Option<(String, Option<Stri
         .and_then(|tail| tail.split_once('`'))
         .map(|(suggestion, _)| suggestion.to_string());
     Some((table.to_string(), suggestion))
+}
+
+/// Extract the `(type_name, suggested_replacement)` payload from an
+/// `unknown-type` diagnostic.
+///
+/// Same two paths as [`unknown_table_payload`]: the stable code plus structured
+/// `data` first, then the message text, so the quick fix survives a client that
+/// strips the non-standard `data` field.
+fn unknown_type_payload(diagnostic: &Diagnostic) -> Option<(String, Option<String>)> {
+    // Primary path: stable code + structured data.
+    if codes::has_code(diagnostic, codes::UNKNOWN_TYPE)
+        && let Some(data) = diagnostic.data.as_ref()
+        && let Some(name) = data.get("type").and_then(|value| value.as_str())
+    {
+        let suggestion = data
+            .get("suggestion")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        return Some((name.to_string(), suggestion));
+    }
+
+    // Fallback: parse the message text. Takes the name up to the closing
+    // backtick so both "Unknown type `x`." and
+    // "Unknown type `x`. Did you mean `y`?" parse.
+    let rest = diagnostic.message.strip_prefix("Unknown type `")?;
+    let (name, tail) = rest.split_once('`')?;
+    let suggestion = tail
+        .strip_prefix(". Did you mean `")
+        .and_then(|tail| tail.split_once('`'))
+        .map(|(suggestion, _)| suggestion.to_string());
+    Some((name.to_string(), suggestion))
 }
 
 fn merge_table(target: &mut HashMap<String, TableDef>, candidate: &TableDef) {

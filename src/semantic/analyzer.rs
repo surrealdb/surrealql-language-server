@@ -9,6 +9,7 @@ use crate::semantic::codes;
 use crate::semantic::node_kind as k;
 use crate::semantic::text::{byte_range_to_lsp, compact_preview, offset_to_position};
 use crate::semantic::type_expr::TypeExpr;
+use crate::semantic::type_name;
 use crate::semantic::types::{
     AccessDef, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
     FunctionParam, IndexDef, InferenceFact, MergedSemanticModel, NamedRange, ParamDef,
@@ -1435,10 +1436,152 @@ fn collect_node_diagnostics(
         return;
     }
 
+    // A type position holding a word the engine's kind grammar does not have.
+    // This sits in the syntax pass rather than beside the type checks in
+    // `infer` because the engine refuses to *parse* such a query, so the
+    // report must not disappear when `enable_type_checking` is off.
+    if node.kind() == k::TYPE_NAME
+        && !parse_failure_on_line(diagnostics, node)
+        && let Some(diagnostic) = unknown_type_diagnostic(source, node)
+    {
+        diagnostics.push(diagnostic);
+        return;
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_node_diagnostics(uri, source, child, known_names, diagnostics);
     }
+}
+
+/// `LET $x: xxx = 2` — a type position naming a type SurrealQL does not have.
+///
+/// Every `TypeName` node in the tree is a candidate, which is sound because the
+/// grammar produces that node from exactly one rule
+/// (`alias($._rawident, $.TypeName)` in `_singleType`), and every parent that can
+/// hold one is a type position: `Type`, `TypeClause`, `TypeCast`,
+/// `ParameterizedType`, `UnionType`, `ArrayType`, `ObjectTypeProperty`, `Closure`
+/// and `DefineStatement`. So the check needs no per-position plumbing, and it
+/// reaches nested arguments, union members, tuple elements and object-type field
+/// types for free.
+fn unknown_type_diagnostic(source: &str, node: Node<'_>) -> Option<Diagnostic> {
+    let name = k::text_of(source, node)?;
+    if name.is_empty() || type_name::is_known(name) {
+        return None;
+    }
+    // `record<person>` names a table, not a type.
+    if names_a_foreign_argument(source, node) {
+        return None;
+    }
+    // A name the parser only guessed at says nothing about what the author
+    // meant, and a `parse` diagnostic already covers the region.
+    if has_error_ancestor(node) {
+        return None;
+    }
+
+    let suggestion = type_name::nearest(name);
+    Some(Diagnostic {
+        range: byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: codes::as_code(codes::UNKNOWN_TYPE),
+        source: Some("surreal-language-server".to_string()),
+        message: match suggestion {
+            Some(candidate) => {
+                format!("Unknown type `{name}`. Did you mean `{candidate}`?")
+            }
+            None => format!("Unknown type `{name}`."),
+        },
+        // Structured payload for the quick fix, with the message text as the
+        // fallback for clients that strip non-standard fields.
+        data: Some(match suggestion {
+            Some(candidate) => {
+                serde_json::json!({ "type": name, "suggestion": candidate })
+            }
+            None => serde_json::json!({ "type": name }),
+        }),
+        ..Diagnostic::default()
+    })
+}
+
+/// True when this `TypeName` is an argument of a constructor whose arguments are
+/// not types, and so names a table, a bucket, or a geometry.
+///
+/// Without this, the check reports `person` in `record<person>`, `bucket` in
+/// `file<bucket>` and `multipoint` in `geometry<multipoint>` — all valid
+/// SurrealQL. The four constructors parse to the same shape as `array<int>`, so
+/// the argument is indistinguishable from a type by node kind alone; only the
+/// constructor name separates them.
+fn names_a_foreign_argument(source: &str, node: Node<'_>) -> bool {
+    // Climb out of any enclosing `UnionType` first. `record<a | b>` nests the
+    // table names one level deeper than `record<a>` does —
+    // `ParameterizedType(TypeName, UnionType(TypeName, Pipe, TypeName))` — so a
+    // check that only reads the immediate parent reports both names as unknown
+    // types. `_type` admits a `UnionType` and nothing else as a wrapper here,
+    // which is why this loop is the whole story.
+    let mut child = node;
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() != k::UNION_TYPE {
+            break;
+        }
+        child = current;
+        ancestor = current.parent();
+    }
+
+    let Some(parent) = ancestor else {
+        return false;
+    };
+    if parent.kind() != k::PARAMETERIZED_TYPE {
+        return false;
+    }
+    // The first named child is the constructor, and that one *is* a type name:
+    // `xxx<int>` must still be reported.
+    let Some(head) = parent.named_child(0) else {
+        return false;
+    };
+    if head.id() == child.id() {
+        return false;
+    }
+    k::text_of(source, head).is_some_and(type_name::takes_foreign_arguments)
+}
+
+/// True when a `parse` diagnostic already covers this node's line.
+///
+/// [`has_error_ancestor`] is not enough on its own, because tree-sitter can
+/// recover from a statement the grammar does not know into a shape that looks
+/// perfectly well-formed. `ALTER FIELD author ON comment TYPE record<person>` —
+/// a statement the grammar has no rule for — leaves an `ERROR` covering the head
+/// of the statement and then reads the tail as a `TypeCast`, so `person` arrives
+/// here as a `TypeName` with no `ERROR` anywhere above it. Reporting it claims
+/// `person` is a misspelled type when it is really a table name in a statement
+/// the grammar could not read.
+///
+/// Reading the diagnostics collected so far is sound because
+/// [`collect_node_diagnostics`] walks in source order, so an earlier failure on
+/// the line is already recorded by the time the type name is reached.
+fn parse_failure_on_line(diagnostics: &[Diagnostic], node: Node<'_>) -> bool {
+    let row = node.start_position().row as u32;
+    diagnostics.iter().any(|diagnostic| {
+        codes::has_code(diagnostic, codes::PARSE)
+            && diagnostic.range.start.line <= row
+            && diagnostic.range.end.line >= row
+    })
+}
+
+/// True when `node` sits inside an `ERROR` node.
+///
+/// [`collect_node_diagnostics`] returns at an `ERROR` node, but
+/// [`descend_into_error`] re-enters it for the *children* of one, so a node
+/// inside a failed region is still reachable from here.
+fn has_error_ancestor(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.is_error() {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
 }
 
 /// Walk the children of a reported ERROR node. Nested errors starting

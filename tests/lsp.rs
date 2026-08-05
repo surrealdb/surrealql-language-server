@@ -380,6 +380,317 @@ fn optional_chaining_produces_no_syntax_diagnostics() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Unknown type names
+// ---------------------------------------------------------------------------
+
+/// Analyze `source` and return its syntax diagnostics.
+///
+/// Deliberately not `diagnostics_for`: that helper returns only the *semantic*
+/// diagnostics, and the `unknown-type` check lives in the syntax pass so it
+/// survives `enable_type_checking = false`. Reading `syntax_diagnostics`, which
+/// takes no `ServerSettings` at all, is what proves it is ungated.
+fn syntax_diagnostics_for(source: &str) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+    analyze_document(uri("types.surql"), source, SymbolOrigin::Local)
+        .expect("analysis")
+        .syntax_diagnostics
+}
+
+fn unknown_type_messages(source: &str) -> Vec<String> {
+    syntax_diagnostics_for(source)
+        .into_iter()
+        .filter(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    "unknown-type".to_string(),
+                ))
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn reports_an_unknown_type_in_every_type_position() {
+    // The motivating case is the first row. SurrealDB rejects every one of these
+    // at parse time with "expected a kind name", so the language server must
+    // not accept them either.
+    let cases = [
+        ("LET $a: xxx = 2;", 1),
+        ("DEFINE FUNCTION fn::a($p: xxx) { RETURN 1; };", 1),
+        ("DEFINE FUNCTION fn::b() -> xxx { RETURN 1; };", 1),
+        ("DEFINE FIELD f ON t TYPE xxx;", 1),
+        ("LET $c: { k: xxx } = 2;", 1),
+        ("LET $d: [string, xxx] = 2;", 1),
+        ("LET $e: option<xxx> = 2;", 1),
+        ("RETURN <xxx> \"5\";", 1),
+        // A closure parameter and a closure return type.
+        ("LET $f = |$x: xxx| -> yyy { 1 };", 2),
+    ];
+
+    for (source, expected) in cases {
+        let messages = unknown_type_messages(source);
+        assert_eq!(
+            messages.len(),
+            expected,
+            "expected {expected} unknown-type diagnostic(s) for {source:?}, got {messages:?}"
+        );
+    }
+}
+
+#[test]
+fn stays_silent_for_every_type_the_engine_accepts() {
+    use surrealql_language_server::semantic::type_name::KIND_NAMES;
+
+    for name in KIND_NAMES {
+        let source = format!("LET $a: {name} = 2;");
+        assert!(
+            unknown_type_messages(&source).is_empty(),
+            "`{name}` is a real SurrealQL type and must not be reported"
+        );
+    }
+}
+
+#[test]
+fn stays_silent_for_an_upper_case_spelling() {
+    // The engine lexes type names through `UniCase`, so `INT` parses.
+    for source in [
+        "LET $a: INT = 2;",
+        "LET $b: String = 2;",
+        "LET $c: RECORD<person> = 2;",
+    ] {
+        assert!(
+            unknown_type_messages(source).is_empty(),
+            "letter case must not matter: {source}"
+        );
+    }
+}
+
+#[test]
+fn stays_silent_for_a_table_bucket_or_geometry_argument() {
+    // The regression this guards against: `record<person>`, `table<person>`,
+    // `file<bucket>` and `geometry<multipoint>` all parse to the same shape,
+    // `ParameterizedType(TypeName, TypeName)`. Checking every `TypeName` against
+    // the type list reports `person`, `bucket` and `multipoint` as unknown types.
+    for source in [
+        "LET $a: record<person> = 2;",
+        "LET $b: table<person> = 2;",
+        "LET $c: file<bucket> = 2;",
+        "LET $d: geometry<multipoint> = 2;",
+        "LET $e: option<array<record<person>>> = 2;",
+        // A union of table names nests one level deeper,
+        // `ParameterizedType(TypeName, UnionType(...))`, so reading only the
+        // immediate parent reports every name in the list.
+        "DEFINE FIELD f ON t TYPE record<orderLine | asset>;",
+        "DEFINE FIELD g ON t TYPE geometry<point | multipoint>;",
+        "DEFINE FIELD h ON t TYPE table<person | animal>;",
+        "DEFINE FIELD i ON t TYPE file<one | two>;",
+    ] {
+        assert!(
+            unknown_type_messages(source).is_empty(),
+            "an argument that names a table, a bucket or a geometry is not a type: {source}"
+        );
+    }
+}
+
+#[test]
+fn still_checks_a_union_that_is_not_a_table_list() {
+    // The counterpart to the test above: climbing out of a `UnionType` must not
+    // turn every union member into an unchecked name.
+    for (source, expected) in [
+        ("DEFINE FIELD f ON t TYPE option<int | xxx>;", 1),
+        ("DEFINE FIELD f ON t TYPE int | xxx;", 1),
+        ("DEFINE FIELD f ON t TYPE xxx | yyy;", 2),
+        ("DEFINE FIELD f ON t TYPE int | float;", 0),
+    ] {
+        let messages = unknown_type_messages(source);
+        assert_eq!(
+            messages.len(),
+            expected,
+            "expected {expected} for {source:?}, got {messages:?}"
+        );
+    }
+}
+
+#[test]
+fn still_reports_the_constructor_itself() {
+    // `xxx` is the constructor here, not an argument, so the exception above
+    // must not swallow it. `int` is its argument and is a real type.
+    let messages = unknown_type_messages("LET $a: xxx<int> = 2;");
+    assert_eq!(messages.len(), 1, "got {messages:?}");
+    assert!(messages[0].contains("`xxx`"), "got {messages:?}");
+}
+
+#[test]
+fn the_reported_range_covers_the_type_name_only() {
+    let source = "LET $a: xxx = 2;";
+    let diagnostic = syntax_diagnostics_for(source)
+        .into_iter()
+        .find(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    "unknown-type".to_string(),
+                ))
+        })
+        .expect("an unknown-type diagnostic");
+
+    let start = diagnostic.range.start.character as usize;
+    let end = diagnostic.range.end.character as usize;
+    assert_eq!(&source[start..end], "xxx", "range must cover the type name");
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR),
+        "the engine refuses to parse this, so it is an error"
+    );
+    assert_eq!(
+        diagnostic.source.as_deref(),
+        Some("surreal-language-server")
+    );
+}
+
+#[test]
+fn suggests_the_intended_type_for_a_typo() {
+    let messages = unknown_type_messages("LET $a: strng = 1;");
+    assert_eq!(
+        messages,
+        vec!["Unknown type `strng`. Did you mean `string`?".to_string()]
+    );
+}
+
+#[test]
+fn offers_no_suggestion_when_nothing_is_close() {
+    // A wrong suggestion sends the reader to a type they did not mean.
+    let messages = unknown_type_messages("LET $a: zzz = 1;");
+    assert_eq!(messages, vec!["Unknown type `zzz`.".to_string()]);
+}
+
+#[test]
+fn reports_value_which_the_engine_does_not_accept_as_a_type() {
+    // `LET $x: value = 1` fails with "Unexpected token `VALUE`, expected a kind
+    // name", although `assign::PRIMITIVES` lists `value` for a different purpose.
+    let messages = unknown_type_messages("LET $a: value = 1;");
+    assert_eq!(messages.len(), 1, "got {messages:?}");
+}
+
+#[test]
+fn adds_nothing_where_the_grammar_already_fails_to_parse() {
+    // Two shapes the tree-sitter grammar rejects although SurrealDB accepts
+    // them: a union in a `ParamDefinition`, and a sized collection. Both already
+    // raise a `parse` diagnostic, and this check must not pile a second,
+    // misleading message on top.
+    for source in ["LET $a: int | float = 2;", "LET $b: array<float, 10> = 2;"] {
+        assert!(
+            unknown_type_messages(source).is_empty(),
+            "must not add an unknown-type diagnostic to a failed parse: {source}"
+        );
+    }
+}
+
+#[test]
+fn stays_silent_for_a_multi_member_geometry_list_in_any_case() {
+    // The first line is a real corpus file
+    // (`doc_examples/surrealql/datemodel/header_geometry.surql`). The engine lexes
+    // geometry names as keywords, so letter case does not matter there either.
+    for source in [
+        "DEFINE FIELD area ON restaurant TYPE geometry<polygon|multipolygon|collection>;",
+        "DEFINE FIELD loc ON t TYPE geometry<POINT | MultiPoint>;",
+    ] {
+        assert!(
+            unknown_type_messages(source).is_empty(),
+            "a geometry list is not a list of types: {source}"
+        );
+    }
+}
+
+#[test]
+fn reaches_a_nested_cast_and_a_nested_object_type() {
+    // A cast on the value side of another cast, and an object type inside an
+    // `option<…>`. Both are reached because the walk visits every node rather
+    // than anchoring on a fixed set of positions.
+    for (source, expected) in [
+        ("RETURN <int> <xxx> \"5\";", 1),
+        ("RETURN <int> <string> \"5\";", 0),
+        ("DEFINE FIELD f ON t TYPE option<{ a: xxx }>;", 1),
+        ("DEFINE FIELD f ON t TYPE { a: int, b: record<x> };", 0),
+    ] {
+        let messages = unknown_type_messages(source);
+        assert_eq!(
+            messages.len(),
+            expected,
+            "expected {expected} for {source:?}, got {messages:?}"
+        );
+    }
+}
+
+#[test]
+fn suggests_a_correction_for_an_upper_case_typo() {
+    // `jaro_winkler` is case-sensitive, so the name has to be folded before it is
+    // scored. Without that, an upper-case annotation is reported but loses the
+    // quick fix.
+    assert_eq!(
+        unknown_type_messages("LET $x: STRNG = 1;"),
+        vec!["Unknown type `STRNG`. Did you mean `string`?".to_string()]
+    );
+}
+
+#[test]
+fn stays_silent_for_a_boolean_literal_type() {
+    // Caught by the corpus sweep, in SurrealDB's own
+    // `casting/basic_literal_kind` test. `<true> true` is legal — the engine reads
+    // `true` as a literal type — but the grammar's `LiteralType` rule omits
+    // booleans, so `true` arrives at the check as a plain `TypeName`.
+    for source in [
+        "RETURN <true> true;",
+        "RETURN <false> false;",
+        "LET $a: true = 2;",
+        "DEFINE FIELD f ON t TYPE true | false;",
+    ] {
+        assert!(
+            unknown_type_messages(source).is_empty(),
+            "a boolean literal type is a real type: {source}"
+        );
+    }
+}
+
+#[test]
+fn stays_silent_on_a_line_the_parser_already_failed_on() {
+    // Also caught by the corpus sweep. The grammar has no `ALTER FIELD` rule, so
+    // it leaves an ERROR for the head of the statement and then reads the tail as
+    // a `TypeCast` — `person` reaches the check as a `TypeName` with no ERROR
+    // ancestor at all. It is a table name in an unreadable statement, not a
+    // misspelled type.
+    let source = "ALTER FIELD author ON comment TYPE record<person>;";
+    assert!(
+        unknown_type_messages(source).is_empty(),
+        "a name on a line the parser failed on is a guess: {:?}",
+        syntax_diagnostics_for(source)
+    );
+    // The parse diagnostic itself must still be reported.
+    assert!(
+        !syntax_diagnostics_for(source).is_empty(),
+        "the unreadable statement must still raise a parse diagnostic"
+    );
+}
+
+#[test]
+fn attaches_a_payload_for_the_quick_fix() {
+    let diagnostic = syntax_diagnostics_for("LET $a: strng = 1;")
+        .into_iter()
+        .find(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    "unknown-type".to_string(),
+                ))
+        })
+        .expect("an unknown-type diagnostic");
+
+    let data = diagnostic.data.as_ref().expect("a data payload");
+    assert_eq!(data.get("type").and_then(|v| v.as_str()), Some("strng"));
+    assert_eq!(
+        data.get("suggestion").and_then(|v| v.as_str()),
+        Some("string")
+    );
+}
+
 #[test]
 fn hover_for_js_function_shows_javascript_badge() {
     let u = uri("functions.surql");
@@ -2842,7 +3153,12 @@ fn adversarial_fixture_reports_no_argument_diagnostics() {
     let codes = codes_of(&diagnostics_for(source));
     let noisy: Vec<_> = codes
         .iter()
-        .filter(|code| code.starts_with("argument-") || *code == "let-type")
+        // `field-type` is here because the fixture is full of `DEFINE FIELD`
+        // clauses — `DEFAULT ALWAYS`, `ASSERT $value …`, `VALUE $value.?.trim()`
+        // — and that pass is the newest and riskiest of the three.
+        .filter(|code| {
+            code.starts_with("argument-") || *code == "let-type" || *code == "field-type"
+        })
         .collect();
     assert!(noisy.is_empty(), "false positives on real code: {noisy:?}");
 }
@@ -3081,6 +3397,12 @@ fn let_bound_variable_types_from_literals() {
         ("true", "bool"),
         ("user:beau", "record<user>"),
         ("{ a: 1 }", "{ a: int }"),
+        ("[1, 2]", "array<int>"),
+        // A set literal used to infer as `set<any>`, because `BraceOpen` and
+        // `BraceClose` are named children and leaked into the element list.
+        // Note `{ 1 }` is a Block, and only `{ 1, }` is a one-element set.
+        ("{ 1, 2 }", "set<int>"),
+        ("{ 'a', }", "set<string>"),
     ] {
         let source = format!("LET $v = {value};\nRETURN $v;");
         let hover = hover_at(&source, "$v").unwrap_or_default();
@@ -3213,6 +3535,282 @@ fn declared_let_type_is_checked_against_the_value() {
 fn declared_let_type_is_silent_when_it_matches() {
     let codes = codes_of(&diagnostics_for("LET $n: int = 42;"));
     assert!(!codes.contains(&"let-type".to_string()), "{codes:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Collection literal element types
+// ---------------------------------------------------------------------------
+
+fn faults_with_code(source: &str, code: &str) -> Vec<String> {
+    diagnostics_for(source)
+        .into_iter()
+        .filter(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    code.to_string(),
+                ))
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn the_reported_set_element_type_is_checked() {
+    // `LET $ages: set<int> = { "20", "30" };` was silent because `BraceOpen` and
+    // `BraceClose` leaked into the element list, so every set literal inferred as
+    // `set<any>`. The engine refuses it:
+    // "Expected `int` but found `'20'` when coercing element at index 0".
+    let messages = faults_with_code("LET $ages: set<int> = { \"20\", \"30\" };", "let-type");
+    assert_eq!(
+        messages,
+        vec!["`$ages` is declared `set<int>` but the value is `set<string>`.".to_string()],
+        "exactly one diagnostic, and it is the whole-value one"
+    );
+}
+
+#[test]
+fn a_mixed_collection_literal_reports_the_bad_element() {
+    // A mixed literal joins to `any`, so the whole-value verdict is Compatible
+    // and only the element walk can speak.
+    assert_eq!(
+        faults_with_code("LET $ages: set<int> = { \"20\", 30 };", "let-type"),
+        vec!["`$ages` is declared `set<int>` but this element is `string`.".to_string()]
+    );
+    assert_eq!(
+        faults_with_code("LET $xs: array<int> = [\"20\", 30];", "let-type"),
+        vec!["`$xs` is declared `array<int>` but element 0 is `string`.".to_string()]
+    );
+    // A set message carries no index on purpose: the engine sorts and
+    // deduplicates a set before it coerces, so a source-order index would
+    // contradict the runtime error.
+    assert!(
+        !faults_with_code("LET $ages: set<int> = { \"20\", 30 };", "let-type")[0].contains("index"),
+        "a set fault must not name an index"
+    );
+}
+
+#[test]
+fn the_element_range_covers_the_element_not_the_literal() {
+    let source = "LET $xs: array<int> = [1, \"20\", 3];";
+    let diagnostic = diagnostics_for(source)
+        .into_iter()
+        .find(|d| {
+            d.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    "let-type".to_string(),
+                ))
+        })
+        .expect("a let-type diagnostic");
+    let start = diagnostic.range.start.character as usize;
+    let end = diagnostic.range.end.character as usize;
+    assert_eq!(
+        &source[start..end],
+        "\"20\"",
+        "the squiggle must cover the offending element"
+    );
+    assert!(
+        diagnostic.message.contains("element 1"),
+        "got {}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn a_collection_literal_never_reports_twice() {
+    // A uniform bad literal has an Incompatible whole-value verdict. That message
+    // already says the whole truth, so the element walk must stay quiet.
+    let messages = faults_with_code("LET $xs: array<int> = [\"20\", \"30\"];", "let-type");
+    assert_eq!(
+        messages,
+        vec!["`$xs` is declared `array<int>` but the value is `array<string>`.".to_string()],
+        "one whole-value diagnostic, unchanged from before this feature"
+    );
+
+    // A set literal against a declared `array<T>` is a *shape* fault, which
+    // `assignable` already reports. The walk must refuse it rather than add a
+    // second message about elements.
+    let messages = faults_with_code("LET $xs: array<string> = { \"a\", \"b\" };", "let-type");
+    assert_eq!(messages.len(), 1, "got {messages:?}");
+    assert!(
+        messages[0].contains("the value is `set<string>`"),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn a_declared_tuple_is_checked_by_position_and_length() {
+    // A declared `[int, string]` becomes a `Tuple`, but a literal is always an
+    // `Array`, and `assignable` answers Unknown for that pair. Only the element
+    // walk can compare them.
+    let messages = faults_with_code("LET $p: [string, string] = [\"a\", 1];", "let-type");
+    assert_eq!(
+        messages,
+        vec!["`$p` is declared `[string, string]` but element 1 is `int`.".to_string()]
+    );
+
+    // The engine refuses both length directions.
+    for (source, count) in [
+        ("LET $p: [string, string] = [\"a\"];", 1),
+        ("LET $p: [string, string] = [\"a\", \"b\", \"c\"];", 1),
+        ("LET $p: [string, string] = [\"a\", \"b\"];", 0),
+    ] {
+        let messages = faults_with_code(source, "let-type");
+        assert_eq!(messages.len(), count, "for {source}: got {messages:?}");
+        if count == 1 {
+            assert!(messages[0].contains("elements"), "got {messages:?}");
+        }
+    }
+}
+
+#[test]
+fn valid_and_undecidable_collection_literals_stay_silent() {
+    for source in [
+        // Correct.
+        "LET $a: array<int> = [1, 2];",
+        "LET $b: set<int> = { 1, 2 };",
+        "LET $c: [int, string] = [1, 'a'];",
+        // Empty is accepted against every collection type.
+        "LET $d: array<int> = [];",
+        "LET $e: set<int> = {,};",
+        // Nothing to compare an element against.
+        "LET $f: array = [0, 0];",
+        "LET $g: array<any> = ['a', 1];",
+        // A union needs every member to fail before `assignable` speaks, and an
+        // element walk cannot reproduce that reasoning.
+        "LET $h: array<int | string> = ['a', 1];",
+        // An element whose type is unknown, and a nullish one.
+        "LET $i: array<int> = [$missing, 1];",
+        "LET $j: array<int> = [NONE, 1];",
+        // `option<…>` is peeled, then the elements match.
+        "LET $k: option<array<int>> = [1, 2];",
+        // One level only: a nested *mixed* literal is a deliberate hole.
+        "LET $l: array<array<int>> = [[1, 'a']];",
+        // Not a literal, so there are no elements to point at.
+        "LET $m: array<int> = array::distinct(['a']);",
+        // Numeric narrowing. The engine does refuse this, but `assignable`
+        // deliberately calls narrowing a runtime question — `LET $n: int = 1.5`
+        // is equally silent. The element walk inherits that rule rather than
+        // inventing a stricter one for collections.
+        "LET $n: array<int> = [1.5, 2.5];",
+    ] {
+        let messages = faults_with_code(source, "let-type");
+        assert!(messages.is_empty(), "for {source}: got {messages:?}");
+    }
+}
+
+#[test]
+fn element_faults_are_reported_in_a_call_argument() {
+    // `math::top` declares `array<number>`, and SurrealDB's own corpus expects
+    // "Expected `number` but found `[]` when coercing element at index 0".
+    // Both elements are wrong here, and both are reported — one diagnostic per
+    // bad element, as the object drill-down gives one per bad property. The
+    // engine stops at the first, but naming all of them saves a round trip.
+    let messages = faults_with_code("RETURN math::top([[], {}], 2);", "argument-type");
+    assert_eq!(messages.len(), 2, "got {messages:?}");
+    assert!(
+        messages[0].starts_with("Argument 1 of `math::top`: element 0 expects `number`"),
+        "got {messages:?}"
+    );
+    assert!(
+        messages[1].contains("element 1 expects `number`"),
+        "got {messages:?}"
+    );
+
+    // A user-defined function, whose parameter type comes from the model.
+    let source = "DEFINE FUNCTION fn::take($xs: array<int>) { RETURN $xs; };\n\
+                  RETURN fn::take([1, 'a']);";
+    let messages = faults_with_code(source, "argument-type");
+    assert_eq!(messages.len(), 1, "got {messages:?}");
+    assert!(
+        messages[0].contains("element 1 expects `int`, found `string`"),
+        "got {messages:?}"
+    );
+}
+
+#[test]
+fn element_faults_are_reported_in_a_declared_return_type() {
+    let source = "DEFINE FUNCTION fn::x() -> array<int> { RETURN [1, 'a']; };";
+    let messages = faults_with_code(source, "return-type");
+    assert_eq!(messages.len(), 1, "got {messages:?}");
+    assert!(
+        messages[0].contains("element 1 is `string`"),
+        "got {messages:?}"
+    );
+
+    // The matching case must stay silent.
+    let ok = "DEFINE FUNCTION fn::y() -> array<int> { RETURN [1, 2]; };";
+    assert!(faults_with_code(ok, "return-type").is_empty());
+}
+
+#[test]
+fn field_clause_values_are_checked_against_the_declared_type() {
+    for (source, fragment) in [
+        (
+            "DEFINE FIELD n ON t TYPE int DEFAULT 'x';",
+            "`n` is declared `int` but this value is `string`.",
+        ),
+        (
+            "DEFINE FIELD n ON t TYPE int VALUE 'x';",
+            "`n` is declared `int` but this value is `string`.",
+        ),
+        (
+            "DEFINE FIELD n ON t TYPE int COMPUTED 'x';",
+            "`n` is declared `int` but this value is `string`.",
+        ),
+        // The `DefaultAlways` skip is what makes this fire. Without it the
+        // payload is the `ALWAYS` marker, which infers as unknown and is silent.
+        (
+            "DEFINE FIELD n ON t TYPE int DEFAULT ALWAYS 'x';",
+            "`n` is declared `int` but this value is `string`.",
+        ),
+    ] {
+        let messages = faults_with_code(source, "field-type");
+        assert_eq!(messages, vec![fragment.to_string()], "for {source}");
+    }
+}
+
+#[test]
+fn field_clause_element_types_are_checked() {
+    let messages = faults_with_code(
+        "DEFINE FIELD tags ON post TYPE array<string> DEFAULT [1, 'a'];",
+        "field-type",
+    );
+    assert_eq!(
+        messages,
+        vec!["`tags` is declared `array<string>` but element 0 is `int`.".to_string()]
+    );
+}
+
+#[test]
+fn field_clauses_that_are_valid_stay_silent() {
+    for source in [
+        // An ASSERT is a predicate over `$value`, not a value coerced to the
+        // type. Comparing it against the type would report a bool where a
+        // decimal is declared.
+        "DEFINE FIELD n ON t TYPE option<decimal> ASSERT $value >= 0;",
+        "DEFINE FIELD n ON t TYPE int ASSERT $value > 0 AND $value < 10;",
+        // `DEFAULT ALWAYS` with a value that fits.
+        "DEFINE FIELD n ON t TYPE number DEFAULT ALWAYS 123.456;",
+        "DEFINE FIELD tags ON t TYPE array<record<user>> DEFAULT ALWAYS [];",
+        // A tuple type whose positions match.
+        "DEFINE FIELD p ON t TYPE [string, datetime] DEFAULT ['London', time::now()];",
+        // A bare `array` declares no element type.
+        "DEFINE FIELD a ON t TYPE array DEFAULT [0, 0];",
+        // `$value` is a special variable outside the binding table, so these
+        // infer as unknown and stay silent.
+        "DEFINE FIELD n ON t TYPE string VALUE $value.?.trim();",
+        "DEFINE FIELD n ON t TYPE number VALUE $value * 2;",
+        // Correct scalars.
+        "DEFINE FIELD n ON t TYPE int DEFAULT 0;",
+        "DEFINE FIELD s ON t TYPE string DEFAULT 'x';",
+        // No TYPE clause means nothing to check against.
+        "DEFINE FIELD n ON t DEFAULT 'x';",
+        // A block payload infers as unknown.
+        "DEFINE FIELD n ON t TYPE int DEFAULT { RETURN 1; };",
+    ] {
+        let messages = faults_with_code(source, "field-type");
+        assert!(messages.is_empty(), "for {source}: got {messages:?}");
+    }
 }
 
 #[test]

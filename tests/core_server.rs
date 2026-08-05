@@ -803,6 +803,110 @@ async fn typo_in_table_name_yields_did_you_mean_diagnostic_and_quick_fix() {
     assert_eq!(quick_fix.title, "Replace `prson` with `person`");
 }
 
+/// `LET $x: strng = 1` names a type SurrealDB does not have, so the engine
+/// refuses to parse the query. This drives the real flow (didOpen → analysis →
+/// published diagnostics → code action) to prove the report reaches a client and
+/// carries a working quick fix.
+#[tokio::test]
+async fn unknown_type_yields_did_you_mean_diagnostic_and_quick_fix() {
+    use tower_lsp_server::ls_types::CodeActionOrCommand;
+
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    let text = "LET $a: strng = 1;";
+    open(&core, "badtype.surql", text).await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("badtype.surql"))
+        .expect("diagnostics published");
+    let unknown: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code == Some(NumberOrString::String("unknown-type".to_string()))
+        })
+        .collect();
+    assert_eq!(
+        unknown.len(),
+        1,
+        "exactly one unknown-type diagnostic: {diagnostics:?}"
+    );
+    let diagnostic = unknown[0];
+    // An ERROR, not a warning: the query never runs.
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostic.message,
+        "Unknown type `strng`. Did you mean `string`?"
+    );
+    // The squiggle covers only the type name.
+    assert_eq!(diagnostic.range.start.line, 0);
+    assert_eq!(diagnostic.range.start.character, 8);
+    assert_eq!(diagnostic.range.end.line, 0);
+    assert_eq!(diagnostic.range.end.character, 13);
+
+    let code_actions = core
+        .code_action(tower_lsp_server::ls_types::CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("badtype.surql"),
+            },
+            range: diagnostic.range,
+            context: tower_lsp_server::ls_types::CodeActionContext {
+                diagnostics: vec![diagnostic.clone()],
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("code actions");
+    let quick_fix = code_actions
+        .iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) if action.title.starts_with("Replace") => {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("quick fix offered");
+    assert_eq!(quick_fix.title, "Replace `strng` with `string`");
+}
+
+/// The report must not vanish when a user turns the type checker off. An unknown
+/// type name is a syntax fault, so it lives in the syntax pass; the gated
+/// `let-type` check is here as the control that proves the toggle really applied.
+#[tokio::test]
+async fn unknown_type_survives_disabled_type_checking() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: json!({ "surrealql": { "analysis": { "enableTypeChecking": false } } }),
+    })
+    .await;
+
+    open(
+        &core,
+        "gated.surql",
+        "LET $a: strng = 1;\nLET $b: int = 'a';",
+    )
+    .await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("gated.surql"))
+        .expect("diagnostics published");
+    let codes: Vec<_> = diagnostics
+        .iter()
+        .filter_map(|diagnostic| match &diagnostic.code {
+            Some(NumberOrString::String(code)) => Some(code.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        codes.contains(&"unknown-type"),
+        "an unknown type name is a syntax fault and is not gated: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"let-type"),
+        "the gated type checks must be off, or this test proves nothing: {codes:?}"
+    );
+}
+
 #[tokio::test]
 async fn usage_only_inferred_tables_stay_silent() {
     let (core, notifier, _) = core_with(Default::default(), Default::default());

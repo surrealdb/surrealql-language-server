@@ -9,4 +9,5 @@ pub mod node_kind;
 pub mod operate;
 pub mod text;
 pub mod type_expr;
+pub mod type_name;
 pub mod types;
