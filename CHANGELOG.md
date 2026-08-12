@@ -2,7 +2,56 @@
 
 ## Unreleased
 
+### Performance
+
+The editor-facing operations were quadratic in document size. One function was
+the cause: `offset_to_position` scanned the document from byte 0 to convert a
+single byte offset, and it is called once per emitted semantic token and about
+ten times per extracted query fact. `LineIndex` records each line start once and
+finds the line by binary search, with a fast path where the UTF-16 column equals
+the byte column.
+
+Measured on a 3200-line (166 KB) file, release profile, and on a 200-document
+workspace. The cost per line is now flat across 200, 800 and 3200 lines, so the
+quadratic term is gone rather than reduced.
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| Semantic tokens, whole document | 2510 ms | 13.1 ms |
+| Semantic tokens, 40-line viewport | 2513 ms | 0.65 ms |
+| `analyze_document` | 6309 ms | 69.7 ms |
+| Hover and go-to cursor lookup | 2.44 ms | under 1 µs |
+| Table completion, 800 tables | 21.5 ms | 0.23 ms |
+| SurrealDB corpus sweep, 1897 files | ~130 s | 4.7 s |
+
+Also:
+
+- A **viewport request for semantic tokens** now walks only the nodes covering
+  the requested range. It used to walk the whole tree and filter afterwards, so
+  asking for 40 lines cost the same as asking for the whole file.
+- **Table completion items ship without documentation** and get it from
+  `completionItem/resolve`, so opening the dropdown no longer renders hover
+  markdown for every table in the schema. `completionProvider.resolveProvider`
+  is now `true`.
+- **`fields_for_table` and the unknown-table check read indexes** instead of
+  filtering the whole field map and flattening every query fact in the
+  workspace.
+- The cursor helpers (`token_at`, `word_range`, `token_prefix`) and the two
+  backward walks in the completion-context table **no longer allocate a vector
+  of the whole document** to read the few characters around one cursor.
+
 ### Added
+
+- **`analysis.diagnosticDebounceMs`** (default `200`) waits for typing to settle
+  before analysing an edited buffer. Every keystroke used to trigger a full
+  reparse, a workspace-model rebuild and a diagnostic publish; at ten characters
+  a second that is ten of each, and only the last describes what is on screen.
+  `0` disables the wait. `didOpen` is never delayed.
+
+  Parsing and extraction now also run off the thread that serves requests, so a
+  hover or completion arriving mid-keystroke is not queued behind a reparse, and
+  a result the client has already superseded is dropped rather than published.
+
 
 - **`analysis.schemalessDiagnostics`** decides which diagnostics apply to
   a table declared `SCHEMALESS`. Three values:
