@@ -67,6 +67,38 @@ fn workspace(docs: usize, tables_per_doc: usize) -> WorkspaceIndex {
     index
 }
 
+/// A document whose queries target tables that no `DEFINE TABLE` declares.
+///
+/// This shape is what exercises the workspace-wide scans in the diagnostics
+/// pass: an undeclared target is *inferred*, and the inferred branch calls
+/// `target_usage_count` over every query fact in the workspace and then runs
+/// `jaro_winkler` against every table. A document that declares the tables it
+/// queries never reaches that branch, so a benchmark built from `schema_doc`
+/// alone reports a diagnostics cost that looks flat when it is not.
+fn undeclared_target_doc(index: usize) -> String {
+    let mut out = String::new();
+    for t in 0..20 {
+        out.push_str(&format!(
+            "SELECT name FROM undeclared_d{index}_t{t} WHERE age > 1;\n"
+        ));
+    }
+    // Some explicit tables, so the near-miss candidate set is not empty.
+    for t in 0..5 {
+        out.push_str(&format!("DEFINE TABLE real_d{index}_t{t} SCHEMAFULL;\n"));
+    }
+    out
+}
+
+fn undeclared_workspace(docs: usize) -> WorkspaceIndex {
+    let mut index = WorkspaceIndex::default();
+    for d in 0..docs {
+        let text = undeclared_target_doc(d);
+        let analysis = analyze_document(uri(d), &text, SymbolOrigin::Local).expect("parses");
+        index.documents.insert(uri(d), Arc::new(analysis));
+    }
+    index
+}
+
 /// Time `body` enough times to get a stable number without a long wall-clock.
 /// Returns the mean milliseconds per iteration.
 fn time<F: FnMut()>(mut body: F) -> f64 {
@@ -193,7 +225,10 @@ fn main() {
     }
 
     // ── 6. Semantic diagnostics for one document ────────────────────────
-    println!("\n== semantic_diagnostics (one document) ==");
+    // Two corpora. The declared one is the common case. The undeclared one
+    // reaches the inferred-target branch, which is the only path that scans
+    // the whole workspace per fact — see `undeclared_target_doc`.
+    println!("\n== semantic_diagnostics (one document, declared targets) ==");
     for docs in DOC_COUNTS {
         let ws = workspace(docs, 4);
         let model = MergedSemanticModel::build(&ws, &Default::default());
@@ -205,6 +240,24 @@ fn main() {
         println!("  {docs:>4} docs: {ms:>9.3} ms");
         results.push(Measured {
             name: "semantic_diagnostics",
+            scale: format!("{docs} docs"),
+            ms,
+            target_ms: (docs == 200).then_some(1.0),
+        });
+    }
+
+    println!("\n== semantic_diagnostics (one document, undeclared targets) ==");
+    for docs in DOC_COUNTS {
+        let ws = undeclared_workspace(docs);
+        let model = MergedSemanticModel::build(&ws, &Default::default());
+        let settings = ServerSettings::default();
+        let analysis = Arc::clone(ws.documents.get(&uri(0)).expect("present"));
+        let ms = time(|| {
+            std::hint::black_box(model.semantic_diagnostics(analysis.as_ref(), &settings));
+        });
+        println!("  {:>4} docs ({:>5} facts): {ms:>9.3} ms", docs, docs * 20);
+        results.push(Measured {
+            name: "semantic_diagnostics/inferred",
             scale: format!("{docs} docs"),
             ms,
             target_ms: (docs == 200).then_some(1.0),
