@@ -29,7 +29,7 @@ use crate::core::state::{ServerState, merged_workspace, workspace_signature};
 use crate::core::statement_shape::SlotYield;
 use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
-use crate::semantic::analyzer::analyze_document;
+use crate::semantic::analyzer::{analyze_document, analyze_document_with_limit};
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
@@ -286,11 +286,25 @@ where
 
     /// [`Self::apply_settings`] body; callers must hold `config_lock`.
     async fn apply_settings_inner(&self, settings: ServerSettings) {
-        let (workspace_folders, last_walked) = {
+        let (workspace_folders, last_walked, previous_syntax_limit) = {
             let mut state = self.state.write().await;
+            let previous_syntax_limit = state.settings.analysis.max_syntax_diagnostics;
             state.settings = Arc::new(settings.clone());
-            (state.workspace_folders.clone(), state.last_walked.clone())
+            (
+                state.workspace_folders.clone(),
+                state.last_walked.clone(),
+                previous_syntax_limit,
+            )
         };
+
+        // The syntax cap is applied while the tree is walked, so an already
+        // analyzed document keeps the count it was parsed under. Re-analyze
+        // the open ones when the cap moves, otherwise raising it appears to
+        // do nothing until each buffer is edited.
+        if previous_syntax_limit != settings.analysis.max_syntax_diagnostics {
+            self.reanalyze_open_documents(settings.analysis.max_syntax_diagnostics)
+                .await;
+        }
 
         let folder_signature = workspace_signature(&workspace_folders);
         let need_walk = last_walked
@@ -344,9 +358,8 @@ where
                 .cloned()
                 .or_else(|| saved_for_diag.documents.get(&uri).cloned());
             if let Some(analysis) = analysis {
-                let mut diagnostics = analysis.syntax_diagnostics.clone();
-                diagnostics
-                    .extend(model_for_diag.semantic_diagnostics(&analysis, &settings_for_diag));
+                let diagnostics =
+                    diagnostics_for_document(&analysis, &model_for_diag, &settings_for_diag);
                 self.notifier.publish_diagnostics(uri, diagnostics).await;
             }
         }
@@ -975,7 +988,16 @@ where
     // ──────────────────────────────────────────────────────────────────
 
     async fn upsert_open_document(&self, uri: Uri, text: String) {
-        let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) else {
+        let limit = self
+            .state
+            .read()
+            .await
+            .settings
+            .analysis
+            .max_syntax_diagnostics;
+        let Some(analysis) =
+            analyze_document_with_limit(uri.clone(), &text, SymbolOrigin::Local, limit)
+        else {
             return;
         };
         {
@@ -984,6 +1006,27 @@ where
         }
         self.recompute_model().await;
         self.publish_diagnostics_for_uri(&uri).await;
+    }
+
+    /// Re-run the analysis of every open document under a new syntax cap.
+    ///
+    /// The text is taken from the stored analysis rather than re-read from
+    /// disk: an open buffer may be dirty, and its `DocumentAnalysis.text` is
+    /// the exact content the client last sent.
+    async fn reanalyze_open_documents(&self, limit: usize) {
+        let open_documents = self.state.read().await.open_documents.clone();
+        let reanalyzed: Vec<(Uri, Arc<DocumentAnalysis>)> = open_documents
+            .iter()
+            .filter_map(|(uri, analysis)| {
+                analyze_document_with_limit(uri.clone(), &analysis.text, SymbolOrigin::Local, limit)
+                    .map(|fresh| (uri.clone(), Arc::new(fresh)))
+            })
+            .collect();
+
+        let mut state = self.state.write().await;
+        for (uri, analysis) in reanalyzed {
+            state.open_documents.insert(uri, analysis);
+        }
     }
 
     async fn sync_saved_document_from_disk(&self, uri: &Uri) {
@@ -1160,8 +1203,7 @@ where
         };
 
         if let Some(analysis) = analysis {
-            let mut diagnostics = analysis.syntax_diagnostics.clone();
-            diagnostics.extend(model.semantic_diagnostics(&analysis, &settings));
+            let diagnostics = diagnostics_for_document(&analysis, &model, &settings);
             self.notifier
                 .publish_diagnostics(uri.clone(), diagnostics)
                 .await;
@@ -1312,6 +1354,27 @@ fn builtin_signature_information(
         parameters: Some(parameters),
         active_parameter: None,
     }
+}
+
+/// The complete diagnostic set for one document: the syntax pass, then the
+/// semantic and type passes, then the schema-mode filter over both.
+///
+/// The filter has to run last because `unknown-type` comes from the syntax
+/// pass, which reads a single document and cannot see the merged model — see
+/// [`MergedSemanticModel::apply_schemaless_policy`].
+///
+/// `model` and `settings` are parameters rather than state reads so callers
+/// already holding a snapshot do not re-acquire the lock per document, and
+/// cannot race a concurrent `recompute_model`.
+fn diagnostics_for_document(
+    analysis: &DocumentAnalysis,
+    model: &MergedSemanticModel,
+    settings: &ServerSettings,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = analysis.syntax_diagnostics.clone();
+    diagnostics.extend(model.semantic_diagnostics(analysis, settings));
+    model.apply_schemaless_policy(&mut diagnostics, settings);
+    diagnostics
 }
 
 /// Extension methods used by [`LanguageServerCore::reload_from_client_configuration`]

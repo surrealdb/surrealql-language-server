@@ -889,6 +889,66 @@ impl MergedSemanticModel {
         items
     }
 
+    /// True when `table` is a declared `SCHEMALESS` table and the active
+    /// `analysis.schemalessDiagnostics` value says `code` must not be reported
+    /// on it.
+    ///
+    /// Deliberately keyed on the **keyword**, not on SurrealDB's effective
+    /// schema mode. A bare `DEFINE TABLE t` is schemaless to the engine, but it
+    /// leaves `schema_mode` unset, and this setting exists to honor a signal the
+    /// author wrote down. Writing `SCHEMALESS` is that signal; omitting the
+    /// clause is not. Keeping the two apart also leaves the checks on a bare
+    /// `DEFINE TABLE` exactly as they were before this setting existed.
+    ///
+    /// An unknown or inferred table answers `false`: nothing may be hidden on
+    /// the strength of a schema mode nobody declared.
+    pub fn schemaless_hides(&self, table: &str, code: &str, settings: &ServerSettings) -> bool {
+        let Some(table_def) = self.tables.get(table) else {
+            return false;
+        };
+        if !table_def.explicit || !is_schemaless(table_def) {
+            return false;
+        }
+        !codes::reports_on_schemaless(code, &settings.analysis.schemaless_diagnostics)
+    }
+
+    /// Drop the diagnostics that [`Self::schemaless_hides`] covers but that no
+    /// emission site could filter for itself.
+    ///
+    /// Only `unknown-type` needs this. It is raised by the syntax pass
+    /// ([`crate::semantic::analyzer`]), which reads one document and cannot see
+    /// the merged model, so it records the table it belongs to in
+    /// `Diagnostic.data` and the decision is deferred to here. Every other code
+    /// in [`codes::SCHEMALESS_SCOPED_CODES`] is filtered where it is emitted.
+    ///
+    /// This is a method on the model rather than a private helper in the server
+    /// so the diagnostic tests can exercise it without an LSP round trip.
+    pub fn apply_schemaless_policy(
+        &self,
+        diagnostics: &mut Vec<Diagnostic>,
+        settings: &ServerSettings,
+    ) {
+        // Cheap exit on the setting that changes nothing, so the common
+        // `strict` case does not walk the list at all.
+        if settings.analysis.schemaless_diagnostics == "strict" {
+            return;
+        }
+        diagnostics.retain(|diagnostic| {
+            if !codes::has_code(diagnostic, codes::UNKNOWN_TYPE) {
+                return true;
+            }
+            let Some(table) = diagnostic
+                .data
+                .as_ref()
+                .and_then(|data| data.get("table"))
+                .and_then(|value| value.as_str())
+            else {
+                return true;
+            };
+            !self.schemaless_hides(table, codes::UNKNOWN_TYPE, settings)
+        });
+    }
+
     pub fn semantic_diagnostics(
         &self,
         analysis: &DocumentAnalysis,
@@ -980,26 +1040,44 @@ impl MergedSemanticModel {
                 // `WHERE $auth.id = id`) that can't be evaluated
                 // without the actual record, so the diagnostics tend
                 // to be noisy false-positives in the editor.
-                if !matches!(fact.action, QueryAction::Select | QueryAction::Relate) {
+                if settings.analysis.enable_permission_analysis
+                    && !matches!(fact.action, QueryAction::Select | QueryAction::Relate)
+                {
                     let permission = self.evaluate_permissions(fact, table_def, active_context);
                     match permission.result {
-                        AccessResult::Denied => diagnostics.push(Diagnostic {
-                            range: table_range,
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: codes::as_code(codes::PERMISSION_DENIED),
-                            source: Some("surreal-language-server".to_string()),
-                            message: permission.message,
-                            ..Diagnostic::default()
-                        }),
-                        AccessResult::Unknown => diagnostics.push(Diagnostic {
-                            range: table_range,
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            code: codes::as_code(codes::PERMISSION_UNKNOWN),
-                            source: Some("surreal-language-server".to_string()),
-                            message: permission.message,
-                            ..Diagnostic::default()
-                        }),
-                        AccessResult::Allowed => {}
+                        AccessResult::Denied
+                            if !self.schemaless_hides(
+                                table,
+                                codes::PERMISSION_DENIED,
+                                settings,
+                            ) =>
+                        {
+                            diagnostics.push(Diagnostic {
+                                range: table_range,
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                code: codes::as_code(codes::PERMISSION_DENIED),
+                                source: Some("surreal-language-server".to_string()),
+                                message: permission.message,
+                                ..Diagnostic::default()
+                            })
+                        }
+                        AccessResult::Unknown
+                            if !self.schemaless_hides(
+                                table,
+                                codes::PERMISSION_UNKNOWN,
+                                settings,
+                            ) =>
+                        {
+                            diagnostics.push(Diagnostic {
+                                range: table_range,
+                                severity: Some(DiagnosticSeverity::WARNING),
+                                code: codes::as_code(codes::PERMISSION_UNKNOWN),
+                                source: Some("surreal-language-server".to_string()),
+                                message: permission.message,
+                                ..Diagnostic::default()
+                            })
+                        }
+                        _ => {}
                     }
                 }
 
@@ -1010,11 +1088,19 @@ impl MergedSemanticModel {
                 // target list mixes the subject tables with the edge
                 // table, so SET fields (which belong to the edge)
                 // would be checked against the wrong schemas.
-                let schemafull = table_def
-                    .schema_mode
-                    .as_deref()
-                    .is_some_and(|mode| mode.eq_ignore_ascii_case("schemafull"));
-                if !(table_def.explicit && schemafull) || fact.action == QueryAction::Relate {
+                //
+                // `analysis.schemalessDiagnostics: "strict"` opts a declared
+                // SCHEMALESS table into the same check. That is off by default
+                // precisely because an ad-hoc field there is legal SurrealQL —
+                // it exists for authors who treat their SCHEMALESS tables as
+                // closed by convention.
+                let closed_schema = is_schemafull(table_def)
+                    || (is_schemaless(table_def)
+                        && codes::reports_on_schemaless(
+                            codes::UNKNOWN_FIELD,
+                            &settings.analysis.schemaless_diagnostics,
+                        ));
+                if !(table_def.explicit && closed_schema) || fact.action == QueryAction::Relate {
                     continue;
                 }
                 for field in &fact.touched_fields {
@@ -1743,6 +1829,25 @@ fn symbol_priority(origin: SymbolOrigin) -> usize {
         SymbolOrigin::Inferred => 2,
         SymbolOrigin::Builtin => 1,
     }
+}
+
+/// True when the table declares `SCHEMAFULL`. The schema is closed, so a field
+/// with no `DEFINE FIELD` is a fault.
+fn is_schemafull(table: &TableDef) -> bool {
+    table
+        .schema_mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("schemafull"))
+}
+
+/// True when the table declares `SCHEMALESS`. An absent clause is *not*
+/// schemaless here — see [`MergedSemanticModel::schemaless_hides`] for why the
+/// keyword and the engine's effective mode are kept apart.
+fn is_schemaless(table: &TableDef) -> bool {
+    table
+        .schema_mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("schemaless"))
 }
 
 fn format_table_hover(

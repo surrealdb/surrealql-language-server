@@ -37,14 +37,14 @@
 - Malformed notification params vanished (`wasm/dispatch.rs:63`) → logged with the method name (dispatch now lives in `src/core/dispatch.rs`, natively tested).
 - `replaceWorkspace` silently skipped invalid URIs (`wasm/server.rs:115`) → logged per entry.
 - "Target could not be resolved statically" fired on legitimate `$param`/expression targets (`model.rs:491`) → `TargetResolution` classification suppresses those. Also fixed: **SELECT target extraction found nothing on the current grammar** (the `FromClause` node no longer exists), so *every* real SELECT warned — extraction now reads the post-`FROM` region directly.
-- Unknown-field warnings fired on explicit SCHEMALESS tables where ad-hoc fields are legal → restricted to SCHEMAFULL.
+- Unknown-field warnings fired on explicit SCHEMALESS tables where ad-hoc fields are legal → restricted to SCHEMAFULL. Superseded: `analysis.schemalessDiagnostics` now decides this, plus `field-type`/`unknown-type`/`permission-*`, across three values (`quiet` default, `errors`, `strict`). The SCHEMAFULL-only rule is what `strict` restores.
 
 ### Correctness / robustness (⏳ deferred unless noted)
 
 - `signature_help` brittle text scan (`rfind('(')` + comma count) — breaks on nested calls/strings (`core/server.rs:564`).
 - CRUD statements inside FOR/IF blocks never analyzed (`analyzer.rs:145`); INSERT produces no query facts (`analyzer.rs:116`); LET/FOR `$variable` scoping untracked (`analyzer.rs:565`); DEFINE ANALYZER/USER/NAMESPACE/DATABASE/MODEL/TOKEN/CONFIG unanalyzed (`analyzer.rs:61`).
 - Rename/references/document-highlight only cover custom functions (`core/server.rs:524,536`); call-hierarchy `fromRanges` point at definitions, not call sites (`core/server.rs:712`); call hierarchy resolves items by bare name.
-- Dead `analysis.*` config flags: `enable_permission_analysis`, `enable_code_actions`, `enable_aggressive_schema_inference` are accepted but never checked — the settings UI lies (`model.rs:481`, `core/server.rs:632`).
+- Dead `analysis.*` config flags: `enable_permission_analysis`, `enable_code_actions`, `enable_aggressive_schema_inference` are accepted but never checked — the settings UI lies (`model.rs:481`, `core/server.rs:632`). ✅ partially: `enable_permission_analysis` now gates the permission block in `semantic_diagnostics`. ⏳ remaining: `enable_code_actions`, `enable_aggressive_schema_inference`.
 - `connection.access` accepted but never used for authentication (`config.rs:48`).
 - WASM ignores `enable_live_metadata`/db mode where native honors them (`wasm/host_data.rs:103`); a db-only metadata mode wipes host-pushed workspace documents in the browser (`core/server.rs:203`).
 - No `didChangeWatchedFiles` — externally created/deleted `.surql` files invisible until restart; live metadata reconnects and re-walks the whole DB on every save (`metadata_db.rs:73`).

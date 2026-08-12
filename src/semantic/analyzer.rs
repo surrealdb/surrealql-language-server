@@ -18,6 +18,19 @@ use crate::semantic::types::{
 };
 
 pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<DocumentAnalysis> {
+    analyze_document_with_limit(uri, text, origin, DEFAULT_MAX_SYNTAX_DIAGNOSTICS)
+}
+
+/// [`analyze_document`], with the per-document syntax-diagnostic cap supplied
+/// by the caller so `analysis.maxSyntaxDiagnostics` can drive it. `0` means no
+/// cap. Everything else about the analysis is identical — the limit only
+/// bounds how many `parse`/`unknown-type` diagnostics the walk collects.
+pub fn analyze_document_with_limit(
+    uri: Uri,
+    text: &str,
+    origin: SymbolOrigin,
+    limit: usize,
+) -> Option<DocumentAnalysis> {
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
     let tree = parser.parse(text, None)?;
@@ -64,28 +77,43 @@ pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<Do
                 .map(|field| field.name.to_ascii_uppercase()),
         )
         .collect();
-    analysis.syntax_diagnostics =
-        collect_syntax_diagnostics_at(Some(&uri), text, root, &known_names);
+    analysis.syntax_diagnostics = collect_syntax_diagnostics_at(
+        Some(&uri),
+        text,
+        root,
+        &known_names,
+        syntax_diagnostic_limit(limit),
+    );
     Some(analysis)
 }
 
 pub fn collect_syntax_diagnostics(source: &str, node: Node<'_>) -> Vec<Diagnostic> {
-    collect_syntax_diagnostics_at(None, source, node, &Default::default())
+    collect_syntax_diagnostics_at(
+        None,
+        source,
+        node,
+        &Default::default(),
+        DEFAULT_MAX_SYNTAX_DIAGNOSTICS,
+    )
 }
 
 /// Like [`collect_syntax_diagnostics`], but able to attach
 /// `relatedInformation` (which needs a document URI) when a clamped
-/// error span continues beyond its first line, and to suppress
+/// error span continues beyond its first line, to suppress
 /// keyword-typo hints for `known_names` (uppercased identifiers
-/// defined in the document).
+/// defined in the document), and to take the per-document cap.
+///
+/// `limit` is the resolved cap, so callers that accept the `0`-means-no-cap
+/// setting must pass it through [`syntax_diagnostic_limit`] first.
 pub fn collect_syntax_diagnostics_at(
     uri: Option<&Uri>,
     source: &str,
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
+    limit: usize,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    collect_node_diagnostics(uri, source, node, known_names, &mut diagnostics);
+    collect_node_diagnostics(uri, source, node, known_names, limit, &mut diagnostics);
     diagnostics
 }
 
@@ -777,20 +805,22 @@ fn infer_fields_from_statement(
 
     for assignment in descendants_of_kind(node, k::FIELD_ASSIGNMENT) {
         let children = k::named_children(assignment);
-        let Some(name) = children
-            .iter()
-            .find(|child| child.kind() == k::IDENT)
-            .and_then(|child| text_of(source, *child))
-        else {
+        let Some((name, target)) = field_assignment_target(assignment, source) else {
             continue;
         };
         // The right-hand side of `field = value` is the last named child
         // (the hidden `_value` rule means its children appear directly
-        // under the `FieldAssignment`).
+        // under the `FieldAssignment`). The target is excluded by identity,
+        // not by kind: once `FieldAssignment` takes an `Idiom`, `SET a = b.c`
+        // has an `Idiom` on both sides and a kind test would skip the value
+        // too. A bare `Ident` right-hand side stays excluded — it names
+        // another field rather than carrying a literal to type.
         let type_expr = children
             .iter()
             .rev()
-            .find(|child| !matches!(child.kind(), k::IDENT | k::OPERATOR))
+            .find(|child| {
+                child.id() != target.id() && !matches!(child.kind(), k::IDENT | k::OPERATOR)
+            })
             .map(|child| infer_type_from_value(*child, source));
 
         fields.push(inferred_field(
@@ -1205,18 +1235,35 @@ fn classify_unresolved_targets(relevant_nodes: &[Node<'_>]) -> TargetResolution 
     TargetResolution::Unresolved
 }
 
+/// The assigned-to side of a `FieldAssignment`, as `(dotted name, node)`.
+///
+/// Accepts both grammar shapes. The pinned grammar declares
+/// `FieldAssignment: seq($.Ident, …)`, so a nested target like
+/// `SET name.first = …` does not parse and the whole `.first` lands in an
+/// ERROR node. Once `FieldAssignment` takes an `Idiom`, the target arrives as
+/// one `Idiom` wrapping the dotted parts, and a plain `SET age = …` arrives as
+/// an `Idiom` around a single `Ident` rather than a bare `Ident`.
+///
+/// Reading both keeps this correct either side of that grammar bump.
+fn field_assignment_target<'tree>(
+    assignment: Node<'tree>,
+    source: &str,
+) -> Option<(String, Node<'tree>)> {
+    let target = k::named_children(assignment)
+        .into_iter()
+        .find(|child| matches!(child.kind(), k::IDIOM | k::PATH | k::IDENT))?;
+    k::dotted_name(source, target).map(|name| (name, target))
+}
+
 fn collect_field_refs(node: Node<'_>, source: &str) -> Vec<NamedRange> {
     let mut fields: Vec<NamedRange> = Vec::new();
     for assignment in descendants_of_kind(node, k::FIELD_ASSIGNMENT) {
-        if let Some((name, ident)) = k::named_children(assignment)
-            .into_iter()
-            .find(|child| child.kind() == k::IDENT)
-            .and_then(|child| text_of(source, child).map(|name| (name, child)))
+        if let Some((name, target)) = field_assignment_target(assignment, source)
             && !fields.iter().any(|existing| existing.name == name)
         {
             fields.push(NamedRange {
                 name,
-                range: byte_range_to_lsp(source, ident.start_byte(), ident.end_byte()),
+                range: byte_range_to_lsp(source, target.start_byte(), target.end_byte()),
             });
         }
     }
@@ -1271,7 +1318,7 @@ fn normalize_table_name(value: &str) -> Option<String> {
     }
 }
 
-fn identifier_from_on_table_clause(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn identifier_from_on_table_clause(node: Node<'_>, source: &str) -> Option<String> {
     // `on_table_clause(keyword_on, keyword_table?, identifier)`. The
     // table target is the first non-keyword child.
     k::named_children(node)
@@ -1398,19 +1445,40 @@ fn location(uri: &Uri, source: &str, node: Node<'_>) -> Location {
     )
 }
 
-/// Upper bound on syntax diagnostics per document. A pathological
+/// Default upper bound on syntax diagnostics per document. A pathological
 /// buffer (generated dumps, pasted binaries) shouldn't flood the
 /// editor's problems panel.
-const MAX_SYNTAX_DIAGNOSTICS: usize = 100;
+///
+/// This counts *diagnostics*, not lines: nothing here limits how long a
+/// document may be. It also covers the syntax pass only — `parse` and
+/// `unknown-type`. Semantic and type diagnostics are bounded by the query
+/// facts and definitions they are derived from, so they need no cap.
+///
+/// Overridable per client through `analysis.maxSyntaxDiagnostics`; raised from
+/// 100 in 0.5.3, because a large schema file mid-edit legitimately exceeds a
+/// hundred parse errors and the truncation read as "the server stopped working".
+pub const DEFAULT_MAX_SYNTAX_DIAGNOSTICS: usize = 2000;
+
+/// `0` in the setting means "report every one". Kept as a saturating sentinel
+/// rather than an `Option` so the comparison in the hot walk stays a plain
+/// integer test.
+pub fn syntax_diagnostic_limit(configured: usize) -> usize {
+    if configured == 0 {
+        usize::MAX
+    } else {
+        configured
+    }
+}
 
 fn collect_node_diagnostics(
     uri: Option<&Uri>,
     source: &str,
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
+    limit: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if diagnostics.len() >= MAX_SYNTAX_DIAGNOSTICS {
+    if diagnostics.len() >= limit {
         return;
     }
 
@@ -1431,6 +1499,7 @@ fn collect_node_diagnostics(
             node,
             known_names,
             node.start_position().row,
+            limit,
             diagnostics,
         );
         return;
@@ -1450,7 +1519,7 @@ fn collect_node_diagnostics(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_node_diagnostics(uri, source, child, known_names, diagnostics);
+        collect_node_diagnostics(uri, source, child, known_names, limit, diagnostics);
     }
 }
 
@@ -1492,12 +1561,22 @@ fn unknown_type_diagnostic(source: &str, node: Node<'_>) -> Option<Diagnostic> {
             None => format!("Unknown type `{name}`."),
         },
         // Structured payload for the quick fix, with the message text as the
-        // fallback for clients that strip non-standard fields.
-        data: Some(match suggestion {
-            Some(candidate) => {
-                serde_json::json!({ "type": name, "suggestion": candidate })
+        // fallback for clients that strip non-standard fields. `table` is
+        // additive and read only by the schemaless policy — `unknown_type_payload`
+        // in `model.rs` looks up `type`/`suggestion` by key and ignores it.
+        data: Some({
+            let mut payload = match suggestion {
+                Some(candidate) => {
+                    serde_json::json!({ "type": name, "suggestion": candidate })
+                }
+                None => serde_json::json!({ "type": name }),
+            };
+            if let Some(table) = enclosing_define_field_table(source, node)
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert("table".to_string(), serde_json::Value::String(table));
             }
-            None => serde_json::json!({ "type": name }),
+            payload
         }),
         ..Diagnostic::default()
     })
@@ -1573,6 +1652,34 @@ fn parse_failure_on_line(diagnostics: &[Diagnostic], node: Node<'_>) -> bool {
 /// [`collect_node_diagnostics`] returns at an `ERROR` node, but
 /// [`descend_into_error`] re-enters it for the *children* of one, so a node
 /// inside a failed region is still reachable from here.
+/// The table named by the `DEFINE FIELD` statement enclosing `node`, if any.
+///
+/// Recorded on the `unknown-type` diagnostic so the publish path can apply
+/// `analysis.schemalessDiagnostics` to it. This pass sees one document and has
+/// no merged model, so it can only state *which* table the diagnostic belongs
+/// to — [`crate::semantic::model::MergedSemanticModel::apply_schemaless_policy`]
+/// decides what that table's schema mode means.
+///
+/// `DefineStatement` is one node kind for every DEFINE form, so the form has to
+/// be checked too: without it a `DEFINE FUNCTION fn::f() -> xxx` would be
+/// attributed to whatever table happened to be nearby.
+fn enclosing_define_field_table(source: &str, node: Node<'_>) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == k::DEFINE_STATEMENT {
+            if define_form(ancestor, source).as_deref() != Some("field") {
+                return None;
+            }
+            return k::named_children(ancestor)
+                .into_iter()
+                .find(|child| child.kind() == k::ON_TABLE_CLAUSE)
+                .and_then(|clause| identifier_from_on_table_clause(clause, source));
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
 fn has_error_ancestor(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
@@ -1595,11 +1702,12 @@ fn descend_into_error(
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
     reported_row: usize,
+    limit: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if diagnostics.len() >= MAX_SYNTAX_DIAGNOSTICS {
+        if diagnostics.len() >= limit {
             return;
         }
         if child.is_missing() {
@@ -1608,7 +1716,15 @@ fn descend_into_error(
         }
         if child.is_error() {
             if child.start_position().row == reported_row {
-                descend_into_error(uri, source, child, known_names, reported_row, diagnostics);
+                descend_into_error(
+                    uri,
+                    source,
+                    child,
+                    known_names,
+                    reported_row,
+                    limit,
+                    diagnostics,
+                );
             } else {
                 diagnostics.push(error_node_diagnostic(uri, source, child, known_names));
                 descend_into_error(
@@ -1617,12 +1733,13 @@ fn descend_into_error(
                     child,
                     known_names,
                     child.start_position().row,
+                    limit,
                     diagnostics,
                 );
             }
             continue;
         }
-        collect_node_diagnostics(uri, source, child, known_names, diagnostics);
+        collect_node_diagnostics(uri, source, child, known_names, limit, diagnostics);
     }
 }
 

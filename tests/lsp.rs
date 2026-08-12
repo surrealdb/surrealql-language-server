@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use surrealql_language_server::config::{AuthContext, ServerSettings};
-use surrealql_language_server::semantic::analyzer::analyze_document;
+use surrealql_language_server::semantic::analyzer::{
+    DEFAULT_MAX_SYNTAX_DIAGNOSTICS, analyze_document, analyze_document_with_limit,
+};
 use surrealql_language_server::semantic::model::{
     function_signature, is_record_type_context, param_label,
 };
@@ -342,12 +344,77 @@ fn pathological_input_caps_syntax_diagnostics() {
     let u = uri("pathological.surql");
     // Hundreds of broken statements — the cap keeps the problems
     // panel usable instead of publishing thousands of entries.
-    let text = "@@@ ;\n".repeat(500);
+    let text = "@@@ ;\n".repeat(5000);
     let analysis = analyze_document(u, &text, SymbolOrigin::Local).expect("analysis");
     assert!(
-        analysis.syntax_diagnostics.len() <= 100,
-        "syntax diagnostics must be capped at 100, got {}",
+        analysis.syntax_diagnostics.len() <= DEFAULT_MAX_SYNTAX_DIAGNOSTICS,
+        "syntax diagnostics must be capped at the default, got {}",
         analysis.syntax_diagnostics.len()
+    );
+}
+
+/// The cap counts diagnostics, not lines, and 100 was low enough that a large
+/// schema file mid-edit hit it and looked like the server had given up.
+#[test]
+fn the_default_cap_is_well_past_the_old_hundred() {
+    let text = "@@@ ;\n".repeat(500);
+    let analysis =
+        analyze_document(uri("many.surql"), &text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.len() > 100,
+        "the old cap of 100 must no longer bind, got {}",
+        analysis.syntax_diagnostics.len()
+    );
+}
+
+#[test]
+fn the_cap_is_configurable() {
+    let text = "@@@ ;\n".repeat(500);
+    let analysis = analyze_document_with_limit(uri("capped.surql"), &text, SymbolOrigin::Local, 7)
+        .expect("analysis");
+    assert_eq!(analysis.syntax_diagnostics.len(), 7);
+}
+
+/// `0` is the documented "report every one" value.
+#[test]
+fn a_zero_cap_reports_every_diagnostic() {
+    let text = "@@@ ;\n".repeat(500);
+    let capped = analyze_document_with_limit(uri("c.surql"), &text, SymbolOrigin::Local, 50)
+        .expect("analysis");
+    let uncapped = analyze_document_with_limit(uri("u.surql"), &text, SymbolOrigin::Local, 0)
+        .expect("analysis");
+    assert_eq!(capped.syntax_diagnostics.len(), 50);
+    assert!(
+        uncapped.syntax_diagnostics.len() > capped.syntax_diagnostics.len(),
+        "0 must not cap: got {}",
+        uncapped.syntax_diagnostics.len()
+    );
+}
+
+/// Nothing anywhere limits document *length* — a long but valid file is
+/// analyzed in full however many lines it has.
+///
+/// Kept to a few hundred statements deliberately: `analyze_document` is
+/// quadratic in document length (`offset_to_position` rescans from byte 0 for
+/// every range), so a few thousand statements turns this into a multi-second
+/// test rather than a correctness one.
+#[test]
+fn a_long_clean_document_is_fully_analyzed() {
+    let text = (0..300)
+        .map(|index| format!("DEFINE FIELD f{index} ON person TYPE string;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let analysis =
+        analyze_document(uri("long.surql"), &text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "a long valid document must produce no syntax diagnostics: {:?}",
+        &analysis.syntax_diagnostics[..analysis.syntax_diagnostics.len().min(3)]
+    );
+    assert_eq!(
+        analysis.fields.len(),
+        300,
+        "every field must be extracted regardless of document length"
     );
 }
 
@@ -2155,12 +2222,42 @@ fn adversarial_fixture_resolves_select_targets() {
 /// Analyze `source`, build a one-document model, and return its semantic
 /// diagnostics.
 fn diagnostics_for(source: &str) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+    diagnostics_for_with(source, &ServerSettings::default())
+}
+
+/// Like [`diagnostics_for`], but under caller-chosen settings, and covering the
+/// syntax pass as well so `unknown-type` is visible. Mirrors what
+/// `diagnostics_for_document` assembles in `src/core/server.rs`, which is the
+/// only place the schemaless filter runs in the real server.
+fn diagnostics_for_with(
+    source: &str,
+    settings: &ServerSettings,
+) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
     let analysis =
         analyze_document(uri("check.surql"), source, SymbolOrigin::Local).expect("analysis");
     let workspace = workspace_from(vec![analysis.clone()]);
     let model = MergedSemanticModel::build(&workspace, &Default::default());
-    model.semantic_diagnostics(&analysis, &ServerSettings::default())
+    let mut diagnostics = analysis.syntax_diagnostics.clone();
+    diagnostics.extend(model.semantic_diagnostics(&analysis, settings));
+    model.apply_schemaless_policy(&mut diagnostics, settings);
+    diagnostics
 }
+
+fn settings_with_schemaless(mode: &str) -> ServerSettings {
+    let mut settings = ServerSettings::default();
+    settings.analysis.schemaless_diagnostics = mode.to_string();
+    settings
+}
+
+/// One SCHEMALESS table carrying every fault the policy governs: an ad-hoc
+/// field (`unknown-field`), a `DEFAULT` that cannot coerce (`field-type`), a
+/// type name the parser rejects (`unknown-type`), and a write with no
+/// permission rule (`permission-unknown`).
+const SCHEMALESS_FAULTS: &str = "DEFINE TABLE person SCHEMALESS;\n\
+     DEFINE FIELD name ON person TYPE string;\n\
+     DEFINE FIELD age ON person TYPE int DEFAULT \"not a number\";\n\
+     DEFINE FIELD tag ON person TYPE strng;\n\
+     CREATE person SET name = \"bob\", nickname = \"b\";";
 
 fn codes_of(diagnostics: &[tower_lsp_server::ls_types::Diagnostic]) -> Vec<String> {
     diagnostics
@@ -5152,4 +5249,205 @@ fn a_wrong_engine_declaration_is_corrected() {
         inferred_type_of("LET $h = crypto::sha256('tobie');", "$h"),
         "string"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// analysis.schemalessDiagnostics
+// ──────────────────────────────────────────────────────────────────────
+
+/// The default. A declared SCHEMALESS table is a statement that the author
+/// does not want the schema policed, so none of the scoped codes report.
+#[test]
+fn quiet_reports_nothing_on_a_schemaless_table() {
+    let codes = codes_of(&diagnostics_for_with(
+        SCHEMALESS_FAULTS,
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(
+        codes.is_empty(),
+        "`quiet` must silence every scoped code: {codes:?}"
+    );
+}
+
+/// The middle setting keeps the two faults the engine itself raises: it
+/// coerces DEFAULT to the declared type, and it refuses to parse an unknown
+/// type name at all.
+#[test]
+fn errors_keeps_only_the_faults_the_engine_raises() {
+    let codes = codes_of(&diagnostics_for_with(
+        SCHEMALESS_FAULTS,
+        &settings_with_schemaless("errors"),
+    ));
+    assert!(codes.contains(&"field-type".to_string()), "{codes:?}");
+    assert!(codes.contains(&"unknown-type".to_string()), "{codes:?}");
+    assert!(!codes.contains(&"unknown-field".to_string()), "{codes:?}");
+    assert!(
+        !codes.contains(&"permission-unknown".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// The opt-in: a SCHEMALESS table is checked exactly as a SCHEMAFULL one is,
+/// down to the same set of codes.
+#[test]
+fn strict_treats_a_schemaless_table_like_a_schemafull_one() {
+    let mut schemaless = codes_of(&diagnostics_for_with(
+        SCHEMALESS_FAULTS,
+        &settings_with_schemaless("strict"),
+    ));
+    let mut schemafull = codes_of(&diagnostics_for_with(
+        &SCHEMALESS_FAULTS.replace("SCHEMALESS", "SCHEMAFULL"),
+        &settings_with_schemaless("strict"),
+    ));
+    schemaless.sort();
+    schemafull.sort();
+    assert_eq!(schemaless, schemafull);
+    assert!(
+        schemaless.contains(&"unknown-field".to_string()),
+        "{schemaless:?}"
+    );
+    assert!(
+        schemaless.contains(&"permission-unknown".to_string()),
+        "{schemaless:?}"
+    );
+}
+
+/// The setting must not leak onto a closed schema: SCHEMAFULL keeps every
+/// diagnostic under every value, including the quiet default.
+#[test]
+fn a_schemafull_table_is_unaffected_by_the_setting() {
+    let source = SCHEMALESS_FAULTS.replace("SCHEMALESS", "SCHEMAFULL");
+    for mode in ["quiet", "errors", "strict"] {
+        let codes = codes_of(&diagnostics_for_with(
+            &source,
+            &settings_with_schemaless(mode),
+        ));
+        for expected in [
+            "unknown-field",
+            "field-type",
+            "unknown-type",
+            "permission-unknown",
+        ] {
+            assert!(
+                codes.contains(&expected.to_string()),
+                "SCHEMAFULL must keep `{expected}` under `{mode}`: {codes:?}"
+            );
+        }
+    }
+}
+
+/// The policy is keyed on the keyword, not on SurrealDB's effective schema
+/// mode. A bare `DEFINE TABLE` is schemaless to the engine but carries no
+/// declaration, so it keeps the behaviour it had before this setting existed.
+#[test]
+fn a_bare_define_table_is_not_treated_as_schemaless() {
+    let source = SCHEMALESS_FAULTS.replace(" SCHEMALESS", "");
+    let codes = codes_of(&diagnostics_for_with(
+        &source,
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(codes.contains(&"field-type".to_string()), "{codes:?}");
+    assert!(codes.contains(&"unknown-type".to_string()), "{codes:?}");
+    assert!(
+        codes.contains(&"permission-unknown".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// An `unknown-type` outside a DEFINE FIELD belongs to no table, so no schema
+/// mode can hide it however quiet the setting is.
+#[test]
+fn a_tableless_unknown_type_is_never_hidden() {
+    let codes = codes_of(&diagnostics_for_with(
+        "DEFINE TABLE person SCHEMALESS;\nLET $a: strng = 1;",
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(codes.contains(&"unknown-type".to_string()), "{codes:?}");
+}
+
+/// A DEFINE FIELD on a table with no DEFINE TABLE has no known schema mode,
+/// so nothing may be hidden on the strength of one.
+#[test]
+fn an_undeclared_table_hides_nothing() {
+    let codes = codes_of(&diagnostics_for_with(
+        "DEFINE FIELD age ON person TYPE int DEFAULT \"not a number\";",
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(codes.contains(&"field-type".to_string()), "{codes:?}");
+}
+
+/// `enablePermissionAnalysis` was accepted but never read before this change.
+#[test]
+fn disabling_permission_analysis_removes_permission_diagnostics() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\nCREATE person SET id = 1;";
+    let mut settings = ServerSettings::default();
+    assert!(
+        codes_of(&diagnostics_for_with(source, &settings))
+            .contains(&"permission-unknown".to_string()),
+        "the flag defaults to on"
+    );
+
+    settings.analysis.enable_permission_analysis = false;
+    let codes = codes_of(&diagnostics_for_with(source, &settings));
+    assert!(
+        !codes.contains(&"permission-unknown".to_string()),
+        "{codes:?}"
+    );
+    assert!(
+        !codes.contains(&"permission-denied".to_string()),
+        "{codes:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Nested `SET` targets (`SET name.first = …`)
+// ──────────────────────────────────────────────────────────────────────
+
+/// `FieldAssignment` at the pinned grammar revision takes a single `Ident`, so
+/// a nested target does not parse — see `docs/grammar-gaps.md`. The analyzer
+/// reads both shapes, so this test asserts the outcome for whichever grammar
+/// it is built against, and starts enforcing the fixed behaviour by itself the
+/// moment the pin moves.
+#[test]
+fn a_nested_set_target_is_extracted_whole_once_the_grammar_parses_it() {
+    let source = "UPDATE person SET name.first = 'Jane';";
+    let analysis =
+        analyze_document(uri("nested.surql"), source, SymbolOrigin::Local).expect("analysis");
+
+    if !analysis.syntax_diagnostics.is_empty() {
+        // Pinned grammar: the known gap. Pin the shape of the gap itself so
+        // this cannot quietly become a different failure.
+        assert!(
+            analysis
+                .syntax_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(".first")),
+            "the only expected parse failure here is the nested target: {:?}",
+            analysis.syntax_diagnostics
+        );
+        return;
+    }
+
+    let touched = &analysis.query_facts[0].touched_fields;
+    assert!(
+        touched.contains(&"name.first".to_string()),
+        "the target must be kept whole, not truncated to `name`: {touched:?}"
+    );
+}
+
+/// A plain single-identifier target must keep working under both grammars —
+/// the fixed one wraps it in an `Idiom`, which must not change what is read.
+#[test]
+fn a_plain_set_target_is_unaffected_by_the_target_shape() {
+    let source = "UPDATE person SET age = 29;";
+    let analysis =
+        analyze_document(uri("plain.surql"), source, SymbolOrigin::Local).expect("analysis");
+
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "{source} must parse"
+    );
+    assert_eq!(analysis.query_facts[0].touched_fields, vec!["age"]);
+    assert_eq!(analysis.fields.len(), 1);
+    assert_eq!(analysis.fields[0].name, "age");
 }

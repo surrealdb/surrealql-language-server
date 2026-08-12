@@ -7,7 +7,7 @@ mod common;
 use common::{core_with, uri};
 use serde_json::json;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionParams, CompletionResponse, DiagnosticSeverity,
+    CompletionItem, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
     DidChangeConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     InitializeParams, MessageType, NumberOrString, Position, TextDocumentIdentifier,
     TextDocumentItem, TextDocumentPositionParams,
@@ -1565,5 +1565,84 @@ async fn a_curated_function_keeps_its_prose() {
             .count(),
         1,
         "and is offered exactly once"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// analysis.maxSyntaxDiagnostics
+// ──────────────────────────────────────────────────────────────────────
+
+fn syntax_diagnostic_count(diagnostics: &[Diagnostic]) -> usize {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == Some(NumberOrString::String("parse".to_string())))
+        .count()
+}
+
+/// A document with far more than a hundred parse errors used to publish
+/// exactly 100 and stop, which read as the server having given up.
+#[tokio::test]
+async fn a_document_past_the_old_cap_publishes_past_a_hundred() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(&core, "many.surql", &"@@@ ;\n".repeat(500)).await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("many.surql"))
+        .expect("published");
+    assert!(
+        syntax_diagnostic_count(&diagnostics) > 100,
+        "got {}",
+        syntax_diagnostic_count(&diagnostics)
+    );
+}
+
+#[tokio::test]
+async fn the_syntax_cap_is_configurable() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: json!({ "surrealql": { "analysis": { "maxSyntaxDiagnostics": 5 } } }),
+    })
+    .await;
+
+    open(&core, "capped.surql", &"@@@ ;\n".repeat(500)).await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("capped.surql"))
+        .expect("published");
+    assert_eq!(syntax_diagnostic_count(&diagnostics), 5, "{diagnostics:?}");
+}
+
+/// The cap is applied while the tree is walked, so a document analyzed under
+/// the old value has to be re-analyzed when the value moves. Without that,
+/// raising the cap appears to do nothing until the buffer is edited.
+#[tokio::test]
+async fn raising_the_cap_reanalyzes_already_open_documents() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: json!({ "surrealql": { "analysis": { "maxSyntaxDiagnostics": 5 } } }),
+    })
+    .await;
+    open(&core, "grow.surql", &"@@@ ;\n".repeat(500)).await;
+    assert_eq!(
+        syntax_diagnostic_count(
+            &notifier
+                .last_published_for(&uri("grow.surql"))
+                .expect("published")
+        ),
+        5
+    );
+
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: json!({ "surrealql": { "analysis": { "maxSyntaxDiagnostics": 60 } } }),
+    })
+    .await;
+
+    let diagnostics = notifier
+        .last_published_for(&uri("grow.surql"))
+        .expect("published");
+    assert_eq!(
+        syntax_diagnostic_count(&diagnostics),
+        60,
+        "the open buffer must be re-analyzed under the new cap: {diagnostics:?}"
     );
 }

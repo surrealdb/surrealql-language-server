@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`analysis.schemalessDiagnostics`** decides which diagnostics apply to
+  a table declared `SCHEMALESS`. Three values:
+  - `quiet` (**default**) — report none of `unknown-field`, `field-type`,
+    `unknown-type`, `permission-denied`, `permission-unknown` on such a
+    table.
+  - `errors` — report only the two the engine itself raises. It coerces
+    `DEFAULT`/`VALUE`/`COMPUTED` to the declared type regardless of schema
+    mode (`field-type`), and it refuses to parse an unknown type name at
+    all (`unknown-type`). The advisory three stay quiet.
+  - `strict` — no exemption; a `SCHEMALESS` table is checked exactly as a
+    `SCHEMAFULL` one.
+
+  An unrecognized value repairs to `quiet` with a `window/logMessage`
+  warning, as `metadata.mode` already does.
+
+- **`analysis.maxSyntaxDiagnostics`** overrides the per-document cap on
+  `parse` / `unknown-type` diagnostics. `0` reports every one. Changing it
+  re-analyzes the open documents, so a raised cap takes effect without
+  touching each buffer.
+
+  Keyed on the **keyword**, not on the engine's effective schema mode. A
+  bare `DEFINE TABLE t` is schemaless to SurrealDB but declares nothing,
+  so it keeps exactly the diagnostics it had before this setting existed.
+  Writing `SCHEMALESS` is the signal; omitting the clause is not.
+
+### Changed
+
+- **A nested `SET` target is read whole.** `field_assignment_target` in
+  `src/semantic/analyzer.rs` now accepts either grammar shape for the
+  assigned-to side of a `FieldAssignment` — an `Ident` (pinned grammar
+  revision) or an `Idiom` (once `FieldAssignment` takes one).
+
+  No behavior change at the pinned revision, where `CREATE person SET
+  name.first = 'John'` still reports ``Invalid SurrealQL syntax near
+  `.first`.`` — the grammar's `FieldAssignment` takes a single `Ident`,
+  so the `.first` lands in an `ERROR` node. The fix for that is one token
+  in `surrealql-tree-sitter`'s `grammar.js` (`$.Ident` → `$.Idiom`) and
+  the pin bump that follows; this change is what lets the pin move
+  without a matching code change. Recorded in `docs/grammar-gaps.md`.
+
+- **`SCHEMALESS` tables are quiet by default.** Before this release the
+  only schema-mode rule was that `unknown-field` fired solely on
+  `SCHEMAFULL` tables; `field-type`, `unknown-type` and the two permission
+  codes ignored schema mode entirely. Under the new `quiet` default all
+  five stand down on a declared `SCHEMALESS` table. *(Behavior change. Set
+  `analysis.schemalessDiagnostics` to `errors` to keep the two faults the
+  engine raises, or to `strict` for the pre-0.5.3 behavior.)*
+- **The syntax-diagnostic cap is 2000, was 100.** The cap counts
+  diagnostics per document, not lines — nothing limits document length.
+  100 was low enough that a large schema file mid-edit hit it and read as
+  the server having given up. *(Behavior change: a document with more than
+  100 parse errors now publishes up to 2000. Set
+  `analysis.maxSyntaxDiagnostics` to `100` for the old value.)*
+- **`analysis.enablePermissionAnalysis` is honored.** It was parsed,
+  defaulted, alias-mapped and asserted in tests, but no code ever read it
+  — setting it to `false` did nothing. It now suppresses
+  `permission-denied` and `permission-unknown` on every table.
+  *(Behavior change for anyone who set it `false` and worked around its
+  having no effect.)* Recorded as a defect in `docs/pain-points.md`.
+
+### Compatibility
+
+- LSP wire: no new or renamed diagnostic codes. `unknown-type`
+  diagnostics gain an additive `data.table` key naming the `DEFINE FIELD`
+  target they belong to; `data.type` and `data.suggestion` are unchanged,
+  so the existing quick fix is unaffected.
+- `analysis.schemalessDiagnostics` and `analysis.maxSyntaxDiagnostics`
+  accept both `camelCase` and `snake_case`, like every other setting.
+- Rust API: `collect_syntax_diagnostics_at` takes a trailing `limit`
+  argument, and `analyze_document_with_limit` is new.
+  `analyze_document` and `collect_syntax_diagnostics` are unchanged and
+  use the default cap.
+
 ## 0.5.0 — unreleased
 
 Engine-parity release. Two things the server claimed to do but did not:

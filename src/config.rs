@@ -91,6 +91,40 @@ pub struct AnalysisSettings {
     /// the inference engine is unsure about stays silent.
     #[serde(default = "default_true", alias = "enable_type_checking")]
     pub enable_type_checking: bool,
+    /// Which diagnostics apply to a table declared `SCHEMALESS`. Such a
+    /// table legitimately accepts ad-hoc fields, so the strict checks
+    /// that fit a `SCHEMAFULL` table are noise there.
+    ///
+    /// - `quiet` (default) — report none of [`SCHEMALESS_SCOPED_CODES`].
+    /// - `errors` — report only the two the engine itself rejects
+    ///   (`field-type`, `unknown-type`); stay quiet about the advisory
+    ///   ones (`unknown-field`, `permission-denied`, `permission-unknown`).
+    /// - `strict` — no exemption at all; treat `SCHEMALESS` exactly like
+    ///   `SCHEMAFULL`.
+    ///
+    /// Only a table that carries the keyword is covered. A bare `DEFINE
+    /// TABLE t` is schemaless to the engine but leaves `schema_mode`
+    /// unset, so it keeps the diagnostics it had before this setting
+    /// existed — see
+    /// [`crate::semantic::model::MergedSemanticModel::schemaless_hides`].
+    #[serde(
+        default = "default_schemaless_diagnostics",
+        alias = "schemaless_diagnostics"
+    )]
+    pub schemaless_diagnostics: String,
+    /// Upper bound on **syntax** diagnostics (`parse`, `unknown-type`) per
+    /// document, so a pathological buffer cannot flood the problems panel.
+    /// `0` reports every one.
+    ///
+    /// This counts diagnostics, not lines — no setting here limits how long a
+    /// document may be. Semantic and type diagnostics are uncapped: they are
+    /// derived from the query facts and definitions in the file, so their
+    /// count is already bounded by the code itself.
+    #[serde(
+        default = "default_max_syntax_diagnostics",
+        alias = "max_syntax_diagnostics"
+    )]
+    pub max_syntax_diagnostics: usize,
     /// Variable names the *caller* binds at runtime, without a `$` sigil —
     /// e.g. `["id", "limit"]` for a script run as
     /// `db.query(sql).bind(("id", id))`, or the names in Surrealist's
@@ -148,6 +182,8 @@ impl Default for AnalysisSettings {
             enable_aggressive_schema_inference: true,
             enable_code_actions: true,
             enable_type_checking: true,
+            schemaless_diagnostics: default_schemaless_diagnostics(),
+            max_syntax_diagnostics: default_max_syntax_diagnostics(),
             external_params: Vec::new(),
         }
     }
@@ -177,6 +213,12 @@ pub const ACCEPTED_METADATA_MODES: &[&str] = &[
     "db",
     "remote",
 ];
+
+/// The `analysis.schemalessDiagnostics` strings the server understands.
+/// Same treatment as [`ACCEPTED_METADATA_MODES`]: an unknown value is
+/// repaired to the default with a warning rather than silently picking
+/// one of the three behaviors.
+pub const ACCEPTED_SCHEMALESS_DIAGNOSTICS: &[&str] = &["quiet", "errors", "strict"];
 
 impl ServerSettings {
     pub fn from_sources(
@@ -262,6 +304,16 @@ impl ServerSettings {
                 ACCEPTED_METADATA_MODES.join(", "),
             ));
             self.metadata.mode = default_metadata_mode();
+        }
+
+        if !ACCEPTED_SCHEMALESS_DIAGNOSTICS.contains(&self.analysis.schemaless_diagnostics.as_str())
+        {
+            warnings.push(format!(
+                "unknown analysis.schemalessDiagnostics `{}` was ignored (accepted values: {})",
+                self.analysis.schemaless_diagnostics,
+                ACCEPTED_SCHEMALESS_DIAGNOSTICS.join(", "),
+            ));
+            self.analysis.schemaless_diagnostics = default_schemaless_diagnostics();
         }
 
         if let Some(active) = &self.active_auth_context {
@@ -408,6 +460,10 @@ const ANALYSIS_KEYS: &[&str] = &[
     "enable_code_actions",
     "enableTypeChecking",
     "enable_type_checking",
+    "schemalessDiagnostics",
+    "schemaless_diagnostics",
+    "maxSyntaxDiagnostics",
+    "max_syntax_diagnostics",
     "externalParams",
     "external_params",
 ];
@@ -502,6 +558,14 @@ fn default_metadata_mode() -> String {
     "workspace+db".to_string()
 }
 
+fn default_schemaless_diagnostics() -> String {
+    "quiet".to_string()
+}
+
+fn default_max_syntax_diagnostics() -> usize {
+    crate::semantic::analyzer::DEFAULT_MAX_SYNTAX_DIAGNOSTICS
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -562,6 +626,45 @@ mod tests {
             Some("user:admin")
         );
         assert_eq!(settings.active_auth_context.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn reads_schemaless_diagnostics_in_both_casings() {
+        for key in ["schemalessDiagnostics", "schemaless_diagnostics"] {
+            let value = json!({ "surrealql": { "analysis": { key: "strict" } } });
+            let (settings, warnings) =
+                ServerSettings::from_sources_with_warnings(Some(&value), None);
+            assert_eq!(settings.analysis.schemaless_diagnostics, "strict", "{key}");
+            assert_eq!(warnings, Vec::<String>::new(), "{key}");
+        }
+    }
+
+    #[test]
+    fn reads_max_syntax_diagnostics_in_both_casings() {
+        for key in ["maxSyntaxDiagnostics", "max_syntax_diagnostics"] {
+            let value = json!({ "surrealql": { "analysis": { key: 250 } } });
+            let (settings, warnings) =
+                ServerSettings::from_sources_with_warnings(Some(&value), None);
+            assert_eq!(settings.analysis.max_syntax_diagnostics, 250, "{key}");
+            assert_eq!(warnings, Vec::<String>::new(), "{key}");
+        }
+    }
+
+    #[test]
+    fn unknown_schemaless_diagnostics_repairs_to_the_default() {
+        let value = json!({ "surrealql": { "analysis": { "schemalessDiagnostics": "loud" } } });
+        let (settings, warnings) = ServerSettings::from_sources_with_warnings(Some(&value), None);
+        assert_eq!(
+            settings.analysis.schemaless_diagnostics, "quiet",
+            "an unknown value must not select a behavior"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("`loud`")
+                    && warning.contains("schemalessDiagnostics")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

@@ -1224,7 +1224,7 @@ pub fn type_diagnostics(
     let root = analysis.tree.root_node();
     check_calls(root, &ctx, &mut diagnostics);
     check_let_annotations(root, &ctx, &mut diagnostics);
-    check_field_clauses(root, &ctx, &mut diagnostics);
+    check_field_clauses(root, &ctx, settings, &mut diagnostics);
     check_function_returns(root, &ctx, &mut diagnostics);
     check_variables(root, &ctx, settings, &mut diagnostics);
     check_binary_expressions(root, &ctx, &mut diagnostics);
@@ -1720,24 +1720,58 @@ fn check_let_annotations(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagno
 /// where a `decimal` is declared. That is a false positive on seven lines of
 /// `tests/fixtures/adversarial.surql` alone. `PERMISSIONS` is a predicate too,
 /// for the same reason.
-fn check_field_clauses(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+fn check_field_clauses(
+    node: Node<'_>,
+    ctx: &TypeCtx<'_>,
+    settings: &ServerSettings,
+    out: &mut Vec<Diagnostic>,
+) {
     if node.kind() == k::DEFINE_STATEMENT
         && crate::semantic::analyzer::define_form(node, ctx.source).as_deref() == Some("field")
     {
-        check_one_field(node, ctx, out);
+        check_one_field(node, ctx, settings, out);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        check_field_clauses(child, ctx, out);
+        check_field_clauses(child, ctx, settings, out);
     }
 }
 
-fn check_one_field(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+/// The table a `DEFINE FIELD` statement targets, when it names one statically.
+///
+/// `None` means "do not apply any table-scoped policy": either there is no
+/// `ON` clause at all, or it does not resolve to a plain name. Note this is
+/// *not* the fallback `extract_field` uses — that records the literal string
+/// `"unknown"` so the field still lands somewhere in the model.
+fn define_field_target(node: Node<'_>, source: &str) -> Option<String> {
+    k::named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == k::ON_TABLE_CLAUSE)
+        .and_then(|clause| {
+            crate::semantic::analyzer::identifier_from_on_table_clause(clause, source)
+        })
+}
+
+fn check_one_field(
+    node: Node<'_>,
+    ctx: &TypeCtx<'_>,
+    settings: &ServerSettings,
+    out: &mut Vec<Diagnostic>,
+) {
     // Guarded on the WHOLE statement rather than on the payload: the pinned
     // grammar cannot read `array<number, 2>`, and SurrealDB's own corpus pairs
     // that type with a perfectly clean `DEFAULT`. A payload-scoped guard would
     // miss it and then compare against a half-read type.
     if contains_parse_error(node) {
+        return;
+    }
+    // Before the clause loop, so it covers the whole-value verdict and the
+    // per-element walk alike.
+    if let Some(table) = define_field_target(node, ctx.source)
+        && ctx
+            .model
+            .schemaless_hides(&table, codes::FIELD_TYPE, settings)
+    {
         return;
     }
     let children = k::named_children(node);
