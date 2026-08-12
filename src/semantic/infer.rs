@@ -1668,7 +1668,7 @@ fn nearest_in_scope(name: &str, at: usize, ctx: &TypeCtx<'_>) -> Option<String> 
             let score = jaro_winkler(name, &candidate);
             (candidate, score)
         })
-        .filter(|(_, score)| *score > 0.86)
+        .filter(|(_, score)| *score > crate::semantic::model::NEAR_MISS_THRESHOLD)
         .max_by(|left, right| {
             left.1
                 .partial_cmp(&right.1)

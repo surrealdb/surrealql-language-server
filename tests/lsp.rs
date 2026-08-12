@@ -1010,19 +1010,16 @@ fn completion_includes_keywords_and_builtins() {
 #[test]
 fn completion_in_record_type_context_shows_only_tables() {
     let mut model = MergedSemanticModel::default();
-    model.tables.insert(
-        "person".to_string(),
-        TableDef {
-            name: "person".to_string(),
-            schema_mode: Some("schemafull".to_string()),
-            comment: None,
-            permissions: Vec::new(),
-            origin: SymbolOrigin::Local,
-            explicit: true,
-            inference: None,
-            location: empty_location("schema.surql"),
-        },
-    );
+    model.insert_table(TableDef {
+        name: "person".to_string(),
+        schema_mode: Some("schemafull".to_string()),
+        comment: None,
+        permissions: Vec::new(),
+        origin: SymbolOrigin::Local,
+        explicit: true,
+        inference: None,
+        location: empty_location("schema.surql"),
+    });
     let items = model.completion_items("per", true, None, None, None);
     assert!(items.iter().any(|i| i.label == "person"));
     // Keywords should not appear in record type context
@@ -1082,7 +1079,7 @@ fn no_diagnostics_for_allowed_permission() {
         location: empty_location("schema.surql"),
     };
     let mut model = MergedSemanticModel::default();
-    model.tables.insert("thing".to_string(), table);
+    model.insert_table(table);
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
@@ -1137,7 +1134,7 @@ fn error_diagnostic_for_denied_permission() {
         location: empty_location("schema.surql"),
     };
     let mut model = MergedSemanticModel::default();
-    model.tables.insert("secret".to_string(), table);
+    model.insert_table(table);
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
@@ -1271,7 +1268,7 @@ fn role_based_permission_allowed_for_matching_context() {
         location: empty_location("schema.surql"),
     };
     let mut model = MergedSemanticModel::default();
-    model.tables.insert("orders".to_string(), table);
+    model.insert_table(table);
     let analysis = DocumentAnalysis {
         uri: u,
         text: String::new(),

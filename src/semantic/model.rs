@@ -273,6 +273,33 @@ impl MergedSemanticModel {
         }
     }
 
+    /// Insert or merge one table, keeping
+    /// [`MergedSemanticModel::explicit_tables`] in step. This is the only
+    /// correct way to add a table to the model.
+    ///
+    /// A table's `explicit` flag only ever moves inferred → explicit — an
+    /// explicit definition replaces an inferred one but never the reverse, see
+    /// [`should_replace_table`] — so a name is appended at most once and never
+    /// has to be removed.
+    pub fn insert_table(&mut self, table: TableDef) {
+        let replace = self
+            .tables
+            .get(&table.name)
+            .map(|current| should_replace_table(current, &table))
+            .unwrap_or(true);
+        if !replace {
+            return;
+        }
+        let was_explicit = self
+            .tables
+            .get(&table.name)
+            .is_some_and(|current| current.explicit);
+        if table.explicit && !was_explicit {
+            self.explicit_tables.push(table.name.clone());
+        }
+        self.tables.insert(table.name.clone(), table);
+    }
+
     /// Recount [`MergedSemanticModel::target_usage`] from
     /// [`MergedSemanticModel::query_facts`]. One pass over the facts, run once
     /// per build rather than once per inferred target.
@@ -335,8 +362,9 @@ impl MergedSemanticModel {
     pub fn find_nearest_table(&self, unknown: &str) -> Option<&TableDef> {
         self.tables
             .values()
+            .filter(|table| can_reach_near_miss_threshold(unknown, &table.name))
             .map(|table| (table, jaro_winkler(unknown, &table.name)))
-            .filter(|(_, score)| *score > 0.86)
+            .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
             .max_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
@@ -558,18 +586,23 @@ impl MergedSemanticModel {
     /// tables qualify as "did you mean" candidates — suggesting an
     /// inferred name would just echo another usage site back.
     fn find_nearest_explicit_table(&self, unknown: &str) -> Option<&TableDef> {
-        self.tables
-            .values()
-            .filter(|table| table.explicit && table.name != unknown)
-            .filter(|table| lengths_can_reach_threshold(unknown, &table.name))
-            .map(|table| (table, jaro_winkler(unknown, &table.name)))
-            .filter(|(_, score)| *score > 0.86)
+        // Over `explicit_tables`, not `tables.values()`. The candidates are a
+        // contiguous run of names; the alternative walked every inferred table
+        // in the workspace to discard it on the next line.
+        let best = self
+            .explicit_tables
+            .iter()
+            .filter(|name| name.as_str() != unknown)
+            .filter(|name| can_reach_near_miss_threshold(unknown, name))
+            .map(|name| (name, jaro_winkler(unknown, name)))
+            .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
             .max_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(table, _)| table)
+            .map(|(name, _)| name)?;
+        self.tables.get(best)
     }
 
     /// Like [`Self::find_nearest_explicit_table`], but restricted to
@@ -593,13 +626,21 @@ impl MergedSemanticModel {
     /// Nearest explicitly defined field on `table` — the unknown-field
     /// "did you mean" candidate.
     fn find_nearest_explicit_field(&self, table: &str, unknown: &str) -> Option<&FieldDef> {
-        self.fields
+        // Via `fields_by_table` rather than a filter over every field in the
+        // workspace — the same reason `fields_for_table` uses it.
+        let names = self
+            .fields_by_table
+            .get(table)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        names
             .iter()
-            .filter(|((field_table, _), field)| {
-                field_table == table && field.explicit && field.name != unknown
-            })
-            .map(|(_, field)| (field, jaro_winkler(unknown, &field.name)))
-            .filter(|(_, score)| *score > 0.86)
+            .filter(|name| name.as_str() != unknown)
+            .filter(|name| can_reach_near_miss_threshold(unknown, name))
+            .filter_map(|name| self.fields.get(&(table.to_string(), name.clone())))
+            .filter(|field| field.explicit)
+            .map(|field| (field, jaro_winkler(unknown, &field.name)))
+            .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
             .max_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
@@ -1548,7 +1589,7 @@ impl MergedSemanticModel {
         // with many overlapping definitions (saved + open + remote merged
         // together) this skips a lot of throwaway allocations.
         for table in &analysis.tables {
-            merge_table(&mut self.tables, table);
+            self.insert_table(table.clone());
         }
         for event in &analysis.events {
             merge_event(&mut self.events, event);
@@ -1748,16 +1789,6 @@ fn unknown_type_payload(diagnostic: &Diagnostic) -> Option<(String, Option<Strin
     Some((name.to_string(), suggestion))
 }
 
-fn merge_table(target: &mut HashMap<String, TableDef>, candidate: &TableDef) {
-    let replace = target
-        .get(&candidate.name)
-        .map(|current| should_replace_table(current, candidate))
-        .unwrap_or(true);
-    if replace {
-        target.insert(candidate.name.clone(), candidate.clone());
-    }
-}
-
 fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: &EventDef) {
     if let Some(current) = target.get(&(candidate.table.clone(), candidate.name.clone())) {
         if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
@@ -1839,30 +1870,137 @@ fn should_replace_table(current: &TableDef, candidate: &TableDef) -> bool {
     )
 }
 
-/// Whether two names are close enough in length that jaro-winkler *could*
-/// score them above the 0.86 gate. Cheap, and sound: it never rejects a pair
-/// the full comparison would have accepted.
+/// `(numerator, denominator)` of `3 * T(p) - 1`, indexed by the common-prefix
+/// length `p`, as exact rationals so the prefilter needs no floating point.
 ///
-/// Jaro is `(m/a + m/b + (m-t)/m) / 3` with `m` matches and `t`
-/// transpositions, so `(m-t)/m <= 1` and `m <= min(a, b)`. Winkler adds at
-/// most `4 * 0.1 * (1 - J)`, so the best reachable score is `0.6J + 0.4`.
-/// Requiring that to exceed 0.86 gives `J > 0.7667`, and substituting the
-/// bounds on `m` leaves `min(a, b) / max(a, b) > 0.3`.
+/// `T(p)` is the Jaro score a pair must exceed for jaro-winkler to clear
+/// [`NEAR_MISS_THRESHOLD`] given a prefix of `p`. See
+/// [`can_reach_near_miss_threshold`] for the derivation. `p` is capped at 4
+/// because that is the longest prefix Winkler rewards.
+/// The jaro-winkler score a name must exceed to be offered as a "did you mean"
+/// near-miss.
 ///
-/// This is a guard for the pathological case — a two-character name against
-/// a thirty-character one — not a way to make the sweep cheap. Names of
-/// similar length all pass, which is the common case. A tighter rule on the
-/// *difference* of the lengths is not available: `person` and
-/// `personaddress` differ by 7 characters and still score 0.892, so cutting
-/// on a fixed difference would drop real near-misses.
-fn lengths_can_reach_threshold(unknown: &str, candidate: &str) -> bool {
-    let (shorter, longer) = if unknown.len() <= candidate.len() {
-        (unknown.len(), candidate.len())
-    } else {
-        (candidate.len(), unknown.len())
-    };
-    // `shorter / longer > 0.3`, in integers.
-    shorter * 10 > longer * 3
+/// One constant rather than a literal per sweep: [`can_reach_near_miss_threshold`]
+/// derives its pruning bound from this number, so a sweep using a different gate
+/// would silently lose suggestions the prefilter had already discarded.
+pub const NEAR_MISS_THRESHOLD: f64 = 0.86;
+
+const JARO_REQUIREMENT: [(u64, u64); 5] = [
+    (79, 50), // p = 0 -> T = 43/50,  3T-1 = 79/50 = 1.58
+    (23, 15), // p = 1 -> T = 38/45,  3T-1 = 23/15 = 1.533
+    (59, 40), // p = 2 -> T = 33/40,  3T-1 = 59/40 = 1.475
+    (7, 5),   // p = 3 -> T =   4/5,  3T-1 =   7/5 = 1.4
+    (13, 10), // p = 4 -> T = 23/30,  3T-1 = 13/10 = 1.3
+];
+
+/// Whether jaro-winkler *could* score two names above [`NEAR_MISS_THRESHOLD`].
+///
+/// Cheap, and sound: it never rejects a pair the full comparison would have
+/// accepted, so it changes which suggestions are *found* not at all — only how
+/// long it takes to not find them. `can_reach_near_miss_threshold_is_sound`
+/// checks that against `strsim` itself over a generated corpus.
+///
+/// # Derivation
+///
+/// Winkler is `JW = J + 0.1 * p * (1 - J)` where `p = min(4, common prefix)`.
+/// For a fixed `p` that is strictly increasing in `J` (the slope is
+/// `1 - 0.1p >= 0.6`), so
+///
+/// ```text
+/// JW > 0.86  <=>  J > T(p) = (0.86 - 0.1p) / (1 - 0.1p)
+/// ```
+///
+/// Jaro is `(m/a + m/b + (m-t)/m) / 3` for `m` matches and `t` transpositions.
+/// Since `t >= 0` the third term is at most 1, so a pair can only pass if
+///
+/// ```text
+/// m * (a + b) > (3 * T(p) - 1) * a * b
+/// ```
+///
+/// Two upper bounds on `m` make that testable without running Jaro. Both bound
+/// the *maximum* matching, and `strsim`'s greedy first-match rule finds no more
+/// than the maximum, so both are safe:
+///
+/// * `m <= min(a, b)` — the length-ratio stage, which reduces to
+///   `min / max > 3 * T(p) - 2`. Cheapest, and rejects the pathological
+///   two-character-against-thirty case.
+/// * `m <= sum over characters of min(count_a[c], count_b[c])` — the multiset
+///   stage. A Jaro match pairs equal characters and uses each position once, so
+///   per character class it cannot exceed the smaller count.
+///
+/// # Why the prefix has to be exact
+///
+/// Assuming the *worst-case* prefix (`p = 4`) collapses the requirement to the
+/// weakest row and makes the filter useless: it keeps 100% of a real workload
+/// where the exact-`p` version keeps 0.4%. Names that share no prefix face
+/// `T(0) = 0.86` rather than `T(4) = 0.767`, which is what does the pruning.
+///
+/// Note that a bound on the *difference* of the lengths is **not** available at
+/// any `p`: `person` and `personaddress` differ by 7 characters and still score
+/// 0.892.
+fn can_reach_near_miss_threshold(unknown: &str, candidate: &str) -> bool {
+    let (a, b) = (unknown.len() as u64, candidate.len() as u64);
+    if a == 0 || b == 0 {
+        return false;
+    }
+
+    // Byte lengths, and byte-wise prefix, rather than characters. For non-ASCII
+    // input the byte length is >= the character count and the byte prefix is
+    // <= the character prefix, and both errors loosen the bound, so the filter
+    // stays sound. Identifier names are ASCII in practice.
+    let prefix = unknown
+        .as_bytes()
+        .iter()
+        .zip(candidate.as_bytes())
+        .take(4)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let (numerator, denominator) = JARO_REQUIREMENT[prefix];
+
+    // Stage 1, `min / max > 3T(p) - 2`, i.e.
+    // `min * denominator > (numerator - denominator) * max`.
+    let (shorter, longer) = if a <= b { (a, b) } else { (b, a) };
+    if shorter * denominator <= (numerator - denominator) * longer {
+        return false;
+    }
+
+    // Stage 2, `m * (a + b) > (3T(p) - 1) * a * b` with `m` bounded by the
+    // character-multiset intersection.
+    let matchable = multiset_intersection(unknown, candidate);
+    matchable * (a + b) * denominator > numerator * a * b
+}
+
+/// The size of the character-multiset intersection: an upper bound on how many
+/// characters Jaro could possibly match.
+///
+/// Case-sensitive, because `jaro_winkler` is. Folding both sides would still be
+/// sound (it can only raise the bound) but would prune less.
+fn multiset_intersection(left: &str, right: &str) -> u64 {
+    // ASCII identifiers are the overwhelming case, so count bytes into a fixed
+    // table and avoid a map allocation. Anything non-ASCII lands in one shared
+    // bucket, which over-counts and therefore only loosens the bound.
+    let mut counts = [0i32; 129];
+    const OTHER: usize = 128;
+    for byte in left.bytes() {
+        counts[if byte.is_ascii() {
+            byte as usize
+        } else {
+            OTHER
+        }] += 1;
+    }
+    let mut shared = 0u64;
+    for byte in right.bytes() {
+        let slot = if byte.is_ascii() {
+            byte as usize
+        } else {
+            OTHER
+        };
+        if counts[slot] > 0 {
+            counts[slot] -= 1;
+            shared += 1;
+        }
+    }
+    shared
 }
 
 fn should_replace_field(current: &FieldDef, candidate: &FieldDef) -> bool {
@@ -2605,7 +2743,7 @@ mod tests {
             ),
         };
         let mut model = MergedSemanticModel::default();
-        model.tables.insert("person".to_string(), table);
+        model.insert_table(table);
         let fact = crate::semantic::types::QueryFact {
             action: QueryAction::Select,
             target_tables: vec!["person".to_string()],
@@ -2671,7 +2809,7 @@ mod tests {
             ),
         };
         let mut model = MergedSemanticModel::default();
-        model.tables.insert("person".to_string(), table);
+        model.insert_table(table);
 
         let diagnostics = model.semantic_diagnostics(
             &DocumentAnalysis {
@@ -2756,7 +2894,7 @@ mod tests {
             ),
         };
         let mut model = MergedSemanticModel::default();
-        model.tables.insert("person".to_string(), person);
+        model.insert_table(person);
 
         let analysis_uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
         let make_fact = |action: QueryAction| crate::semantic::types::QueryFact {
@@ -3126,19 +3264,16 @@ mod tests {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
         // Tables and functions should NOT leak into the column-only output.
-        model.tables.insert(
-            "person".to_string(),
-            TableDef {
-                name: "person".to_string(),
-                schema_mode: Some("schemafull".to_string()),
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
+        model.insert_table(TableDef {
+            name: "person".to_string(),
+            schema_mode: Some("schemafull".to_string()),
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
         model.functions.insert(
             "fn::greet".to_string(),
             FunctionDef {
@@ -3345,6 +3480,121 @@ mod tests {
         );
     }
 
+    /// The prefilter must never reject a pair `jaro_winkler` would have scored
+    /// above the gate, over a corpus wide enough to catch a wrong inequality.
+    ///
+    /// This is the same oracle pattern as the `LineIndex` tests: `strsim` is the
+    /// specification, and the fast path has to agree with it. A rejection above
+    /// the threshold is a silently lost "did you mean" suggestion, which is why
+    /// this sweeps thousands of pairs rather than a handful of named ones.
+    #[test]
+    fn the_prefilter_never_rejects_a_pair_above_the_threshold() {
+        // Deliberately dense in near-misses: a tiny alphabet produces many pairs
+        // that genuinely score above 0.86, so the test has something to catch.
+        let alphabet = ["a", "b", "c", "_", "0"];
+        let mut names: Vec<String> = Vec::new();
+        for len in 2..=6 {
+            for seed in 0..90u32 {
+                let mut name = String::new();
+                let mut value = seed;
+                for _ in 0..len {
+                    name.push_str(alphabet[(value % alphabet.len() as u32) as usize]);
+                    value /= alphabet.len() as u32;
+                }
+                names.push(name);
+            }
+        }
+        // Plus realistic identifiers, including the abbreviation shapes.
+        for extra in [
+            "person",
+            "persn",
+            "prson",
+            "persons",
+            "personaddress",
+            "user",
+            "userdata",
+            "username",
+            "acct",
+            "accounts",
+            "order",
+            "orders",
+            "oders",
+            "address",
+            "addres",
+            "item",
+            "itemvariant",
+            "product",
+            "prodcut",
+            "id",
+            "customer_billing_address_line",
+            "str",
+            "string",
+            "rec",
+            "record",
+        ] {
+            names.push(extra.to_string());
+        }
+
+        let mut above_threshold = 0usize;
+        let mut rejected = 0usize;
+        for unknown in &names {
+            for candidate in &names {
+                if unknown == candidate {
+                    continue;
+                }
+                let score = strsim::jaro_winkler(unknown, candidate);
+                let kept = super::can_reach_near_miss_threshold(unknown, candidate);
+                if score > super::NEAR_MISS_THRESHOLD {
+                    above_threshold += 1;
+                    assert!(
+                        kept,
+                        "prefilter rejected {unknown:?} vs {candidate:?}, which scores {score:.4}"
+                    );
+                }
+                if !kept {
+                    rejected += 1;
+                }
+            }
+        }
+
+        // The corpus has to actually contain near-misses, or the assertion above
+        // is vacuous, and the filter has to actually reject things, or it is not
+        // doing any work.
+        assert!(
+            above_threshold > 500,
+            "corpus produced only {above_threshold} pairs above the threshold — too few to prove anything"
+        );
+        assert!(
+            rejected > 1000,
+            "prefilter rejected only {rejected} pairs — it is not pruning"
+        );
+    }
+
+    /// The prefilter has to prune the shape that made the sweep slow: names that
+    /// share most of their characters but no prefix.
+    #[test]
+    fn the_prefilter_prunes_names_that_share_no_prefix() {
+        let unknowns: Vec<String> = (0..20).map(|t| format!("undeclared_d0_t{t}")).collect();
+        let candidates: Vec<String> = (0..200)
+            .flat_map(|d| (0..5).map(move |t| format!("real_d{d}_t{t}")))
+            .collect();
+
+        let total = unknowns.len() * candidates.len();
+        let surviving = unknowns
+            .iter()
+            .flat_map(|unknown| candidates.iter().map(move |candidate| (unknown, candidate)))
+            .filter(|(unknown, candidate)| super::can_reach_near_miss_threshold(unknown, candidate))
+            .count();
+
+        // None of these pairs is a genuine near-miss, so every survivor is
+        // wasted work. The prefix is what does the pruning: `u` against `r`
+        // means p = 0, which demands a much higher Jaro score.
+        assert!(
+            surviving * 100 < total,
+            "{surviving} of {total} pairs survived; the prefilter must drop over 99%"
+        );
+    }
+
     /// The length prefilter must never reject a pair that jaro-winkler would
     /// have scored above the gate. The named pairs are the trap: they differ in
     /// length by 4 to 7 characters and still score above 0.86, so a prefilter
@@ -3362,9 +3612,9 @@ mod tests {
         ];
         for (unknown, candidate) in pairs {
             let score = strsim::jaro_winkler(unknown, candidate);
-            if score > 0.86 {
+            if score > super::NEAR_MISS_THRESHOLD {
                 assert!(
-                    super::lengths_can_reach_threshold(unknown, candidate),
+                    super::can_reach_near_miss_threshold(unknown, candidate),
                     "prefilter rejected {unknown:?} vs {candidate:?}, which scores {score:.3}"
                 );
             }
@@ -3374,11 +3624,11 @@ mod tests {
     /// It does still reject the hopeless case, or it would not be worth having.
     #[test]
     fn the_length_prefilter_rejects_a_hopeless_pair() {
-        assert!(!super::lengths_can_reach_threshold(
+        assert!(!super::can_reach_near_miss_threshold(
             "id",
             "customer_billing_address_line"
         ));
-        assert!(super::lengths_can_reach_threshold("person", "persons"));
+        assert!(super::can_reach_near_miss_threshold("person", "persons"));
     }
 
     #[test]
@@ -3395,28 +3645,25 @@ mod tests {
     fn model_with_person_table() -> (MergedSemanticModel, DocumentAnalysis) {
         let uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
-        model.tables.insert(
-            "person".to_string(),
-            TableDef {
-                name: "person".to_string(),
-                schema_mode: None,
-                comment: None,
-                permissions: vec![PermissionRule {
-                    actions: vec![QueryAction::Select],
-                    mode: PermissionMode::Full,
-                    raw: "PERMISSIONS FULL".to_string(),
-                    origin: SymbolOrigin::Local,
-                    location: None,
-                }],
+        model.insert_table(TableDef {
+            name: "person".to_string(),
+            schema_mode: None,
+            comment: None,
+            permissions: vec![PermissionRule {
+                actions: vec![QueryAction::Select],
+                mode: PermissionMode::Full,
+                raw: "PERMISSIONS FULL".to_string(),
                 origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(
-                    Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
-                    Range::default(),
-                ),
-            },
-        );
+                location: None,
+            }],
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(
+                Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
+                Range::default(),
+            ),
+        });
         let analysis = DocumentAnalysis {
             uri,
             text: String::new(),

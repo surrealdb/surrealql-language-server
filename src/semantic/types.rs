@@ -323,6 +323,21 @@ pub struct MergedSemanticModel {
     ///
     /// [reindex]: MergedSemanticModel::reindex_target_usage
     pub target_usage: HashMap<String, usize>,
+    /// The names of the *explicitly defined* tables — the only candidates a
+    /// "did you mean" sweep may offer.
+    ///
+    /// Derived, and maintained by
+    /// [`MergedSemanticModel::insert_table`][insert_table] alongside
+    /// [`Self::tables`]. Insert through that method rather than writing to
+    /// `tables` directly, or the sweep will not see the table.
+    ///
+    /// Exists because the sweep read `tables.values()` and filtered on
+    /// `explicit` afterwards. In a workspace where most tables are inferred from
+    /// usage that walks the whole map — thousands of ~230-byte entries streamed
+    /// to read one `bool` — to reach a candidate set a fraction of the size.
+    ///
+    /// [insert_table]: MergedSemanticModel::insert_table
+    pub explicit_tables: Vec<String>,
     /// True when the live-metadata fetch reported errors while this
     /// model was built — remote tables may be missing, so
     /// unknown-name judgments are unreliable until recovery.
