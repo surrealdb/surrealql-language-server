@@ -15,7 +15,7 @@ use crate::grammar::{
     builtin_signature,
 };
 use crate::semantic::codes;
-use crate::semantic::text::compact_preview;
+use crate::semantic::text::{LineIndex, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
@@ -283,7 +283,7 @@ impl MergedSemanticModel {
         position: Position,
         prefix: &str,
     ) -> Vec<CompletionItem> {
-        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
         let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
         bindings
             .visible_at(offset)
@@ -321,7 +321,7 @@ impl MergedSemanticModel {
         position: Position,
         prefix: &str,
     ) -> Vec<CompletionItem> {
-        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
         let Some(dot) = method_dot_offset(&analysis.text, offset) else {
             return Vec::new();
         };
@@ -337,6 +337,7 @@ impl MergedSemanticModel {
                 let ctx = crate::semantic::infer::TypeCtx {
                     model: self,
                     source: &analysis.text,
+                    lines: &analysis.line_index,
                     bindings: &bindings,
                 };
                 crate::semantic::infer::infer_expr_type(node, &ctx)
@@ -416,7 +417,7 @@ impl MergedSemanticModel {
         token: &str,
         active_context: Option<&AuthContext>,
     ) -> Option<String> {
-        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
 
         // A method resolves through its receiver, not through the global function
         // tables. This must run before `hover_markdown_for_token`, which sees only
@@ -443,6 +444,7 @@ impl MergedSemanticModel {
         let ctx = crate::semantic::infer::TypeCtx {
             model: self,
             source: &analysis.text,
+            lines: &analysis.line_index,
             bindings: &bindings,
         };
         let receiver_type = crate::semantic::infer::infer_expr_type(receiver, &ctx);
@@ -1240,7 +1242,8 @@ impl MergedSemanticModel {
             // range, and the engine records the replacement, so the fix needs no
             // payload beyond the text already there.
             if codes::has_code(diagnostic, codes::RENAMED_FUNCTION)
-                && let Some(old) = text_in_range(&analysis.text, diagnostic.range)
+                && let Some(old) =
+                    text_in_range(&analysis.text, &analysis.line_index, diagnostic.range)
                 && let Some(current) = crate::grammar::renamed_builtin(old.trim())
             {
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
@@ -1984,9 +1987,13 @@ fn format_builtin_function_hover(function: &BuiltinFunction, token: &str) -> Str
 /// what we honestly have. Better than the nothing this used to return for 18 of
 /// the 20 advertised namespaces.
 /// The source text an LSP range covers.
-fn text_in_range(source: &str, range: ls_types::Range) -> Option<&str> {
-    let start = crate::semantic::text::position_to_offset(source, range.start);
-    let end = crate::semantic::text::position_to_offset(source, range.end);
+fn text_in_range<'a>(
+    source: &'a str,
+    lines: &LineIndex,
+    range: ls_types::Range,
+) -> Option<&'a str> {
+    let start = lines.offset(source, range.start);
+    let end = lines.offset(source, range.end);
     source.get(start..end)
 }
 
@@ -2350,8 +2357,8 @@ fn normalize_completion_table_name(value: &str) -> Option<String> {
     }
 }
 
-pub fn is_record_type_context(source: &str, position: Position) -> bool {
-    let prefix = &source[..crate::semantic::text::position_to_offset(source, position)];
+pub fn is_record_type_context(source: &str, lines: &LineIndex, position: Position) -> bool {
+    let prefix = &source[..lines.offset(source, position)];
     prefix
         .rsplit_once("record<")
         .map(|(_, suffix)| !suffix.contains('>'))
@@ -2407,6 +2414,7 @@ mod tests {
     use ls_types::{DiagnosticSeverity, Location, Position, Range, Uri};
 
     use crate::config::{AuthContext, ServerSettings};
+    use crate::semantic::text::LineIndex;
     use crate::semantic::types::{
         DocumentAnalysis, EventDef, FunctionDef, IndexDef, PermissionMode, PermissionRule,
         QueryAction, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
@@ -2451,6 +2459,7 @@ mod tests {
             uri,
             text: String::new(),
             tree: empty_tree(),
+            line_index: LineIndex::default(),
             tables: vec![inferred, explicit.clone()],
             events: Vec::new(),
             indexes: Vec::new(),
@@ -2528,6 +2537,7 @@ mod tests {
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -2580,6 +2590,7 @@ mod tests {
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -2677,6 +2688,7 @@ mod tests {
                 uri: analysis_uri.clone(),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -2712,6 +2724,7 @@ mod tests {
                 uri: uri.clone(),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
@@ -2760,6 +2773,7 @@ mod tests {
                 uri: Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
@@ -2795,6 +2809,7 @@ mod tests {
             uri: uri.clone(),
             text: String::new(),
             tree: empty_tree(),
+            line_index: LineIndex::default(),
             tables: vec![TableDef {
                 name: "person".to_string(),
                 schema_mode: Some("schemafull".to_string()),
@@ -3199,7 +3214,11 @@ mod tests {
     fn detects_nested_record_type_context() {
         let source = "DEFINE FIELD friends ON TABLE person TYPE array<record<per";
         let position = Position::new(0, source.len() as u32);
-        assert!(is_record_type_context(source, position));
+        assert!(is_record_type_context(
+            source,
+            &LineIndex::new(source),
+            position
+        ));
     }
 
     fn model_with_person_table() -> (MergedSemanticModel, DocumentAnalysis) {
@@ -3231,6 +3250,7 @@ mod tests {
             uri,
             text: String::new(),
             tree: empty_tree(),
+            line_index: LineIndex::default(),
             tables: Vec::new(),
             events: Vec::new(),
             indexes: Vec::new(),

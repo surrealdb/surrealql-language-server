@@ -7,7 +7,7 @@ use tree_sitter::{Node, Parser};
 use crate::grammar::language;
 use crate::semantic::codes;
 use crate::semantic::node_kind as k;
-use crate::semantic::text::{byte_range_to_lsp, compact_preview, offset_to_position};
+use crate::semantic::text::{LineIndex, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
@@ -36,12 +36,20 @@ pub fn analyze_document_with_limit(
     let tree = parser.parse(text, None)?;
     let root = tree.root_node();
 
+    // Built once, before the walk. Every range the walk records goes through
+    // this index, which is what keeps the walk linear in the document size.
+    let line_index = LineIndex::new(text);
+
     let mut analysis = DocumentAnalysis {
         uri: uri.clone(),
         text: text.to_string(),
         // Shallow (ref-counted) copy; `root` keeps borrowing the local
         // `tree` for the `collect_statements` walk below.
         tree: tree.clone(),
+        // Replaced by `line_index` below: the walks need it by
+        // reference while they hold `&mut analysis`, so it cannot live
+        // in the struct until they are done.
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -56,12 +64,12 @@ pub fn analyze_document_with_limit(
         document_symbols: Vec::new(),
     };
 
-    collect_statements(root, text, &uri, origin, &mut analysis);
+    collect_statements(root, text, &line_index, &uri, origin, &mut analysis);
     // One sweep over the whole tree rather than per-statement calls: a
     // `fn::` call can appear anywhere (a LET value, a RETURN expression,
     // an IF condition), and collecting per-statement both missed those
     // and risked double-counting once containers started descending.
-    collect_function_references(root, text, &uri, &mut analysis);
+    collect_function_references(root, text, &line_index, &uri, &mut analysis);
 
     // Syntax diagnostics run after extraction so the keyword-typo
     // hint can skip names that are identifiers in this document
@@ -80,17 +88,22 @@ pub fn analyze_document_with_limit(
     analysis.syntax_diagnostics = collect_syntax_diagnostics_at(
         Some(&uri),
         text,
+        &line_index,
         root,
         &known_names,
         syntax_diagnostic_limit(limit),
     );
+    analysis.line_index = line_index;
     Some(analysis)
 }
 
 pub fn collect_syntax_diagnostics(source: &str, node: Node<'_>) -> Vec<Diagnostic> {
+    // A one-shot entry point with no cached analysis, so it builds its own
+    // index. That is one linear pass, not one per diagnostic.
     collect_syntax_diagnostics_at(
         None,
         source,
+        &LineIndex::new(source),
         node,
         &Default::default(),
         DEFAULT_MAX_SYNTAX_DIAGNOSTICS,
@@ -108,18 +121,28 @@ pub fn collect_syntax_diagnostics(source: &str, node: Node<'_>) -> Vec<Diagnosti
 pub fn collect_syntax_diagnostics_at(
     uri: Option<&Uri>,
     source: &str,
+    lines: &LineIndex,
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
     limit: usize,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    collect_node_diagnostics(uri, source, node, known_names, limit, &mut diagnostics);
+    collect_node_diagnostics(
+        uri,
+        source,
+        lines,
+        node,
+        known_names,
+        limit,
+        &mut diagnostics,
+    );
     diagnostics
 }
 
 fn collect_statements(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -128,16 +151,16 @@ fn collect_statements(
 
     if kind == k::DEFINE_STATEMENT {
         match define_form(node, source).as_deref() {
-            Some("table") => extract_table(node, source, uri, origin, analysis),
-            Some("field") => extract_field(node, source, uri, origin, analysis),
-            Some("event") => extract_event(node, source, uri, origin, analysis),
-            Some("function") => extract_function(node, source, uri, origin, analysis),
-            Some("index") => extract_index(node, source, uri, origin, analysis),
-            Some("param") => extract_param(node, source, uri, origin, analysis),
-            Some("access" | "scope") => extract_access(node, source, uri, origin, analysis),
-            Some("analyzer") => extract_analyzer(node, source, uri, origin, analysis),
+            Some("table") => extract_table(node, source, lines, uri, origin, analysis),
+            Some("field") => extract_field(node, source, lines, uri, origin, analysis),
+            Some("event") => extract_event(node, source, lines, uri, origin, analysis),
+            Some("function") => extract_function(node, source, lines, uri, origin, analysis),
+            Some("index") => extract_index(node, source, lines, uri, origin, analysis),
+            Some("param") => extract_param(node, source, lines, uri, origin, analysis),
+            Some("access" | "scope") => extract_access(node, source, lines, uri, origin, analysis),
+            Some("analyzer") => extract_analyzer(node, source, lines, uri, origin, analysis),
             _ => {
-                if let Some(symbol) = statement_symbol(node, source, uri) {
+                if let Some(symbol) = statement_symbol(node, source, lines, uri) {
                     analysis.document_symbols.push(symbol);
                 }
             }
@@ -147,34 +170,34 @@ fn collect_statements(
         if define_form(node, source).as_deref() == Some("function")
             && let Some(body) = k::find_child(node, k::BLOCK)
         {
-            collect_statements(body, source, uri, origin, analysis);
+            collect_statements(body, source, lines, uri, origin, analysis);
         }
         return;
     }
 
     match kind {
         k::SELECT_STATEMENT => {
-            extract_query_fact(node, source, uri, QueryAction::Select, analysis);
+            extract_query_fact(node, source, lines, uri, QueryAction::Select, analysis);
             return;
         }
         k::CREATE_STATEMENT => {
-            extract_query_fact(node, source, uri, QueryAction::Create, analysis);
+            extract_query_fact(node, source, lines, uri, QueryAction::Create, analysis);
             return;
         }
         k::UPDATE_STATEMENT | k::UPSERT_STATEMENT => {
-            extract_query_fact(node, source, uri, QueryAction::Update, analysis);
+            extract_query_fact(node, source, lines, uri, QueryAction::Update, analysis);
             return;
         }
         k::DELETE_STATEMENT => {
-            extract_query_fact(node, source, uri, QueryAction::Delete, analysis);
+            extract_query_fact(node, source, lines, uri, QueryAction::Delete, analysis);
             return;
         }
         k::RELATE_STATEMENT => {
-            extract_query_fact(node, source, uri, QueryAction::Relate, analysis);
+            extract_query_fact(node, source, lines, uri, QueryAction::Relate, analysis);
             return;
         }
         k::INSERT_STATEMENT => {
-            extract_query_fact(node, source, uri, QueryAction::Create, analysis);
+            extract_query_fact(node, source, lines, uri, QueryAction::Create, analysis);
             return;
         }
         // Control-flow and binding statements are *containers*: their
@@ -187,14 +210,14 @@ fn collect_statements(
         | k::IF_ELSE_STATEMENT
         | k::RETURN_STATEMENT
         | k::THROW_STATEMENT => {
-            if let Some(symbol) = statement_symbol(node, source, uri) {
+            if let Some(symbol) = statement_symbol(node, source, lines, uri) {
                 analysis.document_symbols.push(symbol);
             }
         }
         // Any other leaf statement (USE, INFO, KILL, …) carries nothing
         // nested that we index, so record it and stop.
         kind if kind.ends_with("Statement") => {
-            if let Some(symbol) = statement_symbol(node, source, uri) {
+            if let Some(symbol) = statement_symbol(node, source, lines, uri) {
                 analysis.document_symbols.push(symbol);
             }
             return;
@@ -205,7 +228,7 @@ fn collect_statements(
     // Descend into containers (SurrealQL root, Block, SubQuery, etc.).
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_statements(child, source, uri, origin, analysis);
+        collect_statements(child, source, lines, uri, origin, analysis);
     }
 }
 
@@ -242,6 +265,7 @@ pub(crate) fn define_form(node: Node<'_>, source: &str) -> Option<String> {
 fn extract_table(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -273,22 +297,23 @@ fn extract_table(
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
-            .map(|child| parse_permission_rule(*child, source, origin, uri))
+            .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
             .collect(),
         origin,
         explicit: true,
         inference: None,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     };
 
     for inferred in infer_record_types_from_table(&table, uri, source, node) {
-        upsert_inferred_table(analysis, inferred, uri, source, node);
+        upsert_inferred_table(analysis, inferred, uri, source, lines, node);
     }
 
     analysis.document_symbols.push(definition_symbol(
         &format!("TABLE {name}"),
         SymbolKind::STRUCT,
         source,
+        lines,
         node,
     ));
     analysis.tables.push(table);
@@ -297,6 +322,7 @@ fn extract_table(
 fn extract_field(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -337,12 +363,12 @@ fn extract_field(
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
-            .map(|child| parse_permission_rule(*child, source, origin, uri))
+            .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
             .collect(),
         origin,
         explicit: true,
         inference: None,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     };
 
     if let Some(type_expr) = type_expr {
@@ -361,9 +387,9 @@ fn extract_field(
                         "Field `{table}.{name}` references `record<{record_table}>`."
                     ),
                 }),
-                location: location(uri, source, node),
+                location: location(uri, source, lines, node),
             };
-            upsert_inferred_table(analysis, inferred, uri, source, node);
+            upsert_inferred_table(analysis, inferred, uri, source, lines, node);
         }
     }
 
@@ -371,6 +397,7 @@ fn extract_field(
         &format!("FIELD {table}.{name}"),
         SymbolKind::FIELD,
         source,
+        lines,
         node,
     ));
     analysis.fields.push(field);
@@ -379,6 +406,7 @@ fn extract_field(
 fn extract_event(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -418,6 +446,7 @@ fn extract_event(
         &format!("EVENT {table}.{name}"),
         SymbolKind::EVENT,
         source,
+        lines,
         node,
     ));
     analysis.events.push(EventDef {
@@ -427,13 +456,14 @@ fn extract_event(
         when_clause,
         then_clause,
         origin,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     });
 }
 
 fn extract_function(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -470,7 +500,7 @@ fn extract_function(
     let permissions = children
         .iter()
         .filter(|child| child.kind() == k::PERMISSIONS_BASIC_CLAUSE)
-        .map(|child| parse_permission_rule(*child, source, origin, uri))
+        .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
         .collect::<Vec<_>>();
 
     let body_node = children
@@ -481,12 +511,13 @@ fn extract_function(
         .map(|body| collect_called_functions(body, source))
         .unwrap_or_default();
 
-    let selection_range = byte_range_to_lsp(source, name_node.start_byte(), name_node.end_byte());
+    let selection_range = lines.range(source, name_node.start_byte(), name_node.end_byte());
 
     analysis.document_symbols.push(definition_symbol(
         &format!("FUNCTION {name}"),
         SymbolKind::FUNCTION,
         source,
+        lines,
         node,
     ));
     analysis.references.push(SymbolReference {
@@ -505,10 +536,9 @@ fn extract_function(
         origin,
         explicit: true,
         inference: None,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
         selection_range,
-        body_range: body_node
-            .map(|body| byte_range_to_lsp(source, body.start_byte(), body.end_byte())),
+        body_range: body_node.map(|body| lines.range(source, body.start_byte(), body.end_byte())),
         called_functions,
     });
 }
@@ -532,6 +562,7 @@ fn detect_function_language(children: &[Node<'_>]) -> FunctionLanguage {
 fn extract_index(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -593,6 +624,7 @@ fn extract_index(
         &format!("INDEX {table}.{name}"),
         SymbolKind::KEY,
         source,
+        lines,
         node,
     ));
     analysis.indexes.push(IndexDef {
@@ -602,13 +634,14 @@ fn extract_index(
         unique,
         options,
         origin,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     });
 }
 
 fn extract_param(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -642,6 +675,7 @@ fn extract_param(
         &format!("PARAM {name}"),
         SymbolKind::CONSTANT,
         source,
+        lines,
         node,
     ));
     analysis.params.push(ParamDef {
@@ -649,7 +683,7 @@ fn extract_param(
         value_preview,
         comment: extract_comment(node, source),
         origin,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     });
 }
 
@@ -661,6 +695,7 @@ fn extract_param(
 fn extract_analyzer(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -677,19 +712,21 @@ fn extract_analyzer(
         &format!("ANALYZER {name}"),
         SymbolKind::OBJECT,
         source,
+        lines,
         node,
     ));
     analysis.analyzers.push(AnalyzerDef {
         name,
         comment: None,
         origin,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     });
 }
 
 fn extract_access(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
     analysis: &mut DocumentAnalysis,
@@ -713,27 +750,29 @@ fn extract_access(
         &format!("ACCESS {name}"),
         SymbolKind::OBJECT,
         source,
+        lines,
         node,
     ));
     analysis.accesses.push(AccessDef {
         name,
         comment: None,
         origin,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     });
 }
 
 fn extract_query_fact(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     action: QueryAction,
     analysis: &mut DocumentAnalysis,
 ) {
     let target_nodes = target_nodes_for_statement(node, source);
-    let target_refs = target_refs_from_nodes(&target_nodes, source);
+    let target_refs = target_refs_from_nodes(&target_nodes, source, lines);
     let targets: Vec<String> = target_refs.iter().map(|entry| entry.name.clone()).collect();
-    let field_refs = collect_field_refs(node, source);
+    let field_refs = collect_field_refs(node, source, lines);
     let touched_fields: Vec<String> = field_refs.iter().map(|entry| entry.name.clone()).collect();
     let target_resolution = if targets.is_empty() {
         classify_unresolved_targets(&target_nodes)
@@ -748,8 +787,8 @@ fn extract_query_fact(
         .unwrap_or_default();
 
     analysis.document_symbols.push(
-        statement_symbol(node, source, uri)
-            .unwrap_or_else(|| definition_symbol(&preview, SymbolKind::EVENT, source, node)),
+        statement_symbol(node, source, lines, uri)
+            .unwrap_or_else(|| definition_symbol(&preview, SymbolKind::EVENT, source, lines, node)),
     );
 
     analysis.query_facts.push(QueryFact {
@@ -757,7 +796,7 @@ fn extract_query_fact(
         target_tables: targets.clone(),
         touched_fields: touched_fields.clone(),
         dynamic,
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
         source_preview: preview,
         target_refs,
         field_refs,
@@ -777,13 +816,13 @@ fn extract_query_fact(
                 origin: SymbolOrigin::Inferred,
                 evidence: format!("Observed `{table}` in {} statement.", action_label(action)),
             }),
-            location: location(uri, source, node),
+            location: location(uri, source, lines, node),
         };
-        upsert_inferred_table(analysis, inferred, uri, source, node);
+        upsert_inferred_table(analysis, inferred, uri, source, lines, node);
     }
 
     for inferred_field in
-        infer_fields_from_statement(node, source, uri, action, &targets, &touched_fields)
+        infer_fields_from_statement(node, source, lines, uri, action, &targets, &touched_fields)
     {
         analysis.fields.push(inferred_field);
     }
@@ -792,6 +831,7 @@ fn extract_query_fact(
 fn infer_fields_from_statement(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     action: QueryAction,
     targets: &[String],
@@ -829,6 +869,7 @@ fn infer_fields_from_statement(
             type_expr,
             uri,
             source,
+            lines,
             assignment,
             action,
         ));
@@ -867,6 +908,7 @@ fn infer_fields_from_statement(
                 type_expr,
                 uri,
                 source,
+                lines,
                 child,
                 action,
             ));
@@ -883,6 +925,7 @@ fn infer_fields_from_statement(
             None,
             uri,
             source,
+            lines,
             node,
             action,
         ));
@@ -897,6 +940,7 @@ fn inferred_field(
     type_expr: Option<TypeExpr>,
     uri: &Uri,
     source: &str,
+    lines: &LineIndex,
     node: Node<'_>,
     action: QueryAction,
 ) -> FieldDef {
@@ -916,13 +960,14 @@ fn inferred_field(
                 action_label(action)
             ),
         }),
-        location: location(uri, source, node),
+        location: location(uri, source, lines, node),
     }
 }
 
 fn collect_function_references(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     uri: &Uri,
     analysis: &mut DocumentAnalysis,
 ) {
@@ -936,8 +981,7 @@ fn collect_function_references(
         if is_function_being_defined(reference, source) {
             continue;
         }
-        let selection_range =
-            byte_range_to_lsp(source, reference.start_byte(), reference.end_byte());
+        let selection_range = lines.range(source, reference.start_byte(), reference.end_byte());
         analysis.references.push(SymbolReference {
             name,
             kind: SymbolKind::FUNCTION,
@@ -1035,6 +1079,7 @@ fn type_expr_of(node: Node<'_>, source: &str) -> Option<TypeExpr> {
 fn parse_permission_rule(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     origin: SymbolOrigin,
     uri: &Uri,
 ) -> PermissionRule {
@@ -1081,7 +1126,7 @@ fn parse_permission_rule(
         mode,
         raw: text_of(source, node).unwrap_or_default(),
         origin,
-        location: Some(location(uri, source, node)),
+        location: Some(location(uri, source, lines, node)),
     }
 }
 
@@ -1165,7 +1210,11 @@ fn target_nodes_for_statement<'tree>(node: Node<'tree>, source: &str) -> Vec<Nod
 /// each deduped table name. A `record_id`'s range is narrowed to its
 /// table prefix (the text before `:`) so a quick fix can replace just
 /// the table name.
-fn target_refs_from_nodes(relevant_nodes: &[Node<'_>], source: &str) -> Vec<NamedRange> {
+fn target_refs_from_nodes(
+    relevant_nodes: &[Node<'_>],
+    source: &str,
+    lines: &LineIndex,
+) -> Vec<NamedRange> {
     let mut refs: Vec<NamedRange> = Vec::new();
     for relevant in relevant_nodes
         .iter()
@@ -1191,7 +1240,7 @@ fn target_refs_from_nodes(relevant_nodes: &[Node<'_>], source: &str) -> Vec<Name
             };
             refs.push(NamedRange {
                 name,
-                range: byte_range_to_lsp(source, candidate.start_byte(), end_byte),
+                range: lines.range(source, candidate.start_byte(), end_byte),
             });
         }
     }
@@ -1255,7 +1304,7 @@ fn field_assignment_target<'tree>(
     k::dotted_name(source, target).map(|name| (name, target))
 }
 
-fn collect_field_refs(node: Node<'_>, source: &str) -> Vec<NamedRange> {
+fn collect_field_refs(node: Node<'_>, source: &str, lines: &LineIndex) -> Vec<NamedRange> {
     let mut fields: Vec<NamedRange> = Vec::new();
     for assignment in descendants_of_kind(node, k::FIELD_ASSIGNMENT) {
         if let Some((name, target)) = field_assignment_target(assignment, source)
@@ -1263,7 +1312,7 @@ fn collect_field_refs(node: Node<'_>, source: &str) -> Vec<NamedRange> {
         {
             fields.push(NamedRange {
                 name,
-                range: byte_range_to_lsp(source, target.start_byte(), target.end_byte()),
+                range: lines.range(source, target.start_byte(), target.end_byte()),
             });
         }
     }
@@ -1377,7 +1426,13 @@ fn leading_comment_text(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn definition_symbol(name: &str, kind: SymbolKind, source: &str, node: Node<'_>) -> DocumentSymbol {
+fn definition_symbol(
+    name: &str,
+    kind: SymbolKind,
+    source: &str,
+    lines: &LineIndex,
+    node: Node<'_>,
+) -> DocumentSymbol {
     #[allow(deprecated)]
     DocumentSymbol {
         name: name.to_string(),
@@ -1385,20 +1440,31 @@ fn definition_symbol(name: &str, kind: SymbolKind, source: &str, node: Node<'_>)
         kind,
         tags: None,
         deprecated: None,
-        range: byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
-        selection_range: byte_range_to_lsp(source, node.start_byte(), node.start_byte()),
+        range: lines.range(source, node.start_byte(), node.end_byte()),
+        selection_range: lines.range(source, node.start_byte(), node.start_byte()),
         children: None,
     }
 }
 
-fn statement_symbol(node: Node<'_>, source: &str, uri: &Uri) -> Option<DocumentSymbol> {
+fn statement_symbol(
+    node: Node<'_>,
+    source: &str,
+    lines: &LineIndex,
+    uri: &Uri,
+) -> Option<DocumentSymbol> {
     let preview = node
         .utf8_text(source.as_bytes())
         .ok()
         .map(compact_preview)
         .filter(|preview| !preview.is_empty())?;
     let _ = uri;
-    Some(definition_symbol(&preview, SymbolKind::EVENT, source, node))
+    Some(definition_symbol(
+        &preview,
+        SymbolKind::EVENT,
+        source,
+        lines,
+        node,
+    ))
 }
 
 fn upsert_inferred_table(
@@ -1406,6 +1472,7 @@ fn upsert_inferred_table(
     inferred: TableDef,
     source_uri: &Uri,
     source: &str,
+    lines: &LineIndex,
     source_node: Node<'_>,
 ) {
     if analysis
@@ -1426,6 +1493,7 @@ fn upsert_inferred_table(
         &format!("TABLE {}", inferred.name),
         SymbolKind::STRUCT,
         source,
+        lines,
         source_node,
     ));
     analysis.references.push(SymbolReference {
@@ -1438,10 +1506,10 @@ fn upsert_inferred_table(
     analysis.tables.push(inferred);
 }
 
-fn location(uri: &Uri, source: &str, node: Node<'_>) -> Location {
+fn location(uri: &Uri, source: &str, lines: &LineIndex, node: Node<'_>) -> Location {
     Location::new(
         uri.clone(),
-        byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
+        lines.range(source, node.start_byte(), node.end_byte()),
     )
 }
 
@@ -1473,6 +1541,7 @@ pub fn syntax_diagnostic_limit(configured: usize) -> usize {
 fn collect_node_diagnostics(
     uri: Option<&Uri>,
     source: &str,
+    lines: &LineIndex,
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
     limit: usize,
@@ -1483,12 +1552,12 @@ fn collect_node_diagnostics(
     }
 
     if node.is_missing() {
-        diagnostics.push(missing_node_diagnostic(source, node));
+        diagnostics.push(missing_node_diagnostic(source, lines, node));
         return;
     }
 
     if node.is_error() {
-        diagnostics.push(error_node_diagnostic(uri, source, node, known_names));
+        diagnostics.push(error_node_diagnostic(uri, source, lines, node, known_names));
         // A single typo often makes tree-sitter emit one ERROR node
         // spanning a large region that still contains more precise
         // nested MISSING/ERROR nodes — surface those too instead of
@@ -1496,6 +1565,7 @@ fn collect_node_diagnostics(
         descend_into_error(
             uri,
             source,
+            lines,
             node,
             known_names,
             node.start_position().row,
@@ -1511,7 +1581,7 @@ fn collect_node_diagnostics(
     // report must not disappear when `enable_type_checking` is off.
     if node.kind() == k::TYPE_NAME
         && !parse_failure_on_line(diagnostics, node)
-        && let Some(diagnostic) = unknown_type_diagnostic(source, node)
+        && let Some(diagnostic) = unknown_type_diagnostic(source, lines, node)
     {
         diagnostics.push(diagnostic);
         return;
@@ -1519,7 +1589,7 @@ fn collect_node_diagnostics(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_node_diagnostics(uri, source, child, known_names, limit, diagnostics);
+        collect_node_diagnostics(uri, source, lines, child, known_names, limit, diagnostics);
     }
 }
 
@@ -1533,7 +1603,7 @@ fn collect_node_diagnostics(
 /// and `DefineStatement`. So the check needs no per-position plumbing, and it
 /// reaches nested arguments, union members, tuple elements and object-type field
 /// types for free.
-fn unknown_type_diagnostic(source: &str, node: Node<'_>) -> Option<Diagnostic> {
+fn unknown_type_diagnostic(source: &str, lines: &LineIndex, node: Node<'_>) -> Option<Diagnostic> {
     let name = k::text_of(source, node)?;
     if name.is_empty() || type_name::is_known(name) {
         return None;
@@ -1550,7 +1620,7 @@ fn unknown_type_diagnostic(source: &str, node: Node<'_>) -> Option<Diagnostic> {
 
     let suggestion = type_name::nearest(name);
     Some(Diagnostic {
-        range: byte_range_to_lsp(source, node.start_byte(), node.end_byte()),
+        range: lines.range(source, node.start_byte(), node.end_byte()),
         severity: Some(DiagnosticSeverity::ERROR),
         code: codes::as_code(codes::UNKNOWN_TYPE),
         source: Some("surreal-language-server".to_string()),
@@ -1699,6 +1769,7 @@ fn has_error_ancestor(node: Node<'_>) -> bool {
 fn descend_into_error(
     uri: Option<&Uri>,
     source: &str,
+    lines: &LineIndex,
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
     reported_row: usize,
@@ -1711,7 +1782,7 @@ fn descend_into_error(
             return;
         }
         if child.is_missing() {
-            diagnostics.push(missing_node_diagnostic(source, child));
+            diagnostics.push(missing_node_diagnostic(source, lines, child));
             continue;
         }
         if child.is_error() {
@@ -1719,6 +1790,7 @@ fn descend_into_error(
                 descend_into_error(
                     uri,
                     source,
+                    lines,
                     child,
                     known_names,
                     reported_row,
@@ -1726,10 +1798,17 @@ fn descend_into_error(
                     diagnostics,
                 );
             } else {
-                diagnostics.push(error_node_diagnostic(uri, source, child, known_names));
+                diagnostics.push(error_node_diagnostic(
+                    uri,
+                    source,
+                    lines,
+                    child,
+                    known_names,
+                ));
                 descend_into_error(
                     uri,
                     source,
+                    lines,
                     child,
                     known_names,
                     child.start_position().row,
@@ -1739,11 +1818,11 @@ fn descend_into_error(
             }
             continue;
         }
-        collect_node_diagnostics(uri, source, child, known_names, limit, diagnostics);
+        collect_node_diagnostics(uri, source, lines, child, known_names, limit, diagnostics);
     }
 }
 
-fn missing_node_diagnostic(source: &str, node: Node<'_>) -> Diagnostic {
+fn missing_node_diagnostic(source: &str, lines: &LineIndex, node: Node<'_>) -> Diagnostic {
     // MISSING nodes are zero-width; extend the range over the next
     // character so editors render a visible squiggle. `get` instead of
     // slicing — this path must never panic on odd byte offsets.
@@ -1754,7 +1833,7 @@ fn missing_node_diagnostic(source: &str, node: Node<'_>) -> Diagnostic {
         .map(|ch| start + ch.len_utf8())
         .unwrap_or(start);
     Diagnostic {
-        range: byte_range_to_lsp(source, start, end),
+        range: lines.range(source, start, end),
         severity: Some(DiagnosticSeverity::ERROR),
         code: codes::as_code(codes::PARSE),
         source: Some("surreal-language-server".to_string()),
@@ -1769,6 +1848,7 @@ fn missing_node_diagnostic(source: &str, node: Node<'_>) -> Diagnostic {
 fn error_node_diagnostic(
     uri: Option<&Uri>,
     source: &str,
+    lines: &LineIndex,
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
 ) -> Diagnostic {
@@ -1799,7 +1879,7 @@ fn error_node_diagnostic(
 
     let related_information = match (spans_multiple_lines, uri) {
         (true, Some(uri)) => Some(vec![DiagnosticRelatedInformation {
-            location: Location::new(uri.clone(), byte_range_to_lsp(source, full_start, full_end)),
+            location: Location::new(uri.clone(), lines.range(source, full_start, full_end)),
             message: format!(
                 "The invalid region continues to line {}.",
                 node.end_position().row + 1
@@ -1809,7 +1889,7 @@ fn error_node_diagnostic(
     };
 
     Diagnostic {
-        range: byte_range_to_lsp(source, full_start, range_end),
+        range: lines.range(source, full_start, range_end),
         severity: Some(DiagnosticSeverity::ERROR),
         code: codes::as_code(codes::PARSE),
         source: Some("surreal-language-server".to_string()),
@@ -2123,13 +2203,22 @@ pub fn collect_inlay_hints(
     model: &MergedSemanticModel,
 ) -> Vec<InlayHint> {
     let mut hints = Vec::new();
-    walk_inlay_hints(root, source, range_start, range_end, model, &mut hints);
+    walk_inlay_hints(
+        root,
+        source,
+        &LineIndex::new(source),
+        range_start,
+        range_end,
+        model,
+        &mut hints,
+    );
     hints
 }
 
 fn walk_inlay_hints(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     range_start: usize,
     range_end: usize,
     model: &MergedSemanticModel,
@@ -2171,7 +2260,7 @@ fn walk_inlay_hints(
                     .children(&mut cursor)
                     .find(|child| child.kind() == k::ARGUMENT_LIST);
                 if let Some(arg_list) = arg_list {
-                    emit_argument_hints(arg_list, source, &names, hints);
+                    emit_argument_hints(arg_list, source, lines, &names, hints);
                 }
             }
         }
@@ -2179,7 +2268,7 @@ fn walk_inlay_hints(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_inlay_hints(child, source, range_start, range_end, model, hints);
+        walk_inlay_hints(child, source, lines, range_start, range_end, model, hints);
     }
 }
 
@@ -2209,6 +2298,7 @@ fn builtin_parameter_names(name: &str) -> Option<Vec<String>> {
 fn emit_argument_hints(
     arg_list: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     param_names: &[String],
     hints: &mut Vec<InlayHint>,
 ) {
@@ -2223,7 +2313,7 @@ fn emit_argument_hints(
             break;
         };
         hints.push(InlayHint {
-            position: offset_to_position(source, argument.start_byte()),
+            position: lines.position(source, argument.start_byte()),
             label: InlayHintLabel::String(format!("{name}:")),
             kind: Some(InlayHintKind::PARAMETER),
             text_edits: None,

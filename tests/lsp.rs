@@ -9,6 +9,7 @@ use surrealql_language_server::semantic::analyzer::{
 use surrealql_language_server::semantic::model::{
     function_signature, is_record_type_context, param_label,
 };
+use surrealql_language_server::semantic::text::LineIndex;
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
     DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, MergedSemanticModel, PermissionMode,
@@ -394,10 +395,11 @@ fn a_zero_cap_reports_every_diagnostic() {
 /// Nothing anywhere limits document *length* — a long but valid file is
 /// analyzed in full however many lines it has.
 ///
-/// Kept to a few hundred statements deliberately: `analyze_document` is
-/// quadratic in document length (`offset_to_position` rescans from byte 0 for
-/// every range), so a few thousand statements turns this into a multi-second
-/// test rather than a correctness one.
+/// Kept to a few hundred statements because this is a correctness test and a
+/// bigger document proves nothing more. It used to be kept small out of
+/// necessity: `analyze_document` was quadratic in document length, because
+/// `offset_to_position` rescanned from byte 0 for every range. `LineIndex`
+/// removed that, and the cost is now linear — see `benches/latency.rs`.
 #[test]
 fn a_long_clean_document_is_fully_analyzed() {
     let text = (0..300)
@@ -766,6 +768,7 @@ fn hover_for_js_function_shows_javascript_badge() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -823,6 +826,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -879,6 +883,7 @@ fn hover_for_table_shows_schema_and_permissions() {
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
+            line_index: LineIndex::default(),
             tables: vec![TableDef {
                 name: "account".to_string(),
                 schema_mode: Some("schemafull".to_string()),
@@ -955,6 +960,7 @@ fn completion_includes_user_js_function() {
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
+            line_index: LineIndex::default(),
             tables: Vec::new(),
             events: Vec::new(),
             indexes: Vec::new(),
@@ -1084,6 +1090,7 @@ fn no_diagnostics_for_allowed_permission() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1138,6 +1145,7 @@ fn error_diagnostic_for_denied_permission() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1181,6 +1189,7 @@ fn warning_for_unknown_table_in_query() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1270,6 +1279,7 @@ fn role_based_permission_allowed_for_matching_context() {
         uri: u,
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1435,6 +1445,7 @@ fn local_function_overrides_remote() {
         uri: uri("remote.surql"),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1466,6 +1477,7 @@ fn local_function_overrides_remote() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1508,14 +1520,18 @@ fn local_function_overrides_remote() {
 fn record_type_context_detected_mid_expression() {
     let source = "DEFINE FIELD owner ON TABLE event TYPE option<record<us";
     let pos = Position::new(0, source.len() as u32);
-    assert!(is_record_type_context(source, pos));
+    assert!(is_record_type_context(source, &LineIndex::new(source), pos));
 }
 
 #[test]
 fn record_type_context_not_detected_after_closing_angle() {
     let source = "DEFINE FIELD owner ON TABLE event TYPE option<record<user>> SELECT";
     let pos = Position::new(0, source.len() as u32);
-    assert!(!is_record_type_context(source, pos));
+    assert!(!is_record_type_context(
+        source,
+        &LineIndex::new(source),
+        pos
+    ));
 }
 
 #[test]
@@ -1528,6 +1544,7 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
+            line_index: LineIndex::default(),
             tables: vec![TableDef {
                 name: "invoice".to_string(),
                 schema_mode: None,
@@ -1597,6 +1614,7 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: vec![TableDef {
             name: "widget".to_string(),
             schema_mode: Some("schemafull".to_string()),
@@ -1923,7 +1941,10 @@ fn decode(tokens: Vec<SemanticToken>, source: &str) -> Vec<Tok> {
 }
 
 fn decode_tokens(source: &str) -> Vec<Tok> {
-    decode(collect_semantic_tokens(&tree_of(source), source), source)
+    decode(
+        collect_semantic_tokens(&tree_of(source), source, &LineIndex::new(source)),
+        source,
+    )
 }
 
 /// The first token whose text equals `needle`.
@@ -2013,7 +2034,7 @@ fn semantic_tokens_split_multiline_block_comment_per_line() {
 
 #[test]
 fn semantic_tokens_empty_for_blank_document() {
-    assert!(collect_semantic_tokens(&tree_of(""), "").is_empty());
+    assert!(collect_semantic_tokens(&tree_of(""), "", &LineIndex::new("")).is_empty());
 }
 
 // keyword=0 function=1 parameter=2 type=3 string=4 number=5 comment=6 variable=7
@@ -2077,7 +2098,7 @@ fn semantic_tokens_range_limits_to_viewport() {
     // Request only the middle line.
     let range = Range::new(Position::new(1, 0), Position::new(1, 9));
     let tokens = decode(
-        collect_semantic_tokens_range(&tree_of(source), source, range),
+        collect_semantic_tokens_range(&tree_of(source), source, &LineIndex::new(source), range),
         source,
     );
     let keywords: Vec<&str> = tokens

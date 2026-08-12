@@ -21,7 +21,7 @@
 use ls_types::Position;
 
 use crate::core::statement_shape::{SlotYield, head_slot};
-use crate::semantic::text::position_to_offset;
+use crate::semantic::text::{LineIndex, preceding_char};
 use crate::semantic::types::{DocumentAnalysis, QueryFact};
 
 /// Stands in for a string, number, or other literal that was consumed whole.
@@ -42,8 +42,8 @@ const LITERAL: &str = "\u{1}literal";
 /// Returns `None` where the head table cannot reason about the position — the
 /// cursor is inside a string, inside a comment, or inside an unclosed bracket.
 /// Every one of those keeps the full completion list.
-pub fn statement_words(source: &str, position: Position) -> Option<Vec<String>> {
-    let offset = position_to_offset(source, position);
+pub fn statement_words(source: &str, lines: &LineIndex, position: Position) -> Option<Vec<String>> {
+    let offset = lines.offset(source, position);
     let before = source.get(..offset)?;
 
     let mut words: Vec<String> = Vec::new();
@@ -118,8 +118,8 @@ pub fn statement_words(source: &str, position: Position) -> Option<Vec<String>> 
 
 /// The vocabulary legal at the cursor, or [`SlotYield::Expression`] when the
 /// position is not a modelled statement head.
-pub fn head_slot_at(source: &str, position: Position) -> SlotYield {
-    match statement_words(source, position) {
+pub fn head_slot_at(source: &str, lines: &LineIndex, position: Position) -> SlotYield {
+    match statement_words(source, lines, position) {
         Some(words) => {
             let borrowed: Vec<&str> = words.iter().map(String::as_str).collect();
             head_slot(&borrowed)
@@ -190,44 +190,44 @@ fn skip_block_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> b
 /// identifier being typed, then (b) any sequence of comma-separated
 /// identifiers (so `FROM a, b, |` still resolves to `FROM`), and inspects
 /// the keyword token immediately preceding that span.
-pub fn is_table_name_context(source: &str, position: Position) -> bool {
-    let offset = position_to_offset(source, position);
+pub fn is_table_name_context(source: &str, lines: &LineIndex, position: Position) -> bool {
+    let offset = lines.offset(source, position);
     let Some(before) = source.get(..offset) else {
         return false;
     };
-    let chars: Vec<char> = before.chars().collect();
-    let mut i = chars.len();
-
-    while i > 0 && is_table_ident_char(chars[i - 1]) {
-        i -= 1;
-    }
+    // Walks backward in byte offsets. The previous version collected the whole
+    // prefix into a `Vec<char>` to index it, which allocated about 4 bytes per
+    // character of everything before the cursor on every completion request.
+    let mut i = before.len();
+    skip_back_while(before, &mut i, is_table_ident_char);
     loop {
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
+        skip_back_while(before, &mut i, char::is_whitespace);
+        match preceding_char(before, i) {
+            Some((start, ',')) => i = start,
+            _ => break,
         }
-        if i == 0 || chars[i - 1] != ',' {
-            break;
-        }
-        i -= 1;
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && is_table_ident_char(chars[i - 1]) {
-            i -= 1;
-        }
+        skip_back_while(before, &mut i, char::is_whitespace);
+        skip_back_while(before, &mut i, is_table_ident_char);
     }
     let keyword_end = i;
-    while i > 0 && is_table_ident_char(chars[i - 1]) {
-        i -= 1;
-    }
+    skip_back_while(before, &mut i, is_table_ident_char);
     if i == keyword_end {
         return false;
     }
-    let keyword: String = chars[i..keyword_end].iter().collect();
     matches!(
-        keyword.to_ascii_uppercase().as_str(),
+        before[i..keyword_end].to_ascii_uppercase().as_str(),
         "FROM" | "INTO" | "UPDATE"
     )
+}
+
+/// Move `i` left over every character that satisfies `predicate`.
+fn skip_back_while(source: &str, i: &mut usize, predicate: impl Fn(char) -> bool) {
+    while let Some((start, ch)) = preceding_char(source, *i) {
+        if !predicate(ch) {
+            return;
+        }
+        *i = start;
+    }
 }
 
 fn is_table_ident_char(c: char) -> bool {
@@ -256,48 +256,38 @@ pub enum ColumnSlot {
 /// the common, syntactically-unambiguous cases listed below and degrades
 /// to `None` for anything unfamiliar (sub-queries, parenthesised
 /// expressions, ON clauses, etc.).
-pub fn column_completion_context(source: &str, position: Position) -> Option<ColumnSlot> {
-    let offset = position_to_offset(source, position);
+pub fn column_completion_context(
+    source: &str,
+    lines: &LineIndex,
+    position: Position,
+) -> Option<ColumnSlot> {
+    let offset = lines.offset(source, position);
     let before = source.get(..offset)?;
-    let chars: Vec<char> = before.chars().collect();
-    let mut i = chars.len();
+    let mut i = before.len();
 
-    while i > 0 && is_table_ident_char(chars[i - 1]) {
-        i -= 1;
-    }
+    skip_back_while(before, &mut i, is_table_ident_char);
     loop {
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
+        skip_back_while(before, &mut i, char::is_whitespace);
+        match preceding_char(before, i) {
+            Some((start, ',')) => i = start,
+            _ => break,
         }
-        if i == 0 || chars[i - 1] != ',' {
-            break;
-        }
-        i -= 1;
-        while i > 0 {
-            let c = chars[i - 1];
-            if c == ',' {
-                break;
+        loop {
+            match preceding_char(before, i) {
+                None => break,
+                Some((_, ',')) => break,
+                Some((_, '\'' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | ';')) => return None,
+                Some((start, _)) => i = start,
             }
-            if matches!(c, '\'' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | ';') {
-                return None;
-            }
-            i -= 1;
         }
     }
-    while i > 0 && chars[i - 1].is_whitespace() {
-        i -= 1;
-    }
+    skip_back_while(before, &mut i, char::is_whitespace);
     let keyword_end = i;
-    while i > 0 && is_table_ident_char(chars[i - 1]) {
-        i -= 1;
-    }
+    skip_back_while(before, &mut i, is_table_ident_char);
     if i == keyword_end {
         return None;
     }
-    let keyword: String = chars[i..keyword_end]
-        .iter()
-        .collect::<String>()
-        .to_ascii_uppercase();
+    let keyword = before[i..keyword_end].to_ascii_uppercase();
     match keyword.as_str() {
         "SELECT" => Some(ColumnSlot::Strict { allow_star: true }),
         "SET" => Some(ColumnSlot::Strict { allow_star: false }),
@@ -311,8 +301,13 @@ pub fn column_completion_context(source: &str, position: Position) -> Option<Col
     }
 }
 
-pub fn completion_prefix(source: &str, position: Position, record_type_context: bool) -> String {
-    let prefix = crate::semantic::text::token_prefix(source, position).unwrap_or_default();
+pub fn completion_prefix(
+    source: &str,
+    lines: &LineIndex,
+    position: Position,
+    record_type_context: bool,
+) -> String {
+    let prefix = crate::semantic::text::token_prefix(source, lines, position).unwrap_or_default();
     if record_type_context {
         prefix
             .rsplit_once('<')
@@ -345,8 +340,12 @@ fn position_gte(left: Position, right: Position) -> bool {
     left.line > right.line || (left.line == right.line && left.character >= right.character)
 }
 
-pub fn completion_table_qualifier(source: &str, position: Position) -> Option<String> {
-    let offset = position_to_offset(source, position);
+pub fn completion_table_qualifier(
+    source: &str,
+    lines: &LineIndex,
+    position: Position,
+) -> Option<String> {
+    let offset = lines.offset(source, position);
     let before_cursor = source.get(..offset)?;
     let (left, right) = before_cursor.rsplit_once('.')?;
     if !right.chars().all(is_field_prefix_char) {
@@ -404,7 +403,11 @@ mod tests {
     fn words_at_end(source: &str) -> Option<Vec<String>> {
         let line = source.lines().count().saturating_sub(1) as u32;
         let character = source.lines().last().map_or(0, str::len) as u32;
-        statement_words(source, Position { line, character })
+        statement_words(
+            source,
+            &LineIndex::new(source),
+            Position { line, character },
+        )
     }
 
     fn words(source: &str) -> Vec<String> {
@@ -486,7 +489,10 @@ mod tests {
             line: 0,
             character: source.len() as u32,
         };
-        assert_eq!(head_slot_at(source, position), SlotYield::Expression);
+        assert_eq!(
+            head_slot_at(source, &LineIndex::new(source), position),
+            SlotYield::Expression
+        );
     }
 
     #[test]
@@ -497,7 +503,7 @@ mod tests {
             character: source.len() as u32,
         };
         assert!(matches!(
-            head_slot_at(source, position),
+            head_slot_at(source, &LineIndex::new(source), position),
             SlotYield::Keywords(_)
         ));
     }

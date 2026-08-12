@@ -5,6 +5,7 @@ use ls_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Uri};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Tree;
 
+use crate::semantic::text::LineIndex;
 use crate::semantic::type_expr::TypeExpr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -225,6 +226,12 @@ pub struct DocumentAnalysis {
     /// foundation for incremental re-parsing once the server moves to
     /// incremental document sync.
     pub tree: Tree,
+    /// Line start offsets for [`Self::text`], built once per analysis so every
+    /// byte-offset-to-[`Position`] conversion is a binary search rather than a
+    /// scan from byte 0. Request handlers reuse it for cursor lookups too.
+    ///
+    /// [`Position`]: ls_types::Position
+    pub line_index: LineIndex,
     pub tables: Vec<TableDef>,
     pub events: Vec<EventDef>,
     pub indexes: Vec<IndexDef>,

@@ -33,7 +33,7 @@ use crate::semantic::analyzer::{analyze_document, analyze_document_with_limit};
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
-use crate::semantic::text::{position_to_offset, token_at, word_range};
+use crate::semantic::text::{token_at, word_range};
 use crate::semantic::types::{
     DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
     WorkspaceIndex,
@@ -505,15 +505,23 @@ where
         let position = params.text_document_position.position;
         let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
 
-        let record_type_context = is_record_type_context(&analysis.text, position);
-        let prefix = completion_prefix(&analysis.text, position, record_type_context);
+        let record_type_context =
+            is_record_type_context(&analysis.text, &analysis.line_index, position);
+        let prefix = completion_prefix(
+            &analysis.text,
+            &analysis.line_index,
+            position,
+            record_type_context,
+        );
 
         // When the cursor sits in a slot that only accepts a table name
         // (e.g. `SELECT * FROM |`, `INSERT INTO |`, `UPDATE |`), restrict
         // suggestions to known tables — otherwise the dropdown is flooded
         // with keywords/functions/fields/params the user can't legally use
         // there.
-        if !record_type_context && is_table_name_context(&analysis.text, position) {
+        if !record_type_context
+            && is_table_name_context(&analysis.text, &analysis.line_index, position)
+        {
             let items = model.table_completion_items(
                 prefix.trim_matches(|ch: char| ch == ':'),
                 settings.active_auth_context(),
@@ -533,7 +541,7 @@ where
         // falls through to the behaviour this handler had before, so no working
         // position can regress.
         if !record_type_context {
-            let slot = head_slot_at(&analysis.text, position);
+            let slot = head_slot_at(&analysis.text, &analysis.line_index, position);
             if slot != SlotYield::Expression {
                 return Some(CompletionResponse::Array(head_slot_items(
                     slot,
@@ -545,7 +553,7 @@ where
         }
 
         let statement_fact = active_query_fact(&analysis, position);
-        let qualifier = completion_table_qualifier(&analysis.text, position);
+        let qualifier = completion_table_qualifier(&analysis.text, &analysis.line_index, position);
 
         // A `.` admits a field *and* a method, so these are added to whatever the
         // position already offers rather than replacing it.
@@ -559,7 +567,7 @@ where
         } else if record_type_context {
             None
         } else {
-            column_completion_context(&analysis.text, position)
+            column_completion_context(&analysis.text, &analysis.line_index, position)
         };
 
         if let Some(ColumnSlot::Strict { allow_star }) = column_slot {
@@ -621,8 +629,8 @@ where
         let position = params.text_document_position_params.position;
         let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
 
-        let token = token_at(&analysis.text, position)?;
-        let range = word_range(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
+        let range = word_range(&analysis.text, &analysis.line_index, position)?;
         let contents = model.hover_markdown_at(
             &analysis,
             position,
@@ -661,8 +669,11 @@ where
     ) -> Option<SemanticTokensResult> {
         let uri = params.text_document.uri;
         let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
-        let data =
-            crate::semantic::highlight::collect_semantic_tokens(&analysis.tree, &analysis.text);
+        let data = crate::semantic::highlight::collect_semantic_tokens(
+            &analysis.tree,
+            &analysis.text,
+            &analysis.line_index,
+        );
         Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -681,6 +692,7 @@ where
         let data = crate::semantic::highlight::collect_semantic_tokens_range(
             &analysis.tree,
             &analysis.text,
+            &analysis.line_index,
             params.range,
         );
         Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
@@ -696,7 +708,7 @@ where
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
 
         let token = token.trim().to_string();
         model
@@ -710,7 +722,7 @@ where
         let Some((analysis, model, _)) = self.snapshot_for_uri(&uri).await else {
             return Vec::new();
         };
-        let Some(token) = token_at(&analysis.text, position) else {
+        let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
         model.references_for_function(token.trim())
@@ -723,7 +735,7 @@ where
         let uri = params.text_document.uri;
         let position = params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let name = token.trim();
         let location = model.definition_for_function(name)?;
         Some(PrepareRenameResponse::RangeWithPlaceholder {
@@ -736,7 +748,7 @@ where
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let changes = model.rename_edits(token.trim(), &params.new_name)?;
         Some(WorkspaceEdit {
             changes: Some(changes),
@@ -748,7 +760,7 @@ where
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let offset = position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
         let prefix = &analysis.text[..offset];
         let open_paren = prefix.rfind('(')?;
         let function_name = prefix[..open_paren]
@@ -786,6 +798,7 @@ where
                 let ctx = crate::semantic::infer::TypeCtx {
                     model: &model,
                     source: &analysis.text,
+                    lines: &analysis.line_index,
                     bindings: &bindings,
                 };
                 let receiver_type = crate::semantic::infer::infer_expr_type(receiver, &ctx);
@@ -882,7 +895,7 @@ where
         let Some((analysis, model, _)) = self.snapshot_for_uri(&uri).await else {
             return Vec::new();
         };
-        let Some(token) = token_at(&analysis.text, position) else {
+        let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
         model
@@ -906,8 +919,10 @@ where
             return Vec::new();
         };
 
-        let range_start = position_to_offset(&analysis.text, params.range.start);
-        let range_end = position_to_offset(&analysis.text, params.range.end);
+        let range_start = analysis
+            .line_index
+            .offset(&analysis.text, params.range.start);
+        let range_end = analysis.line_index.offset(&analysis.text, params.range.end);
 
         crate::semantic::analyzer::collect_inlay_hints(
             analysis.tree.root_node(),
@@ -925,7 +940,7 @@ where
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let function = model.functions.get(token.trim())?;
         Some(vec![call_hierarchy_item(function)])
     }

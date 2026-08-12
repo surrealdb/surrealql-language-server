@@ -16,7 +16,7 @@ use ls_types::{Position, Range, Uri};
 use surrealql_language_server::config::ServerSettings;
 use surrealql_language_server::semantic::analyzer::analyze_document;
 use surrealql_language_server::semantic::highlight;
-use surrealql_language_server::semantic::text::{token_at, word_range};
+use surrealql_language_server::semantic::text::{LineIndex, token_at, word_range};
 use surrealql_language_server::semantic::types::{
     MergedSemanticModel, SymbolOrigin, WorkspaceIndex,
 };
@@ -107,7 +107,10 @@ fn time<F: FnMut()>(mut body: F) -> f64 {
     let budget = Duration::from_millis(400);
     let start = Instant::now();
     let mut runs = 0u32;
-    while start.elapsed() < budget && runs < 200 {
+    // The cap has to be high enough that a sub-microsecond operation still
+    // accumulates a measurable total: the cursor helpers went from 2.4 ms to
+    // well under 1 us, and 200 runs of that is below the clock's resolution.
+    while start.elapsed() < budget && runs < 200_000 {
         body();
         runs += 1;
     }
@@ -137,6 +140,7 @@ fn main() {
             std::hint::black_box(highlight::collect_semantic_tokens(
                 &analysis.tree,
                 &analysis.text,
+                &analysis.line_index,
             ));
         });
         report(lines, text.len(), ms);
@@ -176,6 +180,7 @@ fn main() {
             std::hint::black_box(highlight::collect_semantic_tokens_range(
                 &analysis.tree,
                 &analysis.text,
+                &analysis.line_index,
                 range,
             ));
         });
@@ -193,9 +198,12 @@ fn main() {
     for lines in LINE_SIZES {
         let text = query_doc(lines);
         let pos = Position::new(lines as u32 - 1, 9);
+        // Built outside the timed loop because the server caches it on the
+        // document analysis: a request pays the lookup, not the construction.
+        let index = LineIndex::new(&text);
         let ms = time(|| {
-            std::hint::black_box(token_at(&text, pos));
-            std::hint::black_box(word_range(&text, pos));
+            std::hint::black_box(token_at(&text, &index, pos));
+            std::hint::black_box(word_range(&text, &index, pos));
         });
         report(lines, text.len(), ms);
         results.push(Measured {
@@ -215,7 +223,7 @@ fn main() {
         let ms = time(|| {
             std::hint::black_box(model.table_completion_items("", None));
         });
-        println!("  {docs:>4} docs ({tables:>4} tables): {ms:>9.3} ms");
+        println!("  {docs:>4} docs ({tables:>4} tables): {ms:>9.4} ms");
         results.push(Measured {
             name: "table_completion_items",
             scale: format!("{tables} tables"),
@@ -285,7 +293,7 @@ fn main() {
 
 fn report(lines: usize, bytes: usize, ms: f64) {
     let per_line = ms * 1000.0 / lines as f64;
-    println!("  {lines:>5} lines ({bytes:>7} B): {ms:>9.3} ms  ({per_line:>7.2} us/line)");
+    println!("  {lines:>5} lines ({bytes:>7} B): {ms:>9.4} ms  ({per_line:>7.2} us/line)");
 }
 
 /// Print the target table and exit non-zero when a target is missed, so the

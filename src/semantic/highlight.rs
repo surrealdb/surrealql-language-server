@@ -19,7 +19,7 @@ use ls_types::{
 use tree_sitter::{Node, Tree};
 
 use crate::semantic::node_kind as k;
-use crate::semantic::text::offset_to_position;
+use crate::semantic::text::LineIndex;
 
 // Token-type legend indices. These MUST stay in lock-step with the order
 // of `legend()` below — the protocol references token types by position.
@@ -152,8 +152,8 @@ struct AbsToken {
 /// `tree` is the cached parse of `source` (see [`DocumentAnalysis::tree`]).
 ///
 /// [`DocumentAnalysis::tree`]: crate::semantic::types::DocumentAnalysis::tree
-pub fn collect_semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> {
-    encode(collect_absolute(tree, source))
+pub fn collect_semantic_tokens(tree: &Tree, source: &str, lines: &LineIndex) -> Vec<SemanticToken> {
+    encode(collect_absolute(tree, source, lines))
 }
 
 /// Semantic tokens for a single `range` of the document. Any token that
@@ -162,9 +162,10 @@ pub fn collect_semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> 
 pub fn collect_semantic_tokens_range(
     tree: &Tree,
     source: &str,
+    lines: &LineIndex,
     range: Range,
 ) -> Vec<SemanticToken> {
-    let tokens = collect_absolute(tree, source)
+    let tokens = collect_absolute(tree, source, lines)
         .into_iter()
         .filter(|token| overlaps(token, &range))
         .collect();
@@ -173,9 +174,9 @@ pub fn collect_semantic_tokens_range(
 
 /// Walk the cached `tree` and gather its tokens as absolute positions,
 /// sorted by (line, start).
-fn collect_absolute(tree: &Tree, source: &str) -> Vec<AbsToken> {
+fn collect_absolute(tree: &Tree, source: &str, lines: &LineIndex) -> Vec<AbsToken> {
     let mut tokens = Vec::new();
-    walk(tree.root_node(), source, &mut tokens);
+    walk(tree.root_node(), source, lines, &mut tokens);
 
     // Tree order is already top-to-bottom, but comments (grammar extras)
     // can reattach out of order, so sort — the delta encoding below
@@ -184,14 +185,21 @@ fn collect_absolute(tree: &Tree, source: &str) -> Vec<AbsToken> {
     tokens
 }
 
-fn walk(node: Node<'_>, source: &str, out: &mut Vec<AbsToken>) {
+fn walk(node: Node<'_>, source: &str, lines: &LineIndex, out: &mut Vec<AbsToken>) {
     if let Some(token_type) = token_type(node.kind()) {
-        push_node(node, source, token_type, modifiers(node, source), out);
+        push_node(
+            node,
+            source,
+            lines,
+            token_type,
+            modifiers(node, source),
+            out,
+        );
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, source, out);
+        walk(child, source, lines, out);
     }
 }
 
@@ -201,6 +209,7 @@ fn walk(node: Node<'_>, source: &str, out: &mut Vec<AbsToken>) {
 fn push_node(
     node: Node<'_>,
     source: &str,
+    lines: &LineIndex,
     token_type: u32,
     modifiers: u32,
     out: &mut Vec<AbsToken>,
@@ -211,18 +220,19 @@ fn push_node(
     let mut i = line_start;
     while i < end {
         if bytes[i] == b'\n' {
-            push_span(source, line_start, i, token_type, modifiers, out);
+            push_span(source, lines, line_start, i, token_type, modifiers, out);
             line_start = i + 1;
         }
         i += 1;
     }
-    push_span(source, line_start, end, token_type, modifiers, out);
+    push_span(source, lines, line_start, end, token_type, modifiers, out);
 }
 
 /// Push a single-line span `[start, end)`. Lengths and character offsets
 /// are counted in UTF-16 code units, as the protocol requires.
 fn push_span(
     source: &str,
+    lines: &LineIndex,
     start: usize,
     end: usize,
     token_type: u32,
@@ -232,7 +242,7 @@ fn push_span(
     if start >= end {
         return;
     }
-    let position = offset_to_position(source, start);
+    let position = lines.position(source, start);
     let length: u32 = source[start..end]
         .chars()
         .map(|ch| ch.len_utf16() as u32)
