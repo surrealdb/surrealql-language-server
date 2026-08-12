@@ -125,6 +125,21 @@ pub struct AnalysisSettings {
         alias = "max_syntax_diagnostics"
     )]
     pub max_syntax_diagnostics: usize,
+    /// How long to wait for typing to settle before analysing an edited buffer,
+    /// in milliseconds. `0` disables the wait.
+    ///
+    /// Every keystroke otherwise triggers a full reparse and diagnostic
+    /// publish. At ten characters a second that is ten of each, and only the
+    /// last one describes what is on screen. The wait is per document: a newer
+    /// edit arriving during it supersedes the older one, which is dropped.
+    ///
+    /// `didOpen` is never delayed. The file just appeared and the user is
+    /// waiting to see what is wrong with it.
+    #[serde(
+        default = "default_diagnostic_debounce_ms",
+        alias = "diagnostic_debounce_ms"
+    )]
+    pub diagnostic_debounce_ms: u64,
     /// Variable names the *caller* binds at runtime, without a `$` sigil —
     /// e.g. `["id", "limit"]` for a script run as
     /// `db.query(sql).bind(("id", id))`, or the names in Surrealist's
@@ -184,6 +199,7 @@ impl Default for AnalysisSettings {
             enable_type_checking: true,
             schemaless_diagnostics: default_schemaless_diagnostics(),
             max_syntax_diagnostics: default_max_syntax_diagnostics(),
+            diagnostic_debounce_ms: default_diagnostic_debounce_ms(),
             external_params: Vec::new(),
         }
     }
@@ -464,6 +480,8 @@ const ANALYSIS_KEYS: &[&str] = &[
     "schemaless_diagnostics",
     "maxSyntaxDiagnostics",
     "max_syntax_diagnostics",
+    "diagnosticDebounceMs",
+    "diagnostic_debounce_ms",
     "externalParams",
     "external_params",
 ];
@@ -560,6 +578,12 @@ fn default_metadata_mode() -> String {
 
 fn default_schemaless_diagnostics() -> String {
     "quiet".to_string()
+}
+
+/// 200 ms. Long enough that a burst of keystrokes collapses to one analysis,
+/// short enough that a pause between words still feels immediate.
+fn default_diagnostic_debounce_ms() -> u64 {
+    200
 }
 
 fn default_max_syntax_diagnostics() -> usize {

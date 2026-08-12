@@ -6,11 +6,13 @@ mod common;
 
 use common::{core_with, uri};
 use serde_json::json;
+use surrealql_language_server::config::ServerSettings;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
-    DidChangeConfigurationParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, MessageType, NumberOrString, Position, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, InitializeParams,
+    MessageType, NumberOrString, Position, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, VersionedTextDocumentIdentifier,
 };
 
 fn text_document(path: &str, text: &str) -> TextDocumentItem {
@@ -1644,5 +1646,151 @@ async fn raising_the_cap_reanalyzes_already_open_documents() {
         syntax_diagnostic_count(&diagnostics),
         60,
         "the open buffer must be re-analyzed under the new cap: {diagnostics:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Debounce and edit supersession
+// ──────────────────────────────────────────────────────────────────────
+
+/// Settings with an explicit debounce. `0` makes a change synchronous, which is
+/// what the ordering tests want; a real value exercises the coalescing.
+fn settings_with_debounce(ms: u64) -> ServerSettings {
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = ms;
+    settings
+}
+
+/// A `didChange` carrying one full-document replacement, as the server
+/// advertises `TextDocumentSyncKind::FULL`.
+fn change(path: &str, version: i32, text: &str) -> DidChangeTextDocumentParams {
+    DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri(path),
+            version,
+        },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.to_string(),
+        }],
+    }
+}
+
+/// The table name the open buffer currently defines, read through the real
+/// `documentSymbol` handler. Each version writes a different name, so this says
+/// which analysis is the one the server is serving.
+async fn defined_table(core: &common::TestCore, path: &str) -> Option<String> {
+    let response = core
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await?;
+    let DocumentSymbolResponse::Nested(symbols) = response else {
+        return None;
+    };
+    symbols.first().map(|symbol| symbol.name.clone())
+}
+
+/// Edits arriving faster than the debounce must collapse to one analysis.
+///
+/// The edits are *staggered* deliberately. Spawned all at once they would
+/// coalesce through version supersession alone — a later edit records its
+/// version before an earlier one gets to publish — and the test would pass with
+/// the debounce switched off, proving nothing about it. Staggering them by less
+/// than the window means each edit is the newest when it starts, so only the
+/// wait can collapse them.
+#[tokio::test]
+async fn edits_faster_than_the_debounce_collapse_to_one_analysis() {
+    const DEBOUNCE_MS: u64 = 300;
+    const STAGGER_MS: u64 = 30;
+
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    let core = std::sync::Arc::new(core);
+    core.apply_settings(settings_with_debounce(DEBOUNCE_MS))
+        .await;
+    open(&core, "burst.surql", "DEFINE TABLE t1 SCHEMAFULL;").await;
+    let after_open = notifier.published().len();
+
+    let mut handles = Vec::new();
+    for version in 2..=6 {
+        let core = std::sync::Arc::clone(&core);
+        handles.push(tokio::spawn(async move {
+            // Arrive while the previous edit is still inside its window.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                STAGGER_MS * u64::from(version as u32 - 2),
+            ))
+            .await;
+            core.did_change(change(
+                "burst.surql",
+                version,
+                &format!("DEFINE TABLE t{version} SCHEMAFULL;"),
+            ))
+            .await;
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("no panic");
+    }
+
+    let publishes = notifier.published().len() - after_open;
+    assert_eq!(
+        publishes, 1,
+        "5 edits inside one {DEBOUNCE_MS} ms window published {publishes} times; \
+         the debounce did not collapse them"
+    );
+    assert_eq!(
+        defined_table(&core, "burst.surql").await.as_deref(),
+        Some("TABLE t6"),
+        "the surviving analysis must be the newest edit"
+    );
+}
+
+/// An out-of-order edit must not overwrite a newer one. Spawning `did_change`
+/// in the native adapter makes this reachable — two edits can be in flight at
+/// once — so the core carries a version per document and drops the stale one.
+#[tokio::test]
+async fn a_stale_change_does_not_overwrite_a_newer_one() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "order.surql", "DEFINE TABLE t1 SCHEMAFULL;").await;
+
+    // Version 9 arrives, then version 3. The older one must be discarded.
+    core.did_change(change("order.surql", 9, "DEFINE TABLE t9 SCHEMAFULL;"))
+        .await;
+    core.did_change(change("order.surql", 3, "DEFINE TABLE t3 SCHEMAFULL;"))
+        .await;
+
+    assert_eq!(
+        defined_table(&core, "order.surql").await.as_deref(),
+        Some("TABLE t9"),
+        "an older version overwrote a newer one"
+    );
+    assert!(
+        !notifier.published().is_empty(),
+        "the newer version must still have published"
+    );
+}
+
+/// `didOpen` is never delayed. The file just appeared and the user is waiting to
+/// see what is wrong with it.
+#[tokio::test]
+async fn did_open_is_not_debounced() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(10_000)).await;
+
+    let started = std::time::Instant::now();
+    open(&core, "immediate.surql", "SELECT * FROM;").await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "didOpen waited {elapsed:?}; it must not go through the debounce"
+    );
+    assert!(
+        !notifier.published().is_empty(),
+        "didOpen must publish diagnostics"
     );
 }

@@ -62,8 +62,19 @@ impl LanguageServer for Backend {
         self.core.did_open(params).await;
     }
 
+    /// Spawned, not awaited. The handler has to return before the debounce
+    /// elapses, or tower-lsp holds every following request behind it — and the
+    /// debounce only coalesces a burst if the burst can reach the server while
+    /// an earlier edit is still waiting.
+    ///
+    /// Spawning makes the order of two edits arrive-order rather than
+    /// completion-order, which is why the core carries a version per document
+    /// and drops a result the client has already superseded.
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        self.core.did_change(params).await;
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            core.did_change(params).await;
+        });
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {

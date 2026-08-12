@@ -374,15 +374,20 @@ where
 
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.upsert_open_document(document.uri, document.text).await;
+        self.upsert_open_document(document.uri, document.text, Edit::Opened)
+            .await;
     }
 
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let Some(change) = params.content_changes.into_iter().last() else {
             return;
         };
-        self.upsert_open_document(params.text_document.uri, change.text)
-            .await;
+        self.upsert_open_document(
+            params.text_document.uri,
+            change.text,
+            Edit::Changed(params.text_document.version),
+        )
+        .await;
     }
 
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -1019,25 +1024,70 @@ where
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────
 
-    async fn upsert_open_document(&self, uri: Uri, text: String) {
-        let limit = self
-            .state
-            .read()
-            .await
-            .settings
-            .analysis
-            .max_syntax_diagnostics;
-        let Some(analysis) =
-            analyze_document_with_limit(uri.clone(), &text, SymbolOrigin::Local, limit)
-        else {
+    async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
+        let (limit, debounce_ms) = {
+            let state = self.state.read().await;
+            (
+                state.settings.analysis.max_syntax_diagnostics,
+                state.settings.analysis.diagnostic_debounce_ms,
+            )
+        };
+
+        // Record the version first, so a later edit can tell that this one is
+        // superseded even while this call is still waiting or analysing.
+        if let Edit::Changed(version) = edit {
+            let mut state = self.state.write().await;
+            if state
+                .document_versions
+                .get(&uri)
+                .is_some_and(|newest| *newest > version)
+            {
+                // A newer edit already arrived. Its own call does the work.
+                return;
+            }
+            state.document_versions.insert(uri.clone(), version);
+        }
+
+        // Let a burst of keystrokes settle. `didOpen` skips this entirely.
+        if let Edit::Changed(version) = edit
+            && debounce_ms > 0
+        {
+            runtime::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+            if self.superseded(&uri, version).await {
+                return;
+            }
+        }
+
+        // Parsing and extraction are CPU-bound and now the most frequent work
+        // the server does, so they must not run on a thread that is also
+        // serving requests.
+        let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit).await else {
             return;
         };
+
+        // The text may have moved on while the analysis ran.
+        if let Edit::Changed(version) = edit
+            && self.superseded(&uri, version).await
+        {
+            return;
+        }
+
         {
             let mut state = self.state.write().await;
             state.open_documents.insert(uri.clone(), Arc::new(analysis));
         }
         self.recompute_model().await;
         self.publish_diagnostics_for_uri(&uri).await;
+    }
+
+    /// True when a newer `didChange` for `uri` has arrived since `version`.
+    async fn superseded(&self, uri: &Uri, version: i32) -> bool {
+        self.state
+            .read()
+            .await
+            .document_versions
+            .get(uri)
+            .is_some_and(|newest| *newest > version)
     }
 
     /// Re-run the analysis of every open document under a new syntax cap.
@@ -1386,6 +1436,46 @@ fn builtin_signature_information(
         parameters: Some(parameters),
         active_parameter: None,
     }
+}
+
+/// Why a buffer is being (re)analysed.
+///
+/// `didOpen` and `didChange` differ in two ways that both matter here: an open
+/// is never delayed, and it cannot be superseded because there is no earlier
+/// version of the same document in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Opened,
+    Changed(i32),
+}
+
+/// Run [`analyze_document_with_limit`] without occupying a thread that serves
+/// requests.
+///
+/// On native this hands the work to tokio's blocking pool, so a hover or
+/// completion arriving mid-keystroke is not queued behind a reparse. The
+/// workspace walk already did this (see
+/// [`crate::native::workspace_fs::FilesystemWorkspaceLoader::load`]); the
+/// per-edit path did not, and it is the far more frequent one.
+///
+/// On `wasm32` it runs inline. `tokio_with_wasm` would move it to a web worker,
+/// which means shipping the module to that worker and a serialisation hop for
+/// every edit — a change to how the browser build works that nothing here can
+/// test, since CI does not exercise the wasm JS surface. Inline keeps the
+/// browser behaviour exactly as it was.
+#[cfg(not(target_arch = "wasm32"))]
+async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
+    runtime::task::spawn_blocking(move || {
+        analyze_document_with_limit(uri, &text, SymbolOrigin::Local, limit)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
+    analyze_document_with_limit(uri, &text, SymbolOrigin::Local, limit)
 }
 
 /// The complete diagnostic set for one document: the syntax pass, then the
