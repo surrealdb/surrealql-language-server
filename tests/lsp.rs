@@ -1036,20 +1036,17 @@ fn completion_in_record_type_context_shows_only_tables() {
 #[test]
 fn completion_for_fields_scoped_to_statement_target_table() {
     let mut model = MergedSemanticModel::default();
-    model.fields.insert(
-        ("product".to_string(), "price".to_string()),
-        FieldDef {
-            table: "product".to_string(),
-            name: "price".to_string(),
-            type_expr: Some(TypeExpr::Scalar("number".to_string())),
-            comment: None,
-            permissions: Vec::new(),
-            origin: SymbolOrigin::Local,
-            explicit: true,
-            inference: None,
-            location: empty_location("schema.surql"),
-        },
-    );
+    model.insert_field(FieldDef {
+        table: "product".to_string(),
+        name: "price".to_string(),
+        type_expr: Some(TypeExpr::Scalar("number".to_string())),
+        comment: None,
+        permissions: Vec::new(),
+        origin: SymbolOrigin::Local,
+        explicit: true,
+        inference: None,
+        location: empty_location("schema.surql"),
+    });
     let fact = QueryFact {
         action: QueryAction::Select,
         target_tables: vec!["product".to_string()],

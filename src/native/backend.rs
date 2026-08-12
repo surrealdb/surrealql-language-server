@@ -95,6 +95,10 @@ impl LanguageServer for Backend {
         Ok(self.core.completion(params).await)
     }
 
+    async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        Ok(self.core.completion_resolve(item).await)
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         Ok(self.core.hover(params).await)
     }

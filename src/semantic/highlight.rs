@@ -165,18 +165,57 @@ pub fn collect_semantic_tokens_range(
     lines: &LineIndex,
     range: Range,
 ) -> Vec<SemanticToken> {
-    let tokens = collect_absolute(tree, source, lines)
+    // Prune the walk to the requested bytes, then apply the same positional
+    // filter as before. The pruning is deliberately coarse — it drops only
+    // nodes that lie wholly outside the range — so the surviving token set is
+    // identical to walking the whole tree and filtering. It is the walk that
+    // gets cheaper, not the answer that changes.
+    //
+    // Before this, a viewport request cost exactly as much as a full-document
+    // one: a 40-line window of a 3200-line file collected all 16000 tokens and
+    // threw away 99 percent of them.
+    let span = ByteSpan {
+        start: lines.offset(source, range.start),
+        end: lines.offset(source, range.end),
+    };
+    let tokens = collect_absolute_in(tree, source, lines, Some(span))
         .into_iter()
         .filter(|token| overlaps(token, &range))
         .collect();
     encode(tokens)
 }
 
+/// A half-open byte range of the document that the walk is restricted to.
+#[derive(Clone, Copy)]
+struct ByteSpan {
+    start: usize,
+    end: usize,
+}
+
+impl ByteSpan {
+    /// True when `node` cannot contain a token inside this span.
+    ///
+    /// A node touching the span at one end only is kept: a token is emitted
+    /// whole when it overlaps, and the positional filter decides the edges.
+    fn excludes(&self, node: Node<'_>) -> bool {
+        node.end_byte() <= self.start || node.start_byte() >= self.end
+    }
+}
+
 /// Walk the cached `tree` and gather its tokens as absolute positions,
 /// sorted by (line, start).
 fn collect_absolute(tree: &Tree, source: &str, lines: &LineIndex) -> Vec<AbsToken> {
+    collect_absolute_in(tree, source, lines, None)
+}
+
+fn collect_absolute_in(
+    tree: &Tree,
+    source: &str,
+    lines: &LineIndex,
+    span: Option<ByteSpan>,
+) -> Vec<AbsToken> {
     let mut tokens = Vec::new();
-    walk(tree.root_node(), source, lines, &mut tokens);
+    walk(tree.root_node(), source, lines, span, &mut tokens);
 
     // Tree order is already top-to-bottom, but comments (grammar extras)
     // can reattach out of order, so sort — the delta encoding below
@@ -185,7 +224,19 @@ fn collect_absolute(tree: &Tree, source: &str, lines: &LineIndex) -> Vec<AbsToke
     tokens
 }
 
-fn walk(node: Node<'_>, source: &str, lines: &LineIndex, out: &mut Vec<AbsToken>) {
+fn walk(
+    node: Node<'_>,
+    source: &str,
+    lines: &LineIndex,
+    span: Option<ByteSpan>,
+    out: &mut Vec<AbsToken>,
+) {
+    if let Some(span) = span
+        && span.excludes(node)
+    {
+        return;
+    }
+
     if let Some(token_type) = token_type(node.kind()) {
         push_node(
             node,
@@ -199,7 +250,7 @@ fn walk(node: Node<'_>, source: &str, lines: &LineIndex, out: &mut Vec<AbsToken>
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, source, lines, out);
+        walk(child, source, lines, span, out);
     }
 }
 
@@ -290,4 +341,94 @@ fn encode(tokens: Vec<AbsToken>) -> Vec<SemanticToken> {
         prev_start = token.start_char;
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ByteSpan, collect_absolute, collect_absolute_in, encode, overlaps};
+    use crate::grammar::language;
+    use crate::semantic::text::LineIndex;
+    use ls_types::{Position, Range};
+    use tree_sitter::{Parser, Tree};
+
+    fn parse(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser.set_language(&language()).expect("grammar loads");
+        parser.parse(source, None).expect("parses")
+    }
+
+    /// The ranged pass as it was before pruning: walk everything, then filter.
+    /// This is the specification for the pruned walk.
+    fn unpruned_range(
+        tree: &Tree,
+        source: &str,
+        lines: &LineIndex,
+        range: Range,
+    ) -> Vec<ls_types::SemanticToken> {
+        let tokens = collect_absolute(tree, source, lines)
+            .into_iter()
+            .filter(|token| overlaps(token, &range))
+            .collect();
+        encode(tokens)
+    }
+
+    /// Pruning the walk must not change which tokens come back — only what it
+    /// costs to find them. Checked over every window of a multi-statement
+    /// document, including windows that start and end mid-statement.
+    #[test]
+    fn pruning_the_walk_does_not_change_the_tokens() {
+        let sources = [
+            "",
+            "SELECT * FROM person;",
+            "SELECT name, email FROM person WHERE age > 21;\nUPDATE person SET age = 30;\n",
+            // A multi-line node (a block), so a window can cut through one.
+            "DEFINE FUNCTION fn::f($a: int) {\n    LET $b = $a + 1;\n    RETURN $b;\n};\nSELECT 1;\n",
+            // Comments are grammar extras and can reattach out of tree order.
+            "-- a comment\nSELECT 1;\n/* block\n   comment */\nSELECT 2;\n",
+            "SET sym = '₹';\nSELECT sym;\nSELECT '🚀';\n",
+        ];
+
+        for source in sources {
+            let tree = parse(source);
+            let lines = LineIndex::new(source);
+            let line_count = source.split('\n').count() as u32;
+
+            for start_line in 0..line_count + 1 {
+                for end_line in start_line..line_count + 1 {
+                    for end_char in [0u32, 3, 40] {
+                        let range = Range::new(
+                            Position::new(start_line, 0),
+                            Position::new(end_line, end_char),
+                        );
+                        assert_eq!(
+                            super::collect_semantic_tokens_range(&tree, source, &lines, range),
+                            unpruned_range(&tree, source, &lines, range),
+                            "pruned walk differs for {range:?} of {source:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pruning must actually prune: a small window of a long document has
+    /// to visit far fewer nodes than the whole tree.
+    #[test]
+    fn pruning_the_walk_collects_far_fewer_tokens() {
+        let source = "SELECT name, email, age FROM person WHERE age > 21;\n".repeat(400);
+        let tree = parse(&source);
+        let lines = LineIndex::new(&source);
+        let span = ByteSpan {
+            start: lines.offset(&source, Position::new(0, 0)),
+            end: lines.offset(&source, Position::new(40, 0)),
+        };
+
+        let all = collect_absolute(&tree, &source, &lines).len();
+        let pruned = collect_absolute_in(&tree, &source, &lines, Some(span)).len();
+
+        assert!(
+            pruned * 5 < all,
+            "pruning collected {pruned} of {all} tokens — not pruning enough"
+        );
+    }
 }

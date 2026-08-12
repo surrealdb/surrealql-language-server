@@ -98,7 +98,10 @@ where
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             completion_provider: Some(CompletionOptions {
-                resolve_provider: Some(false),
+                // Table items ship without documentation and get it from
+                // `completion_resolve`, so the dropdown does not pay to render
+                // hover markdown for every table in the schema.
+                resolve_provider: Some(true),
                 trigger_characters: Some(vec![
                     ".".into(),
                     ":".into(),
@@ -622,6 +625,20 @@ where
             items = merged;
         }
         Some(CompletionResponse::Array(items))
+    }
+
+    /// Fill in the documentation for the completion item the client is
+    /// showing. See [`MergedSemanticModel::resolve_completion_item`].
+    ///
+    /// The item is echoed back unchanged when nothing can be added, which is
+    /// what the protocol expects — a resolve must never drop fields the client
+    /// already has.
+    pub async fn completion_resolve(&self, item: CompletionItem) -> CompletionItem {
+        let (model, settings) = {
+            let state = self.state.read().await;
+            (Arc::clone(&state.model), Arc::clone(&state.settings))
+        };
+        model.resolve_completion_item(item, settings.active_auth_context())
     }
 
     pub async fn hover(&self, params: HoverParams) -> Option<Hover> {

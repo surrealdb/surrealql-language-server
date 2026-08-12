@@ -300,6 +300,29 @@ pub struct MergedSemanticModel {
     pub inferred_function_returns: HashMap<String, TypeExpr>,
     pub workspace_symbols: Vec<DocumentSymbol>,
     pub query_facts: HashMap<Uri, Vec<QueryFact>>,
+    /// The field names defined on each table — the keys of [`Self::fields`]
+    /// grouped by their table half.
+    ///
+    /// Derived, and maintained by
+    /// [`MergedSemanticModel::insert_field`][insert_field] alongside
+    /// [`Self::fields`]. Insert through that method rather than writing to
+    /// `fields` directly, or a lookup will miss the field.
+    ///
+    /// Exists because `fields_for_table` filtered the whole field map on every
+    /// call, and `table_completion_items` calls it once per table.
+    ///
+    /// [insert_field]: MergedSemanticModel::insert_field
+    pub fields_by_table: HashMap<String, Vec<String>>,
+    /// How many query facts across the workspace target each table name.
+    ///
+    /// Derived from [`Self::query_facts`] by
+    /// [`MergedSemanticModel::reindex_target_usage`][reindex]. The
+    /// unknown-table check needs this per inferred target in the document being
+    /// diagnosed, and counting it on demand meant flattening every fact in the
+    /// workspace each time.
+    ///
+    /// [reindex]: MergedSemanticModel::reindex_target_usage
+    pub target_usage: HashMap<String, usize>,
     /// True when the live-metadata fetch reported errors while this
     /// model was built — remote tables may be missing, so
     /// unknown-name judgments are unreliable until recovery.

@@ -53,6 +53,8 @@ impl MergedSemanticModel {
             }
         }
 
+        model.reindex_target_usage();
+
         let function_names = model.functions.keys().cloned().collect::<Vec<_>>();
         for name in function_names {
             if let Some(function) = model.functions.get(&name) {
@@ -159,10 +161,14 @@ impl MergedSemanticModel {
     /// fields, params, etc). Use when the cursor is positioned in a slot
     /// that syntactically only accepts a table name (e.g. right after
     /// `SELECT * FROM `, `INSERT INTO `, `UPDATE `).
+    /// `_active_context` is unused now that the hover text is built in
+    /// [`Self::resolve_completion_item`], which reads the context itself. The
+    /// parameter stays so the call sites keep their shape, matching
+    /// [`Self::column_completion_items`].
     pub fn table_completion_items(
         &self,
         prefix: &str,
-        active_context: Option<&AuthContext>,
+        _active_context: Option<&AuthContext>,
     ) -> Vec<CompletionItem> {
         self.table_names_by_priority()
             .into_iter()
@@ -178,10 +184,12 @@ impl MergedSemanticModel {
                         .unwrap_or_else(|| "inferred".to_string()),
                     origin_label(table.origin)
                 )),
-                documentation: Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format_table_hover(table, self, active_context),
-                })),
+                // No `documentation` here. The client shows it for the one item
+                // the user highlights, and asks for it through
+                // `completionItem/resolve`; rendering the hover markdown for
+                // every table meant a schema-sized cost on every keystroke that
+                // opened the dropdown. `data` carries what resolve needs.
+                data: Some(serde_json::json!({ "table": table.name })),
                 sort_text: Some(format!(
                     "0-{}-{}",
                     symbol_priority(table.origin),
@@ -190,6 +198,33 @@ impl MergedSemanticModel {
                 ..CompletionItem::default()
             })
             .collect()
+    }
+
+    /// Fill in the documentation for one completion item, on demand.
+    ///
+    /// Returns the item unchanged when it carries no `data.table` — every other
+    /// completion kind still ships whatever it was built with.
+    pub fn resolve_completion_item(
+        &self,
+        mut item: CompletionItem,
+        active_context: Option<&AuthContext>,
+    ) -> CompletionItem {
+        if item.documentation.is_some() {
+            return item;
+        }
+        let table_name = item
+            .data
+            .as_ref()
+            .and_then(|data| data.get("table"))
+            .and_then(|name| name.as_str());
+        let Some(table) = table_name.and_then(|name| self.tables.get(name)) else {
+            return item;
+        };
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format_table_hover(table, self, active_context),
+        }));
+        item
     }
 
     /// The `DEFINE ANALYZER` names, for the slots that reference one.
@@ -217,11 +252,49 @@ impl MergedSemanticModel {
         items
     }
 
-    pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
-        let mut fields = self
+    /// Insert or merge one field, keeping [`MergedSemanticModel::fields_by_table`]
+    /// in step. This is the only correct way to add a field to the model.
+    pub fn insert_field(&mut self, field: FieldDef) {
+        let key = (field.table.clone(), field.name.clone());
+        let is_new = !self.fields.contains_key(&key);
+        let replace = self
             .fields
-            .values()
-            .filter(|field| field.table == table)
+            .get(&key)
+            .map(|current| should_replace_field(current, &field))
+            .unwrap_or(true);
+        if is_new {
+            self.fields_by_table
+                .entry(field.table.clone())
+                .or_default()
+                .push(field.name.clone());
+        }
+        if replace {
+            self.fields.insert(key, field);
+        }
+    }
+
+    /// Recount [`MergedSemanticModel::target_usage`] from
+    /// [`MergedSemanticModel::query_facts`]. One pass over the facts, run once
+    /// per build rather than once per inferred target.
+    pub fn reindex_target_usage(&mut self) {
+        self.target_usage.clear();
+        for fact in self.query_facts.values().flatten() {
+            for table in &fact.target_tables {
+                *self.target_usage.entry(table.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
+        // Only this table's fields, looked up by name, rather than a filter over
+        // every field in the workspace. The sort is unchanged: origin priority
+        // first so a local definition outranks an inferred one, then name.
+        let Some(names) = self.fields_by_table.get(table) else {
+            return Vec::new();
+        };
+        let mut fields = names
+            .iter()
+            .filter_map(|name| self.fields.get(&(table.to_string(), name.clone())))
             .collect::<Vec<_>>();
         fields.sort_by(|left, right| {
             symbol_priority(right.origin)
@@ -488,6 +561,7 @@ impl MergedSemanticModel {
         self.tables
             .values()
             .filter(|table| table.explicit && table.name != unknown)
+            .filter(|table| lengths_can_reach_threshold(unknown, &table.name))
             .map(|table| (table, jaro_winkler(unknown, &table.name)))
             .filter(|(_, score)| *score > 0.86)
             .max_by(|left, right| {
@@ -513,11 +587,7 @@ impl MergedSemanticModel {
     /// name used in several statements is a deliberate table, not a
     /// one-off typo.
     fn target_usage_count(&self, name: &str) -> usize {
-        self.query_facts
-            .values()
-            .flatten()
-            .filter(|fact| fact.target_tables.iter().any(|table| table == name))
-            .count()
+        self.target_usage.get(name).copied().unwrap_or(0)
     }
 
     /// Nearest explicitly defined field on `table` — the unknown-field
@@ -1487,7 +1557,7 @@ impl MergedSemanticModel {
             merge_index(&mut self.indexes, index);
         }
         for field in &analysis.fields {
-            merge_field(&mut self.fields, field);
+            self.insert_field(field.clone());
         }
         for function in &analysis.functions {
             merge_function(&mut self.functions, function);
@@ -1712,17 +1782,6 @@ fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: &Ind
     );
 }
 
-fn merge_field(target: &mut HashMap<(String, String), FieldDef>, candidate: &FieldDef) {
-    let key = (candidate.table.clone(), candidate.name.clone());
-    let replace = target
-        .get(&key)
-        .map(|current| should_replace_field(current, candidate))
-        .unwrap_or(true);
-    if replace {
-        target.insert(key, candidate.clone());
-    }
-}
-
 fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: &FunctionDef) {
     let replace = target
         .get(&candidate.name)
@@ -1778,6 +1837,32 @@ fn should_replace_table(current: &TableDef, candidate: &TableDef) -> bool {
             .map(|fact| fact.confidence)
             .unwrap_or(1.0),
     )
+}
+
+/// Whether two names are close enough in length that jaro-winkler *could*
+/// score them above the 0.86 gate. Cheap, and sound: it never rejects a pair
+/// the full comparison would have accepted.
+///
+/// Jaro is `(m/a + m/b + (m-t)/m) / 3` with `m` matches and `t`
+/// transpositions, so `(m-t)/m <= 1` and `m <= min(a, b)`. Winkler adds at
+/// most `4 * 0.1 * (1 - J)`, so the best reachable score is `0.6J + 0.4`.
+/// Requiring that to exceed 0.86 gives `J > 0.7667`, and substituting the
+/// bounds on `m` leaves `min(a, b) / max(a, b) > 0.3`.
+///
+/// This is a guard for the pathological case — a two-character name against
+/// a thirty-character one — not a way to make the sweep cheap. Names of
+/// similar length all pass, which is the common case. A tighter rule on the
+/// *difference* of the lengths is not available: `person` and
+/// `personaddress` differ by 7 characters and still score 0.892, so cutting
+/// on a fixed difference would drop real near-misses.
+fn lengths_can_reach_threshold(unknown: &str, candidate: &str) -> bool {
+    let (shorter, longer) = if unknown.len() <= candidate.len() {
+        (unknown.len(), candidate.len())
+    } else {
+        (candidate.len(), unknown.len())
+    };
+    // `shorter / longer > 0.3`, in integers.
+    shorter * 10 > longer * 3
 }
 
 fn should_replace_field(current: &FieldDef, candidate: &FieldDef) -> bool {
@@ -2411,7 +2496,10 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use ls_types::{DiagnosticSeverity, Location, Position, Range, Uri};
+    use ls_types::{
+        CompletionItem, DiagnosticSeverity, Documentation, Location, MarkupKind, Position, Range,
+        Uri,
+    };
 
     use crate::config::{AuthContext, ServerSettings};
     use crate::semantic::text::LineIndex;
@@ -2956,38 +3044,32 @@ mod tests {
     fn completion_items_include_statement_fields_for_select_update_create() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
-        model.fields.insert(
-            ("person".to_string(), "email".to_string()),
-            crate::semantic::types::FieldDef {
-                table: "person".to_string(),
-                name: "email".to_string(),
-                type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
-                    "string".to_string(),
-                )),
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
-        model.fields.insert(
-            ("company".to_string(), "email".to_string()),
-            crate::semantic::types::FieldDef {
-                table: "company".to_string(),
-                name: "email".to_string(),
-                type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
-                    "string".to_string(),
-                )),
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
+        model.insert_field(crate::semantic::types::FieldDef {
+            table: "person".to_string(),
+            name: "email".to_string(),
+            type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                "string".to_string(),
+            )),
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
+        model.insert_field(crate::semantic::types::FieldDef {
+            table: "company".to_string(),
+            name: "email".to_string(),
+            type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                "string".to_string(),
+            )),
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
 
         let single_table = crate::semantic::types::QueryFact {
             action: QueryAction::Select,
@@ -3076,22 +3158,19 @@ mod tests {
             },
         );
         for field_name in ["email", "name"] {
-            model.fields.insert(
-                ("person".to_string(), field_name.to_string()),
-                crate::semantic::types::FieldDef {
-                    table: "person".to_string(),
-                    name: field_name.to_string(),
-                    type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
-                        "string".to_string(),
-                    )),
-                    comment: None,
-                    permissions: Vec::new(),
-                    origin: SymbolOrigin::Local,
-                    explicit: true,
-                    inference: None,
-                    location: Location::new(uri.clone(), Range::default()),
-                },
-            );
+            model.insert_field(crate::semantic::types::FieldDef {
+                table: "person".to_string(),
+                name: field_name.to_string(),
+                type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                    "string".to_string(),
+                )),
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+            });
         }
 
         let items = model.column_completion_items("", &["person".to_string()], false, None);
@@ -3117,20 +3196,17 @@ mod tests {
     fn field_sort_text_puts_fields_above_functions_in_loose_mode() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
-        model.fields.insert(
-            ("person".to_string(), "email".to_string()),
-            crate::semantic::types::FieldDef {
-                table: "person".to_string(),
-                name: "email".to_string(),
-                type_expr: None,
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
+        model.insert_field(crate::semantic::types::FieldDef {
+            table: "person".to_string(),
+            name: "email".to_string(),
+            type_expr: None,
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
         model.functions.insert(
             "fn::greet".to_string(),
             FunctionDef {
@@ -3208,6 +3284,101 @@ mod tests {
         );
 
         assert!(model.rename_edits("fn::remote", "fn::renamed").is_none());
+    }
+
+    /// A table item ships without documentation, and resolve puts back exactly
+    /// what the eager version used to inline. Without this, moving the hover
+    /// text behind `completionItem/resolve` would read as a speed-up while
+    /// quietly dropping the documentation.
+    #[test]
+    fn resolve_restores_the_documentation_the_item_ships_without() {
+        let (model, _) = model_with_person_table();
+
+        let items = model.table_completion_items("", None);
+        let item = items
+            .iter()
+            .find(|item| item.label == "person")
+            .expect("person is offered")
+            .clone();
+        assert!(
+            item.documentation.is_none(),
+            "the item must not carry documentation before resolve"
+        );
+
+        let resolved = model.resolve_completion_item(item, None);
+        let Some(Documentation::MarkupContent(markup)) = resolved.documentation else {
+            panic!("resolve did not attach markdown documentation");
+        };
+        assert_eq!(markup.kind, MarkupKind::Markdown);
+        assert_eq!(
+            markup.value,
+            super::format_table_hover(model.tables.get("person").expect("present"), &model, None),
+            "resolve must produce the same text the eager version inlined"
+        );
+    }
+
+    /// An item that is not a table, or already carries documentation, comes back
+    /// untouched. A resolve that dropped fields would break the client.
+    #[test]
+    fn resolve_leaves_other_items_alone() {
+        let (model, _) = model_with_person_table();
+
+        let keyword = CompletionItem {
+            label: "SELECT".to_string(),
+            ..CompletionItem::default()
+        };
+        assert_eq!(
+            model.resolve_completion_item(keyword.clone(), None),
+            keyword
+        );
+
+        let already = CompletionItem {
+            label: "person".to_string(),
+            documentation: Some(Documentation::String("kept".to_string())),
+            data: Some(serde_json::json!({ "table": "person" })),
+            ..CompletionItem::default()
+        };
+        assert_eq!(
+            model.resolve_completion_item(already.clone(), None),
+            already,
+            "an item that already has documentation must not be rewritten"
+        );
+    }
+
+    /// The length prefilter must never reject a pair that jaro-winkler would
+    /// have scored above the gate. The named pairs are the trap: they differ in
+    /// length by 4 to 7 characters and still score above 0.86, so a prefilter
+    /// keyed on the *difference* of the lengths would drop real near-misses.
+    #[test]
+    fn the_length_prefilter_never_rejects_a_real_near_miss() {
+        let pairs = [
+            ("user", "userdata"),
+            ("user", "username"),
+            ("acct", "accounts"),
+            ("item", "itemvariant"),
+            ("person", "personaddress"),
+            ("persn", "person"),
+            ("oders", "orders"),
+        ];
+        for (unknown, candidate) in pairs {
+            let score = strsim::jaro_winkler(unknown, candidate);
+            if score > 0.86 {
+                assert!(
+                    super::lengths_can_reach_threshold(unknown, candidate),
+                    "prefilter rejected {unknown:?} vs {candidate:?}, which scores {score:.3}"
+                );
+            }
+        }
+    }
+
+    /// It does still reject the hopeless case, or it would not be worth having.
+    #[test]
+    fn the_length_prefilter_rejects_a_hopeless_pair() {
+        assert!(!super::lengths_can_reach_threshold(
+            "id",
+            "customer_billing_address_line"
+        ));
+        assert!(super::lengths_can_reach_threshold("person", "persons"));
     }
 
     #[test]
