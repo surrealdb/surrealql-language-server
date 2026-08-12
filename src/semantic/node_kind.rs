@@ -247,19 +247,32 @@ pub fn is_define_statement(kind: &str) -> bool {
 
 /// First child node with a matching kind (named children only).
 pub fn find_child<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if node.child_count() == 0 {
+        return None;
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|c| c.kind() == kind)
 }
 
 /// First child node whose kind matches any of `kinds` (named children only).
 pub fn find_child_any<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+    if node.child_count() == 0 {
+        return None;
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|c| kinds.contains(&c.kind()))
 }
 
 /// Iterator-friendly collection of all named children.
+///
+/// The early return matters: `node.walk()` allocates a tree-sitter cursor, and
+/// this is called on leaves often enough for that to show up in a whole-document
+/// walk.
 pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    if node.child_count() == 0 {
+        return Vec::new();
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
 }
@@ -270,6 +283,9 @@ pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
 pub fn has_descendant(node: Node<'_>, kind: &str) -> bool {
     if node.kind() == kind {
         return true;
+    }
+    if node.child_count() == 0 {
+        return false;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {

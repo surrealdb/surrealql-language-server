@@ -193,7 +193,6 @@ pub struct QueryFact {
     pub touched_fields: Vec<String>,
     pub dynamic: bool,
     pub location: Location,
-    pub source_preview: String,
     /// Tight token ranges for [`Self::target_tables`] entries.
     /// `#[serde(default)]` keeps previously-serialized facts loading.
     #[serde(default)]

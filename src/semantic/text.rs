@@ -135,6 +135,23 @@ impl LineIndex {
         line_end
     }
 
+    /// The text of one line, without its terminator.
+    ///
+    /// `None` past the end of the document. Exists so a caller that needs a few
+    /// lines near a node does not have to build a `Vec` of every line in the
+    /// file to index into.
+    pub fn line_text<'a>(&self, source: &'a str, line: usize) -> Option<&'a str> {
+        let start = *self.line_starts.get(line)?;
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .map(|next| next.saturating_sub(1))
+            .unwrap_or(source.len());
+        let line = source.get(start..end)?;
+        // A `\r\n` document leaves the carriage return at the end of the slice.
+        Some(line.strip_suffix('\r').unwrap_or(line))
+    }
+
     /// Convert a byte range to an LSP range.
     ///
     /// One index serves both ends, so this costs two binary searches where

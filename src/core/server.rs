@@ -1466,7 +1466,7 @@ enum Edit {
 #[cfg(not(target_arch = "wasm32"))]
 async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
     runtime::task::spawn_blocking(move || {
-        analyze_document_with_limit(uri, &text, SymbolOrigin::Local, limit)
+        analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
     })
     .await
     .ok()
@@ -1475,7 +1475,7 @@ async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<Doc
 
 #[cfg(target_arch = "wasm32")]
 async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
-    analyze_document_with_limit(uri, &text, SymbolOrigin::Local, limit)
+    analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
 }
 
 /// The complete diagnostic set for one document: the syntax pass, then the

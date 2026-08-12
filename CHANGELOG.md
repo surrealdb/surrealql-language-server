@@ -4,6 +4,23 @@
 
 ### Performance
 
+Editor-facing latency, measured on a 3200-line (166 KB) file and a 200-document
+workspace, release profile:
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| Semantic tokens, whole document | 2510 ms | 13.5 ms |
+| Semantic tokens, 40-line viewport | 2513 ms | 0.64 ms |
+| `analyze_document` | 6309 ms | 59.3 ms |
+| Hover and go-to cursor lookup | 2.44 ms | under 1 µs |
+| Table completion, 800 tables | 21.5 ms | 0.22 ms |
+| Unknown-table check, 200 documents | 8.90 ms | 0.80 ms |
+| SurrealDB corpus sweep, 1897 files | ~130 s | 4.5 s |
+
+Every document operation is now linear in file size; the cost per line no longer
+grows. Details below.
+
+
 The editor-facing operations were quadratic in document size. One function was
 the cause: `offset_to_position` scanned the document from byte 0 to convert a
 single byte offset, and it is called once per emitted semantic token and about
@@ -26,6 +43,17 @@ quadratic term is gone rather than reduced.
 
 Also:
 
+- The **"did you mean" sweep** for an unknown table or field now skips candidates
+  that provably cannot clear the similarity threshold, and reads an index of the
+  explicitly-defined tables rather than every table the server has inferred from
+  usage. Which names are suggested is unchanged — the bound is derived from the
+  metric and tested against it directly.
+- **Comment lookup no longer scans the whole document.** Reading the comment above
+  a `DEFINE` split the entire file into lines, once per definition, whenever the
+  statement had no `COMMENT` clause — so a large schema file scanned itself once
+  per definition.
+- **The extraction walk reuses one tree cursor** instead of allocating a fresh one
+  at every node it visits.
 - A **viewport request for semantic tokens** now walks only the nodes covering
   the requested range. It used to walk the whole tree and filter afterwards, so
   asking for 40 lines cost the same as asking for the whole file.

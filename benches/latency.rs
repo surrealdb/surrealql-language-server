@@ -57,6 +57,20 @@ fn schema_doc(index: usize, tables: usize) -> String {
     out
 }
 
+/// A schema document: one `DEFINE FIELD` per line with a `TYPE` clause and no
+/// `COMMENT` clause.
+///
+/// This is the shape the all-SELECT rows miss entirely, and it drives two paths
+/// they never reach: the leading-comment lookup (which runs for every DEFINE
+/// without a `COMMENT` clause) and the `TypeName` check in the syntax pass.
+fn schema_only_doc(lines: usize) -> String {
+    let mut out = String::from("DEFINE TABLE person SCHEMAFULL;\n");
+    for i in 0..lines {
+        out.push_str(&format!("DEFINE FIELD f{i} ON person TYPE string;\n"));
+    }
+    out
+}
+
 fn workspace(docs: usize, tables_per_doc: usize) -> WorkspaceIndex {
     let mut index = WorkspaceIndex::default();
     for d in 0..docs {
@@ -158,12 +172,40 @@ fn main() {
     println!("\n== analyze_document ==");
     for lines in LINE_SIZES {
         let text = query_doc(lines);
+        // Constructed outside the loop: `uri()` parses a URI, which is not
+        // part of what this row measures.
+        let doc_uri = uri(0);
         let ms = time(|| {
-            std::hint::black_box(analyze_document(uri(0), &text, SymbolOrigin::Local));
+            std::hint::black_box(analyze_document(
+                doc_uri.clone(),
+                &text,
+                SymbolOrigin::Local,
+            ));
         });
         report(lines, text.len(), ms);
         results.push(Measured {
             name: "analyze_document",
+            scale: format!("{lines} lines"),
+            ms,
+            target_ms: (lines == 3200).then_some(60.0),
+        });
+    }
+
+    // ── 2b. analyze_document on a DEFINE-heavy document ─────────────────
+    println!("\n== analyze_document (schema shape: one DEFINE FIELD per line) ==");
+    for lines in LINE_SIZES {
+        let text = schema_only_doc(lines);
+        let doc_uri = uri(0);
+        let ms = time(|| {
+            std::hint::black_box(analyze_document(
+                doc_uri.clone(),
+                &text,
+                SymbolOrigin::Local,
+            ));
+        });
+        report(lines, text.len(), ms);
+        results.push(Measured {
+            name: "analyze_document/schema",
             scale: format!("{lines} lines"),
             ms,
             target_ms: (lines == 3200).then_some(60.0),

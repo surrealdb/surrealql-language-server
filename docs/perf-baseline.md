@@ -76,32 +76,74 @@ slightly slower than at the baseline. Both now maintain two extra indexes
 (`fields_by_table` and `target_usage`), which costs a little on build to save a
 lot on lookup — `table_completion_items` is 93 times faster.
 
-## The two targets that fail
+## All targets met
 
-`analyze_document` is 69.7 ms against a 60 ms budget. It is linear now, at
-21.8 µs per line. The parse underneath it is 23.8 ms, so about 46 ms is the
-extraction walk doing real work. Step D5, the incremental parse, is what closes
-this: it removes most of the parse for a single keystroke. The target is left in
-`benches/latency.rs` as a failing gate rather than moved.
+Both failing targets were closed. `cargo bench` exits 0.
 
-`semantic_diagnostics` over undeclared targets is 9.47 ms against 1 ms. The
-`target_usage` index removed the workspace-wide scan it was supposed to, but that
-scan was not the cost. Attribution: 20000 `jaro_winkler` comparisons take
-3.9 ms of it, and no *sound* prefilter prunes them on this corpus.
+| Operation | Baseline | After phases A-D | Final | Target |
+|-----------|----------|------------------|-------|--------|
+| `analyze_document`, 3200 lines | 6309.34 ms | 69.70 ms | **59.31 ms** | 60 ms ✅ |
+| `semantic_diagnostics`, undeclared | 8.90 ms | 9.47 ms | **0.80 ms** | 1 ms ✅ |
+| `analyze_document`, schema shape | not measured | not measured | **32.50 ms** | 60 ms ✅ |
 
-CAUTION: The planned prefilter — skip a candidate whose name length differs by
-more than 3 — is unsound. `person` and `personaddress` differ by 7 characters
-and score 0.892, above the 0.86 gate, so it would stop suggesting real
-near-misses. Do not add it. The bound that does follow from the metric is a
-length *ratio* of 0.3, which is in the code and prunes nothing at realistic name
-lengths.
+CAUTION: `analyze_document` clears its budget by about 1 ms — measured 58.8, 58.8,
+59.6 and 59.3 ms across four runs. That is a real gate on a 60 ms budget, so a
+slower machine can fail it. If CI reports a failure there, the next lever is
+`collect_node_diagnostics`, which still allocates one tree-sitter cursor per
+non-leaf node; converting it to the reused-cursor form used by
+`collect_descendants` is worth an estimated 2-3 ms. Do not relax the target
+without doing that first.
 
-NOTE: The undeclared-target corpus is adversarial for any prefilter. The names
-`undeclared_dN_tM` and `real_dN_tM` share almost every character. Realistic
-table names would prune far better, so this row is closer to a worst case than
-to a typical one.
+## What closed the typo sweep
+
+Two changes, and the second one corrects a claim this document used to make.
+
+`find_nearest_explicit_table` read `tables.values()` and filtered on `explicit`
+afterwards, so with most tables inferred from usage it walked 5000 ~230-byte
+entries to reach 1000 candidates. `explicit_tables` holds the candidates
+contiguously.
+
+The previous text here said no *sound* prefilter prunes this corpus. **That was
+wrong.** It assumed the worst-case Winkler prefix bonus. Winkler is
+`J + 0.1p(1-J)` for `p = min(4, common prefix)`, strictly increasing in `J`, so
+`JW > 0.86` iff `J > T(p)` — and `T(0) = 0.860` against `T(4) = 0.767`. A pair can
+only pass if `m(a+b) > (3T(p)-1)ab`, with `m` bounded by `min(a,b)` and then by
+the character-multiset intersection. Computing `p` exactly is what does the work:
+on the benchmark cross-product survivors go from 20,000 to 88.
+
+NOTE: A bound on the *difference* of the lengths is still unsound at any `p`.
+`person` and `personaddress` differ by 7 characters and score 0.892. That
+counterexample is pinned by a test.
+
+## What closed analyze_document
+
+The cost was never the parse (23.8 ms of the original 69.7) and it was not the
+allocations either. Measured directly: a 70,000-node tree walks in 7.53 ms when
+each node allocates its own cursor via `node.walk()`, and 4.25 ms with one reused
+cursor — 3.3 ms per traversal, and the extraction path made several.
+
+`collect_descendants` now drives one cursor instead of recursing with a fresh one
+per node, and the helpers that iterate children return early for a node that has
+none. Together: 69.70 -> 59.31 ms.
+
+NOTE: Two estimates that did not survive measurement, recorded so nobody spends
+the time again. Swapping `kind()` for `kind_id()` was projected at 4-8 ms; it
+measured **0.36 ms** per traversal, so it was not done — `kind()` is far cheaper
+than its strlen-plus-UTF-8-validation description suggests. And the isolated
+allocation fixes (the discarded `TableDef`, the duplicated preview, the redundant
+range conversions, the clones, `with_capacity`) were projected at 5-8 ms
+*combined* and moved the number by less than the run-to-run noise. They are kept
+because they are strictly less work, not because they were measurable.
+
+## The schema-shape row
+
+The all-SELECT rows could not see `leading_comment_text`, which ran
+`source.lines().collect::<Vec<_>>()` — a whole-document scan — for every DEFINE
+without a `COMMENT` clause, the common case in real schema files. The new
+`analyze_document/schema` row covers that shape, and it is linear: 10.24 / 10.04 /
+10.16 µs per line at 200 / 800 / 3200 lines.
 
 ## What phase D still owes
 
 D1 and D2 are done. D3, D4 and D5 are not — see the entries in
-`docs/pain-points.md`.
+`docs/pain-points.md`. Neither failing target needed them.

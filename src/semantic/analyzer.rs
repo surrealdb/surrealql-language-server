@@ -27,10 +27,17 @@ pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<Do
 /// bounds how many `parse`/`unknown-type` diagnostics the walk collects.
 pub fn analyze_document_with_limit(
     uri: Uri,
-    text: &str,
+    text: impl Into<String>,
     origin: SymbolOrigin,
     limit: usize,
 ) -> Option<DocumentAnalysis> {
+    // Owned once. The document text used to be copied into the analysis with
+    // `to_string()` even though every caller already owns a `String` and drops
+    // it — a whole-document memcpy per keystroke. It is moved in at the end
+    // instead, after the walks are done borrowing it.
+    let owned_text: String = text.into();
+    let text: &str = &owned_text;
+
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
     let tree = parser.parse(text, None)?;
@@ -39,16 +46,19 @@ pub fn analyze_document_with_limit(
     // Built once, before the walk. Every range the walk records goes through
     // this index, which is what keeps the walk linear in the document size.
     let line_index = LineIndex::new(text);
+    // A statement cannot be shorter than a line, so the line count is a sound
+    // upper bound and a good first guess. Without it a 3200-statement document
+    // grows each of these through a dozen reallocations.
+    let statement_hint = line_index.line_count();
 
     let mut analysis = DocumentAnalysis {
         uri: uri.clone(),
-        text: text.to_string(),
+        // Both replaced below, once the walks stop borrowing them: they need
+        // `text` and `line_index` by reference while holding `&mut analysis`.
+        text: String::new(),
         // Shallow (ref-counted) copy; `root` keeps borrowing the local
         // `tree` for the `collect_statements` walk below.
         tree: tree.clone(),
-        // Replaced by `line_index` below: the walks need it by
-        // reference while they hold `&mut analysis`, so it cannot live
-        // in the struct until they are done.
         line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
@@ -58,10 +68,10 @@ pub fn analyze_document_with_limit(
         params: Vec::new(),
         accesses: Vec::new(),
         analyzers: Vec::new(),
-        query_facts: Vec::new(),
+        query_facts: Vec::with_capacity(statement_hint),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
-        document_symbols: Vec::new(),
+        document_symbols: Vec::with_capacity(statement_hint),
     };
 
     collect_statements(root, text, &line_index, &uri, origin, &mut analysis);
@@ -94,6 +104,7 @@ pub fn analyze_document_with_limit(
         syntax_diagnostic_limit(limit),
     );
     analysis.line_index = line_index;
+    analysis.text = owned_text;
     Some(analysis)
 }
 
@@ -127,6 +138,8 @@ pub fn collect_syntax_diagnostics_at(
     limit: usize,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+    // One slot per line, marked as `parse` diagnostics are pushed.
+    let mut parse_rows = vec![false; lines.line_count()];
     collect_node_diagnostics(
         uri,
         source,
@@ -134,6 +147,7 @@ pub fn collect_syntax_diagnostics_at(
         node,
         known_names,
         limit,
+        &mut parse_rows,
         &mut diagnostics,
     );
     diagnostics
@@ -293,7 +307,7 @@ fn extract_table(
     let table = TableDef {
         name: name.clone(),
         schema_mode,
-        comment: extract_comment(node, source),
+        comment: extract_comment(node, source, lines),
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
@@ -359,7 +373,7 @@ fn extract_field(
         table: table.clone(),
         name: name.clone(),
         type_expr: type_expr.clone(),
-        comment: extract_comment(node, source),
+        comment: extract_comment(node, source, lines),
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
@@ -452,7 +466,7 @@ fn extract_event(
     analysis.events.push(EventDef {
         table,
         name,
-        comment: extract_comment(node, source),
+        comment: extract_comment(node, source, lines),
         when_clause,
         then_clause,
         origin,
@@ -531,7 +545,7 @@ fn extract_function(
         params,
         return_type,
         language,
-        comment: extract_comment(node, source),
+        comment: extract_comment(node, source, lines),
         permissions,
         origin,
         explicit: true,
@@ -681,7 +695,7 @@ fn extract_param(
     analysis.params.push(ParamDef {
         name,
         value_preview,
-        comment: extract_comment(node, source),
+        comment: extract_comment(node, source, lines),
         origin,
         location: location(uri, source, lines, node),
     });
@@ -780,30 +794,36 @@ fn extract_query_fact(
         TargetResolution::Static
     };
     let dynamic = targets.is_empty();
-    let preview = node
-        .utf8_text(source.as_bytes())
-        .ok()
-        .map(compact_preview)
-        .unwrap_or_default();
 
-    analysis.document_symbols.push(
-        statement_symbol(node, source, lines, uri)
-            .unwrap_or_else(|| definition_symbol(&preview, SymbolKind::EVENT, source, lines, node)),
-    );
+    // `statement_symbol` answers for every statement kind the grammar names, so
+    // the fallback only runs for one it does not. Build the preview inside the
+    // `unwrap_or_else` rather than ahead of it — it is two allocations and a
+    // character count, and on the common path nothing reads it.
+    analysis
+        .document_symbols
+        .push(
+            statement_symbol(node, source, lines, uri).unwrap_or_else(|| {
+                let preview = node
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(compact_preview)
+                    .unwrap_or_default();
+                definition_symbol(&preview, SymbolKind::EVENT, source, lines, node)
+            }),
+        );
 
-    analysis.query_facts.push(QueryFact {
-        action,
-        target_tables: targets.clone(),
-        touched_fields: touched_fields.clone(),
-        dynamic,
-        location: location(uri, source, lines, node),
-        source_preview: preview,
-        target_refs,
-        field_refs,
-        target_resolution,
-    });
+    // One location for the statement, shared by the fact and by every inferred
+    // table below. It used to be recomputed per use.
+    let statement_location = location(uri, source, lines, node);
 
     for table in &targets {
+        // The guard first: `upsert_inferred_table` discards the definition when
+        // the document already has this table, which for a file that queries the
+        // same table repeatedly is almost every statement. Building it first meant
+        // two `format!`s, a `Uri` clone and a range conversion thrown away.
+        if already_has_table(analysis, table) {
+            continue;
+        }
         let inferred = TableDef {
             name: table.clone(),
             schema_mode: None,
@@ -816,7 +836,7 @@ fn extract_query_fact(
                 origin: SymbolOrigin::Inferred,
                 evidence: format!("Observed `{table}` in {} statement.", action_label(action)),
             }),
-            location: location(uri, source, lines, node),
+            location: statement_location.clone(),
         };
         upsert_inferred_table(analysis, inferred, uri, source, lines, node);
     }
@@ -826,6 +846,17 @@ fn extract_query_fact(
     {
         analysis.fields.push(inferred_field);
     }
+
+    analysis.query_facts.push(QueryFact {
+        action,
+        target_tables: targets,
+        touched_fields,
+        dynamic,
+        location: statement_location,
+        target_refs,
+        field_refs,
+        target_resolution,
+    });
 }
 
 fn infer_fields_from_statement(
@@ -1379,7 +1410,7 @@ pub(crate) fn identifier_from_on_table_clause(node: Node<'_>, source: &str) -> O
         })
 }
 
-fn extract_comment(node: Node<'_>, source: &str) -> Option<String> {
+fn extract_comment(node: Node<'_>, source: &str, lines: &LineIndex) -> Option<String> {
     let clause = k::named_children(node)
         .into_iter()
         .find(|child| child.kind() == k::COMMENT_CLAUSE)
@@ -1387,13 +1418,18 @@ fn extract_comment(node: Node<'_>, source: &str) -> Option<String> {
         .and_then(|child| text_of(source, child))
         .map(|value| unquote(&value));
 
-    clause.or_else(|| leading_comment_text(node, source))
+    clause.or_else(|| leading_comment_text(node, source, lines))
 }
 
-fn leading_comment_text(node: Node<'_>, source: &str) -> Option<String> {
+/// The run of `--` / `//` / `#` comment lines directly above `node`, if any.
+///
+/// Reads lines through [`LineIndex`] rather than `source.lines().collect()`. The
+/// `Vec` version allocated one entry per line of the *whole document* on every
+/// call, and this runs for every DEFINE that has no `COMMENT` clause — the common
+/// case — so a large schema file scanned itself once per definition.
+fn leading_comment_text(node: Node<'_>, source: &str, lines: &LineIndex) -> Option<String> {
     let start_row = node.start_position().row;
-    let lines = source.lines().collect::<Vec<_>>();
-    if start_row == 0 || start_row > lines.len() {
+    if start_row == 0 || start_row >= lines.line_count() {
         return None;
     }
 
@@ -1401,7 +1437,10 @@ fn leading_comment_text(node: Node<'_>, source: &str) -> Option<String> {
     let mut row = start_row;
     while row > 0 {
         row -= 1;
-        let trimmed = lines[row].trim();
+        let Some(line) = lines.line_text(source, row) else {
+            break;
+        };
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             if comments.is_empty() {
                 continue;
@@ -1475,18 +1514,9 @@ fn upsert_inferred_table(
     lines: &LineIndex,
     source_node: Node<'_>,
 ) {
-    if analysis
-        .tables
-        .iter()
-        .any(|table| table.name == inferred.name && table.explicit)
-    {
-        return;
-    }
-    if analysis
-        .tables
-        .iter()
-        .any(|table| table.name == inferred.name && !table.explicit)
-    {
+    // One scan, not two: the previous pair tested `explicit` and `!explicit`
+    // separately, which is just "is this name present at all".
+    if already_has_table(analysis, &inferred.name) {
         return;
     }
     analysis.document_symbols.push(definition_symbol(
@@ -1504,6 +1534,16 @@ fn upsert_inferred_table(
     });
     let _ = source_uri;
     analysis.tables.push(inferred);
+}
+
+/// Whether the document already records a table by this name, explicit or
+/// inferred.
+///
+/// The caller uses it as a guard *before* building an inferred [`TableDef`], so a
+/// file that queries the same table on every line pays one name comparison per
+/// statement instead of a discarded definition.
+fn already_has_table(analysis: &DocumentAnalysis, name: &str) -> bool {
+    analysis.tables.iter().any(|table| table.name == name)
 }
 
 fn location(uri: &Uri, source: &str, lines: &LineIndex, node: Node<'_>) -> Location {
@@ -1545,6 +1585,7 @@ fn collect_node_diagnostics(
     node: Node<'_>,
     known_names: &std::collections::HashSet<String>,
     limit: usize,
+    parse_rows: &mut [bool],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if diagnostics.len() >= limit {
@@ -1552,12 +1593,20 @@ fn collect_node_diagnostics(
     }
 
     if node.is_missing() {
-        diagnostics.push(missing_node_diagnostic(source, lines, node));
+        push_parse_diagnostic(
+            missing_node_diagnostic(source, lines, node),
+            parse_rows,
+            diagnostics,
+        );
         return;
     }
 
     if node.is_error() {
-        diagnostics.push(error_node_diagnostic(uri, source, lines, node, known_names));
+        push_parse_diagnostic(
+            error_node_diagnostic(uri, source, lines, node, known_names),
+            parse_rows,
+            diagnostics,
+        );
         // A single typo often makes tree-sitter emit one ERROR node
         // spanning a large region that still contains more precise
         // nested MISSING/ERROR nodes — surface those too instead of
@@ -1570,6 +1619,7 @@ fn collect_node_diagnostics(
             known_names,
             node.start_position().row,
             limit,
+            parse_rows,
             diagnostics,
         );
         return;
@@ -1580,16 +1630,31 @@ fn collect_node_diagnostics(
     // `infer` because the engine refuses to *parse* such a query, so the
     // report must not disappear when `enable_type_checking` is off.
     if node.kind() == k::TYPE_NAME
-        && !parse_failure_on_line(diagnostics, node)
+        && !parse_failure_on_line(parse_rows, node)
         && let Some(diagnostic) = unknown_type_diagnostic(source, lines, node)
     {
         diagnostics.push(diagnostic);
         return;
     }
 
+    // `node.walk()` allocates and frees a tree-sitter cursor, so it is not worth
+    // paying for a node that has nothing to iterate. This walk covers every node
+    // in the tree, anonymous ones included, and over half of them are leaves.
+    if node.child_count() == 0 {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_node_diagnostics(uri, source, lines, child, known_names, limit, diagnostics);
+        collect_node_diagnostics(
+            uri,
+            source,
+            lines,
+            child,
+            known_names,
+            limit,
+            parse_rows,
+            diagnostics,
+        );
     }
 }
 
@@ -1708,13 +1773,34 @@ fn names_a_foreign_argument(source: &str, node: Node<'_>) -> bool {
 /// Reading the diagnostics collected so far is sound because
 /// [`collect_node_diagnostics`] walks in source order, so an earlier failure on
 /// the line is already recorded by the time the type name is reached.
-fn parse_failure_on_line(diagnostics: &[Diagnostic], node: Node<'_>) -> bool {
-    let row = node.start_position().row as u32;
-    diagnostics.iter().any(|diagnostic| {
-        codes::has_code(diagnostic, codes::PARSE)
-            && diagnostic.range.start.line <= row
-            && diagnostic.range.end.line >= row
-    })
+/// Whether a `parse` diagnostic already covers `node`'s line.
+///
+/// One indexed load. The previous version scanned every diagnostic collected so
+/// far, comparing a `String` code on each, for *every* `TypeName` node in the
+/// tree — so a schema file full of `TYPE` clauses and parse errors paid
+/// `diagnostics x type names` string comparisons.
+fn parse_failure_on_line(parse_rows: &[bool], node: Node<'_>) -> bool {
+    parse_rows
+        .get(node.start_position().row)
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Push a `parse`-coded diagnostic and mark the rows it covers, so
+/// [`parse_failure_on_line`] stays a lookup.
+fn push_parse_diagnostic(
+    diagnostic: Diagnostic,
+    parse_rows: &mut [bool],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let start = diagnostic.range.start.line as usize;
+    if start < parse_rows.len() {
+        let end = (diagnostic.range.end.line as usize).min(parse_rows.len() - 1);
+        for row in &mut parse_rows[start..=end] {
+            *row = true;
+        }
+    }
+    diagnostics.push(diagnostic);
 }
 
 /// True when `node` sits inside an `ERROR` node.
@@ -1774,6 +1860,7 @@ fn descend_into_error(
     known_names: &std::collections::HashSet<String>,
     reported_row: usize,
     limit: usize,
+    parse_rows: &mut [bool],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut cursor = node.walk();
@@ -1782,7 +1869,11 @@ fn descend_into_error(
             return;
         }
         if child.is_missing() {
-            diagnostics.push(missing_node_diagnostic(source, lines, child));
+            push_parse_diagnostic(
+                missing_node_diagnostic(source, lines, child),
+                parse_rows,
+                diagnostics,
+            );
             continue;
         }
         if child.is_error() {
@@ -1795,16 +1886,15 @@ fn descend_into_error(
                     known_names,
                     reported_row,
                     limit,
+                    parse_rows,
                     diagnostics,
                 );
             } else {
-                diagnostics.push(error_node_diagnostic(
-                    uri,
-                    source,
-                    lines,
-                    child,
-                    known_names,
-                ));
+                push_parse_diagnostic(
+                    error_node_diagnostic(uri, source, lines, child, known_names),
+                    parse_rows,
+                    diagnostics,
+                );
                 descend_into_error(
                     uri,
                     source,
@@ -1813,12 +1903,22 @@ fn descend_into_error(
                     known_names,
                     child.start_position().row,
                     limit,
+                    parse_rows,
                     diagnostics,
                 );
             }
             continue;
         }
-        collect_node_diagnostics(uri, source, lines, child, known_names, limit, diagnostics);
+        collect_node_diagnostics(
+            uri,
+            source,
+            lines,
+            child,
+            known_names,
+            limit,
+            parse_rows,
+            diagnostics,
+        );
     }
 }
 
@@ -2137,19 +2237,81 @@ fn friendly_symbol_name(raw: &str) -> String {
 
 fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut matches = Vec::new();
-    collect_descendants(node, kind, &mut matches);
+    let mut cursor = node.walk();
+    collect_descendants(node, kind, &mut cursor, &mut matches);
     matches
 }
 
-fn collect_descendants<'tree>(node: Node<'tree>, kind: &str, matches: &mut Vec<Node<'tree>>) {
-    if node.kind() == kind {
-        matches.push(node);
+/// Every named descendant of `node` (and `node` itself) whose kind is `kind`, in
+/// pre-order.
+///
+/// Driven by one reused cursor rather than recursion. The recursive form called
+/// `node.walk()` at every node, and each of those allocates and frees a
+/// tree-sitter cursor — measured at 7.53 ms against 4.25 ms for the same
+/// traversal with a single cursor, on a 70,000-node tree. This function is
+/// reached several times per statement, so that difference is most of what
+/// `analyze_document` spent above the parse.
+///
+/// Visits **named** nodes only, matching the `named_children` walk it replaced:
+/// an anonymous child is neither visited nor descended into.
+/// `descendants_of_kind_recursive` is the oracle for that in the tests.
+fn collect_descendants<'tree>(
+    node: Node<'tree>,
+    kind: &str,
+    cursor: &mut tree_sitter::TreeCursor<'tree>,
+    matches: &mut Vec<Node<'tree>>,
+) {
+    cursor.reset(node);
+    loop {
+        let current = cursor.node();
+        if current.kind() == kind {
+            matches.push(current);
+        }
+        if goto_first_named_child(cursor) {
+            continue;
+        }
+        // No children left to descend: step sideways, climbing until a sibling
+        // exists or we are back at the root of this walk.
+        loop {
+            if cursor.node() == node {
+                return;
+            }
+            if goto_next_named_sibling(cursor) {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
+}
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_descendants(child, kind, matches);
+/// Move `cursor` to the first *named* child, leaving it put and returning false
+/// when there is none.
+fn goto_first_named_child(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    if !cursor.goto_first_child() {
+        return false;
     }
+    loop {
+        if cursor.node().is_named() {
+            return true;
+        }
+        if !cursor.goto_next_sibling() {
+            cursor.goto_parent();
+            return false;
+        }
+    }
+}
+
+/// Move `cursor` to the next *named* sibling. Returns false with the cursor
+/// left on the last sibling when there is none.
+fn goto_next_named_sibling(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    while cursor.goto_next_sibling() {
+        if cursor.node().is_named() {
+            return true;
+        }
+    }
+    false
 }
 
 fn first_non_keyword_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -2328,6 +2490,115 @@ fn emit_argument_hints(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+
+    use crate::semantic::node_kind as k;
+
+    /// The recursive walk `collect_descendants` replaced, kept as its oracle.
+    ///
+    /// The rewrite is an allocation change — one reused cursor instead of one
+    /// per node — and must visit exactly the same nodes in the same order. This
+    /// is the only specification for that.
+    fn descendants_of_kind_recursive<'tree>(
+        node: tree_sitter::Node<'tree>,
+        kind: &str,
+    ) -> Vec<tree_sitter::Node<'tree>> {
+        fn walk<'tree>(
+            node: tree_sitter::Node<'tree>,
+            kind: &str,
+            out: &mut Vec<tree_sitter::Node<'tree>>,
+        ) {
+            if node.kind() == kind {
+                out.push(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk(child, kind, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(node, kind, &mut out);
+        out
+    }
+
+    #[test]
+    fn the_cursor_walk_visits_exactly_what_the_recursive_walk_did() {
+        let sources = [
+            "",
+            "SELECT name FROM person;",
+            "SELECT name, email FROM person WHERE age > 21;\nUPDATE person SET age = 30;\n",
+            "DEFINE TABLE person SCHEMAFULL;\nDEFINE FIELD name ON person TYPE string;\n",
+            "CREATE person SET name = 'a', tags = ['x', 'y'], meta = { k: 1, j: { n: 2 } };",
+            "DEFINE FUNCTION fn::f($a: int) { LET $b = $a + 1; RETURN fn::g($b); };",
+            "UPDATE person SET a = 1, b = 2, c = 3 WHERE id = person:1;",
+            // Deliberately broken, so ERROR and MISSING nodes are in the tree.
+            "SELCT nmae FRM WHERE ;;;\nDEFINE FIELD ON TYPE;\n",
+            "SET sym = '₹';\nCREATE t SET emoji = '🚀';\n",
+        ];
+        // Every kind the extraction walk actually searches for, plus a couple
+        // that exercise deeper nesting.
+        let kinds = [
+            k::FIELD_ASSIGNMENT,
+            k::OBJECT,
+            k::FUNCTION_NAME,
+            k::CUSTOM_FUNCTION_NAME,
+            k::IDENT,
+            k::TYPE_NAME,
+            k::VARIABLE_NAME,
+            k::BLOCK,
+        ];
+
+        for source in sources {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&crate::grammar::language())
+                .expect("grammar loads");
+            let tree = parser.parse(source, None).expect("parses");
+            let root = tree.root_node();
+
+            for kind in kinds {
+                let expected: Vec<(usize, usize)> = descendants_of_kind_recursive(root, kind)
+                    .iter()
+                    .map(|node| (node.start_byte(), node.end_byte()))
+                    .collect();
+                let actual: Vec<(usize, usize)> = super::descendants_of_kind(root, kind)
+                    .iter()
+                    .map(|node| (node.start_byte(), node.end_byte()))
+                    .collect();
+                assert_eq!(actual, expected, "kind {kind:?} differs for {source:?}");
+            }
+        }
+    }
+
+    /// A nested search must work when the walk starts below the root, since the
+    /// extraction walk calls it per statement.
+    #[test]
+    fn the_cursor_walk_is_correct_from_a_nested_start_node() {
+        let source = "CREATE a SET x = 1; CREATE b SET y = 2, z = { inner: 3 }; SELECT * FROM c;";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::grammar::language())
+            .expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parses");
+
+        let mut cursor = tree.root_node().walk();
+        let statements: Vec<tree_sitter::Node<'_>> =
+            tree.root_node().named_children(&mut cursor).collect();
+        assert!(statements.len() >= 3, "expected several statements");
+
+        for statement in statements {
+            for kind in [k::FIELD_ASSIGNMENT, k::OBJECT, k::IDENT] {
+                let expected: Vec<(usize, usize)> = descendants_of_kind_recursive(statement, kind)
+                    .iter()
+                    .map(|node| (node.start_byte(), node.end_byte()))
+                    .collect();
+                let actual: Vec<(usize, usize)> = super::descendants_of_kind(statement, kind)
+                    .iter()
+                    .map(|node| (node.start_byte(), node.end_byte()))
+                    .collect();
+                assert_eq!(actual, expected, "kind {kind:?} differs within a statement");
+            }
+        }
+    }
 
     use ls_types::Uri;
 
