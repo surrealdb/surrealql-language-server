@@ -33,7 +33,7 @@ use crate::semantic::analyzer::{analyze_document, analyze_document_with_limit};
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
-use crate::semantic::text::{position_to_offset, token_at, word_range};
+use crate::semantic::text::{token_at, word_range};
 use crate::semantic::types::{
     DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
     WorkspaceIndex,
@@ -98,7 +98,10 @@ where
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             completion_provider: Some(CompletionOptions {
-                resolve_provider: Some(false),
+                // Table items ship without documentation and get it from
+                // `completion_resolve`, so the dropdown does not pay to render
+                // hover markdown for every table in the schema.
+                resolve_provider: Some(true),
                 trigger_characters: Some(vec![
                     ".".into(),
                     ":".into(),
@@ -371,15 +374,20 @@ where
 
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.upsert_open_document(document.uri, document.text).await;
+        self.upsert_open_document(document.uri, document.text, Edit::Opened)
+            .await;
     }
 
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let Some(change) = params.content_changes.into_iter().last() else {
             return;
         };
-        self.upsert_open_document(params.text_document.uri, change.text)
-            .await;
+        self.upsert_open_document(
+            params.text_document.uri,
+            change.text,
+            Edit::Changed(params.text_document.version),
+        )
+        .await;
     }
 
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -505,15 +513,23 @@ where
         let position = params.text_document_position.position;
         let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
 
-        let record_type_context = is_record_type_context(&analysis.text, position);
-        let prefix = completion_prefix(&analysis.text, position, record_type_context);
+        let record_type_context =
+            is_record_type_context(&analysis.text, &analysis.line_index, position);
+        let prefix = completion_prefix(
+            &analysis.text,
+            &analysis.line_index,
+            position,
+            record_type_context,
+        );
 
         // When the cursor sits in a slot that only accepts a table name
         // (e.g. `SELECT * FROM |`, `INSERT INTO |`, `UPDATE |`), restrict
         // suggestions to known tables — otherwise the dropdown is flooded
         // with keywords/functions/fields/params the user can't legally use
         // there.
-        if !record_type_context && is_table_name_context(&analysis.text, position) {
+        if !record_type_context
+            && is_table_name_context(&analysis.text, &analysis.line_index, position)
+        {
             let items = model.table_completion_items(
                 prefix.trim_matches(|ch: char| ch == ':'),
                 settings.active_auth_context(),
@@ -533,7 +549,7 @@ where
         // falls through to the behaviour this handler had before, so no working
         // position can regress.
         if !record_type_context {
-            let slot = head_slot_at(&analysis.text, position);
+            let slot = head_slot_at(&analysis.text, &analysis.line_index, position);
             if slot != SlotYield::Expression {
                 return Some(CompletionResponse::Array(head_slot_items(
                     slot,
@@ -545,7 +561,7 @@ where
         }
 
         let statement_fact = active_query_fact(&analysis, position);
-        let qualifier = completion_table_qualifier(&analysis.text, position);
+        let qualifier = completion_table_qualifier(&analysis.text, &analysis.line_index, position);
 
         // A `.` admits a field *and* a method, so these are added to whatever the
         // position already offers rather than replacing it.
@@ -559,7 +575,7 @@ where
         } else if record_type_context {
             None
         } else {
-            column_completion_context(&analysis.text, position)
+            column_completion_context(&analysis.text, &analysis.line_index, position)
         };
 
         if let Some(ColumnSlot::Strict { allow_star }) = column_slot {
@@ -616,13 +632,27 @@ where
         Some(CompletionResponse::Array(items))
     }
 
+    /// Fill in the documentation for the completion item the client is
+    /// showing. See [`MergedSemanticModel::resolve_completion_item`].
+    ///
+    /// The item is echoed back unchanged when nothing can be added, which is
+    /// what the protocol expects — a resolve must never drop fields the client
+    /// already has.
+    pub async fn completion_resolve(&self, item: CompletionItem) -> CompletionItem {
+        let (model, settings) = {
+            let state = self.state.read().await;
+            (Arc::clone(&state.model), Arc::clone(&state.settings))
+        };
+        model.resolve_completion_item(item, settings.active_auth_context())
+    }
+
     pub async fn hover(&self, params: HoverParams) -> Option<Hover> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
 
-        let token = token_at(&analysis.text, position)?;
-        let range = word_range(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
+        let range = word_range(&analysis.text, &analysis.line_index, position)?;
         let contents = model.hover_markdown_at(
             &analysis,
             position,
@@ -661,8 +691,11 @@ where
     ) -> Option<SemanticTokensResult> {
         let uri = params.text_document.uri;
         let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
-        let data =
-            crate::semantic::highlight::collect_semantic_tokens(&analysis.tree, &analysis.text);
+        let data = crate::semantic::highlight::collect_semantic_tokens(
+            &analysis.tree,
+            &analysis.text,
+            &analysis.line_index,
+        );
         Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -681,6 +714,7 @@ where
         let data = crate::semantic::highlight::collect_semantic_tokens_range(
             &analysis.tree,
             &analysis.text,
+            &analysis.line_index,
             params.range,
         );
         Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
@@ -696,7 +730,7 @@ where
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
 
         let token = token.trim().to_string();
         model
@@ -710,7 +744,7 @@ where
         let Some((analysis, model, _)) = self.snapshot_for_uri(&uri).await else {
             return Vec::new();
         };
-        let Some(token) = token_at(&analysis.text, position) else {
+        let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
         model.references_for_function(token.trim())
@@ -723,7 +757,7 @@ where
         let uri = params.text_document.uri;
         let position = params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let name = token.trim();
         let location = model.definition_for_function(name)?;
         Some(PrepareRenameResponse::RangeWithPlaceholder {
@@ -736,7 +770,7 @@ where
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let changes = model.rename_edits(token.trim(), &params.new_name)?;
         Some(WorkspaceEdit {
             changes: Some(changes),
@@ -748,7 +782,7 @@ where
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let offset = position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
         let prefix = &analysis.text[..offset];
         let open_paren = prefix.rfind('(')?;
         let function_name = prefix[..open_paren]
@@ -786,6 +820,7 @@ where
                 let ctx = crate::semantic::infer::TypeCtx {
                     model: &model,
                     source: &analysis.text,
+                    lines: &analysis.line_index,
                     bindings: &bindings,
                 };
                 let receiver_type = crate::semantic::infer::infer_expr_type(receiver, &ctx);
@@ -882,7 +917,7 @@ where
         let Some((analysis, model, _)) = self.snapshot_for_uri(&uri).await else {
             return Vec::new();
         };
-        let Some(token) = token_at(&analysis.text, position) else {
+        let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
         model
@@ -906,8 +941,10 @@ where
             return Vec::new();
         };
 
-        let range_start = position_to_offset(&analysis.text, params.range.start);
-        let range_end = position_to_offset(&analysis.text, params.range.end);
+        let range_start = analysis
+            .line_index
+            .offset(&analysis.text, params.range.start);
+        let range_end = analysis.line_index.offset(&analysis.text, params.range.end);
 
         crate::semantic::analyzer::collect_inlay_hints(
             analysis.tree.root_node(),
@@ -925,7 +962,7 @@ where
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        let token = token_at(&analysis.text, position)?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let function = model.functions.get(token.trim())?;
         Some(vec![call_hierarchy_item(function)])
     }
@@ -987,25 +1024,70 @@ where
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────
 
-    async fn upsert_open_document(&self, uri: Uri, text: String) {
-        let limit = self
-            .state
-            .read()
-            .await
-            .settings
-            .analysis
-            .max_syntax_diagnostics;
-        let Some(analysis) =
-            analyze_document_with_limit(uri.clone(), &text, SymbolOrigin::Local, limit)
-        else {
+    async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
+        let (limit, debounce_ms) = {
+            let state = self.state.read().await;
+            (
+                state.settings.analysis.max_syntax_diagnostics,
+                state.settings.analysis.diagnostic_debounce_ms,
+            )
+        };
+
+        // Record the version first, so a later edit can tell that this one is
+        // superseded even while this call is still waiting or analysing.
+        if let Edit::Changed(version) = edit {
+            let mut state = self.state.write().await;
+            if state
+                .document_versions
+                .get(&uri)
+                .is_some_and(|newest| *newest > version)
+            {
+                // A newer edit already arrived. Its own call does the work.
+                return;
+            }
+            state.document_versions.insert(uri.clone(), version);
+        }
+
+        // Let a burst of keystrokes settle. `didOpen` skips this entirely.
+        if let Edit::Changed(version) = edit
+            && debounce_ms > 0
+        {
+            runtime::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+            if self.superseded(&uri, version).await {
+                return;
+            }
+        }
+
+        // Parsing and extraction are CPU-bound and now the most frequent work
+        // the server does, so they must not run on a thread that is also
+        // serving requests.
+        let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit).await else {
             return;
         };
+
+        // The text may have moved on while the analysis ran.
+        if let Edit::Changed(version) = edit
+            && self.superseded(&uri, version).await
+        {
+            return;
+        }
+
         {
             let mut state = self.state.write().await;
             state.open_documents.insert(uri.clone(), Arc::new(analysis));
         }
         self.recompute_model().await;
         self.publish_diagnostics_for_uri(&uri).await;
+    }
+
+    /// True when a newer `didChange` for `uri` has arrived since `version`.
+    async fn superseded(&self, uri: &Uri, version: i32) -> bool {
+        self.state
+            .read()
+            .await
+            .document_versions
+            .get(uri)
+            .is_some_and(|newest| *newest > version)
     }
 
     /// Re-run the analysis of every open document under a new syntax cap.
@@ -1354,6 +1436,46 @@ fn builtin_signature_information(
         parameters: Some(parameters),
         active_parameter: None,
     }
+}
+
+/// Why a buffer is being (re)analysed.
+///
+/// `didOpen` and `didChange` differ in two ways that both matter here: an open
+/// is never delayed, and it cannot be superseded because there is no earlier
+/// version of the same document in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Opened,
+    Changed(i32),
+}
+
+/// Run [`analyze_document_with_limit`] without occupying a thread that serves
+/// requests.
+///
+/// On native this hands the work to tokio's blocking pool, so a hover or
+/// completion arriving mid-keystroke is not queued behind a reparse. The
+/// workspace walk already did this (see
+/// [`crate::native::workspace_fs::FilesystemWorkspaceLoader::load`]); the
+/// per-edit path did not, and it is the far more frequent one.
+///
+/// On `wasm32` it runs inline. `tokio_with_wasm` would move it to a web worker,
+/// which means shipping the module to that worker and a serialisation hop for
+/// every edit — a change to how the browser build works that nothing here can
+/// test, since CI does not exercise the wasm JS surface. Inline keeps the
+/// browser behaviour exactly as it was.
+#[cfg(not(target_arch = "wasm32"))]
+async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
+    runtime::task::spawn_blocking(move || {
+        analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
+    analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
 }
 
 /// The complete diagnostic set for one document: the syntax pass, then the

@@ -33,7 +33,7 @@ use crate::semantic::assign::{
 };
 use crate::semantic::codes;
 use crate::semantic::node_kind as k;
-use crate::semantic::text::byte_range_to_lsp;
+use crate::semantic::text::LineIndex;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{DocumentAnalysis, FunctionLanguage, MergedSemanticModel};
 
@@ -43,6 +43,9 @@ const SOURCE: &str = "surreal-language-server";
 pub struct TypeCtx<'a> {
     pub model: &'a MergedSemanticModel,
     pub source: &'a str,
+    /// Line starts for [`Self::source`], so a node range costs two binary
+    /// searches instead of two scans of the document.
+    pub lines: &'a LineIndex,
     pub bindings: &'a BindingTable,
 }
 
@@ -246,7 +249,14 @@ pub fn infer_expr_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
 pub fn resolve_bindings(analysis: &DocumentAnalysis, model: &MergedSemanticModel) -> BindingTable {
     let mut table = BindingTable::default();
     let root = analysis.tree.root_node();
-    collect_bindings(root, root.end_byte(), &analysis.text, model, &mut table);
+    collect_bindings(
+        root,
+        root.end_byte(),
+        &analysis.text,
+        &analysis.line_index,
+        model,
+        &mut table,
+    );
     table
 }
 
@@ -254,12 +264,13 @@ fn collect_bindings(
     node: Node<'_>,
     scope_end: usize,
     source: &str,
+    lines: &LineIndex,
     model: &MergedSemanticModel,
     table: &mut BindingTable,
 ) {
     match node.kind() {
         k::LET_STATEMENT => {
-            bind_let(node, scope_end, source, model, table);
+            bind_let(node, scope_end, source, lines, model, table);
             return;
         }
         k::DEFINE_STATEMENT => {
@@ -276,7 +287,7 @@ fn collect_bindings(
             }
         }
         k::FOR_STATEMENT => {
-            bind_for(node, source, model, table);
+            bind_for(node, source, lines, model, table);
         }
         k::CLOSURE => {
             // Scope closure parameters over the *whole* closure, not over a
@@ -297,7 +308,7 @@ fn collect_bindings(
     };
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_bindings(child, inner_end, source, model, table);
+        collect_bindings(child, inner_end, source, lines, model, table);
     }
 }
 
@@ -307,6 +318,7 @@ fn bind_let(
     node: Node<'_>,
     scope_end: usize,
     source: &str,
+    lines: &LineIndex,
     model: &MergedSemanticModel,
     table: &mut BindingTable,
 ) {
@@ -334,6 +346,7 @@ fn bind_let(
         let ctx = TypeCtx {
             model,
             source,
+            lines,
             bindings: table,
         };
         value
@@ -344,7 +357,7 @@ fn bind_let(
     // Descend first: a nested statement in the initializer may itself
     // bind things, and they belong before this entry in source order.
     if let Some(value) = value {
-        collect_bindings(value, scope_end, source, model, table);
+        collect_bindings(value, scope_end, source, lines, model, table);
     }
 
     table.entries.push(Binding {
@@ -361,7 +374,13 @@ fn bind_let(
 
 /// `FOR $item IN iterable { … }` — the loop variable is the element type
 /// of the iterable, visible only inside the body.
-fn bind_for(node: Node<'_>, source: &str, model: &MergedSemanticModel, table: &mut BindingTable) {
+fn bind_for(
+    node: Node<'_>,
+    source: &str,
+    lines: &LineIndex,
+    model: &MergedSemanticModel,
+    table: &mut BindingTable,
+) {
     let children = k::named_children(node);
     // The grammar gives a bare `VariableName` here, not a `ParamDefinition`.
     let Some(name_node) = children
@@ -388,6 +407,7 @@ fn bind_for(node: Node<'_>, source: &str, model: &MergedSemanticModel, table: &m
         let ctx = TypeCtx {
             model,
             source,
+            lines,
             bindings: table,
         };
         match iterable.map(|node| infer_expr_type(node, &ctx)) {
@@ -722,6 +742,7 @@ struct ReturnCandidate<'tree> {
     define: Node<'tree>,
     body: Node<'tree>,
     source: &'tree str,
+    lines: &'tree LineIndex,
 }
 
 /// Read a return type out of the body of every function that declares none.
@@ -783,12 +804,14 @@ pub fn infer_function_return_types(
                         candidate.define,
                         candidate.define.end_byte(),
                         candidate.source,
+                        candidate.lines,
                         snapshot,
                         &mut bindings,
                     );
                     let ctx = TypeCtx {
                         model: snapshot,
                         source: candidate.source,
+                        lines: candidate.lines,
                         bindings: &bindings,
                     };
                     body_return_type(candidate.body, &ctx)
@@ -866,6 +889,7 @@ fn return_candidate<'tree>(
     model: &MergedSemanticModel,
 ) -> Option<ReturnCandidate<'tree>> {
     let source = &analysis.text;
+    let lines = &analysis.line_index;
     let name = k::text_of(source, k::find_child(define, k::FUNCTION_NAME)?)?;
 
     // Judge against the definition that won the merge, not against this one. A
@@ -896,6 +920,7 @@ fn return_candidate<'tree>(
         define,
         body,
         source,
+        lines,
     })
 }
 
@@ -1153,7 +1178,7 @@ fn fold_chain(
                 None => {
                     if arith.can_fail() {
                         out.push(diagnostic(
-                            byte_range_to_lsp(ctx.source, left.start, right.end),
+                            ctx.lines.range(ctx.source, left.start, right.end),
                             codes::OPERATOR_TYPE,
                             arith.failure_message(&left.ty, &right.ty),
                         ));
@@ -1218,6 +1243,7 @@ pub fn type_diagnostics(
     let ctx = TypeCtx {
         model,
         source: &analysis.text,
+        lines: &analysis.line_index,
         bindings: &bindings,
     };
     let mut diagnostics = Vec::new();
@@ -1515,7 +1541,7 @@ fn report_return_mismatch(
         return;
     }
     out.push(diagnostic(
-        node_range(ctx.source, value),
+        node_range(ctx, value),
         codes::RETURN_TYPE,
         format!("`{name}` returns `{declared}`, but this value is `{actual}`."),
     ));
@@ -1566,7 +1592,7 @@ fn check_variables(
             None => String::new(),
         };
         out.push(diagnostic(
-            node_range(ctx.source, node),
+            node_range(ctx, node),
             codes::UNDEFINED_VARIABLE,
             format!("`{name}` is not defined.{hint}"),
         ));
@@ -1642,7 +1668,7 @@ fn nearest_in_scope(name: &str, at: usize, ctx: &TypeCtx<'_>) -> Option<String> 
             let score = jaro_winkler(name, &candidate);
             (candidate, score)
         })
-        .filter(|(_, score)| *score > 0.86)
+        .filter(|(_, score)| *score > crate::semantic::model::NEAR_MISS_THRESHOLD)
         .max_by(|left, right| {
             left.1
                 .partial_cmp(&right.1)
@@ -1678,7 +1704,7 @@ fn check_let_annotations(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagno
             // and every declared tuple.
             if assignable(&actual, &declared).is_incompatible() {
                 out.push(diagnostic(
-                    node_range(ctx.source, *value),
+                    node_range(ctx, *value),
                     codes::LET_TYPE,
                     format!("`{name}` is declared `{declared}` but the value is `{actual}`."),
                 ));
@@ -1812,7 +1838,7 @@ fn check_one_field(
         // when it speaks, and the element walk runs only when it stays silent.
         if assignable(&actual, &declared).is_incompatible() {
             out.push(diagnostic(
-                node_range(ctx.source, payload),
+                node_range(ctx, payload),
                 codes::FIELD_TYPE,
                 format!("`{name}` is declared `{declared}` but this value is `{actual}`."),
             ));
@@ -1885,7 +1911,7 @@ fn check_one_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) 
         && let Some(name_node) = k::find_child(node, k::FUNCTION_NAME)
     {
         out.push(warning(
-            node_range(ctx.source, name_node),
+            node_range(ctx, name_node),
             codes::RENAMED_FUNCTION,
             format!("`{name}` has been renamed to `{current}`."),
         ));
@@ -1970,7 +1996,7 @@ fn check_method_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic
         // it cannot find is unprovable rather than wrong.
         if kind != "Object" {
             out.push(diagnostic(
-                node_range(ctx.source, node),
+                node_range(ctx, node),
                 codes::UNKNOWN_METHOD,
                 format!(
                     "`{}` has no method `{method}`.",
@@ -2007,7 +2033,7 @@ fn check_method_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic
     let maximum = signature.maximum_arity().map(|max| max.saturating_sub(1));
     if args.len() < required || maximum.is_some_and(|max| args.len() > max) {
         out.push(diagnostic(
-            node_range(ctx.source, arg_list),
+            node_range(ctx, arg_list),
             codes::ARGUMENT_COUNT,
             format!(
                 "`.{method}()` (`{}`) expects {}, found {}.",
@@ -2041,7 +2067,7 @@ fn check_method_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic
             continue;
         }
         out.push(diagnostic(
-            node_range(ctx.source, *argument),
+            node_range(ctx, *argument),
             codes::ARGUMENT_TYPE,
             format!(
                 // Numbered as the engine numbers it: the receiver is argument
@@ -2113,7 +2139,7 @@ fn check_builtin_call(
     // `duration::set_day` and `object::matches`.
     if signature.generated.not_callable {
         out.push(warning(
-            node_range(ctx.source, arg_list),
+            node_range(ctx, arg_list),
             codes::NOT_CALLABLE,
             format!(
                 "`{name}` parses, but SurrealDB has no implementation to call. \
@@ -2141,7 +2167,7 @@ fn check_builtin_call(
     let too_many = maximum.is_some_and(|max| args.len() > max);
     if too_few || too_many {
         out.push(diagnostic(
-            node_range(ctx.source, arg_list),
+            node_range(ctx, arg_list),
             codes::ARGUMENT_COUNT,
             format!(
                 "`{name}` expects {}, found {}.",
@@ -2175,7 +2201,7 @@ fn check_builtin_call(
             continue;
         }
         out.push(diagnostic(
-            node_range(ctx.source, *argument),
+            node_range(ctx, *argument),
             codes::ARGUMENT_TYPE,
             format!(
                 "Argument {} of `{name}` expects `{expected}`, found `{actual}`.",
@@ -2209,7 +2235,7 @@ fn check_user_call(
     let required = required_arity(&function.params);
     if args.len() < required || args.len() > function.params.len() {
         out.push(diagnostic(
-            node_range(ctx.source, arg_list),
+            node_range(ctx, arg_list),
             codes::ARGUMENT_COUNT,
             format!(
                 "`{name}` expects {} argument{}, found {}.",
@@ -2269,7 +2295,7 @@ fn check_user_call(
         }
 
         out.push(diagnostic(
-            node_range(ctx.source, *argument),
+            node_range(ctx, *argument),
             codes::ARGUMENT_TYPE,
             format!(
                 "Argument {} of `{name}` expects `{expected}`, found `{actual}`.",
@@ -2298,8 +2324,8 @@ fn report_object_faults(
                 // Point at the property's value, falling back to the whole
                 // literal if we cannot locate it.
                 let range = property_value_node(literal, &key, ctx.source)
-                    .map(|value| node_range(ctx.source, value))
-                    .unwrap_or_else(|| node_range(ctx.source, literal));
+                    .map(|value| node_range(ctx, value))
+                    .unwrap_or_else(|| node_range(ctx, literal));
                 (
                     range,
                     format!(
@@ -2309,7 +2335,7 @@ fn report_object_faults(
                 )
             }
             ObjectFault::Missing { key } => (
-                node_range(ctx.source, literal),
+                node_range(ctx, literal),
                 format!("Argument {position} of `{name}`: missing required property `{key}`."),
             ),
         };
@@ -2453,19 +2479,20 @@ fn report_element_faults(
             ElementFault::Element { index, .. } => (
                 elements
                     .get(*index)
-                    .map(|node| node_range(ctx.source, *node))
-                    .unwrap_or_else(|| node_range(ctx.source, value)),
+                    .map(|node| node_range(ctx, *node))
+                    .unwrap_or_else(|| node_range(ctx, value)),
                 element_label(value, *index),
             ),
             // A wrong length is about the whole literal, not one element.
-            ElementFault::Arity { .. } => (node_range(ctx.source, value), String::new()),
+            ElementFault::Arity { .. } => (node_range(ctx, value), String::new()),
         };
         out.push(diagnostic(range, code, message(&fault, &label)));
     }
 }
 
-fn node_range(source: &str, node: Node<'_>) -> Range {
-    byte_range_to_lsp(source, node.start_byte(), node.end_byte())
+fn node_range(ctx: &TypeCtx<'_>, node: Node<'_>) -> Range {
+    ctx.lines
+        .range(ctx.source, node.start_byte(), node.end_byte())
 }
 
 fn diagnostic(range: Range, code: &str, message: String) -> Diagnostic {

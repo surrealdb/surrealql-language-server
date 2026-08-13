@@ -23,7 +23,7 @@ fn server_capabilities_golden() {
         "textDocumentSync": 1,
         "hoverProvider": true,
         "completionProvider": {
-            "resolveProvider": false,
+            "resolveProvider": true,
             "triggerCharacters": [".", ":", "<", "$", "("],
         },
         "signatureHelpProvider": {
