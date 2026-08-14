@@ -35,7 +35,9 @@ use crate::semantic::codes;
 use crate::semantic::node_kind as k;
 use crate::semantic::text::LineIndex;
 use crate::semantic::type_expr::TypeExpr;
-use crate::semantic::types::{DocumentAnalysis, FunctionLanguage, MergedSemanticModel};
+use crate::semantic::types::{
+    DocumentAnalysis, FunctionLanguage, LookupDirection, MergedSemanticModel,
+};
 
 const SOURCE: &str = "surreal-language-server";
 
@@ -233,10 +235,216 @@ pub fn infer_expr_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
         // [`chain_type`].
         k::BINARY_EXPRESSION => chain_type(node, ctx),
 
+        // A query bound to a variable — `LET $people = (SELECT name, age FROM
+        // person)`. Typed from the projection and the schema, so the binding
+        // carries a real shape instead of `unknown`.
+        k::SELECT_STATEMENT => select_type(node, ctx),
+
         // Deliberately unhandled, needing field resolution the server does not
         // have: Idiom, Subscript, IdiomFunction on its own, Closure, Range,
-        // Block, IfElseStatement, and every statement kind.
+        // Block, IfElseStatement, and every other statement kind.
         _ => TypeExpr::Unknown,
+    }
+}
+
+/// The type a `SELECT` evaluates to.
+///
+/// A `SELECT` yields a list of rows, so this is `array<row>` — except after
+/// `ONLY`, which yields the row itself. The row is an object with one property
+/// per projected field, or the bare value under `SELECT VALUE`.
+///
+/// Answers [`TypeExpr::Unknown`] rather than guessing whenever the shape is not
+/// fully determined: `SELECT *` on a table whose columns are not all declared,
+/// a projection this cannot name, or a target that is not a static table. A
+/// wrong shape here would surface as a wrong `let-type` diagnostic on working
+/// code, which costs more than no shape at all.
+fn select_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    let tables = crate::semantic::analyzer::select_target_tables(node, ctx.source);
+    if tables.is_empty() {
+        return TypeExpr::Unknown;
+    }
+    let Some(fields) = k::find_child(node, k::FIELDS) else {
+        return TypeExpr::Unknown;
+    };
+    let Some(row) = row_type(fields, &tables, ctx) else {
+        return TypeExpr::Unknown;
+    };
+
+    // `FROM ONLY person` returns the row, not a list of one.
+    let only = k::named_children(node)
+        .into_iter()
+        .any(|child| k::is_kw(child, ctx.source, "ONLY"));
+    if only {
+        row
+    } else {
+        TypeExpr::Array(Box::new(row))
+    }
+}
+
+/// The type of one row of a `SELECT`, or `None` when the shape is not knowable.
+fn row_type(fields: Node<'_>, tables: &[String], ctx: &TypeCtx<'_>) -> Option<TypeExpr> {
+    let children = k::named_children(fields);
+
+    // `SELECT VALUE name` yields the column's own values, unwrapped. The
+    // grammar marks it with a `Keyword` child directly on `Fields`; the
+    // ordinary form has none.
+    if children
+        .iter()
+        .any(|child| k::is_kw(*child, ctx.source, "VALUE"))
+    {
+        let predicate = children
+            .into_iter()
+            .find(|child| child.kind() == k::PREDICATE)?;
+        let (_, value) = projected_property(predicate, tables, ctx)?;
+        return Some(value);
+    }
+
+    let mut properties: Vec<(String, TypeExpr)> = Vec::new();
+    for child in children {
+        // `SELECT *` names every column, including ones no `DEFINE FIELD`
+        // declares. Claiming a shape for it would be a guess.
+        if child.kind() == k::ANY {
+            return None;
+        }
+        if child.kind() != k::PREDICATE {
+            continue;
+        }
+        let (name, value) = projected_property(child, tables, ctx)?;
+        merge_property(&mut properties, name, value);
+    }
+    (!properties.is_empty()).then_some(TypeExpr::Object(properties))
+}
+
+/// One entry of a projection, as the property name and type it contributes.
+///
+/// `None` when the entry cannot be named — an expression with no `AS`, whose
+/// output key SurrealDB derives from the source text.
+fn projected_property(
+    predicate: Node<'_>,
+    tables: &[String],
+    ctx: &TypeCtx<'_>,
+) -> Option<(String, TypeExpr)> {
+    let children = k::named_children(predicate);
+    let value = *children.first()?;
+
+    // `… AS alias` names the property outright, whatever the expression is.
+    if let Some(alias) = children
+        .iter()
+        .skip_while(|child| !k::is_kw(**child, ctx.source, "AS"))
+        .find(|child| child.kind() == k::IDENT)
+        && let Some(name) = k::text_of(ctx.source, *alias)
+    {
+        return Some((name.to_string(), projected_value_type(value, tables, ctx)));
+    }
+
+    // Otherwise the column path is the name. `SELECT address.street` returns
+    // `{ address: { street: … } }`, so a dotted path nests.
+    let path = idiom_segments(value, ctx.source)?;
+    let leaf = column_type(&path.join("."), tables, ctx);
+    Some(nest_property(&path, leaf))
+}
+
+/// The written segments of a plain column path, or `None` for anything else.
+fn idiom_segments<'a>(node: Node<'_>, source: &'a str) -> Option<Vec<&'a str>> {
+    match node.kind() {
+        k::IDENT => k::text_of(source, node).map(|name| vec![name]),
+        k::PATH => {
+            let mut segments = Vec::new();
+            for child in k::named_children(node) {
+                let ident = match child.kind() {
+                    k::IDENT => child,
+                    // `.name`
+                    k::SUBSCRIPT => k::find_child(child, k::IDENT)?,
+                    // A filter, a method call, or a graph hop: not a plain
+                    // column path, so its output key is not the path.
+                    _ => return None,
+                };
+                segments.push(k::text_of(source, ident)?);
+            }
+            (!segments.is_empty()).then_some(segments)
+        }
+        _ => None,
+    }
+}
+
+/// Fold a dotted path into the nested object SurrealDB returns for it.
+fn nest_property(segments: &[&str], leaf: TypeExpr) -> (String, TypeExpr) {
+    match segments {
+        // `idiom_segments` never returns an empty path.
+        [] => (String::new(), leaf),
+        [last] => (last.to_string(), leaf),
+        [head, rest @ ..] => {
+            let (name, value) = nest_property(rest, leaf);
+            (head.to_string(), TypeExpr::Object(vec![(name, value)]))
+        }
+    }
+}
+
+/// Add a property, merging into an object already under that name.
+///
+/// `SELECT address.street, address.city` contributes `address` twice, and the
+/// row has one `address` with both.
+fn merge_property(properties: &mut Vec<(String, TypeExpr)>, name: String, value: TypeExpr) {
+    if let Some((_, existing)) = properties.iter_mut().find(|(key, _)| *key == name)
+        && let (TypeExpr::Object(into), TypeExpr::Object(from)) = (&mut *existing, &value)
+    {
+        for (key, nested) in from {
+            merge_property(into, key.clone(), nested.clone());
+        }
+        return;
+    }
+    properties.push((name, value));
+}
+
+/// The type of a projected expression: a column read from the schema, or
+/// anything else typed the ordinary way.
+fn projected_value_type(value: Node<'_>, tables: &[String], ctx: &TypeCtx<'_>) -> TypeExpr {
+    if let Some(path) = idiom_segments(value, ctx.source) {
+        return column_type(&path.join("."), tables, ctx);
+    }
+    infer_expr_type(value, ctx)
+}
+
+/// A column's declared type, read from the schema.
+///
+/// `Unknown` unless every target table agrees: `SELECT name FROM person, pet`
+/// where the two declare different types for `name` has no single answer, and
+/// picking one would be a guess.
+fn column_type(name: &str, tables: &[String], ctx: &TypeCtx<'_>) -> TypeExpr {
+    let mut agreed: Option<TypeExpr> = None;
+    for table in tables {
+        let found = ctx
+            .model
+            .fields
+            .get(table)
+            .and_then(|by_name| by_name.get(name))
+            .and_then(|field| field.type_expr.clone())
+            .or_else(|| implicit_column_type(name, table, ctx));
+        match (&agreed, found) {
+            (_, None) => return TypeExpr::Unknown,
+            (None, Some(found)) => agreed = Some(found),
+            (Some(current), Some(found)) if *current == found => {}
+            (Some(_), Some(_)) => return TypeExpr::Unknown,
+        }
+    }
+    agreed.unwrap_or(TypeExpr::Unknown)
+}
+
+/// The type of a column that exists without a `DEFINE FIELD`.
+fn implicit_column_type(name: &str, table: &str, ctx: &TypeCtx<'_>) -> Option<TypeExpr> {
+    let relation = || {
+        ctx.model
+            .tables
+            .get(table)
+            .and_then(|def| def.relation.as_ref())
+    };
+    match name {
+        "id" => Some(TypeExpr::Record(vec![table.to_string()])),
+        // The endpoints exist on every edge row, and the declaration says which
+        // tables they may point to.
+        "in" => Some(TypeExpr::Record(relation()?.in_tables.clone())),
+        "out" => Some(TypeExpr::Record(relation()?.out_tables.clone())),
+        _ => None,
     }
 }
 
@@ -393,14 +601,16 @@ fn bind_for(
         return;
     };
     let body = k::find_child(node, k::BLOCK);
+    // The iterable is whatever follows `IN`, found by position rather than by
+    // kind. Excluding every `VariableName` to skip the loop variable also
+    // excluded the commonest iterable there is — `FOR $person IN $people`,
+    // where the list was bound by an earlier `LET` — so the loop variable came
+    // out `unknown` in exactly the case the binding is most worth having.
     let iterable = children
         .iter()
-        .find(|child| {
-            child.kind() != k::VARIABLE_NAME
-                && child.kind() != k::BLOCK
-                && !k::is_keyword(**child)
-                && !is_trivia(**child)
-        })
+        .skip_while(|child| !k::is_kw(**child, source, "IN"))
+        .skip(1)
+        .find(|child| child.kind() != k::BLOCK && !is_trivia(**child))
         .copied();
 
     let element = {
@@ -936,19 +1146,53 @@ fn return_candidate<'tree>(
 /// would invent a type. An `Optional` link is the exception: `$v.?.trim()` reads
 /// the same value as `$v.trim()`.
 fn path_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    path_type_until(node, ctx, None)
+}
+
+/// [`path_type`], stopping after the segment that contains `until`.
+///
+/// Hover and completion both need the type of a path *part way along* — what
+/// `$person` is before `.age` is read off it — and a whole-path answer cannot
+/// give them that.
+pub fn path_type_until(node: Node<'_>, ctx: &TypeCtx<'_>, until: Option<usize>) -> TypeExpr {
     let children = k::named_children(node);
     let Some((base, links)) = children.split_first() else {
         return TypeExpr::Unknown;
     };
 
-    let mut current = infer_expr_type(*base, ctx);
+    // A path may *start* with a hop: `SELECT ->knows->person FROM person` has
+    // no written base, so the base is the statement's own target table.
+    let (mut current, links) = if base.kind() == k::LOOKUP {
+        (anchor_type(node, ctx), children.as_slice())
+    } else {
+        (infer_expr_type(*base, ctx), links)
+    };
+
     for link in links {
+        // Reading further would answer for a segment the caller has not
+        // reached. A link that *starts* past the cutoff is one of those.
+        if until.is_some_and(|at| link.start_byte() > at) {
+            break;
+        }
         if matches!(current, TypeExpr::Unknown) {
             return TypeExpr::Unknown;
+        }
+        if link.kind() == k::LOOKUP {
+            current = hop_type(&current, *link, ctx);
+            continue;
         }
         // Optional chaining declines to fail on NONE; it does not change the
         // value's type.
         if k::find_child(*link, k::OPTIONAL).is_some() {
+            continue;
+        }
+        // `.name` — a property of an object, or a column of a record.
+        if link.kind() == k::SUBSCRIPT
+            && k::find_child(*link, k::IDIOM_FUNCTION).is_none()
+            && let Some(name) =
+                k::find_child(*link, k::IDENT).and_then(|node| k::text_of(ctx.source, node))
+        {
+            current = property_type(&current, name, ctx);
             continue;
         }
         let Some(resolved) = k::find_child(*link, k::IDIOM_FUNCTION)
@@ -967,6 +1211,185 @@ fn path_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
     }
 
     current
+}
+
+/// The type of `name` read off a value of type `current`.
+///
+/// Three receivers carry named members:
+///
+/// * an object — the row shape a bound `SELECT` produces — answers from its own
+///   properties;
+/// * a record answers from the schema of the table it points at;
+/// * a list answers element-wise, because a SurrealQL idiom maps over one:
+///   `$people.name` on `array<{name: string}>` is `array<string>`.
+///
+/// `Unknown` for anything else, and for a member the receiver does not have.
+/// Absence is deliberately not an error here: nothing in this server yet knows
+/// enough about a partially-declared row to call a missing property a fault.
+pub fn property_type(current: &TypeExpr, name: &str, ctx: &TypeCtx<'_>) -> TypeExpr {
+    match current {
+        TypeExpr::Object(properties) => properties
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or(TypeExpr::Unknown),
+        TypeExpr::Record(tables) if !tables.is_empty() => column_type(name, tables, ctx),
+        // The idiom maps over the list, so the result is a list too.
+        TypeExpr::Array(inner) | TypeExpr::Set(inner) => match property_type(inner, name, ctx) {
+            TypeExpr::Unknown => TypeExpr::Unknown,
+            mapped => TypeExpr::Array(Box::new(mapped)),
+        },
+        // NONE propagates rather than changing what the member is.
+        TypeExpr::Option(inner) => property_type(inner, name, ctx),
+        _ => TypeExpr::Unknown,
+    }
+}
+
+/// The named members a value of this type has, for completion.
+///
+/// Mirrors [`property_type`]: an object lists its own properties, a record
+/// lists the columns of the tables it points at, and a list answers for its
+/// element.
+pub fn property_names(current: &TypeExpr, ctx: &TypeCtx<'_>) -> Vec<String> {
+    match current {
+        TypeExpr::Object(properties) => properties.iter().map(|(key, _)| key.clone()).collect(),
+        TypeExpr::Record(tables) => {
+            let mut names: Vec<String> = Vec::new();
+            for table in tables {
+                let columns = ctx
+                    .model
+                    .fields
+                    .get(table)
+                    .into_iter()
+                    .flat_map(|by_name| by_name.keys().cloned());
+                let implicit = ctx
+                    .model
+                    .implicit_fields(table)
+                    .into_iter()
+                    .map(str::to_string);
+                for name in columns.chain(implicit) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            names
+        }
+        TypeExpr::Array(inner) | TypeExpr::Set(inner) | TypeExpr::Option(inner) => {
+            property_names(inner, ctx)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The type of the idiom at `offset`, read only as far as the segment the offset
+/// falls in.
+///
+/// `None` when the offset is not inside an idiom at all.
+pub fn idiom_type_at(
+    analysis: &DocumentAnalysis,
+    offset: usize,
+    ctx: &TypeCtx<'_>,
+) -> Option<TypeExpr> {
+    let mut node = analysis
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)?;
+    while node.kind() != k::PATH {
+        node = node.parent()?;
+    }
+    Some(path_type_until(node, ctx, Some(offset)))
+}
+
+/// The direction a [`k::LOOKUP`] points, read from its arrow child.
+///
+/// The grammar names no fields on a `Lookup`, so the arrow is found by kind
+/// among the siblings rather than by a field lookup.
+fn hop_direction(hop: Node<'_>) -> Option<LookupDirection> {
+    k::named_children(hop)
+        .into_iter()
+        .find_map(|child| match child.kind() {
+            k::LOOKUP_RIGHT => Some(LookupDirection::Right),
+            k::LOOKUP_LEFT => Some(LookupDirection::Left),
+            k::LOOKUP_BOTH => Some(LookupDirection::Both),
+            _ => None,
+        })
+}
+
+/// The type that one graph hop yields, given the type it starts from.
+///
+/// A traversal always produces a list, so this returns `array<record<…>>`.
+/// The named table is matched against the graph two ways, because a hop names
+/// either an edge or a table depending on where it sits in the chain:
+/// `->knows` names the edge, and the `->person` after it names the far table.
+///
+/// Answers [`TypeExpr::Unknown`] whenever the graph cannot confirm the step —
+/// an unknown edge, a wildcard hop, or a start that is not a record. Unknown is
+/// the honest answer there, and the type checker is required to stay silent on
+/// it, so a partial schema costs a hover rather than a wrong diagnostic.
+fn hop_type(current: &TypeExpr, hop: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    let Some(direction) = hop_direction(hop) else {
+        return TypeExpr::Unknown;
+    };
+    // `->?` and `->(… WHERE …)` name no table to follow.
+    let Some(name) = k::find_child(hop, k::IDENT).and_then(|node| k::text_of(ctx.source, node))
+    else {
+        return TypeExpr::Unknown;
+    };
+
+    let from = current.record_tables();
+    if from.is_empty() {
+        return TypeExpr::Unknown;
+    }
+
+    let mut reached: Vec<String> = Vec::new();
+    for table in &from {
+        // Two readings, because what a hop names depends on where it sits:
+        // `->knows` names an edge leaving `person`, and the `->person` after
+        // it names the table that edge reaches. Both are checked against the
+        // graph, so a name that is not actually reachable yields Unknown
+        // rather than a confident wrong type.
+        let reachable = ctx.model.edges_from(table, direction).contains(&name)
+            || ctx.model.tables_across(table, direction).contains(&name);
+        if reachable {
+            push_table(&mut reached, name);
+        }
+    }
+
+    if reached.is_empty() {
+        return TypeExpr::Unknown;
+    }
+    TypeExpr::Array(Box::new(TypeExpr::Record(reached)))
+}
+
+fn push_table(tables: &mut Vec<String>, name: &str) {
+    if !tables.iter().any(|existing| existing == name) {
+        tables.push(name.to_string());
+    }
+}
+
+/// The type a bodiless traversal starts from — the target of the statement it
+/// sits in.
+///
+/// `SELECT ->knows->person FROM person` writes no base, so the base is
+/// `person`. Found by walking up to the enclosing statement rather than by
+/// carrying a table on [`TypeCtx`]: the anchor varies per node, while a
+/// `TypeCtx` is built once per document, and three call sites would each have
+/// to compute something they have no way to know.
+fn anchor_type(path: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    let mut node = path;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == k::SELECT_STATEMENT {
+            let tables = crate::semantic::analyzer::select_target_tables(parent, ctx.source);
+            return if tables.is_empty() {
+                TypeExpr::Unknown
+            } else {
+                TypeExpr::Record(tables)
+            };
+        }
+        node = parent;
+    }
+    TypeExpr::Unknown
 }
 
 // ---------------------------------------------------------------------------

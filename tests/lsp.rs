@@ -6,15 +6,16 @@ use surrealql_language_server::config::{AuthContext, ServerSettings};
 use surrealql_language_server::semantic::analyzer::{
     DEFAULT_MAX_SYNTAX_DIAGNOSTICS, analyze_document, analyze_document_with_limit,
 };
+use surrealql_language_server::semantic::infer::{TypeCtx, infer_expr_type, resolve_bindings};
 use surrealql_language_server::semantic::model::{
     function_signature, is_record_type_context, param_label,
 };
 use surrealql_language_server::semantic::text::LineIndex;
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
-    DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, MergedSemanticModel, PermissionMode,
-    PermissionRule, QueryAction, QueryFact, SymbolOrigin, TableDef, TargetResolution,
-    WorkspaceIndex,
+    DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, LookupDirection,
+    MergedSemanticModel, PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin,
+    TableDef, TargetResolution, WorkspaceIndex,
 };
 
 fn uri(path: &str) -> Uri {
@@ -765,6 +766,7 @@ fn hover_for_js_function_shows_javascript_badge() {
     let u = uri("functions.surql");
     let mut ws = WorkspaceIndex::default();
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
@@ -823,6 +825,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
     let u = uri("functions.surql");
     let mut ws = WorkspaceIndex::default();
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
@@ -880,11 +883,13 @@ fn hover_for_table_shows_schema_and_permissions() {
     ws.documents.insert(
         u.clone(),
         Arc::new(DocumentAnalysis {
+            edge_observations: Vec::new(),
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
             line_index: LineIndex::default(),
             tables: vec![TableDef {
+                relation: None,
                 name: "account".to_string(),
                 schema_mode: Some("schemafull".to_string()),
                 comment: Some("User accounts".to_string()),
@@ -957,6 +962,7 @@ fn completion_includes_user_js_function() {
     ws.documents.insert(
         u.clone(),
         Arc::new(DocumentAnalysis {
+            edge_observations: Vec::new(),
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
@@ -1011,6 +1017,7 @@ fn completion_includes_keywords_and_builtins() {
 fn completion_in_record_type_context_shows_only_tables() {
     let mut model = MergedSemanticModel::default();
     model.insert_table(TableDef {
+        relation: None,
         name: "person".to_string(),
         schema_mode: Some("schemafull".to_string()),
         comment: None,
@@ -1062,6 +1069,7 @@ fn completion_for_fields_scoped_to_statement_target_table() {
 fn no_diagnostics_for_allowed_permission() {
     let u = uri("query.surql");
     let table = TableDef {
+        relation: None,
         name: "thing".to_string(),
         schema_mode: None,
         comment: None,
@@ -1080,6 +1088,7 @@ fn no_diagnostics_for_allowed_permission() {
     let mut model = MergedSemanticModel::default();
     model.insert_table(table);
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
@@ -1116,6 +1125,7 @@ fn error_diagnostic_for_denied_permission() {
     // use CREATE to exercise the denied-permission diagnostic path.
     let u = uri("query.surql");
     let table = TableDef {
+        relation: None,
         name: "secret".to_string(),
         schema_mode: None,
         comment: None,
@@ -1134,6 +1144,7 @@ fn error_diagnostic_for_denied_permission() {
     let mut model = MergedSemanticModel::default();
     model.insert_table(table);
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
@@ -1177,6 +1188,7 @@ fn warning_for_unknown_table_in_query() {
     let model = MergedSemanticModel::default();
     let u = uri("query.surql");
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
@@ -1248,6 +1260,7 @@ fn role_based_permission_allowed_for_matching_context() {
         ..ServerSettings::default()
     };
     let table = TableDef {
+        relation: None,
         name: "orders".to_string(),
         schema_mode: None,
         comment: None,
@@ -1266,6 +1279,7 @@ fn role_based_permission_allowed_for_matching_context() {
     let mut model = MergedSemanticModel::default();
     model.insert_table(table);
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u,
         text: String::new(),
         tree: tree_of(""),
@@ -1431,6 +1445,7 @@ fn rename_of_remote_function_returns_none() {
 fn local_function_overrides_remote() {
     let u = uri("fn.surql");
     let remote = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: uri("remote.surql"),
         text: String::new(),
         tree: tree_of(""),
@@ -1463,6 +1478,7 @@ fn local_function_overrides_remote() {
         document_symbols: Vec::new(),
     };
     let local = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
@@ -1530,11 +1546,13 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
     ws.documents.insert(
         u.clone(),
         Arc::new(DocumentAnalysis {
+            edge_observations: Vec::new(),
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
             line_index: LineIndex::default(),
             tables: vec![TableDef {
+                relation: None,
                 name: "invoice".to_string(),
                 schema_mode: None,
                 comment: None,
@@ -1600,11 +1618,13 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
 fn code_action_suggests_add_permissions_for_table_without_rules() {
     let u = uri("schema.surql");
     let analysis = DocumentAnalysis {
+        edge_observations: Vec::new(),
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
         line_index: LineIndex::default(),
         tables: vec![TableDef {
+            relation: None,
             name: "widget".to_string(),
             schema_mode: Some("schemafull".to_string()),
             comment: None,
@@ -3266,8 +3286,27 @@ fn adversarial_fixture_reports_no_argument_diagnostics() {
         .filter(|code| {
             code.starts_with("argument-") || *code == "let-type" || *code == "field-type"
         })
+        .cloned()
         .collect();
-    assert!(noisy.is_empty(), "false positives on real code: {noisy:?}");
+
+    // Exactly one finding, and it is not a false positive.
+    //
+    // Line 212 passes `$doc.line` to `fn::canUserEdit`, whose second parameter
+    // is `record<orderData | project>`. `$doc` is annotated
+    // `{ line: record<orderLine>, asset: record<asset> }`, so the argument is
+    // `record<orderLine>` — a table the parameter does not accept, and the
+    // engine coerces a function argument to its declared type. The fixture is
+    // real code, and this is a real inconsistency in it that the server could
+    // not see until reading a property off an object type resolved at all.
+    //
+    // Asserted as an exact set rather than relaxed to a count: a *second*
+    // finding here still fails the build, which is the whole point of this
+    // guard. Correct the fixture's annotation and this list goes back to empty.
+    assert_eq!(
+        noisy,
+        vec!["argument-type".to_string()],
+        "the set of findings on real code changed"
+    );
 }
 
 #[test]
@@ -3408,7 +3447,7 @@ fn hover_at(source: &str, needle: &str) -> Option<String> {
     let line = source[..offset].matches('\n').count() as u32;
     let column = (offset - source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
 
-    model.hover_markdown_at(&analysis, Position::new(line, column), needle, None)
+    model.hover_markdown_at(&analysis, Position::new(line, column), needle, None, &[])
 }
 
 #[test]
@@ -3563,7 +3602,7 @@ fn later_bindings_shadow_earlier_ones() {
 
     // On the `RETURN` line, the second binding wins.
     let hover = model
-        .hover_markdown_at(&analysis, Position::new(2, 8), "$x", None)
+        .hover_markdown_at(&analysis, Position::new(2, 8), "$x", None, &[])
         .expect("hover");
     assert!(hover.contains("Type: `string`"), "got {hover}");
 }
@@ -3598,7 +3637,7 @@ fn block_scoped_bindings_do_not_leak() {
     let column = (outer - source[..outer].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
     assert!(
         model
-            .hover_markdown_at(&analysis, Position::new(line, column), "$inner", None)
+            .hover_markdown_at(&analysis, Position::new(line, column), "$inner", None, &[])
             .is_none(),
         "a LET inside a function body must not escape it"
     );
@@ -3621,7 +3660,7 @@ fn function_parameters_are_bound_inside_the_body() {
     let column = (body_use - source[..body_use].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
 
     let inside = model
-        .hover_markdown_at(&analysis, Position::new(line, column), "$name", None)
+        .hover_markdown_at(&analysis, Position::new(line, column), "$name", None, &[])
         .expect("hover inside body");
     assert!(inside.contains("Type: `string`"), "got {inside} / {hover}");
 }
@@ -4334,7 +4373,7 @@ fn hover_across(documents: &[(&str, &str)], needle: &str) -> Option<String> {
     let offset = source.find(needle).expect("needle present");
     let line = source[..offset].matches('\n').count() as u32;
     let column = (offset - source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-    model.hover_markdown_at(target, Position::new(line, column), needle, None)
+    model.hover_markdown_at(target, Position::new(line, column), needle, None, &[])
 }
 
 /// The type hover reports for `needle`, as a bare string.
@@ -5460,4 +5499,800 @@ fn a_plain_set_target_is_unaffected_by_the_target_shape() {
     assert_eq!(analysis.query_facts[0].touched_fields, vec!["age"]);
     assert_eq!(analysis.fields.len(), 1);
     assert_eq!(analysis.fields[0].name, "age");
+}
+
+// ---------------------------------------------------------------------------
+// Graph edges
+// ---------------------------------------------------------------------------
+//
+// Two independent sources feed the graph: a `TYPE RELATION` declaration, and a
+// `RELATE` statement. Both are needed. SurrealDB's own graph benchmark corpus
+// declares `person` `SCHEMALESS` and never defines `knows` at all — it exists
+// only because `RELATE` wrote to it — so a declaration-only implementation
+// would know nothing about the queries graph users actually write.
+
+/// Build a merged model from one document's source.
+fn model_from(source: &str) -> MergedSemanticModel {
+    let analysis =
+        analyze_document(uri("graph.surql"), source, SymbolOrigin::Local).expect("analysis");
+    MergedSemanticModel::build(&workspace_from(vec![analysis]), &Default::default())
+}
+
+#[test]
+fn a_declared_relation_records_both_endpoints() {
+    let model = model_from("DEFINE TABLE knows TYPE RELATION IN person OUT person;");
+
+    let relation = model.tables["knows"]
+        .relation
+        .as_ref()
+        .expect("`TYPE RELATION` must be extracted");
+    assert_eq!(relation.in_tables, vec!["person"]);
+    assert_eq!(relation.out_tables, vec!["person"]);
+    assert!(!relation.enforced);
+
+    assert_eq!(
+        model.edges_from("person", LookupDirection::Right),
+        ["knows"]
+    );
+    assert_eq!(model.edges_from("person", LookupDirection::Left), ["knows"]);
+    assert_eq!(
+        model.tables_across("knows", LookupDirection::Right),
+        ["person"]
+    );
+}
+
+/// `FROM`/`TO` are the other accepted spelling of `IN`/`OUT`, and a piped list
+/// declares more than one table per side.
+#[test]
+fn a_relation_reads_the_alternate_spelling_and_piped_lists() {
+    let model = model_from("DEFINE TABLE owns TYPE RELATION FROM person|company TO car ENFORCED;");
+
+    let relation = model.tables["owns"].relation.as_ref().expect("relation");
+    assert_eq!(relation.in_tables, vec!["person", "company"]);
+    assert_eq!(relation.out_tables, vec!["car"]);
+    assert!(relation.enforced, "`ENFORCED` must be read");
+
+    assert_eq!(
+        model.edges_from("company", LookupDirection::Right),
+        ["owns"]
+    );
+    assert_eq!(model.tables_across("owns", LookupDirection::Right), ["car"]);
+}
+
+/// A bare `TYPE RELATION` constrains neither endpoint. It must still mark the
+/// table as an edge, and must not invent an endpoint.
+#[test]
+fn a_bare_relation_is_an_edge_with_no_endpoints() {
+    let model = model_from("DEFINE TABLE knows TYPE RELATION;");
+
+    let relation = model.tables["knows"].relation.as_ref().expect("relation");
+    assert!(relation.in_tables.is_empty());
+    assert!(relation.out_tables.is_empty());
+    assert!(
+        model
+            .edges_from("person", LookupDirection::Right)
+            .is_empty()
+    );
+}
+
+/// `TYPE NORMAL` and `TYPE ANY` are not relations and must leave `relation`
+/// unset, or every ordinary table would look like an edge.
+#[test]
+fn a_normal_table_is_not_a_relation() {
+    for source in [
+        "DEFINE TABLE person TYPE NORMAL;",
+        "DEFINE TABLE person TYPE ANY;",
+        "DEFINE TABLE person SCHEMAFULL;",
+    ] {
+        let model = model_from(source);
+        assert!(
+            model.tables["person"].relation.is_none(),
+            "{source} must not declare a relation"
+        );
+    }
+}
+
+#[test]
+fn a_relate_statement_witnesses_an_edge() {
+    let model = model_from("RELATE person:a->knows->person:b;");
+
+    assert_eq!(
+        model.edges_from("person", LookupDirection::Right),
+        ["knows"]
+    );
+    assert_eq!(
+        model.tables_across("knows", LookupDirection::Right),
+        ["person"]
+    );
+}
+
+/// The two endpoints of a `RELATE` need not be the same table, and the edge
+/// must point the way it was written.
+#[test]
+fn a_relate_statement_keeps_its_direction() {
+    let model = model_from("RELATE person:a->bought->product:b;");
+
+    assert_eq!(
+        model.edges_from("person", LookupDirection::Right),
+        ["bought"],
+        "`person` reaches `bought` going right"
+    );
+    assert!(
+        model
+            .edges_from("product", LookupDirection::Right)
+            .is_empty(),
+        "`product` is the far end, so nothing leaves it rightward"
+    );
+    assert_eq!(
+        model.edges_from("product", LookupDirection::Left),
+        ["bought"],
+        "`product` reaches `bought` going left"
+    );
+}
+
+/// `RELATE b<-knows<-a` records the same edge as `RELATE a->knows->b`. The
+/// grammar accepts both, and reading the left form forward would reverse it.
+#[test]
+fn a_left_pointing_relate_is_read_in_reverse() {
+    let model = model_from("RELATE product:b<-bought<-person:a;");
+
+    assert_eq!(
+        model.edges_from("person", LookupDirection::Right),
+        ["bought"],
+        "`person` is still the source"
+    );
+    assert_eq!(
+        model.tables_across("bought", LookupDirection::Right),
+        ["product"]
+    );
+}
+
+/// A `$parameter` subject names no table. The edge itself is still real, so it
+/// must be recorded — just without the endpoint it cannot resolve.
+#[test]
+fn a_relate_on_parameters_records_the_edge_without_endpoints() {
+    let model = model_from("RELATE $a->knows->$b;");
+
+    assert!(
+        model.graph_edges.outgoing.is_empty(),
+        "no endpoint is statically known"
+    );
+    assert!(
+        model.tables.contains_key("knows"),
+        "the edge is still a table"
+    );
+}
+
+/// The declared and the observed halves must combine rather than replace each
+/// other: a schema may declare one edge while a query writes another.
+#[test]
+fn declared_and_observed_edges_combine_without_duplicates() {
+    let model = model_from(concat!(
+        "DEFINE TABLE knows TYPE RELATION IN person OUT person;\n",
+        "RELATE person:a->knows->person:b;\n",
+        "RELATE person:a->bought->product:c;\n",
+    ));
+
+    let mut edges = model.edges_from("person", LookupDirection::Right);
+    edges.sort_unstable();
+    assert_eq!(
+        edges,
+        ["bought", "knows"],
+        "the declaration and the observation must both count, once each"
+    );
+}
+
+/// An explicit `DEFINE TABLE` outranks an inferred one and replaces it
+/// wholesale. The observed edges must survive that, which is why they live on
+/// the model rather than on `TableDef`.
+#[test]
+fn an_explicit_definition_does_not_erase_an_observed_edge() {
+    let model = model_from(concat!(
+        "RELATE person:a->knows->person:b;\n",
+        "DEFINE TABLE knows SCHEMAFULL;\n",
+    ));
+
+    assert!(
+        model.tables["knows"].explicit,
+        "the DEFINE must win the merge"
+    );
+    assert!(
+        model.tables["knows"].relation.is_none(),
+        "this DEFINE declares no relation"
+    );
+    assert_eq!(
+        model.edges_from("person", LookupDirection::Right),
+        ["knows"],
+        "the observed edge must outlive the table merge"
+    );
+}
+
+/// A traversal in a target position names *one* table — where the walk ends.
+///
+/// Before this, `is_target_name_kind` accepted `Path` and the sweep harvested
+/// every `Ident` under it, so this reported three co-equal targets: the edge
+/// name drew a false `Unknown table` warning, and column completion offered
+/// the fields of all three tables at once.
+#[test]
+fn a_traversal_target_collapses_to_the_table_it_lands_on() {
+    let analysis = analyze_document(
+        uri("t.surql"),
+        "SELECT * FROM person->likes->product;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+
+    assert_eq!(
+        analysis.query_facts[0].target_tables,
+        vec!["product".to_string()],
+        "only the landing table is a target"
+    );
+    assert_eq!(
+        analysis.query_facts[0].target_resolution,
+        TargetResolution::Static
+    );
+}
+
+#[test]
+fn an_inbound_traversal_target_collapses_the_same_way() {
+    let analysis = analyze_document(
+        uri("t.surql"),
+        "SELECT * FROM person<-bought<-customer;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+
+    assert_eq!(
+        analysis.query_facts[0].target_tables,
+        vec!["customer".to_string()]
+    );
+}
+
+/// A one-hop traversal lands on the edge table itself, which is a real table
+/// holding real rows.
+#[test]
+fn a_single_hop_target_lands_on_the_edge_table() {
+    let analysis = analyze_document(
+        uri("t.surql"),
+        "SELECT * FROM person->likes;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+
+    assert_eq!(
+        analysis.query_facts[0].target_tables,
+        vec!["likes".to_string()]
+    );
+}
+
+/// A record-id base is still just a base — the walk still decides the target.
+#[test]
+fn a_record_id_base_does_not_become_the_target() {
+    let analysis = analyze_document(
+        uri("t.surql"),
+        "SELECT * FROM person:alice->likes->product;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+
+    assert_eq!(
+        analysis.query_facts[0].target_tables,
+        vec!["product".to_string()]
+    );
+}
+
+/// A wildcard hop names no table. Reporting none is right; reporting the
+/// tables it passed through would be a target the server invented.
+#[test]
+fn a_wildcard_hop_reports_no_target_and_no_warning() {
+    for source in [
+        "SELECT * FROM person->?;",
+        "SELECT * FROM person->*;",
+        "SELECT * FROM person->likes->?;",
+    ] {
+        let analysis =
+            analyze_document(uri("t.surql"), source, SymbolOrigin::Local).expect("analysis");
+        let fact = &analysis.query_facts[0];
+        assert!(
+            fact.target_tables.is_empty(),
+            "{source} must name no target, got {:?}",
+            fact.target_tables
+        );
+        assert_eq!(
+            fact.target_resolution,
+            TargetResolution::Expression,
+            "{source} must not draw a `could not be resolved` warning"
+        );
+    }
+}
+
+/// The collapse must not touch an ordinary target, including a comma-separated
+/// list of them.
+#[test]
+fn an_ordinary_target_is_unaffected_by_the_collapse() {
+    let analysis = analyze_document(
+        uri("t.surql"),
+        "SELECT * FROM person, product;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+
+    assert_eq!(
+        analysis.query_facts[0].target_tables,
+        vec!["person".to_string(), "product".to_string()]
+    );
+}
+
+/// The reported query. A traversal in the *projection* is not a target at all,
+/// so the `FROM` table must survive untouched.
+#[test]
+fn a_traversal_in_the_projection_leaves_the_from_target_alone() {
+    let analysis = analyze_document(
+        uri("t.surql"),
+        "SELECT ->is_friends_with->person AS friends FROM person WHERE friends.length > 0;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+
+    assert_eq!(
+        analysis.query_facts[0].target_tables,
+        vec!["person".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Traversal typing
+// ---------------------------------------------------------------------------
+
+/// The type of the first `Path` in a document, with the graph model built from
+/// the same source.
+fn traversal_type(source: &str) -> TypeExpr {
+    let analysis =
+        analyze_document(uri("graph.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let model =
+        MergedSemanticModel::build(&workspace_from(vec![analysis.clone()]), &Default::default());
+    let bindings = resolve_bindings(&analysis, &model);
+    let ctx = TypeCtx {
+        model: &model,
+        source: &analysis.text,
+        lines: &analysis.line_index,
+        bindings: &bindings,
+    };
+
+    fn first_path<'tree>(node: tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>> {
+        if node.kind() == "Path" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find_map(first_path)
+    }
+
+    let path = first_path(analysis.tree.root_node()).expect("a Path node");
+    infer_expr_type(path, &ctx)
+}
+
+const KNOWS: &str = "DEFINE TABLE knows TYPE RELATION IN person OUT person;\n";
+
+/// The reported query's shape: a traversal with no written base takes its
+/// anchor from the statement's own `FROM` table.
+#[test]
+fn a_bodiless_traversal_types_from_the_from_table() {
+    assert_eq!(
+        traversal_type(&format!(
+            "{KNOWS}SELECT ->knows->person AS friends FROM person;"
+        )),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["person".to_string()]))),
+        "`->knows->person` from `person` is a list of person records"
+    );
+}
+
+/// One hop lands on the edge table, which holds rows of its own.
+#[test]
+fn a_single_hop_types_as_the_edge_table() {
+    assert_eq!(
+        traversal_type(&format!("{KNOWS}SELECT ->knows AS edges FROM person;")),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["knows".to_string()])))
+    );
+}
+
+#[test]
+fn an_inbound_traversal_follows_the_edge_backwards() {
+    assert_eq!(
+        traversal_type(&format!(
+            "{KNOWS}SELECT <-knows<-person AS followers FROM person;"
+        )),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["person".to_string()])))
+    );
+}
+
+/// Two hops in a row, from SurrealDB's own `two_hop` benchmark.
+#[test]
+fn a_two_hop_traversal_chains_through_the_graph() {
+    assert_eq!(
+        traversal_type(&format!(
+            "{KNOWS}SELECT ->knows->person->knows->person AS fof FROM person;"
+        )),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["person".to_string()])))
+    );
+}
+
+/// A written base is used as-is; the anchor walk is only for a bodiless path.
+#[test]
+fn a_traversal_from_a_record_id_uses_that_record() {
+    assert_eq!(
+        traversal_type(&format!(
+            "{KNOWS}SELECT * FROM person:alice->knows->person;"
+        )),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["person".to_string()])))
+    );
+}
+
+/// An edge witnessed only by `RELATE` types a traversal just as well as a
+/// declared one — which is the case that matters, since most schemas never
+/// declare their edges.
+#[test]
+fn an_observed_edge_is_enough_to_type_a_traversal() {
+    assert_eq!(
+        traversal_type(concat!(
+            "RELATE person:a->bought->product:b;\n",
+            "SELECT ->bought->product AS items FROM person;",
+        )),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["product".to_string()])))
+    );
+}
+
+/// Silence beats a guess. Every one of these is a step the graph cannot
+/// confirm, and `Unknown` is the value the type checker must stay quiet on.
+#[test]
+fn an_unconfirmed_hop_types_as_unknown() {
+    for source in [
+        // No such edge anywhere.
+        &format!("{KNOWS}SELECT ->nonsense->person AS x FROM person;"),
+        // A real edge, but not one that leaves `product`.
+        &format!("{KNOWS}SELECT ->knows->person AS x FROM product;"),
+        // A wildcard hop names nothing to follow.
+        &format!("{KNOWS}SELECT ->? AS x FROM person;"),
+        // No `FROM` at all, so a bodiless traversal has no anchor.
+        &format!("{KNOWS}SELECT ->knows->person AS x;"),
+        // The edge is right, but `car` is not on the far side of it.
+        &format!("{KNOWS}SELECT ->knows->car AS x FROM person;"),
+    ] {
+        assert_eq!(
+            traversal_type(source),
+            TypeExpr::Unknown,
+            "must not invent a type for {source:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queries bound to variables
+// ---------------------------------------------------------------------------
+//
+// `LET $people = (SELECT name, age FROM person)` used to bind `unknown`, so
+// nothing downstream could be checked against it — including the loop variable
+// of a `FOR $person IN $people`, which is the whole reason to bind a query.
+
+const LET_SCHEMA: &str = concat!(
+    "DEFINE TABLE person SCHEMAFULL;\n",
+    "DEFINE FIELD name ON person TYPE string;\n",
+    "DEFINE FIELD age ON person TYPE int;\n",
+    "DEFINE FIELD address.street ON person TYPE string;\n",
+    "DEFINE FIELD address.city ON person TYPE string;\n",
+);
+
+/// The type bound to `name`, resolved at its last occurrence in `query`.
+fn binding_type(query: &str, name: &str) -> TypeExpr {
+    let source = format!("{LET_SCHEMA}{query}");
+    let analysis =
+        analyze_document(uri("let.surql"), &source, SymbolOrigin::Local).expect("analysis");
+    let model =
+        MergedSemanticModel::build(&workspace_from(vec![analysis.clone()]), &Default::default());
+    let bindings = resolve_bindings(&analysis, &model);
+    let at = source
+        .rfind(name)
+        .map(|at| at + name.len())
+        .expect("the variable must appear in the query");
+    bindings
+        .at(name, at)
+        .map(|binding| binding.ty.clone())
+        .unwrap_or(TypeExpr::Unknown)
+}
+
+/// `SELECT VALUE` yields the column's values, unwrapped — so a list of them.
+#[test]
+fn a_value_projection_binds_a_list_of_that_column() {
+    assert_eq!(
+        binding_type("LET $names = (SELECT VALUE name FROM person);", "$names"),
+        TypeExpr::Array(Box::new(TypeExpr::Scalar("string".to_string())))
+    );
+}
+
+/// A projection list binds a list of rows, one property per column.
+#[test]
+fn a_projection_list_binds_a_list_of_rows() {
+    assert_eq!(
+        binding_type("LET $people = (SELECT name, age FROM person);", "$people"),
+        TypeExpr::Array(Box::new(TypeExpr::Object(vec![
+            ("name".to_string(), TypeExpr::Scalar("string".to_string())),
+            ("age".to_string(), TypeExpr::Scalar("int".to_string())),
+        ])))
+    );
+}
+
+/// The point of binding the query: the loop variable carries the row type.
+#[test]
+fn a_for_loop_over_a_bound_query_types_its_variable() {
+    let row = TypeExpr::Object(vec![
+        ("name".to_string(), TypeExpr::Scalar("string".to_string())),
+        ("age".to_string(), TypeExpr::Scalar("int".to_string())),
+    ]);
+    assert_eq!(
+        binding_type(
+            concat!(
+                "LET $people = (SELECT name, age FROM person);\n",
+                "FOR $person IN $people { RETURN $person; };",
+            ),
+            "$person"
+        ),
+        row,
+        "the loop variable is one row of the list"
+    );
+}
+
+/// A literal list still works — the iterable is found by position now, not by
+/// ruling out every variable.
+#[test]
+fn a_for_loop_over_a_literal_still_types_its_variable() {
+    assert_eq!(
+        binding_type("FOR $n IN [1, 2, 3] { RETURN $n; };", "$n"),
+        TypeExpr::Scalar("int".to_string())
+    );
+}
+
+/// A subquery written inline needs no `LET` first.
+#[test]
+fn a_for_loop_over_an_inline_query_types_its_variable() {
+    assert_eq!(
+        binding_type("FOR $p IN (SELECT name FROM person) { RETURN $p; };", "$p"),
+        TypeExpr::Object(vec![(
+            "name".to_string(),
+            TypeExpr::Scalar("string".to_string())
+        )])
+    );
+}
+
+/// `ONLY` returns the row itself, not a list of one.
+#[test]
+fn an_only_query_binds_a_single_row() {
+    assert_eq!(
+        binding_type("LET $one = (SELECT name FROM ONLY person);", "$one"),
+        TypeExpr::Object(vec![(
+            "name".to_string(),
+            TypeExpr::Scalar("string".to_string())
+        )])
+    );
+}
+
+/// Parentheses are optional.
+#[test]
+fn a_bare_query_binds_the_same_type_as_a_parenthesised_one() {
+    assert_eq!(
+        binding_type("LET $bare = SELECT name FROM person;", "$bare"),
+        binding_type("LET $wrapped = (SELECT name FROM person);", "$wrapped")
+    );
+}
+
+/// A dotted projection nests, and two columns of the same parent merge into one
+/// property — which is what SurrealDB returns.
+#[test]
+fn dotted_projections_nest_and_merge() {
+    assert_eq!(
+        binding_type(
+            "LET $n = (SELECT address.street, address.city FROM person);",
+            "$n"
+        ),
+        TypeExpr::Array(Box::new(TypeExpr::Object(vec![(
+            "address".to_string(),
+            TypeExpr::Object(vec![
+                ("street".to_string(), TypeExpr::Scalar("string".to_string())),
+                ("city".to_string(), TypeExpr::Scalar("string".to_string())),
+            ])
+        )])))
+    );
+}
+
+/// An alias names the property, so any expression can be projected.
+#[test]
+fn an_aliased_expression_becomes_a_named_property() {
+    assert_eq!(
+        binding_type(
+            "LET $a = (SELECT string::len(name) AS len FROM person);",
+            "$a"
+        ),
+        TypeExpr::Array(Box::new(TypeExpr::Object(vec![(
+            "len".to_string(),
+            TypeExpr::Scalar("number".to_string())
+        )])))
+    );
+}
+
+/// `id` exists without a `DEFINE FIELD` and is a record of its own table.
+#[test]
+fn the_implicit_id_column_types_as_a_record() {
+    assert_eq!(
+        binding_type("LET $ids = (SELECT VALUE id FROM person);", "$ids"),
+        TypeExpr::Array(Box::new(TypeExpr::Record(vec!["person".to_string()])))
+    );
+}
+
+/// Silence beats a guess. Each of these has a shape this cannot know, and a
+/// wrong one would surface as a wrong `let-type` on working code.
+#[test]
+fn an_unknowable_shape_stays_unknown() {
+    for query in [
+        // `*` names every column, declared or not.
+        "LET $x = (SELECT * FROM person);",
+        // No static table to read a schema from.
+        "LET $x = (SELECT name FROM $target);",
+        // An expression with no alias: SurrealDB derives the key from the
+        // source text, which this does not reproduce.
+        "LET $x = (SELECT string::len(name) FROM person);",
+    ] {
+        assert_eq!(
+            binding_type(query, "$x"),
+            TypeExpr::Unknown,
+            "must not invent a shape for {query}"
+        );
+    }
+}
+
+/// Two targets that declare a column differently have no single answer.
+#[test]
+fn disagreeing_targets_leave_the_column_unknown() {
+    let source = concat!(
+        "DEFINE TABLE pet SCHEMAFULL;\n",
+        "DEFINE FIELD name ON pet TYPE int;\n",
+        "LET $x = (SELECT name FROM person, pet);",
+    );
+    let analysis = analyze_document(uri("d.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let model =
+        MergedSemanticModel::build(&workspace_from(vec![analysis.clone()]), &Default::default());
+    let bindings = resolve_bindings(&analysis, &model);
+    let at = source.rfind("$x").expect("the variable") + 2;
+    let ty = bindings
+        .at("$x", at)
+        .map(|b| b.ty.clone())
+        .expect("a binding");
+
+    assert_eq!(
+        ty,
+        TypeExpr::Array(Box::new(TypeExpr::Object(vec![(
+            "name".to_string(),
+            TypeExpr::Unknown
+        )]))),
+        "the row still has a `name`; its type is what is unknown"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reading a member off a value
+// ---------------------------------------------------------------------------
+//
+// `$person.age` used to be `unknown`: `path_type` followed method calls and
+// nothing else, so a `.name` segment ended the fold. That left every value a
+// query produced opaque the moment anything was read off it.
+
+/// The row a `SELECT id, name, age FROM person` produces, bound and iterated —
+/// the shape from the reported query.
+const ROW_PREAMBLE: &str = concat!(
+    "LET $people = (SELECT id, name, age FROM person);\n",
+    "FOR $person IN $people {\n",
+);
+
+#[test]
+fn a_property_of_a_bound_row_resolves() {
+    assert_eq!(
+        binding_type(&format!("{ROW_PREAMBLE}  LET $a = $person.age;\n}};"), "$a"),
+        TypeExpr::Scalar("int".to_string())
+    );
+    assert_eq!(
+        binding_type(
+            &format!("{ROW_PREAMBLE}  LET $a = $person.name;\n}};"),
+            "$a"
+        ),
+        TypeExpr::Scalar("string".to_string())
+    );
+}
+
+/// `id` on the row is a record, so reading a column off *it* resolves through
+/// the schema — two links of the same fold.
+#[test]
+fn a_property_chain_resolves_through_a_record() {
+    assert_eq!(
+        binding_type(
+            &format!("{ROW_PREAMBLE}  LET $a = $person.id.name;\n}};"),
+            "$a"
+        ),
+        TypeExpr::Scalar("string".to_string())
+    );
+}
+
+/// An idiom maps over a list, which is what SurrealQL does.
+#[test]
+fn a_property_read_off_a_list_maps_over_it() {
+    assert_eq!(
+        binding_type(
+            "LET $people = (SELECT name FROM person);\nLET $a = $people.name;",
+            "$a"
+        ),
+        TypeExpr::Array(Box::new(TypeExpr::Scalar("string".to_string())))
+    );
+}
+
+/// A column read off a record resolves against that record's table.
+#[test]
+fn a_column_read_off_a_record_resolves_against_its_table() {
+    assert_eq!(
+        binding_type(
+            "LET $p = (SELECT VALUE id FROM ONLY person);\nLET $a = $p.age;",
+            "$a"
+        ),
+        TypeExpr::Scalar("int".to_string())
+    );
+}
+
+/// A member the receiver does not have is unknown, not an error. Nothing here
+/// knows enough about a partially-declared row to call it a fault.
+#[test]
+fn an_absent_member_is_unknown_and_silent() {
+    let source = format!("{LET_SCHEMA}{ROW_PREAMBLE}  LET $a = $person.nonexistent;\n}};");
+    assert_eq!(
+        binding_type(
+            &format!("{ROW_PREAMBLE}  LET $a = $person.nonexistent;\n}};"),
+            "$a"
+        ),
+        TypeExpr::Unknown
+    );
+
+    let analysis =
+        analyze_document(uri("m.surql"), &source, SymbolOrigin::Local).expect("analysis");
+    let model =
+        MergedSemanticModel::build(&workspace_from(vec![analysis.clone()]), &Default::default());
+    let codes = codes_of(&model.semantic_diagnostics(&analysis, &ServerSettings::default()));
+    assert!(
+        !codes.iter().any(|code| code.starts_with("argument-")),
+        "an unknown member must stay silent, got {codes:?}"
+    );
+}
+
+/// A row whose columns come from one table may still *contain* records pointing
+/// at others. The receiver's own table is what decides a column, not whatever
+/// its columns happen to reference.
+#[test]
+fn a_record_valued_column_does_not_capture_the_row() {
+    let source = concat!(
+        "DEFINE TABLE person SCHEMAFULL;\n",
+        "DEFINE FIELD name ON person TYPE int;\n",
+        "DEFINE TABLE book SCHEMAFULL;\n",
+        "DEFINE FIELD name ON book TYPE string;\n",
+        "DEFINE FIELD author ON book TYPE record<person>;\n",
+        "LET $books = (SELECT name, author FROM book);\n",
+        "LET $a = $books.name;\n",
+    );
+    let analysis = analyze_document(uri("b.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let model =
+        MergedSemanticModel::build(&workspace_from(vec![analysis.clone()]), &Default::default());
+    let bindings = resolve_bindings(&analysis, &model);
+    let at = source.rfind("$a").expect("the variable") + 2;
+    let ty = bindings
+        .at("$a", at)
+        .map(|b| b.ty.clone())
+        .expect("a binding");
+
+    assert_eq!(
+        ty,
+        TypeExpr::Array(Box::new(TypeExpr::Scalar("string".to_string()))),
+        "`name` is `book`'s `string`, not `person`'s `int` reached through `author`"
+    );
 }

@@ -24,7 +24,9 @@ fn server_capabilities_golden() {
         "hoverProvider": true,
         "completionProvider": {
             "resolveProvider": true,
-            "triggerCharacters": [".", ":", "<", "$", "("],
+            // `>` was added deliberately, so `->` opens the completion list
+            // the way `<-` already did through `<`.
+            "triggerCharacters": [".", ":", "<", ">", "$", "("],
         },
         "signatureHelpProvider": {
             "triggerCharacters": ["(", ","],

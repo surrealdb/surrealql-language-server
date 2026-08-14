@@ -11,10 +11,10 @@ use crate::semantic::text::{LineIndex, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
-    AccessDef, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef, FunctionLanguage,
-    FunctionParam, IndexDef, InferenceFact, MergedSemanticModel, NamedRange, ParamDef,
-    PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin, SymbolReference,
-    TableDef, TargetResolution,
+    AccessDef, AnalyzerDef, DocumentAnalysis, EdgeObservation, EventDef, FieldDef, FunctionDef,
+    FunctionLanguage, FunctionParam, IndexDef, InferenceFact, MergedSemanticModel, NamedRange,
+    ParamDef, PermissionMode, PermissionRule, QueryAction, QueryFact, RelationDef, SymbolOrigin,
+    SymbolReference, TableDef, TargetResolution,
 };
 
 pub fn analyze_document(uri: Uri, text: &str, origin: SymbolOrigin) -> Option<DocumentAnalysis> {
@@ -69,6 +69,9 @@ pub fn analyze_document_with_limit(
         accesses: Vec::new(),
         analyzers: Vec::new(),
         query_facts: Vec::with_capacity(statement_hint),
+        // Most documents hold no RELATE at all, so this one starts empty
+        // rather than at the statement hint.
+        edge_observations: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::with_capacity(statement_hint),
@@ -317,6 +320,10 @@ fn extract_table(
         explicit: true,
         inference: None,
         location: location(uri, source, lines, node),
+        relation: children
+            .iter()
+            .find(|child| child.kind() == k::TABLE_TYPE_CLAUSE)
+            .and_then(|clause| parse_relation_clause(*clause, source)),
     };
 
     for inferred in infer_record_types_from_table(&table, uri, source, node) {
@@ -331,6 +338,66 @@ fn extract_table(
         node,
     ));
     analysis.tables.push(table);
+}
+
+/// Read `TYPE RELATION IN a|b OUT c|d ENFORCED` out of a `TableTypeClause`.
+///
+/// Returns `None` for `TYPE NORMAL`, `TYPE ANY`, and anything else that is not
+/// a relation — the caller stores that as "this table is not an edge".
+///
+/// The clause exposes no tree-sitter fields: `RELATION`, `IN`, `FROM`, `OUT`
+/// and `TO` all arrive as generic `Keyword` nodes, and both table lists as bare
+/// `Ident`s. So this walks the children in source order and lets each keyword
+/// select which list the following identifiers belong to. `IN`/`FROM` and
+/// `OUT`/`TO` are the two accepted spellings of each side.
+fn parse_relation_clause(clause: Node<'_>, source: &str) -> Option<RelationDef> {
+    /// Which side of the relation the walk is currently filling.
+    enum Side {
+        /// Before any `IN`/`OUT` keyword — a bare `TYPE RELATION`.
+        Neither,
+        In,
+        Out,
+    }
+
+    let mut is_relation = false;
+    let mut side = Side::Neither;
+    let mut relation = RelationDef::default();
+
+    for child in k::named_children(clause) {
+        if child.kind() == k::ENFORCED_CLAUSE {
+            relation.enforced = true;
+            continue;
+        }
+        if k::is_keyword(child) {
+            match text_of(source, child)
+                .map(|text| text.to_ascii_uppercase())
+                .as_deref()
+            {
+                Some("RELATION") => is_relation = true,
+                Some("IN" | "FROM") => side = Side::In,
+                Some("OUT" | "TO") => side = Side::Out,
+                // `TYPE`, and the `NORMAL` / `ANY` that make this not a
+                // relation at all.
+                _ => {}
+            }
+            continue;
+        }
+        if child.kind() != k::IDENT {
+            continue;
+        }
+        let Some(table) = text_of(source, child) else {
+            continue;
+        };
+        match side {
+            Side::In => relation.in_tables.push(table.to_string()),
+            Side::Out => relation.out_tables.push(table.to_string()),
+            // An `Ident` before either keyword cannot be placed. The grammar
+            // does not produce one here, so this is a guard, not a case.
+            Side::Neither => {}
+        }
+    }
+
+    is_relation.then_some(relation)
 }
 
 fn extract_field(
@@ -402,6 +469,7 @@ fn extract_field(
                     ),
                 }),
                 location: location(uri, source, lines, node),
+                relation: None,
             };
             upsert_inferred_table(analysis, inferred, uri, source, lines, node);
         }
@@ -837,8 +905,15 @@ fn extract_query_fact(
                 evidence: format!("Observed `{table}` in {} statement.", action_label(action)),
             }),
             location: statement_location.clone(),
+            relation: None,
         };
         upsert_inferred_table(analysis, inferred, uri, source, lines, node);
+    }
+
+    if action == QueryAction::Relate
+        && let Some(observation) = relate_edge_observation(node, source)
+    {
+        analysis.edge_observations.push(observation);
     }
 
     for inferred_field in
@@ -857,6 +932,48 @@ fn extract_query_fact(
         field_refs,
         target_resolution,
     });
+}
+
+/// Read `RELATE from->edge->to` as one graph edge.
+///
+/// The grammar spells a RELATE's arrows as *direct* children of the statement
+/// (`LookupRight` / `LookupLeft`), not wrapped in a [`k::LOOKUP`] the way a
+/// traversal is, so this cannot share the traversal walk.
+///
+/// A left arrow reverses the reading: `RELATE b<-knows<-a` records the same
+/// edge as `RELATE a->knows->b`. Returns `None` unless the statement has all
+/// three subjects and the middle one names a table.
+fn relate_edge_observation(node: Node<'_>, source: &str) -> Option<EdgeObservation> {
+    let mut subjects: Vec<Option<String>> = Vec::with_capacity(3);
+    let mut points_right: Option<bool> = None;
+
+    for child in k::named_children(node) {
+        match child.kind() {
+            k::LOOKUP_RIGHT | k::LOOKUP_LEFT => {
+                // Only the first arrow decides the reading. The grammar lets
+                // the two arrows differ; SurrealDB reads the first.
+                points_right.get_or_insert(child.kind() == k::LOOKUP_RIGHT);
+            }
+            // A `$param`, a call, or an array names no table we can pin down.
+            k::VARIABLE_NAME | k::FUNCTION_CALL | k::ARRAY => subjects.push(None),
+            k::IDENT | k::RECORD_ID => {
+                subjects.push(text_of(source, child).and_then(|text| normalize_table_name(&text)));
+            }
+            _ => {}
+        }
+    }
+
+    let [first, edge, third] = subjects.as_slice() else {
+        return None;
+    };
+    // Without a named edge table there is no edge to record.
+    let edge = edge.clone()?;
+    let (from, to) = if points_right.unwrap_or(true) {
+        (first.clone(), third.clone())
+    } else {
+        (third.clone(), first.clone())
+    };
+    Some(EdgeObservation { edge, from, to })
 }
 
 fn infer_fields_from_statement(
@@ -1247,10 +1364,38 @@ fn target_refs_from_nodes(
     lines: &LineIndex,
 ) -> Vec<NamedRange> {
     let mut refs: Vec<NamedRange> = Vec::new();
-    for relevant in relevant_nodes
-        .iter()
-        .filter(|node| is_target_name_kind(node.kind()))
-    {
+    for relevant in relevant_nodes {
+        // Read the kind once. This runs for every target of every statement in
+        // the document, and `Node::kind` crosses into the C parser each time.
+        let kind = relevant.kind();
+        if !is_target_name_kind(kind) {
+            continue;
+        }
+        // A graph traversal names one target — where the walk *ends* — not
+        // every table it passes through. Without this, `FROM person->likes->
+        // product` reports `person`, `likes` and `product` as three co-equal
+        // targets: the edge draws a false `unknown-table`, and field
+        // completion offers all three tables' columns.
+        if kind == k::PATH
+            && let Some(hop) = traversal_last_hop(*relevant)
+        {
+            if let Some(terminal) = traversal_terminal(hop)
+                && let Some(name) = terminal
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .and_then(normalize_table_name)
+                && !refs.iter().any(|existing| existing.name == name)
+            {
+                refs.push(NamedRange {
+                    name,
+                    range: lines.range(source, terminal.start_byte(), terminal.end_byte()),
+                });
+            }
+            // Never fall through to the sweep below: a wildcard hop names no
+            // table, and naming the ones it passed through would be worse than
+            // naming none.
+            continue;
+        }
         for candidate in descendants_of_kind(*relevant, k::IDENT)
             .into_iter()
             .chain(descendants_of_kind(*relevant, k::RECORD_ID))
@@ -1278,6 +1423,72 @@ fn target_refs_from_nodes(
     refs
 }
 
+/// The tables a statement reads from, for a statement node.
+///
+/// Exposed for [`crate::semantic::infer`], which needs it twice: for the anchor
+/// of a traversal that writes no base (`SELECT ->knows->person FROM person`),
+/// and for the schema a projection's columns are read from.
+///
+/// Only *statically named* tables count. A `$parameter`, a function call or a
+/// subquery target names no table until run time, and answering with the source
+/// text — `"$target"` — would have the caller look up columns on a table that
+/// cannot exist, and then claim a row shape built from what it did not find.
+///
+/// Resolves a traversal the same way [`target_refs_from_nodes`] does, so this
+/// and the query facts can never disagree about what `FROM` means.
+pub fn select_target_tables(statement: Node<'_>, source: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for node in target_nodes_for_statement(statement, source) {
+        // A traversal reads the table it lands on, not the one it starts from.
+        let named = match traversal_last_hop(node) {
+            Some(hop) => match traversal_terminal(hop) {
+                Some(terminal) => terminal,
+                // A wildcard hop lands nowhere nameable.
+                None => continue,
+            },
+            None => node,
+        };
+        if !matches!(named.kind(), k::IDENT | k::RECORD_ID | k::RANGE_RECORD_ID) {
+            continue;
+        }
+        if let Some(name) = named
+            .utf8_text(source.as_bytes())
+            .ok()
+            .and_then(normalize_table_name)
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The last hop of a graph traversal, for a node that is one.
+///
+/// `None` when the node is not a traversal at all — an ordinary target, which
+/// the caller reads whole.
+fn traversal_last_hop<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() != k::PATH {
+        return None;
+    }
+    k::named_children(node)
+        .into_iter()
+        .rfind(|child| child.kind() == k::LOOKUP)
+}
+
+/// The table a graph traversal *lands on*.
+///
+/// The rows a statement reads come from where the walk ends, so that is its
+/// one target — `person->likes->product` selects products.
+///
+/// `None` when the last hop is `->?`, `->*` or a parenthesised selection,
+/// which names no single table. The caller reports no target at all in that
+/// case, rather than inventing one or falling back to naming every table the
+/// traversal passes through.
+fn traversal_terminal<'tree>(hop: Node<'tree>) -> Option<Node<'tree>> {
+    k::find_child(hop, k::IDENT)
+}
+
 /// Explain *why* no static target was found, so the "could not be
 /// resolved" warning fires only for genuinely opaque targets and not
 /// for `$param` / expression targets that are fine at runtime.
@@ -1296,6 +1507,17 @@ fn classify_unresolved_targets(relevant_nodes: &[Node<'_>]) -> TargetResolution 
             k::FUNCTION_CALL | k::SUB_QUERY | k::BLOCK | k::SELECT_STATEMENT | k::ARRAY
         )
     }) {
+        return TargetResolution::Expression;
+    }
+    // A traversal that ends on `->?`, `->*` or a parenthesised selection. The
+    // walk is perfectly valid SurrealQL; the server just cannot name where it
+    // lands, which is exactly what `Expression` means — and what keeps the
+    // "target could not be resolved" warning quiet.
+    if relevant_nodes
+        .iter()
+        .filter_map(|node| traversal_last_hop(*node))
+        .any(|hop| traversal_terminal(hop).is_none())
+    {
         return TargetResolution::Expression;
     }
     for relevant in relevant_nodes {

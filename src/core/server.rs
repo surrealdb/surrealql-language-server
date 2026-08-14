@@ -23,7 +23,8 @@ use crate::config::{AuthContext, ServerSettings};
 use crate::core::client::{LspNotifier, MetadataProvider, WorkspaceLoader};
 use crate::core::completion_context::{
     ColumnSlot, active_query_fact, column_completion_context, completion_prefix,
-    completion_table_qualifier, head_slot_at, is_table_name_context,
+    completion_table_qualifier, graph_anchors, graph_edge_context, head_slot_at,
+    is_table_name_context, statement_target_in_text,
 };
 use crate::core::state::{ServerState, merged_workspace, workspace_signature};
 use crate::core::statement_shape::SlotYield;
@@ -102,10 +103,15 @@ where
                 // `completion_resolve`, so the dropdown does not pay to render
                 // hover markdown for every table in the schema.
                 resolve_provider: Some(true),
+                // `>` closes a `->`, the way `<` opens a `<-`. Without it the
+                // two arrow directions behaved differently: `<-` popped the
+                // list and `->` did not, so the commoner spelling was the one
+                // that looked broken.
                 trigger_characters: Some(vec![
                     ".".into(),
                     ":".into(),
                     "<".into(),
+                    ">".into(),
                     "$".into(),
                     "(".into(),
                 ]),
@@ -522,6 +528,38 @@ where
             record_type_context,
         );
 
+        // A cursor just after `->` / `<-` names the next hop of a graph
+        // traversal, so only a table is legal there — and the ones actually
+        // reachable from this statement's table belong at the top. Checked
+        // before the plain table slot below because the two scans disagree
+        // about the arrow: `is_table_name_context` walks back over identifier
+        // characters, which `>` is not, so it would answer `false` and let the
+        // whole catalogue through.
+        if !record_type_context
+            && let Some(slot) = graph_edge_context(&analysis.text, &analysis.line_index, position)
+        {
+            let anchors = graph_anchors(&slot, &analysis, position);
+            let items = model.graph_completion_items(
+                prefix.trim_matches(|ch: char| ch == ':'),
+                &anchors,
+                slot.direction,
+                slot.from_edge,
+                settings.active_auth_context(),
+            );
+            // Say exactly which characters an item replaces, instead of
+            // leaving the client to work it out. Everywhere else in this
+            // handler the cursor follows a space or a `.`, so any client's
+            // word scan agrees with ours; after `->` it does not. A client
+            // whose word pattern admits `-` or `>` reads the prefix as
+            // `person->`, filters every item against it, matches none, and
+            // shows an empty popup — the same defect this server had, arrived
+            // at independently. An explicit range removes the guesswork.
+            let replace = replaced_range(&analysis, position, prefix.len());
+            return Some(CompletionResponse::Array(with_replace_range(
+                items, replace,
+            )));
+        }
+
         // When the cursor sits in a slot that only accepts a table name
         // (e.g. `SELECT * FROM |`, `INSERT INTO |`, `UPDATE |`), restrict
         // suggestions to known tables — otherwise the dropdown is flooded
@@ -567,6 +605,18 @@ where
         // position already offers rather than replacing it.
         let method_items = model.method_completion_items(&analysis, position, trimmed_prefix);
 
+        // A `.` on a value that has named members — a row a query built, or a
+        // record pointing at a declared table. Only those members and the
+        // methods are legal there, so this answers outright. `completion_table_
+        // qualifier` cannot serve this case: it deliberately refuses a `$`
+        // receiver, having no way to tell a variable from a table name.
+        let property_items = model.property_completion_items(&analysis, position, trimmed_prefix);
+        if !property_items.is_empty() {
+            let mut items = property_items;
+            items.extend(method_items);
+            return Some(CompletionResponse::Array(items));
+        }
+
         // Decide whether the cursor is in a column-name slot. A `tbl.`
         // qualifier is always treated as a strict slot (the only legal
         // continuations are field names of `tbl`).
@@ -579,7 +629,7 @@ where
         };
 
         if let Some(ColumnSlot::Strict { allow_star }) = column_slot {
-            let field_tables = field_completion_tables(statement_fact, qualifier.as_deref());
+            let field_tables = field_tables_at(&analysis, position, qualifier.as_deref());
             if !field_tables.is_empty() {
                 let multi_table_context = qualifier.is_none() && field_tables.len() > 1;
                 let mut items = model.column_completion_items(
@@ -653,6 +703,15 @@ where
 
         let token = token_at(&analysis.text, &analysis.line_index, position)?;
         let range = word_range(&analysis.text, &analysis.line_index, position)?;
+        // A column name resolves only against the table the statement reads, so
+        // hover needs the same context completion does — but *not* the `tbl.`
+        // qualifier. Completion needs it because the cursor sits after the dot
+        // with nothing else to go on; hover can see the whole idiom, and
+        // `address.street` would otherwise read `address` as a table and look
+        // the column up on a table that does not exist. `field_hover` splits a
+        // genuine `table.column` itself.
+        let field_tables = field_tables_at(&analysis, position, None);
+
         let contents = model.hover_markdown_at(
             &analysis,
             position,
@@ -660,6 +719,7 @@ where
                 matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
             }),
             settings.active_auth_context(),
+            &field_tables,
         )?;
 
         Some(Hover {
@@ -1323,6 +1383,65 @@ where
 /// Keyword order follows the engine's own parser arms rather than the
 /// alphabet, because `INFO FOR ` reads better as `ROOT NAMESPACE NS …` than as
 /// `DATABASE DB INDEX …`. The `sort_text` preserves that order and keeps every
+/// The tables whose columns are in scope at `position`.
+///
+/// A `tbl.` qualifier names its own table. Otherwise it is the statement's
+/// target: from the query fact when the document parses, and from the raw text
+/// when it does not. That second half matters more than it looks — the query
+/// facts describe the document *as it stands*, and a projection the author has
+/// not filled in yet does not parse. `SELECT  FROM person` yields an `ERROR`
+/// node and no fact at all, so the one position where the column list is most
+/// wanted was the one position with no table to draw it from.
+///
+/// Shared by completion and hover so the two cannot disagree about which table
+/// a bare column name belongs to.
+fn field_tables_at(
+    analysis: &DocumentAnalysis,
+    position: Position,
+    qualifier: Option<&str>,
+) -> Vec<String> {
+    let tables = field_completion_tables(active_query_fact(analysis, position), qualifier);
+    if !tables.is_empty() || qualifier.is_some() {
+        return tables;
+    }
+    statement_target_in_text(&analysis.text, &analysis.line_index, position)
+        .into_iter()
+        .collect()
+}
+
+/// The span of the `prefix_len` bytes immediately before the cursor.
+///
+/// That run is the partial name the author has typed, so it is what a chosen
+/// completion replaces.
+fn replaced_range(analysis: &DocumentAnalysis, position: Position, prefix_len: usize) -> Range {
+    let cursor = analysis.line_index.offset(&analysis.text, position);
+    let start = cursor.saturating_sub(prefix_len);
+    analysis.line_index.range(&analysis.text, start, cursor)
+}
+
+/// Pin every item to replace exactly `range`.
+///
+/// Without a `textEdit` the client picks the range itself, from its own idea of
+/// where the current word starts — which is only safe while the character
+/// before the cursor is one every client agrees ends a word.
+fn with_replace_range(items: Vec<CompletionItem>, range: Range) -> Vec<CompletionItem> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            let new_text = item
+                .insert_text
+                .clone()
+                .unwrap_or_else(|| item.label.clone());
+            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit { range, new_text }));
+            // With an explicit range the client filters the range's text
+            // against this rather than against a word it scanned for itself.
+            item.filter_text = Some(item.label.clone());
+            item
+        })
+        .collect()
+}
+
+/// Rank the head-slot keywords in the order the engine documents them, each
 /// keyword above the table names, which sort under `0-{priority}-{name}` with
 /// a priority of at least 1 (`crate::semantic::model`).
 fn head_slot_items(

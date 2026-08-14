@@ -74,6 +74,28 @@ constants together.
   fixed grammar wraps *every* target in an `Idiom`, including the plain
   `SET age = 29` case.
 
+- **A graph hop names no fields.** `Lookup` is
+  `seq(choice($.LookupRight, $.LookupLeft, $.LookupBoth), choice($.Ident,
+  $.Any, $.LookupSelection))`, and `node-types.json` gives it `"fields": {}`.
+  The arrow and the thing it reaches are therefore *siblings*, and direction
+  has to be read by scanning the children for an arrow kind rather than by a
+  field lookup. `LookupLeft` covers both `<-` and `<~`. The same is true of
+  `TableTypeClause`, where `RELATION`, `IN`, `OUT`, `FROM` and `TO` all arrive
+  as generic `Keyword` nodes and only their order says which table list
+  follows — see `parse_relation_clause` in
+  [`src/semantic/analyzer.rs`](../src/semantic/analyzer.rs).
+
+  Two further shape notes, both load-bearing:
+
+  * A `Path` may *start* with a `Lookup`. `SELECT ->knows->person FROM person`
+    writes no base, so the first child is a hop and the anchor table is the
+    statement's own `FROM` target (`anchor_type` in
+    [`src/semantic/infer.rs`](../src/semantic/infer.rs)).
+  * A `RelateStatement` does **not** wrap its arrows in a `Lookup`. There the
+    `LookupRight` / `LookupLeft` tokens are direct children of the statement,
+    between the three subjects, so `RELATE` needs its own walk
+    (`relate_edge_observation`).
+
 - **An empty argument list is a field access.** `'abc'.slice(` parses as
   `Path(String, Subscript(Ident))` with the `(` left over as an `ERROR`
   sibling; only once an argument is typed does it become

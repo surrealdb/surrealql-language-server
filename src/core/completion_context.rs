@@ -22,7 +22,7 @@ use ls_types::Position;
 
 use crate::core::statement_shape::{SlotYield, head_slot};
 use crate::semantic::text::{LineIndex, preceding_char};
-use crate::semantic::types::{DocumentAnalysis, QueryFact};
+use crate::semantic::types::{DocumentAnalysis, LookupDirection, QueryFact};
 
 /// Stands in for a string, number, or other literal that was consumed whole.
 ///
@@ -273,6 +273,16 @@ pub fn column_completion_context(
             _ => break,
         }
         loop {
+            // Stop at the keyword that opened the list. Without this the scan
+            // reads straight through it — on `SELECT id,|` it consumed
+            // `SELECT id` whole, landed at offset 0, and the keyword lookup
+            // below then found nothing and answered `None`. Every position
+            // after a comma therefore fell through to the full catalogue, so
+            // only the *first* column of a `SELECT` or `SET` list ever
+            // completed.
+            if ends_with_list_keyword(&before[..i]) {
+                break;
+            }
             match preceding_char(before, i) {
                 None => break,
                 Some((_, ',')) => break,
@@ -298,6 +308,226 @@ pub fn column_completion_context(
         // position hides the fields, variables and functions that are all
         // legal there.
         _ => None,
+    }
+}
+
+/// True when `text` ends with a keyword that opens a comma-separated column
+/// list.
+///
+/// Word-bounded, so a table named `preset` does not read as a `SET`.
+fn ends_with_list_keyword(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    ["SELECT", "SET"].iter().any(|keyword| {
+        let Some(tail) = trimmed
+            .len()
+            .checked_sub(keyword.len())
+            .and_then(|at| trimmed.get(at..))
+        else {
+            return false;
+        };
+        tail.eq_ignore_ascii_case(keyword)
+            && trimmed[..trimmed.len() - keyword.len()]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !is_table_ident_char(ch))
+    })
+}
+
+/// A cursor sitting just after a graph arrow, where the author is naming the
+/// next hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphSlot {
+    /// Which way the arrow the cursor follows points.
+    pub direction: LookupDirection,
+    /// The name written immediately before that arrow.
+    ///
+    /// `None` for a traversal with no written base — `SELECT ->|` — whose
+    /// anchor is the statement's own `FROM` table instead.
+    pub anchor: Option<String>,
+    /// True when [`Self::anchor`] names an *edge* table, so the legal
+    /// continuations are the tables that edge reaches rather than the edges
+    /// leaving a table.
+    ///
+    /// Decided by counting arrows, because a traversal alternates: the first
+    /// hop leaves a table, the second leaves the edge the first named, and so
+    /// on. `person->knows->|` is at the second hop, so it wants tables.
+    pub from_edge: bool,
+}
+
+/// Classify the cursor as a graph hop, or `None` when it is not one.
+///
+/// Scans backward over the partial name, then over the chain of
+/// `arrow name arrow name …` behind it. Text rather than tree, like every
+/// other classifier here, and for the same reason: the document is mid-edit,
+/// and `SELECT -> FROM person` does not parse.
+pub fn graph_edge_context(
+    source: &str,
+    lines: &LineIndex,
+    position: Position,
+) -> Option<GraphSlot> {
+    let offset = lines.offset(source, position);
+    let before = source.get(..offset)?;
+
+    let mut index = before.len();
+    skip_back_over_name(before, &mut index);
+    let direction = take_arrow_back(before, &mut index)?;
+
+    // Walk the whole chain behind the cursor. The *first* name found is the
+    // anchor — the one this hop leaves. The rest are walked only to count the
+    // arrows, because the count is what says whether the anchor is a table or
+    // an edge.
+    let mut arrows = 1;
+    let mut at = index;
+    let mut anchor: Option<&str> = None;
+    loop {
+        let name_end = at;
+        let mut name_start = at;
+        skip_back_over_name(before, &mut name_start);
+        if name_start == name_end {
+            // Nothing between this arrow and whatever precedes it, so the
+            // traversal writes no base: `SELECT ->|`.
+            break;
+        }
+        anchor.get_or_insert(&before[name_start..name_end]);
+
+        let mut behind = name_start;
+        if take_arrow_back(before, &mut behind).is_none() {
+            break;
+        }
+        arrows += 1;
+        at = behind;
+    }
+
+    Some(GraphSlot {
+        direction,
+        // A record id anchors on its table: `person:alice->` leaves `person`.
+        anchor: anchor
+            .and_then(|name| name.split(':').next())
+            .map(|name| name.trim_matches('`').to_string())
+            .filter(|name| !name.is_empty()),
+        from_edge: arrows % 2 == 0,
+    })
+}
+
+/// The tables a graph hop starts from.
+///
+/// A written base answers for itself. A traversal with none —
+/// `SELECT ->| FROM person` — starts from the statement's own target, which is
+/// why the ranking only applies once a table follows `FROM`.
+pub fn graph_anchors(
+    slot: &GraphSlot,
+    analysis: &DocumentAnalysis,
+    position: Position,
+) -> Vec<String> {
+    if let Some(anchor) = &slot.anchor {
+        return vec![anchor.clone()];
+    }
+    if let Some(fact) = active_query_fact(analysis, position)
+        && !fact.target_tables.is_empty()
+    {
+        return fact.target_tables.clone();
+    }
+    // The parse is of the document *mid-edit*: `SELECT -> FROM person` is not
+    // valid SurrealQL, so it yields an ERROR node and no usable query fact.
+    // The table is right there in the text, though, so read it from there.
+    statement_target_in_text(&analysis.text, &analysis.line_index, position)
+        .into_iter()
+        .collect()
+}
+
+/// The keywords a statement's target table follows.
+///
+/// `DELETE` is here for `DELETE person`; the guard below steps over the `FROM`
+/// of `DELETE FROM person` so that form reads its table too.
+const TARGET_KEYWORDS: [&str; 6] = ["FROM", "INTO", "UPDATE", "UPSERT", "CREATE", "DELETE"];
+
+/// The table a statement targets, read from the raw text.
+///
+/// The fallback for a statement the parser cannot make sense of yet — which is
+/// the *normal* state while typing. `SELECT  FROM person` has an empty
+/// projection and yields an `ERROR` node, so there is no query fact to read the
+/// target from, at exactly the moment the author wants the column list. Same
+/// for `SELECT -> FROM person`, and for any list left with a trailing comma.
+///
+/// Deliberately small: one statement, the first target keyword, the name after
+/// it.
+pub fn statement_target_in_text(
+    source: &str,
+    lines: &LineIndex,
+    position: Position,
+) -> Option<String> {
+    let cursor = lines.offset(source, position);
+    let start = source[..cursor].rfind(';').map_or(0, |at| at + 1);
+    let end = source[cursor..]
+        .find(';')
+        .map_or(source.len(), |at| cursor + at);
+    let words: Vec<&str> = source.get(start..end)?.split_whitespace().collect();
+
+    let is_keyword = |word: &str| {
+        TARGET_KEYWORDS
+            .iter()
+            .any(|keyword| word.eq_ignore_ascii_case(keyword))
+    };
+
+    for (index, word) in words.iter().enumerate() {
+        if !is_keyword(word) {
+            continue;
+        }
+        let Some(next) = words.get(index + 1) else {
+            continue;
+        };
+        // `DELETE FROM person` — the table follows the *second* keyword.
+        if is_keyword(next) {
+            continue;
+        }
+        let name: String = next
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            .collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Move `index` left over one graph arrow, reporting which way it points.
+///
+/// Longest first: `<->` ends in `->`, so a shortest-first read would take the
+/// `->` and leave a stray `<` for the name scan.
+fn take_arrow_back(source: &str, index: &mut usize) -> Option<LookupDirection> {
+    for (arrow, direction) in [
+        ("<->", LookupDirection::Both),
+        ("->", LookupDirection::Right),
+        ("<-", LookupDirection::Left),
+        ("<~", LookupDirection::Left),
+    ] {
+        if source[..*index].ends_with(arrow) {
+            *index -= arrow.len();
+            return Some(direction);
+        }
+    }
+    None
+}
+
+/// Move `index` left over one hop's name.
+///
+/// A hyphen is part of a table name — `my-table` is one name — so it is walked
+/// over. But a hyphen that belongs to an arrow is not: swallowing it would
+/// merge two hops into one, or hide the arrow entirely. Both halves have to be
+/// excluded, the `-` that opens a `->` and the `-` that closes a `<-`.
+///
+/// A colon is included so a record-id base scans whole; the caller keeps the
+/// table half.
+fn skip_back_over_name(source: &str, index: &mut usize) {
+    while let Some((start, ch)) = preceding_char(source, *index) {
+        let is_name = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '`' | ':');
+        let is_arrow_half = source[start..].starts_with("->") || source[..start].ends_with('<');
+        let is_inner_hyphen = ch == '-' && !is_arrow_half;
+        if !(is_name || is_inner_hyphen) {
+            return;
+        }
+        *index = start;
     }
 }
 
@@ -412,6 +642,103 @@ mod tests {
 
     fn words(source: &str) -> Vec<String> {
         words_at_end(source).expect("expected a classifiable position")
+    }
+
+    /// The classifier at a cursor placed at the very end of `source`.
+    fn slot(source: &str) -> Option<GraphSlot> {
+        let line = source.lines().count().saturating_sub(1) as u32;
+        let character = source.lines().last().map_or(0, str::len) as u32;
+        graph_edge_context(
+            source,
+            &LineIndex::new(source),
+            Position { line, character },
+        )
+    }
+
+    #[test]
+    fn a_cursor_after_an_arrow_is_a_graph_slot() {
+        let found = slot("SELECT * FROM person->").expect("a graph slot");
+        assert_eq!(found.direction, LookupDirection::Right);
+        assert_eq!(found.anchor.as_deref(), Some("person"));
+        assert!(!found.from_edge, "the first hop leaves a table");
+    }
+
+    #[test]
+    fn a_half_typed_hop_name_is_still_a_graph_slot() {
+        let found = slot("SELECT * FROM person->kno").expect("a graph slot");
+        assert_eq!(found.anchor.as_deref(), Some("person"));
+    }
+
+    #[test]
+    fn every_arrow_spelling_is_classified() {
+        for (arrow, expected) in [
+            ("->", LookupDirection::Right),
+            ("<-", LookupDirection::Left),
+            ("<~", LookupDirection::Left),
+            ("<->", LookupDirection::Both),
+        ] {
+            let source = format!("SELECT * FROM person{arrow}");
+            let found = slot(&source).unwrap_or_else(|| panic!("a graph slot for {source}"));
+            assert_eq!(found.direction, expected, "for {arrow}");
+            assert_eq!(found.anchor.as_deref(), Some("person"), "for {arrow}");
+        }
+    }
+
+    /// The second hop leaves the edge the first named, so it wants the tables
+    /// that edge reaches — not another edge.
+    #[test]
+    fn the_second_hop_reads_from_the_edge() {
+        let found = slot("SELECT * FROM person->knows->").expect("a graph slot");
+        assert_eq!(found.anchor.as_deref(), Some("knows"));
+        assert!(found.from_edge);
+    }
+
+    /// And the third is back to leaving a table.
+    #[test]
+    fn the_third_hop_reads_from_a_table_again() {
+        let found = slot("SELECT * FROM person->knows->person->").expect("a graph slot");
+        assert_eq!(found.anchor.as_deref(), Some("person"));
+        assert!(!found.from_edge);
+    }
+
+    /// A traversal with no written base takes its anchor from the statement,
+    /// which the handler resolves — the classifier only reports that there is
+    /// none here.
+    #[test]
+    fn a_bodiless_traversal_reports_no_written_anchor() {
+        let found = slot("SELECT ->").expect("a graph slot");
+        assert_eq!(found.anchor, None);
+        assert!(!found.from_edge, "the first hop still leaves a table");
+
+        let second = slot("SELECT ->knows->").expect("a graph slot");
+        assert_eq!(second.anchor.as_deref(), Some("knows"));
+        assert!(second.from_edge);
+    }
+
+    #[test]
+    fn a_record_id_base_anchors_on_its_table() {
+        let found = slot("SELECT * FROM person:alice->").expect("a graph slot");
+        assert_eq!(found.anchor.as_deref(), Some("person"));
+    }
+
+    /// A hyphen belongs to the name, but the `-` of a `->` does not.
+    #[test]
+    fn a_hyphenated_anchor_keeps_its_hyphen() {
+        let found = slot("SELECT * FROM my-table->").expect("a graph slot");
+        assert_eq!(found.anchor.as_deref(), Some("my-table"));
+    }
+
+    #[test]
+    fn a_cursor_that_follows_no_arrow_is_not_a_graph_slot() {
+        for source in [
+            "SELECT * FROM person",
+            "SELECT * FROM ",
+            "SELECT name FROM person WHERE age > ",
+            "LET $x: record<person",
+            "SELECT 1 - ",
+        ] {
+            assert_eq!(slot(source), None, "{source} is not a graph slot");
+        }
     }
 
     #[test]

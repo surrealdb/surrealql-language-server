@@ -104,6 +104,13 @@ pub const DEFAULT_ALWAYS: &str = "DefaultAlways";
 
 pub const FIELDS_COLUMNS_CLAUSE: &str = "FieldsColumnsClause";
 pub const UNIQUE_CLAUSE: &str = "UniqueClause";
+/// `TYPE NORMAL` / `TYPE ANY` / `TYPE RELATION IN a|b OUT c|d` on a
+/// `DEFINE TABLE`. Holds only `Keyword`, [`IDENT`] and [`ENFORCED_CLAUSE`]
+/// children — the grammar names no fields, so `RELATION`, `IN`, `OUT`, `FROM`
+/// and `TO` are indistinguishable except by their order and their text.
+pub const TABLE_TYPE_CLAUSE: &str = "TableTypeClause";
+/// The `ENFORCED` tail of a `TYPE RELATION`.
+pub const ENFORCED_CLAUSE: &str = "EnforcedClause";
 
 pub const PERMISSIONS_FOR_CLAUSE: &str = "PermissionsForClause";
 pub const PERMISSIONS_BASIC_CLAUSE: &str = "PermissionsBasicClause";
@@ -114,6 +121,20 @@ pub const BINARY_EXPRESSION: &str = "BinaryExpression";
 pub const PREFIX_EXPRESSION: &str = "PrefixExpression";
 pub const PATH: &str = "Path";
 pub const SUBSCRIPT: &str = "Subscript";
+/// One hop of a graph traversal: an arrow token followed by what it reaches.
+///
+/// The arrow ([`LOOKUP_RIGHT`], [`LOOKUP_LEFT`] or [`LOOKUP_BOTH`]) and the
+/// target are *siblings* under this node — the grammar names no fields — so
+/// direction has to be read from the child order, not from a field lookup.
+/// The target is an [`IDENT`] (one table), an [`ANY`] (`?` / `*`), or a
+/// [`LOOKUP_SELECTION`]; only the first names a table.
+pub const LOOKUP: &str = "Lookup";
+/// `<-` and `<~`. Both spellings produce this one kind.
+pub const LOOKUP_LEFT: &str = "LookupLeft";
+/// `<->`, which traverses in both directions.
+pub const LOOKUP_BOTH: &str = "LookupBoth";
+/// The parenthesised hop form, `->(knows WHERE since > 1)`.
+pub const LOOKUP_SELECTION: &str = "LookupSelection";
 pub const ARGUMENT_LIST: &str = "ArgumentList";
 /// `DEFINE CONFIG API MIDDLEWARE fn::x()` — the parent of a function *reference*
 /// rather than a call. The API runtime supplies the arguments.
