@@ -188,6 +188,15 @@ NOTE: Phase C corrects finding 02, finding 06 and finding 07. Each step in Phase
 
 #### C2. Add a field index to the merged model
 
+NOTE: This step is done, but not as written here. It first added a separate
+`fields_by_table: HashMap<String, Vec<String>>` map beside a flat `fields` map
+keyed by a `(table, field)` tuple. That map is gone. `MergedSemanticModel::fields`
+is now nested — `HashMap<String, HashMap<String, FieldDef>>` — so the outer map
+*is* the index, and no separate map has to be kept in step. A tuple key also
+cannot be borrowed from a pair of `&str`, so the flat map allocated two `String`s
+on every read; the nested one allocates nothing. Read the current code before you
+follow the steps below.
+
 1. Open `src/semantic/types.rs`.
 2. Add a `fields_by_table: HashMap<String, Vec<FieldDef>>` field to `MergedSemanticModel`.
 3. Open `src/semantic/model.rs`.

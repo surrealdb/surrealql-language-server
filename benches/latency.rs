@@ -81,6 +81,42 @@ fn workspace(docs: usize, tables_per_doc: usize) -> WorkspaceIndex {
     index
 }
 
+/// A workspace where one document declares the schema and the rest only query
+/// it, so most merge candidates lose.
+///
+/// `workspace` gives every document its own table names, so every candidate
+/// wins the merge and the clone-on-win path is never exercised. Repeating an
+/// identical document would not help either: `should_replace_table` compares
+/// with `>=`, so a tie still replaces.
+///
+/// A candidate only loses when it scores strictly lower, and the ordinary way
+/// that happens is provenance. A query over an undeclared name *infers* a
+/// table and its fields, and an inferred definition (score 206) loses to the
+/// explicit one (score 1410). One schema file plus the queries that use it is
+/// the common workspace shape, and it is also what `INFO FOR DB` produces when
+/// it mirrors local names back from the engine.
+fn overlapping_workspace(docs: usize) -> WorkspaceIndex {
+    let mut index = WorkspaceIndex::default();
+    // One document declares four tables with five fields each.
+    let schema = schema_doc(0, 4);
+    let analysis = analyze_document(uri(0), &schema, SymbolOrigin::Local).expect("parses");
+    index.documents.insert(uri(0), Arc::new(analysis));
+
+    // Every other document only reads those tables. Each one contributes an
+    // inferred table and three inferred fields per table, and all of them lose.
+    let mut queries = String::new();
+    for t in 0..4 {
+        queries.push_str(&format!(
+            "SELECT name, email, age FROM t0_{t} WHERE age > 21;\n"
+        ));
+    }
+    for d in 1..docs {
+        let analysis = analyze_document(uri(d), &queries, SymbolOrigin::Local).expect("parses");
+        index.documents.insert(uri(d), Arc::new(analysis));
+    }
+    index
+}
+
 /// A document whose queries target tables that no `DEFINE TABLE` declares.
 ///
 /// This shape is what exercises the workspace-wide scans in the diagnostics
@@ -324,6 +360,26 @@ fn main() {
         println!("  {docs:>4} docs: {ms:>9.3} ms");
         results.push(Measured {
             name: "model_build",
+            scale: format!("{docs} docs"),
+            ms,
+            target_ms: None,
+        });
+    }
+
+    // ── 8. Merged model rebuild over overlapping definitions ────────────
+    // The row above gives every document its own tables, so every candidate
+    // wins the merge. This one repeats one document's definitions, so all but
+    // the first copy lose — the case where cloning before the merge decides
+    // is pure waste. See `overlapping_workspace`.
+    println!("\n== MergedSemanticModel::build (overlapping definitions) ==");
+    for docs in DOC_COUNTS {
+        let ws = overlapping_workspace(docs);
+        let ms = time(|| {
+            std::hint::black_box(MergedSemanticModel::build(&ws, &Default::default()));
+        });
+        println!("  {docs:>4} docs: {ms:>9.3} ms");
+        results.push(Measured {
+            name: "model_build/overlap",
             scale: format!("{docs} docs"),
             ms,
             target_ms: None,

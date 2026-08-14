@@ -67,6 +67,31 @@ Also:
 - The cursor helpers (`token_at`, `word_range`, `token_prefix`) and the two
   backward walks in the completion-context table **no longer allocate a vector
   of the whole document** to read the few characters around one cursor.
+- **The merged-model rebuild allocates less.** `MergedSemanticModel::build` runs
+  on every keystroke and was within 3% of its 2 ms budget at 200 documents.
+  Three allocation patterns were removed from it:
+
+  | Model rebuild, 200 documents | Before | After |
+  |------------------------------|--------|-------|
+  | Distinct definitions per document | 1.96 ms | 1.49 ms |
+  | Overlapping definitions across documents | 0.37 ms | 0.28 ms |
+
+  `MergedSemanticModel::fields` is now `HashMap<String, HashMap<String, FieldDef>>`
+  rather than a flat map keyed by a `(table, field)` tuple. A tuple key cannot be
+  borrowed from a pair of `&str`, so *every* read of the old map built two
+  `String`s and dropped them again — `fields_for_table` paid that per field, on a
+  path completion runs once per table. The outer map also subsumes the separate
+  `fields_by_table` index, which is removed: the inner map's keys are a table's
+  field names.
+
+  `absorb_analysis` also cloned every table and field before the merge decided
+  whether the candidate won, so a losing candidate was cloned and dropped. It now
+  passes them by reference, which is what the surrounding merge functions already
+  did. The second row above measures exactly this case: one schema document plus
+  199 that only query it, so every inferred definition loses to the explicit one.
+
+  Counting how often each table is targeted no longer clones the name on every
+  sighting, only on the first.
 
 ### Added
 
@@ -153,6 +178,14 @@ Also:
   argument, and `analyze_document_with_limit` is new.
   `analyze_document` and `collect_syntax_diagnostics` are unchanged and
   use the default cap.
+- Rust API, breaking: `MergedSemanticModel::fields` changes from
+  `HashMap<(String, String), FieldDef>` to
+  `HashMap<String, HashMap<String, FieldDef>>`, and
+  `MergedSemanticModel::fields_by_table` is removed — the outer map replaces
+  it. Read a single field with `model.fields.get(table)?.get(name)` and a
+  table's fields with `model.fields_for_table(table)`, which is unchanged.
+  `insert_field` and `insert_table` keep their owned parameters, so callers
+  that build a model by hand are unaffected. No LSP wire behaviour changes.
 
 ## 0.5.0 — unreleased
 
