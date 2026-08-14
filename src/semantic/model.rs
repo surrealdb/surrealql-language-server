@@ -252,24 +252,31 @@ impl MergedSemanticModel {
         items
     }
 
-    /// Insert or merge one field, keeping [`MergedSemanticModel::fields_by_table`]
-    /// in step. This is the only correct way to add a field to the model.
+    /// Insert or merge one field. This is the only correct way to add a field
+    /// to the model — it applies the origin-priority merge.
     pub fn insert_field(&mut self, field: FieldDef) {
-        let key = (field.table.clone(), field.name.clone());
-        let is_new = !self.fields.contains_key(&key);
-        let replace = self
-            .fields
-            .get(&key)
-            .map(|current| should_replace_field(current, &field))
-            .unwrap_or(true);
-        if is_new {
-            self.fields_by_table
-                .entry(field.table.clone())
-                .or_default()
-                .push(field.name.clone());
+        self.insert_field_ref(&field);
+    }
+
+    /// [`Self::insert_field`] without an owned candidate, so the clone happens
+    /// only when the candidate wins. See [`Self::insert_table_ref`].
+    fn insert_field_ref(&mut self, field: &FieldDef) {
+        // `entry` would clone the table name on every call. A workspace holds
+        // far more fields than tables, so let only a table's first field pay
+        // for the name; the rest find the inner map already there.
+        if !self.fields.contains_key(&field.table) {
+            self.fields.insert(field.table.clone(), HashMap::new());
         }
+        let by_name = self
+            .fields
+            .get_mut(&field.table)
+            .expect("inserted directly above when absent");
+        let replace = by_name
+            .get(&field.name)
+            .map(|current| should_replace_field(current, field))
+            .unwrap_or(true);
         if replace {
-            self.fields.insert(key, field);
+            by_name.insert(field.name.clone(), field.clone());
         }
     }
 
@@ -282,22 +289,28 @@ impl MergedSemanticModel {
     /// [`should_replace_table`] — so a name is appended at most once and never
     /// has to be removed.
     pub fn insert_table(&mut self, table: TableDef) {
-        let replace = self
-            .tables
-            .get(&table.name)
-            .map(|current| should_replace_table(current, &table))
+        self.insert_table_ref(&table);
+    }
+
+    /// [`Self::insert_table`] without an owned candidate.
+    ///
+    /// A losing candidate is never cloned. `absorb_analysis` merges every
+    /// definition of every document into one model, so the same table arrives
+    /// once per document that mentions it, and once more from live metadata
+    /// that mirrors it — most of those arrivals lose.
+    fn insert_table_ref(&mut self, table: &TableDef) {
+        let current = self.tables.get(&table.name);
+        let replace = current
+            .map(|current| should_replace_table(current, table))
             .unwrap_or(true);
         if !replace {
             return;
         }
-        let was_explicit = self
-            .tables
-            .get(&table.name)
-            .is_some_and(|current| current.explicit);
+        let was_explicit = current.is_some_and(|current| current.explicit);
         if table.explicit && !was_explicit {
             self.explicit_tables.push(table.name.clone());
         }
-        self.tables.insert(table.name.clone(), table);
+        self.tables.insert(table.name.clone(), table.clone());
     }
 
     /// Recount [`MergedSemanticModel::target_usage`] from
@@ -307,22 +320,28 @@ impl MergedSemanticModel {
         self.target_usage.clear();
         for fact in self.query_facts.values().flatten() {
             for table in &fact.target_tables {
-                *self.target_usage.entry(table.clone()).or_insert(0) += 1;
+                // `entry` would clone the name on every sighting. A repeated
+                // target is the common case — counting them is the whole point
+                // of this map — so only the first sighting of a name allocates.
+                if let Some(count) = self.target_usage.get_mut(table) {
+                    *count += 1;
+                } else {
+                    self.target_usage.insert(table.clone(), 1);
+                }
             }
         }
     }
 
     pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
-        // Only this table's fields, looked up by name, rather than a filter over
-        // every field in the workspace. The sort is unchanged: origin priority
-        // first so a local definition outranks an inferred one, then name.
-        let Some(names) = self.fields_by_table.get(table) else {
+        // Only this table's fields, rather than a filter over every field in
+        // the workspace, and with no key allocated to reach them. The sort is
+        // unchanged: origin priority first so a local definition outranks an
+        // inferred one, then name. Name is unique within a table, so the order
+        // is total and does not depend on the map's iteration order.
+        let Some(by_name) = self.fields.get(table) else {
             return Vec::new();
         };
-        let mut fields = names
-            .iter()
-            .filter_map(|name| self.fields.get(&(table.to_string(), name.clone())))
-            .collect::<Vec<_>>();
+        let mut fields = by_name.values().collect::<Vec<_>>();
         fields.sort_by(|left, right| {
             symbol_priority(right.origin)
                 .cmp(&symbol_priority(left.origin))
@@ -626,18 +645,13 @@ impl MergedSemanticModel {
     /// Nearest explicitly defined field on `table` — the unknown-field
     /// "did you mean" candidate.
     fn find_nearest_explicit_field(&self, table: &str, unknown: &str) -> Option<&FieldDef> {
-        // Via `fields_by_table` rather than a filter over every field in the
-        // workspace — the same reason `fields_for_table` uses it.
-        let names = self
-            .fields_by_table
-            .get(table)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        names
-            .iter()
-            .filter(|name| name.as_str() != unknown)
-            .filter(|name| can_reach_near_miss_threshold(unknown, name))
-            .filter_map(|name| self.fields.get(&(table.to_string(), name.clone())))
+        // Only this table's fields rather than a filter over every field in
+        // the workspace — the same reason `fields_for_table` reads the group.
+        self.fields
+            .get(table)?
+            .values()
+            .filter(|field| field.name.as_str() != unknown)
+            .filter(|field| can_reach_near_miss_threshold(unknown, &field.name))
             .filter(|field| field.explicit)
             .map(|field| (field, jaro_winkler(unknown, &field.name)))
             .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
@@ -1229,7 +1243,8 @@ impl MergedSemanticModel {
                     // counts as "known" on a closed schema.
                     let explicitly_defined = self
                         .fields
-                        .get(&(table.clone(), field.clone()))
+                        .get(table)
+                        .and_then(|by_name| by_name.get(field.as_str()))
                         .is_some_and(|field_def| field_def.explicit);
                     if !explicitly_defined {
                         let range = range_for_name(&fact.field_refs, field, fact.location.range);
@@ -1534,7 +1549,7 @@ impl MergedSemanticModel {
                 ));
             }
         }
-        for field in self.fields.values() {
+        for field in self.fields.values().flat_map(HashMap::values) {
             let label = format!("{}.{}", field.table, field.name);
             if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 items.push(symbol_information(
@@ -1584,12 +1599,12 @@ impl MergedSemanticModel {
         self.workspace_symbols
             .extend(analysis.document_symbols.iter().cloned());
 
-        // Pass references to the merge functions; they clone the candidate
+        // Every merge below takes the candidate by reference and clones it
         // only when it actually wins over the current entry. For workspaces
         // with many overlapping definitions (saved + open + remote merged
         // together) this skips a lot of throwaway allocations.
         for table in &analysis.tables {
-            self.insert_table(table.clone());
+            self.insert_table_ref(table);
         }
         for event in &analysis.events {
             merge_event(&mut self.events, event);
@@ -1598,7 +1613,7 @@ impl MergedSemanticModel {
             merge_index(&mut self.indexes, index);
         }
         for field in &analysis.fields {
-            self.insert_field(field.clone());
+            self.insert_field_ref(field);
         }
         for function in &analysis.functions {
             merge_function(&mut self.functions, function);
@@ -1630,7 +1645,8 @@ impl MergedSemanticModel {
         for field in &fact.touched_fields {
             if let Some(rule) = self
                 .fields
-                .get(&(table.name.clone(), field.clone()))
+                .get(table.name.as_str())
+                .and_then(|by_name| by_name.get(field.as_str()))
                 .and_then(|field| {
                     field
                         .permissions
@@ -1789,28 +1805,28 @@ fn unknown_type_payload(diagnostic: &Diagnostic) -> Option<(String, Option<Strin
     Some((name.to_string(), suggestion))
 }
 
+// These two keep the `(table, name)` tuple key rather than nesting like
+// `fields`: a workspace holds orders of magnitude fewer events and indexes
+// than fields, so the tuple is not on a hot path. Building the key once
+// instead of twice is the whole of the saving here.
 fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: &EventDef) {
-    if let Some(current) = target.get(&(candidate.table.clone(), candidate.name.clone())) {
+    let key = (candidate.table.clone(), candidate.name.clone());
+    if let Some(current) = target.get(&key) {
         if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
             return;
         }
     }
-    target.insert(
-        (candidate.table.clone(), candidate.name.clone()),
-        candidate.clone(),
-    );
+    target.insert(key, candidate.clone());
 }
 
 fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: &IndexDef) {
-    if let Some(current) = target.get(&(candidate.table.clone(), candidate.name.clone())) {
+    let key = (candidate.table.clone(), candidate.name.clone());
+    if let Some(current) = target.get(&key) {
         if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
             return;
         }
     }
-    target.insert(
-        (candidate.table.clone(), candidate.name.clone()),
-        candidate.clone(),
-    );
+    target.insert(key, candidate.clone());
 }
 
 fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: &FunctionDef) {

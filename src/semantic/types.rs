@@ -279,7 +279,23 @@ pub struct MergedSemanticModel {
     pub tables: HashMap<String, TableDef>,
     pub events: HashMap<(String, String), EventDef>,
     pub indexes: HashMap<(String, String), IndexDef>,
-    pub fields: HashMap<(String, String), FieldDef>,
+    /// Every field, grouped by the table it belongs to: table name → field
+    /// name → definition.
+    ///
+    /// Nested rather than keyed by a `(table, field)` tuple so a lookup
+    /// borrows both halves instead of allocating them. A tuple key cannot be
+    /// borrowed from a `(&str, &str)` pair, so every read of a flat map had to
+    /// build — and then drop — two `String`s. `fields_for_table` paid that per
+    /// field, on a path completion runs per table.
+    ///
+    /// The outer map also replaces the separate `fields_by_table` index: the
+    /// inner map's keys *are* the field names of a table.
+    ///
+    /// Insert through [`MergedSemanticModel::insert_field`][insert_field],
+    /// which applies the origin-priority merge.
+    ///
+    /// [insert_field]: MergedSemanticModel::insert_field
+    pub fields: HashMap<String, HashMap<String, FieldDef>>,
     pub functions: HashMap<String, FunctionDef>,
     pub params: HashMap<String, ParamDef>,
     pub accesses: HashMap<String, AccessDef>,
@@ -299,19 +315,6 @@ pub struct MergedSemanticModel {
     pub inferred_function_returns: HashMap<String, TypeExpr>,
     pub workspace_symbols: Vec<DocumentSymbol>,
     pub query_facts: HashMap<Uri, Vec<QueryFact>>,
-    /// The field names defined on each table — the keys of [`Self::fields`]
-    /// grouped by their table half.
-    ///
-    /// Derived, and maintained by
-    /// [`MergedSemanticModel::insert_field`][insert_field] alongside
-    /// [`Self::fields`]. Insert through that method rather than writing to
-    /// `fields` directly, or a lookup will miss the field.
-    ///
-    /// Exists because `fields_for_table` filtered the whole field map on every
-    /// call, and `table_completion_items` calls it once per table.
-    ///
-    /// [insert_field]: MergedSemanticModel::insert_field
-    pub fields_by_table: HashMap<String, Vec<String>>,
     /// How many query facts across the workspace target each table name.
     ///
     /// Derived from [`Self::query_facts`] by

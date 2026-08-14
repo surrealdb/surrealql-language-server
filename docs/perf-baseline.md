@@ -72,9 +72,16 @@ operation, so the quadratic term is gone rather than reduced:
 | `semantic_tokens_range` | 0.91 → 0.34 → 0.20 (falls, because the walk is pruned) |
 
 NOTE: `MergedSemanticModel::build` and the declared-target diagnostics read
-slightly slower than at the baseline. Both now maintain two extra indexes
-(`fields_by_table` and `target_usage`), which costs a little on build to save a
-lot on lookup — `table_completion_items` is 93 times faster.
+slightly slower than at the baseline. Both now maintain an extra index
+(`target_usage`), which costs a little on build to save a lot on lookup —
+`table_completion_items` is 93 times faster.
+
+NOTE: A field index was part of that trade too, as a separate
+`fields_by_table` map. It no longer exists. `MergedSemanticModel::fields` is
+now keyed `table → field → definition`, so the grouping it provided is the
+outer map and a lookup allocates nothing. That, plus cloning a merge candidate
+only when it wins, took `MergedSemanticModel::build` at 200 documents from
+1.96 ms to 1.49 ms.
 
 ## All targets met
 
