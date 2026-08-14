@@ -69,6 +69,24 @@ pub struct FieldDef {
     pub location: Location,
 }
 
+/// The `TYPE RELATION IN a|b OUT c|d` half of a `DEFINE TABLE`.
+///
+/// A faithful record of what the source declares, which is why it lives on
+/// [`TableDef`] rather than on the merged model. The *derived* graph — which
+/// includes edges only a `RELATE` statement witnesses — is
+/// [`MergedSemanticModel::graph_edges`] instead.
+///
+/// Either list can be empty: `TYPE RELATION` alone is legal and constrains
+/// neither endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RelationDef {
+    /// The tables an edge row may point *from*, written `IN` or `FROM`.
+    pub in_tables: Vec<String>,
+    /// The tables an edge row may point *to*, written `OUT` or `TO`.
+    pub out_tables: Vec<String>,
+    pub enforced: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
@@ -79,6 +97,10 @@ pub struct TableDef {
     pub explicit: bool,
     pub inference: Option<InferenceFact>,
     pub location: Location,
+    /// `Some` only for a table declared `TYPE RELATION`. `#[serde(default)]`
+    /// keeps a previously-serialized definition loading.
+    #[serde(default)]
+    pub relation: Option<RelationDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,6 +185,26 @@ pub struct AnalyzerDef {
     pub location: Location,
 }
 
+/// One `RELATE a->edge->b` sighting: proof that `edge` joins two tables.
+///
+/// Most SurrealQL schemas never declare their edge tables — SurrealDB's own
+/// graph corpus defines `person` as `SCHEMALESS` and creates `knows` purely
+/// through `RELATE`. Without this, the graph would be empty for exactly the
+/// projects that use graphs most.
+///
+/// An observation is weaker evidence than a `TYPE RELATION` declaration, so
+/// [`MergedSemanticModel::reindex_graph_edges`] reads the declarations first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeObservation {
+    /// The edge table — the middle subject of the `RELATE`.
+    pub edge: String,
+    /// The table the edge points from. `None` when the subject is a
+    /// `$parameter`, a call, or an array, which name no table statically.
+    pub from: Option<String>,
+    /// The table the edge points to, under the same rule as [`Self::from`].
+    pub to: Option<String>,
+}
+
 /// A name paired with the tight range of the token that produced it,
 /// so diagnostics can underline `prson` instead of the whole statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +282,8 @@ pub struct DocumentAnalysis {
     pub accesses: Vec<AccessDef>,
     pub analyzers: Vec<AnalyzerDef>,
     pub query_facts: Vec<QueryFact>,
+    /// Every `RELATE a->edge->b` this document writes, in source order.
+    pub edge_observations: Vec<EdgeObservation>,
     pub references: Vec<SymbolReference>,
     pub syntax_diagnostics: Vec<Diagnostic>,
     pub document_symbols: Vec<DocumentSymbol>,
@@ -272,6 +316,56 @@ pub struct WorkspaceIndex {
 pub struct LiveMetadataSnapshot {
     pub documents: HashMap<Uri, Arc<DocumentAnalysis>>,
     pub errors: Vec<String>,
+}
+
+/// Which way a graph hop points.
+///
+/// The grammar has three arrow kinds and this mirrors them: `->` is
+/// [`Self::Right`], `<-` and `<~` are [`Self::Left`], and `<->` is
+/// [`Self::Both`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupDirection {
+    Right,
+    Left,
+    Both,
+}
+
+impl LookupDirection {
+    /// Pick which of a rightward and a leftward index this direction reads.
+    ///
+    /// [`Self::Both`] reads each in turn, so every caller stays a single loop
+    /// instead of branching three ways. Yields references, and allocates
+    /// nothing — this runs on the completion path.
+    pub fn maps<'a, T>(self, rightward: &'a T, leftward: &'a T) -> impl Iterator<Item = &'a T> {
+        let (first, second) = match self {
+            Self::Right => (rightward, None),
+            Self::Left => (leftward, None),
+            Self::Both => (rightward, Some(leftward)),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
+/// Which edge tables leave, and which arrive at, each table.
+///
+/// Both maps are keyed by an *endpoint* table name and hold edge table names,
+/// which is the direction completion and type inference ask in: "I am on
+/// `person` and I typed `->` — what can I traverse?"
+///
+/// `outgoing["person"]` answers for `->`; `incoming["person"]` answers for
+/// `<-`. An edge that declares neither endpoint appears in neither map, and an
+/// edge whose two endpoints are the same table appears in both.
+#[derive(Debug, Clone, Default)]
+pub struct GraphIndex {
+    /// Endpoint table → edge tables reachable with `->`.
+    pub outgoing: HashMap<String, Vec<String>>,
+    /// Endpoint table → edge tables reachable with `<-`.
+    pub incoming: HashMap<String, Vec<String>>,
+    /// Edge table → the tables it points *to*, for the second hop of
+    /// `->edge->target`.
+    pub edge_targets: HashMap<String, Vec<String>>,
+    /// Edge table → the tables it points *from*, for `<-edge<-source`.
+    pub edge_sources: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -344,4 +438,18 @@ pub struct MergedSemanticModel {
     /// model was built — remote tables may be missing, so
     /// unknown-name judgments are unreliable until recovery.
     pub metadata_degraded: bool,
+    /// The graph topology, derived from every `TableDef::relation` and every
+    /// [`EdgeObservation`] in the workspace.
+    ///
+    /// Derived and cross-document, so it belongs here rather than on
+    /// [`TableDef`] — the same reason [`Self::function_callers`] does, and a
+    /// load-bearing one: [`MergedSemanticModel::insert_table`] *replaces* a
+    /// `TableDef` wholesale when a higher-origin definition wins, which would
+    /// discard any observed edges stored there.
+    ///
+    /// Rebuilt by
+    /// [`MergedSemanticModel::reindex_graph_edges`][reindex_graph_edges].
+    ///
+    /// [reindex_graph_edges]: MergedSemanticModel::reindex_graph_edges
+    pub graph_edges: GraphIndex,
 }

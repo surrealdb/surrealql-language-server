@@ -20,9 +20,9 @@ use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
     AccessDef, AccessResult, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef,
-    FunctionLanguage, FunctionParam, IndexDef, LiveMetadataSnapshot, MergedSemanticModel,
-    NamedRange, ParamDef, PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin,
-    TableDef, TargetResolution, WorkspaceIndex,
+    FunctionLanguage, FunctionParam, GraphIndex, IndexDef, LiveMetadataSnapshot, LookupDirection,
+    MergedSemanticModel, NamedRange, ParamDef, PermissionMode, PermissionRule, QueryAction,
+    QueryFact, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
 };
 
 impl MergedSemanticModel {
@@ -85,6 +85,9 @@ impl MergedSemanticModel {
             .map(|analysis| analysis.as_ref())
             .collect();
         crate::semantic::infer::infer_function_return_types(&documents, &mut model);
+        // After the merge, so the `TYPE RELATION` half reads the definitions
+        // that won it rather than ones a later document replaced.
+        model.reindex_graph_edges(&documents);
 
         model
     }
@@ -115,6 +118,30 @@ impl MergedSemanticModel {
     ) -> Vec<CompletionItem> {
         let mut items = Vec::new();
         for table_name in tables {
+            for implicit in self.implicit_fields(table_name) {
+                let label = if multi_table_context {
+                    format!("{table_name}.{implicit}")
+                } else {
+                    implicit.to_string()
+                };
+                if !(prefix.is_empty() || label.starts_with(prefix)) {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: label.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(format!("table: {table_name} | source: built-in")),
+                    insert_text: Some(label),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: implicit_field_hover(implicit, table_name),
+                    })),
+                    // Ranked with the defined fields rather than above them: it
+                    // is a real column, but rarely the one being reached for.
+                    sort_text: Some(format!("0-fld-{table_name}-{implicit}")),
+                    ..CompletionItem::default()
+                });
+            }
             for field in self.fields_for_table(table_name) {
                 let qualified_label = format!("{}.{}", field.table, field.name);
                 let matches_prefix = prefix.is_empty()
@@ -147,7 +174,7 @@ impl MergedSemanticModel {
                     insert_text: Some(insert_text),
                     documentation: Some(Documentation::MarkupContent(MarkupContent {
                         kind: MarkupKind::Markdown,
-                        value: format_field_hover(field),
+                        value: format_field_hover(field, self),
                     })),
                     sort_text: Some(format!("0-fld-{}-{}", field.table, field.name)),
                     ..CompletionItem::default()
@@ -155,6 +182,130 @@ impl MergedSemanticModel {
             }
         }
         items
+    }
+
+    /// The columns a table has without anyone declaring them.
+    ///
+    /// Every record carries an `id`, and every row of an edge table carries the
+    /// `in` and `out` that `RELATE` wrote. No `DEFINE FIELD` mentions them, so
+    /// nothing put them in the completion list — `SELECT id FROM person` is
+    /// about as common as SurrealQL gets, and `id` was the one column the editor
+    /// could not offer. The unknown-field check has always known about the same
+    /// three names; this is the other half of that fact.
+    ///
+    /// A declared field of the same name wins, so a schema that spells out
+    /// `DEFINE FIELD id` is not listed twice.
+    pub(crate) fn implicit_fields(&self, table: &str) -> Vec<&'static str> {
+        let declared = self.fields.get(table);
+        let is_relation = self
+            .tables
+            .get(table)
+            .is_some_and(|def| def.relation.is_some())
+            || self.graph_edges.edge_targets.contains_key(table)
+            || self.graph_edges.edge_sources.contains_key(table);
+
+        let candidates: &[&'static str] = if is_relation {
+            &["id", "in", "out"]
+        } else {
+            &["id"]
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter(|name| !declared.is_some_and(|fields| fields.contains_key(*name)))
+            .collect()
+    }
+
+    /// Table-name completions for a cursor just after a graph arrow, with the
+    /// tables that are actually reachable ranked to the top.
+    ///
+    /// `anchors` is where the hop starts. When `from_edge` is set the anchors
+    /// name edge tables and the reachable set is the tables they lead to;
+    /// otherwise they name ordinary tables and the reachable set is the edges
+    /// leaving them.
+    ///
+    /// The unreachable tables are still offered, below. The graph is built from
+    /// whatever the workspace happens to declare or write, so it is routinely
+    /// incomplete — hiding a table because this server has not seen a `RELATE`
+    /// for it would turn missing knowledge into a missing feature. Ranking says
+    /// "these are the likely ones"; filtering would say "these are the only
+    /// ones", which the server cannot know.
+    ///
+    /// With no anchor, or an anchor the graph knows nothing about, this is
+    /// exactly [`Self::table_completion_items`].
+    pub fn graph_completion_items(
+        &self,
+        prefix: &str,
+        anchors: &[String],
+        direction: LookupDirection,
+        from_edge: bool,
+        active_context: Option<&AuthContext>,
+    ) -> Vec<CompletionItem> {
+        let mut reachable: Vec<&str> = Vec::new();
+        for anchor in anchors {
+            let step = if from_edge {
+                self.tables_across(anchor, direction)
+            } else {
+                self.edges_from(anchor, direction)
+            };
+            for name in step {
+                if !reachable.contains(&name) {
+                    reachable.push(name);
+                }
+            }
+        }
+
+        let mut items: Vec<CompletionItem> = reachable
+            .iter()
+            .filter(|name| prefix.is_empty() || name.starts_with(prefix))
+            .map(|name| CompletionItem {
+                label: (*name).to_string(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some(self.graph_detail(name, anchors, direction, from_edge)),
+                // `0-0-` beats every rank `table_completion_items` can produce:
+                // its lowest is `0-1-`, for a builtin.
+                sort_text: Some(format!("0-0-{name}")),
+                data: Some(serde_json::json!({ "table": name })),
+                ..CompletionItem::default()
+            })
+            .collect();
+
+        items.extend(
+            self.table_completion_items(prefix, active_context)
+                .into_iter()
+                .filter(|item| !reachable.contains(&item.label.as_str())),
+        );
+        items
+    }
+
+    /// The one-line description on a reachable graph completion, naming what
+    /// makes it reachable.
+    fn graph_detail(
+        &self,
+        name: &str,
+        anchors: &[String],
+        direction: LookupDirection,
+        from_edge: bool,
+    ) -> String {
+        let arrow = match direction {
+            LookupDirection::Right => "->",
+            LookupDirection::Left => "<-",
+            LookupDirection::Both => "<->",
+        };
+        if from_edge {
+            return format!("reached by {}", anchors.join(", "));
+        }
+        // For an edge, the useful fact is where it goes next.
+        let across = self.tables_across(name, direction);
+        if across.is_empty() {
+            format!("edge from {}", anchors.join(", "))
+        } else {
+            format!(
+                "edge: {}{arrow}{name}{arrow}{}",
+                anchors.join(", "),
+                across.join(" | ")
+            )
+        }
     }
 
     /// Returns *only* table-name completion items (no keywords, functions,
@@ -313,6 +464,79 @@ impl MergedSemanticModel {
         self.tables.insert(table.name.clone(), table.clone());
     }
 
+    /// Rebuild [`MergedSemanticModel::graph_edges`] from the two things that
+    /// witness an edge: a `TYPE RELATION` declaration, and a `RELATE`
+    /// statement.
+    ///
+    /// Declarations go in first because they are the stronger evidence — they
+    /// state what the schema *permits*, while an observation only proves what
+    /// some query happened to write. An observation that repeats a declared
+    /// pair is dropped rather than duplicated.
+    ///
+    /// Takes the analyses rather than reading `self`, because the observations
+    /// live per-document and never enter a `TableDef`. See the field's own doc
+    /// comment for why they must not.
+    pub fn reindex_graph_edges(&mut self, documents: &[&DocumentAnalysis]) {
+        self.graph_edges = GraphIndex::default();
+
+        for table in self.tables.values() {
+            let Some(relation) = &table.relation else {
+                continue;
+            };
+            for source in &relation.in_tables {
+                push_unique(&mut self.graph_edges.outgoing, source, &table.name);
+                push_unique(&mut self.graph_edges.edge_sources, &table.name, source);
+            }
+            for target in &relation.out_tables {
+                push_unique(&mut self.graph_edges.incoming, target, &table.name);
+                push_unique(&mut self.graph_edges.edge_targets, &table.name, target);
+            }
+        }
+
+        for analysis in documents {
+            for observation in &analysis.edge_observations {
+                if let Some(from) = &observation.from {
+                    push_unique(&mut self.graph_edges.outgoing, from, &observation.edge);
+                    push_unique(&mut self.graph_edges.edge_sources, &observation.edge, from);
+                }
+                if let Some(to) = &observation.to {
+                    push_unique(&mut self.graph_edges.incoming, to, &observation.edge);
+                    push_unique(&mut self.graph_edges.edge_targets, &observation.edge, to);
+                }
+            }
+        }
+    }
+
+    /// The edge tables reachable from `table` in `direction`, or an empty
+    /// slice when the graph knows none.
+    pub fn edges_from(&self, table: &str, direction: LookupDirection) -> Vec<&str> {
+        let index = &self.graph_edges;
+        let mut edges: Vec<&str> = Vec::new();
+        for map in direction.maps(&index.outgoing, &index.incoming) {
+            for edge in map.get(table).into_iter().flatten() {
+                if !edges.contains(&edge.as_str()) {
+                    edges.push(edge);
+                }
+            }
+        }
+        edges
+    }
+
+    /// The tables that `edge` reaches in `direction` — the second hop of
+    /// `->edge->target`.
+    pub fn tables_across(&self, edge: &str, direction: LookupDirection) -> Vec<&str> {
+        let index = &self.graph_edges;
+        let mut tables: Vec<&str> = Vec::new();
+        for map in direction.maps(&index.edge_targets, &index.edge_sources) {
+            for table in map.get(edge).into_iter().flatten() {
+                if !tables.contains(&table.as_str()) {
+                    tables.push(table);
+                }
+            }
+        }
+        tables
+    }
+
     /// Recount [`MergedSemanticModel::target_usage`] from
     /// [`MergedSemanticModel::query_facts`]. One pass over the facts, run once
     /// per build rather than once per inferred target.
@@ -435,6 +659,76 @@ impl MergedSemanticModel {
     /// `unknown` — every method is offered, sorted below everything else. An
     /// empty list would read as "this feature is broken" in exactly the positions
     /// people use most.
+    /// The named members legal after a `.`, read from the receiver's type.
+    ///
+    /// Answers for a row a query built as well as for a record that points at a
+    /// declared table — `$person.` after
+    /// `LET $people = (SELECT id, name, age FROM person)` offers `id`, `name`
+    /// and `age`. Empty when the receiver has no named members, which leaves
+    /// every other completion path exactly as it was.
+    pub fn property_completion_items(
+        &self,
+        analysis: &DocumentAnalysis,
+        position: Position,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
+        let Some(receiver) = self.receiver_type_at(analysis, position) else {
+            return Vec::new();
+        };
+        let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+        let ctx = crate::semantic::infer::TypeCtx {
+            model: self,
+            source: &analysis.text,
+            lines: &analysis.line_index,
+            bindings: &bindings,
+        };
+
+        crate::semantic::infer::property_names(&receiver, &ctx)
+            .into_iter()
+            .filter(|name| prefix.is_empty() || name.starts_with(prefix))
+            .map(|name| {
+                let ty = crate::semantic::infer::property_type(&receiver, &name, &ctx);
+                let detail = match &ty {
+                    TypeExpr::Unknown => "property".to_string(),
+                    known => format!("property | type: {known}"),
+                };
+                CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(detail),
+                    insert_text: Some(name.clone()),
+                    // Above a method: after a `.` on a row, the author is far
+                    // likelier to be reaching for one of its own columns.
+                    sort_text: Some(format!("0-prp-{name}")),
+                    ..CompletionItem::default()
+                }
+            })
+            .collect()
+    }
+
+    /// The type of whatever sits immediately left of the `.` at `position`.
+    ///
+    /// Shared by property and method completion so the two agree about what the
+    /// receiver is.
+    fn receiver_type_at(
+        &self,
+        analysis: &DocumentAnalysis,
+        position: Position,
+    ) -> Option<TypeExpr> {
+        let offset = analysis.line_index.offset(&analysis.text, position);
+        let dot = method_dot_offset(&analysis.text, offset)?;
+        let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+        let ctx = crate::semantic::infer::TypeCtx {
+            model: self,
+            source: &analysis.text,
+            lines: &analysis.line_index,
+            bindings: &bindings,
+        };
+        // Through the idiom, so a chain resolves: `$person.address.` reads the
+        // whole path up to the second dot, not just the `address` token.
+        crate::semantic::infer::idiom_type_at(analysis, dot.saturating_sub(1), &ctx)
+    }
+
     pub fn method_completion_items(
         &self,
         analysis: &DocumentAnalysis,
@@ -536,6 +830,7 @@ impl MergedSemanticModel {
         position: Position,
         token: &str,
         active_context: Option<&AuthContext>,
+        field_tables: &[String],
     ) -> Option<String> {
         let offset = analysis.line_index.offset(&analysis.text, position);
 
@@ -552,7 +847,144 @@ impl MergedSemanticModel {
                 return Some(format_binding_hover(binding));
             }
         }
+
+        // `.age` read off a value, before the schema lookup: the value's own
+        // shape decides what the member is, and it may be a row a query built
+        // rather than a table anyone declared.
+        if let Some(hover) = self.property_hover(analysis, offset) {
+            return Some(hover);
+        }
+
+        // Before the global lookup, because a column and a table can share a
+        // name and inside `SELECT name FROM person` the column is what the
+        // pointer is on.
+        if let Some(hover) = self.field_hover(analysis, position, field_tables) {
+            return Some(hover);
+        }
+
         self.hover_markdown_for_token(token, active_context)
+    }
+
+    /// Hover for `.name` read off a value — `$person.age`.
+    ///
+    /// Resolves through the *value's* type rather than the schema, so it answers
+    /// for a row a query built (`LET $people = (SELECT id, name, age FROM …)`)
+    /// as well as for a record that points at a declared table. Where the
+    /// receiver is a record, the declared column wins: its hover carries the
+    /// comment, the permissions and the indexes that a bare type cannot.
+    fn property_hover(&self, analysis: &DocumentAnalysis, offset: usize) -> Option<String> {
+        use crate::semantic::node_kind as k;
+
+        // Both offsets, because the two halves of hover disagree about where a
+        // cursor is: `token_at` reads the character *before* the position, while
+        // a tree lookup reads the one *at* it. On the first character of a
+        // segment only the former lands inside it, on the position just past the
+        // last only the latter does.
+        let subscript = [offset, offset.saturating_sub(1)]
+            .into_iter()
+            .find_map(|at| {
+                let node = analysis
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(at, at)?;
+                // A zero-width lookup on a segment's first character can land
+                // on the segment itself rather than on its name.
+                if node.kind() == k::SUBSCRIPT {
+                    return Some(node);
+                }
+                // Only a `.name` segment, not the base and not a method call.
+                let parent = node.parent()?;
+                (node.kind() == k::IDENT && parent.kind() == k::SUBSCRIPT).then_some(parent)
+            })?;
+        let name = k::text_of(&analysis.text, k::find_child(subscript, k::IDENT)?)?;
+
+        let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
+        let ctx = crate::semantic::infer::TypeCtx {
+            model: self,
+            source: &analysis.text,
+            lines: &analysis.line_index,
+            bindings: &bindings,
+        };
+
+        // The receiver is the idiom up to just before this segment.
+        let receiver = crate::semantic::infer::idiom_type_at(
+            analysis,
+            subscript.start_byte().saturating_sub(1),
+            &ctx,
+        )?;
+
+        // A record points *at* a table, so the declared column is the better
+        // answer: it carries the comment, the permissions and the indexes that a
+        // bare type cannot.
+        //
+        // Only when the receiver is itself a record, though. `record_tables()`
+        // on a *row* collects the tables of every record-typed column in it, so
+        // reading `name` off `SELECT name, author FROM book` would resolve
+        // against `person` — whatever `author` points at — instead of `book`.
+        if let Some(tables) = record_target_tables(&receiver) {
+            for table in tables {
+                if let Some(field) = self.fields.get(table).and_then(|by| by.get(name)) {
+                    return Some(format_field_hover(field, self));
+                }
+                if self.implicit_fields(table).contains(&name) {
+                    return Some(implicit_field_hover(name, table));
+                }
+            }
+        }
+
+        let ty = crate::semantic::infer::property_type(&receiver, name, &ctx);
+        if matches!(ty, TypeExpr::Unknown) {
+            return None;
+        }
+        Some(hover_block(
+            format!("PROPERTY {name}"),
+            None,
+            vec![format!("Type: `{ty}`"), format!("Read from: `{receiver}`")],
+            Vec::new(),
+        ))
+    }
+
+    /// Hover for a column, resolved against the tables the statement reads.
+    ///
+    /// A column name means nothing on its own — `name` is a column of whichever
+    /// table the statement targets — which is why this needs `field_tables`
+    /// rather than working from the token alone, and why nothing resolved a
+    /// column before: [`Self::hover_markdown_for_token`] only ever sees a bare
+    /// word.
+    fn field_hover(
+        &self,
+        analysis: &DocumentAnalysis,
+        position: Position,
+        field_tables: &[String],
+    ) -> Option<String> {
+        let path =
+            crate::semantic::text::dotted_path_at(&analysis.text, &analysis.line_index, position)?;
+
+        // The statement's own tables first. `person.name` written out is the
+        // rarer form, and a table that happens to share a column's name must
+        // not shadow the column the pointer is actually on.
+        for table in field_tables {
+            if let Some(field) = self
+                .fields
+                .get(table)
+                .and_then(|by_name| by_name.get(&path))
+            {
+                return Some(format_field_hover(field, self));
+            }
+        }
+        // Written as `table.column`, which names its own table.
+        if let Some((head, rest)) = path.split_once('.')
+            && let Some(field) = self.fields.get(head).and_then(|by_name| by_name.get(rest))
+        {
+            return Some(format_field_hover(field, self));
+        }
+        // A column every record has, that no `DEFINE FIELD` declares.
+        for table in field_tables {
+            if self.implicit_fields(table).contains(&path.as_str()) {
+                return Some(implicit_field_hover(&path, table));
+            }
+        }
+        None
     }
 
     /// Hover for a method call, resolved through the engine's receiver tables.
@@ -956,7 +1388,7 @@ impl MergedSemanticModel {
                         insert_text: Some(insert_text),
                         documentation: Some(Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: format_field_hover(field),
+                            value: format_field_hover(field, self),
                         })),
                         // `0-fld-...` sorts above `1-` user functions, `2-`
                         // builtin functions, and unsorted keywords so that
@@ -2064,6 +2496,22 @@ fn replacement_score(explicit: bool, origin: SymbolOrigin, confidence: f32) -> i
     explicit_score + (symbol_priority(origin) as i32 * 100) + (confidence * 10.0) as i32
 }
 
+/// Append `value` under `key`, unless it is already there.
+///
+/// The graph index is read far more often than it is built, and a duplicate
+/// would show twice in the completion list, so the linear scan is paid here.
+/// Each list holds the edges of one table, so it stays short.
+fn push_unique(map: &mut HashMap<String, Vec<String>>, key: &str, value: &str) {
+    let entry = match map.get_mut(key) {
+        Some(entry) => entry,
+        // Only the first edge of a table pays for the key.
+        None => map.entry(key.to_string()).or_default(),
+    };
+    if !entry.iter().any(|existing| existing == value) {
+        entry.push(value.to_string());
+    }
+}
+
 fn symbol_priority(origin: SymbolOrigin) -> usize {
     match origin {
         SymbolOrigin::Local => 4,
@@ -2317,7 +2765,40 @@ fn format_access_hover(access: &AccessDef) -> String {
     )
 }
 
-fn format_field_hover(field: &FieldDef) -> String {
+/// The tables a value *points at*, when the value is itself a record.
+///
+/// Deliberately not [`TypeExpr::record_tables`], which reaches inside an object
+/// and collects whatever its columns point at. That is the right answer for
+/// "which tables does this type mention" and the wrong one for "which table are
+/// this value's columns declared on".
+fn record_target_tables(ty: &TypeExpr) -> Option<&[String]> {
+    match ty {
+        TypeExpr::Record(tables) if !tables.is_empty() => Some(tables),
+        TypeExpr::Array(inner) | TypeExpr::Set(inner) | TypeExpr::Option(inner) => {
+            record_target_tables(inner)
+        }
+        _ => None,
+    }
+}
+
+/// Hover text for a column that exists without a `DEFINE FIELD`.
+fn implicit_field_hover(name: &str, table: &str) -> String {
+    let description = match name {
+        "id" => "The record's own identifier. Present on every record.",
+        "in" => "The record this edge points *from*. Written by `RELATE`.",
+        "out" => "The record this edge points *to*. Written by `RELATE`.",
+        // Unreachable: `implicit_fields` yields only the three above.
+        _ => "A built-in column.",
+    };
+    hover_block(
+        format!("FIELD {table}.{name}"),
+        Some(description.to_string()),
+        vec!["Source: built-in".to_string()],
+        Vec::new(),
+    )
+}
+
+fn format_field_hover(field: &FieldDef, model: &MergedSemanticModel) -> String {
     let mut metadata = vec![
         format!("Source: {}", origin_label(field.origin)),
         format!(
@@ -2331,11 +2812,41 @@ fn format_field_hover(field: &FieldDef) -> String {
     if let Some(inference) = &field.inference {
         metadata.push(format!("Confidence: {:.2}", inference.confidence));
     }
+
+    // The column-level counterpart of the table hover's index section: whether
+    // this column is indexed is the thing most worth knowing about it that the
+    // `DEFINE FIELD` itself does not say.
+    let covering: Vec<String> = model
+        .indexes_for_table(&field.table)
+        .iter()
+        .filter(|index| index.fields.iter().any(|name| *name == field.name))
+        .map(|index| {
+            let mut details = Vec::new();
+            if index.fields.len() > 1 {
+                details.push(format!("over {}", index.fields.join(", ")));
+            }
+            if index.unique {
+                details.push("unique".to_string());
+            }
+            details.extend(index.options.iter().cloned());
+            if details.is_empty() {
+                index.name.clone()
+            } else {
+                format!("{} ({})", index.name, details.join(" | "))
+            }
+        })
+        .collect();
+    let sections = if covering.is_empty() {
+        Vec::new()
+    } else {
+        vec![list_section("Indexed by", covering)]
+    };
+
     hover_block(
         format!("FIELD {}.{}", field.table, field.name),
         field.comment.clone(),
         metadata,
-        Vec::new(),
+        sections,
     )
 }
 
@@ -2678,6 +3189,7 @@ mod tests {
     fn local_definitions_override_inferred() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let explicit = TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: Some("schemafull".to_string()),
             comment: None,
@@ -2688,6 +3200,7 @@ mod tests {
             location: Location::new(uri.clone(), Range::default()),
         };
         let inferred = TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: None,
             comment: None,
@@ -2698,6 +3211,7 @@ mod tests {
             location: Location::new(uri.clone(), Range::default()),
         };
         let analysis = DocumentAnalysis {
+            edge_observations: Vec::new(),
             uri,
             text: String::new(),
             tree: empty_tree(),
@@ -2746,6 +3260,7 @@ mod tests {
             ..ServerSettings::default()
         };
         let table = TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: None,
             comment: None,
@@ -2775,6 +3290,7 @@ mod tests {
         };
         let result = model.semantic_diagnostics(
             &DocumentAnalysis {
+                edge_observations: Vec::new(),
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
@@ -2805,6 +3321,7 @@ mod tests {
         // uses CREATE to exercise the denied-permission code path.
         let settings = ServerSettings::default();
         let table = TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: None,
             comment: None,
@@ -2828,6 +3345,7 @@ mod tests {
 
         let diagnostics = model.semantic_diagnostics(
             &DocumentAnalysis {
+                edge_observations: Vec::new(),
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
@@ -2880,6 +3398,7 @@ mod tests {
         // unreliable. The same applies to RELATE.
         let settings = ServerSettings::default();
         let person = TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: None,
             comment: None,
@@ -2924,6 +3443,7 @@ mod tests {
 
         let diagnostics = model.semantic_diagnostics(
             &DocumentAnalysis {
+                edge_observations: Vec::new(),
                 uri: analysis_uri.clone(),
                 text: String::new(),
                 tree: empty_tree(),
@@ -2960,11 +3480,13 @@ mod tests {
         workspace.documents.insert(
             uri.clone(),
             Arc::new(DocumentAnalysis {
+                edge_observations: Vec::new(),
                 uri: uri.clone(),
                 text: String::new(),
                 tree: empty_tree(),
                 line_index: LineIndex::default(),
                 tables: vec![TableDef {
+                    relation: None,
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
                     comment: Some("People".to_string()),
@@ -3009,11 +3531,13 @@ mod tests {
         workspace.documents.insert(
             uri,
             Arc::new(DocumentAnalysis {
+                edge_observations: Vec::new(),
                 uri: Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
                 line_index: LineIndex::default(),
                 tables: vec![TableDef {
+                    relation: None,
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
                     comment: Some("People".to_string()),
@@ -3045,11 +3569,13 @@ mod tests {
     fn table_hover_lists_indexes_events_and_permission_posture() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let analysis = DocumentAnalysis {
+            edge_observations: Vec::new(),
             uri: uri.clone(),
             text: String::new(),
             tree: empty_tree(),
             line_index: LineIndex::default(),
             tables: vec![TableDef {
+                relation: None,
                 name: "person".to_string(),
                 schema_mode: Some("schemafull".to_string()),
                 comment: Some("People".to_string()),
@@ -3276,6 +3802,7 @@ mod tests {
         let mut model = MergedSemanticModel::default();
         // Tables and functions should NOT leak into the column-only output.
         model.insert_table(TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: Some("schemafull".to_string()),
             comment: None,
@@ -3320,7 +3847,11 @@ mod tests {
         }
 
         let items = model.column_completion_items("", &["person".to_string()], false, None);
-        assert_eq!(items.len(), 2, "expected exactly the two fields");
+        assert_eq!(
+            items.len(),
+            3,
+            "the two declared fields plus the implicit `id`, and nothing else"
+        );
         assert!(
             items
                 .iter()
@@ -3334,6 +3865,10 @@ mod tests {
         let labels: Vec<_> = items.iter().map(|item| item.label.clone()).collect();
         assert!(labels.contains(&"email".to_string()));
         assert!(labels.contains(&"name".to_string()));
+        // Every record has one, and no `DEFINE FIELD` ever says so.
+        assert!(labels.contains(&"id".to_string()));
+        // A plain table has no `in` / `out`; only an edge does.
+        assert!(!labels.iter().any(|l| l == "in" || l == "out"));
         // No table / function leakage.
         assert!(!labels.iter().any(|l| l == "person" || l == "fn::greet"));
     }
@@ -3656,6 +4191,7 @@ mod tests {
         let uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
         model.insert_table(TableDef {
+            relation: None,
             name: "person".to_string(),
             schema_mode: None,
             comment: None,
@@ -3675,6 +4211,7 @@ mod tests {
             ),
         });
         let analysis = DocumentAnalysis {
+            edge_observations: Vec::new(),
             uri,
             text: String::new(),
             tree: empty_tree(),

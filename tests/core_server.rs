@@ -1794,3 +1794,773 @@ async fn did_open_is_not_debounced() {
         "didOpen must publish diagnostics"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Graph traversals
+//
+// The reported defect: `SELECT ->is_friends_with->person AS friends FROM
+// person` resolved nothing. Two separate causes met here — `is_token_char`
+// accepts `-`, `<` and `>`, so a traversal scanned as one token and neither
+// hover nor the completion prefix could see the names in it; and nothing in
+// the model knew which tables an edge joins.
+// ──────────────────────────────────────────────────────────────────────
+
+/// A schema that declares one edge and one unrelated table, so a test can tell
+/// ranking apart from "everything happens to be an edge".
+const GRAPH_SCHEMA: &str = concat!(
+    "DEFINE TABLE person SCHEMAFULL;\n",
+    "DEFINE TABLE unrelated SCHEMAFULL;\n",
+    "DEFINE TABLE is_friends_with TYPE RELATION IN person OUT person;\n",
+);
+
+async fn hover_text(core: &common::TestCore, path: &str, line: u32, character: u32) -> String {
+    let hover = core
+        .hover(tower_lsp_server::ls_types::HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(path) },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await;
+    format!("{hover:?}")
+}
+
+/// The exact query from the report. The edge name must resolve to its table.
+#[tokio::test]
+async fn an_edge_name_in_a_traversal_resolves_to_its_table() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT ->is_friends_with->person AS friends FROM person WHERE friends.length > 0;";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{query}")).await;
+
+    // Column 12 is inside `is_friends_with` on the query line.
+    let rendered = hover_text(&core, "a.surql", 3, 12).await;
+    assert!(
+        rendered.contains("is_friends_with"),
+        "hovering the edge must resolve it, got {rendered}"
+    );
+}
+
+/// Go-to-definition on the edge name must reach its `DEFINE TABLE`.
+#[tokio::test]
+async fn go_to_definition_reaches_an_edge_table() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{GRAPH_SCHEMA}SELECT ->is_friends_with->person AS f FROM person;"),
+    )
+    .await;
+
+    let found = core
+        .goto_definition(tower_lsp_server::ls_types::GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("a.surql"),
+                },
+                position: Position::new(3, 12),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+
+    let rendered = format!("{found:?}");
+    assert!(
+        rendered.contains("line: 2"),
+        "must jump to the `DEFINE TABLE is_friends_with` on line 2, got {rendered}"
+    );
+}
+
+/// The core of the request: after `->`, the edges connected to the statement's
+/// table come first.
+#[tokio::test]
+async fn a_connected_edge_is_ranked_first_after_an_arrow() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT -> FROM person;";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{query}")).await;
+
+    // Just after the `->`.
+    let items = complete(&core, "a.surql", 3, 9).await;
+
+    assert_eq!(
+        labels(&items).first(),
+        Some(&"is_friends_with"),
+        "the edge that leaves `person` must lead, got {:?}",
+        labels(&items)
+    );
+    assert!(
+        labels(&items).contains(&"unrelated"),
+        "an unconnected table is ranked lower, not hidden: {:?}",
+        labels(&items)
+    );
+}
+
+/// The popup must not come back empty. Before the prefix fix, every builder
+/// filtered its candidates against the literal string `person->`.
+#[tokio::test]
+async fn completion_after_an_arrow_is_not_empty() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT * FROM person->";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{query}")).await;
+
+    let items = complete(&core, "a.surql", 3, 22).await;
+
+    assert!(!items.is_empty(), "the list must not be empty");
+    assert_eq!(
+        labels(&items).first(),
+        Some(&"is_friends_with"),
+        "got {:?}",
+        labels(&items)
+    );
+}
+
+/// A written base anchors on itself, so the ranking works without a `FROM`.
+#[tokio::test]
+async fn a_written_base_anchors_the_ranking() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT person->";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{query}")).await;
+
+    let items = complete(&core, "a.surql", 3, query.len() as u32).await;
+    assert_eq!(
+        labels(&items).first(),
+        Some(&"is_friends_with"),
+        "got {:?}",
+        labels(&items)
+    );
+}
+
+/// The second hop leaves the edge, so it must offer the tables that edge
+/// reaches — not the edges again.
+#[tokio::test]
+async fn the_second_hop_offers_the_tables_the_edge_reaches() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let before_cursor = "SELECT ->is_friends_with->";
+    open(
+        &core,
+        "a.surql",
+        &format!("{GRAPH_SCHEMA}{before_cursor} FROM person;"),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 3, before_cursor.len() as u32).await;
+    assert_eq!(
+        labels(&items).first(),
+        Some(&"person"),
+        "`is_friends_with` points at `person`, got {:?}",
+        labels(&items)
+    );
+}
+
+/// With no table after `FROM` there is nothing to rank against, so the list
+/// falls back to the plain table order rather than inventing a winner. This is
+/// the "only when a table is defined after FROM" half of the request.
+#[tokio::test]
+async fn without_a_from_table_no_edge_is_promoted() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}SELECT ->")).await;
+
+    let items = complete(&core, "a.surql", 3, 9).await;
+
+    assert!(!items.is_empty(), "tables are still offered");
+    assert!(
+        items
+            .iter()
+            .all(|item| item.sort_text.as_deref() != Some("0-0-is_friends_with")),
+        "nothing may be promoted without an anchor: {:?}",
+        items
+            .iter()
+            .map(|item| (&item.label, &item.sort_text))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// An edge that only a `RELATE` witnesses ranks exactly like a declared one.
+/// This is the case SurrealDB's own graph corpus is written in.
+#[tokio::test]
+async fn an_edge_known_only_from_relate_is_ranked_too() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        concat!(
+            "DEFINE TABLE person SCHEMALESS;\n",
+            "DEFINE TABLE unrelated SCHEMALESS;\n",
+            "RELATE person:a->knows->person:b;\n",
+            "SELECT -> FROM person;",
+        ),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 3, 9).await;
+    assert_eq!(
+        labels(&items).first(),
+        Some(&"knows"),
+        "got {:?}",
+        labels(&items)
+    );
+}
+
+/// A traversal in a target position must not draw an `unknown-table` warning
+/// on the edge it passes through.
+#[tokio::test]
+async fn a_traversal_target_draws_no_unknown_table_warning() {
+    let (core, notifier, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{GRAPH_SCHEMA}SELECT * FROM person->is_friends_with->person;"),
+    )
+    .await;
+
+    let published = notifier.published();
+    let codes: Vec<String> = published
+        .iter()
+        .flat_map(|(_, diagnostics)| diagnostics.iter())
+        .filter_map(|diagnostic| match &diagnostic.code {
+            Some(NumberOrString::String(code)) => Some(code.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !codes.iter().any(|code| code == "unknown-table"),
+        "a traversal must not report an unknown table, got {codes:?}"
+    );
+}
+
+/// `->` is also the return arrow of `DEFINE FUNCTION`. The graph branch runs
+/// before the other classifiers, so this pins what it does there.
+///
+/// A type is wanted, not a table — but the server has never modelled that slot,
+/// and before the prefix fix it answered with an *empty* popup, because every
+/// builder filtered against the literal string `->`. Offering the tables is no
+/// worse, and `record<…>` types do name tables. What matters is that the list
+/// is not empty and nothing is falsely promoted.
+#[tokio::test]
+async fn the_function_return_arrow_is_not_hijacked() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let head = "DEFINE FUNCTION fn::x() ->";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{head}")).await;
+
+    let items = complete(&core, "a.surql", 3, head.len() as u32).await;
+
+    assert!(
+        items
+            .iter()
+            .all(|item| item.sort_text.as_deref() != Some("0-0-is_friends_with")),
+        "no edge may be promoted here — there is no table to traverse from"
+    );
+}
+
+/// With a space after it, the return arrow is not a graph slot at all, so the
+/// pre-existing behaviour is untouched.
+#[tokio::test]
+async fn a_space_after_an_arrow_ends_the_graph_slot() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let head = "SELECT * FROM person-> ";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{head}")).await;
+
+    let items = complete(&core, "a.surql", 3, head.len() as u32).await;
+    assert!(
+        items
+            .iter()
+            .all(|item| item.sort_text.as_deref() != Some("0-0-is_friends_with")),
+        "the hop is over once a space follows the arrow"
+    );
+}
+
+/// Items after an arrow must say exactly which characters they replace.
+///
+/// Without a `textEdit` the client decides the range from its own word scan.
+/// That is safe everywhere else in this handler — a space or a `.` precedes the
+/// cursor — but after `->` a client whose word pattern admits `-` or `>` reads
+/// the prefix as `person->`, matches no item against it, and shows an empty
+/// popup no matter what the server returned. Ctrl+Space does not help, because
+/// the filtering happens after the response arrives.
+#[tokio::test]
+async fn graph_items_carry_an_explicit_replace_range() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let head = "SELECT * FROM person->";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{head}")).await;
+
+    let items = complete(&core, "a.surql", 3, head.len() as u32).await;
+    let first = items.first().expect("at least one item");
+
+    let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &first.text_edit else {
+        panic!(
+            "a graph item must carry a plain textEdit, got {:?}",
+            first.text_edit
+        );
+    };
+    assert_eq!(edit.new_text, "is_friends_with");
+    assert_eq!(
+        (edit.range.start.line, edit.range.start.character),
+        (3, head.len() as u32),
+        "nothing is typed yet, so the edit inserts at the cursor"
+    );
+    assert_eq!(edit.range.end, edit.range.start);
+    assert_eq!(
+        first.filter_text.as_deref(),
+        Some("is_friends_with"),
+        "the client must filter on the name, not on the text it scanned"
+    );
+}
+
+/// With a half-typed name the range must cover that name — and only it, not
+/// the arrow before it.
+#[tokio::test]
+async fn the_replace_range_covers_the_typed_hop_only() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let head = "SELECT * FROM person->is_fr";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{head}")).await;
+
+    let items = complete(&core, "a.surql", 3, head.len() as u32).await;
+    let first = items.first().expect("at least one item");
+
+    let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &first.text_edit else {
+        panic!("expected a plain textEdit");
+    };
+    assert_eq!(
+        (edit.range.start.character, edit.range.end.character),
+        // `is_fr` is five characters, and the arrow before it is untouched.
+        (head.len() as u32 - 5, head.len() as u32),
+        "the edit must replace `is_fr` and leave `->` alone"
+    );
+    assert_eq!(edit.new_text, "is_friends_with");
+}
+
+/// Every item in the list gets the range, not only the promoted ones —
+/// otherwise picking an ordinary table would insert at the wrong place.
+#[tokio::test]
+async fn every_graph_item_carries_the_range() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let head = "SELECT * FROM person->";
+    open(&core, "a.surql", &format!("{GRAPH_SCHEMA}{head}")).await;
+
+    let items = complete(&core, "a.surql", 3, head.len() as u32).await;
+    assert!(items.len() > 1, "expected more than the promoted edge");
+    assert!(
+        items.iter().all(|item| item.text_edit.is_some()),
+        "an item without a range would insert in the wrong place"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Column completion in a projection list
+//
+// Only the *first* column of a `SELECT` or `SET` list ever completed. The scan
+// that skips backwards over already-written columns read straight through the
+// opening keyword, so after a comma the slot went unrecognised and the position
+// fell through to the whole ~765-item catalogue.
+// ──────────────────────────────────────────────────────────────────────
+
+/// A schema with one plain table, one nested field, and one edge.
+const FIELD_SCHEMA: &str = concat!(
+    "DEFINE TABLE person SCHEMAFULL;\n",
+    "DEFINE FIELD name ON person TYPE string;\n",
+    "DEFINE FIELD address.street ON person TYPE string;\n",
+);
+
+/// Every column position in a projection list offers the same columns.
+#[tokio::test]
+async fn every_column_position_in_a_select_list_completes() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT id, name, address.street FROM person;";
+    open(&core, "a.surql", &format!("{FIELD_SCHEMA}{query}")).await;
+
+    for (what, character) in [
+        ("after `SELECT `", 7),
+        ("right after the first `,`", 10),
+        ("after `, `", 11),
+        ("after the second `, `", 17),
+    ] {
+        let items = complete(&core, "a.surql", 3, character).await;
+        let found = labels(&items);
+        for column in ["id", "name", "address.street"] {
+            assert!(
+                found.contains(&column),
+                "{what}: `{column}` must be offered, got {found:?}"
+            );
+        }
+        assert!(
+            !found.iter().any(|label| label.starts_with('$')),
+            "{what}: a column slot offers no variables, got {found:?}"
+        );
+    }
+}
+
+/// The same for a `SET` list, which shares the scan.
+#[tokio::test]
+async fn every_column_position_in_a_set_list_completes() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    // The value is a number on purpose. A quote anywhere in an already-written
+    // item aborts the backward scan — a pre-existing guard, because a backward
+    // reader cannot tell an opening quote from a closing one — so
+    // `SET name = 'a', ` degrades to the full list. That is a separate
+    // limitation from the one this test covers.
+    let query = "UPDATE person SET age = 29, ";
+    open(&core, "a.surql", &format!("{FIELD_SCHEMA}{query}")).await;
+
+    let items = complete(&core, "a.surql", 3, query.len() as u32).await;
+
+    let found = labels(&items);
+    assert!(
+        found.contains(&"name"),
+        "a `SET` list must keep completing after a comma, got {found:?}"
+    );
+    assert!(!found.contains(&"*"), "`SET` takes no `*`, got {found:?}");
+}
+
+/// A table named `preset` ends in the letters of `SET`. The keyword check is
+/// word-bounded so it does not read as one.
+#[tokio::test]
+async fn a_name_ending_in_a_keyword_is_not_read_as_one() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT name, preset, ";
+    open(
+        &core,
+        "a.surql",
+        &format!("{FIELD_SCHEMA}{query} FROM person;"),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 3, query.len() as u32).await;
+
+    let found = labels(&items);
+    assert!(
+        found.contains(&"*"),
+        "the list still belongs to `SELECT`, not to a `SET` found inside `preset`: {found:?}"
+    );
+}
+
+/// `id` exists on every record and no `DEFINE FIELD` declares it, so nothing
+/// used to offer it — on the single most common projection in SurrealQL.
+#[tokio::test]
+async fn the_implicit_id_column_is_offered() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{FIELD_SCHEMA}SELECT  FROM person;"),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 3, 7).await;
+    let id = items
+        .iter()
+        .find(|item| item.label == "id")
+        .expect("`id` must be offered");
+    assert_eq!(
+        id.kind,
+        Some(tower_lsp_server::ls_types::CompletionItemKind::FIELD)
+    );
+    assert!(
+        !labels(&items)
+            .iter()
+            .any(|label| *label == "in" || *label == "out"),
+        "a plain table has no `in` / `out`"
+    );
+}
+
+/// An edge table carries `in` and `out` as well, written by `RELATE`.
+#[tokio::test]
+async fn an_edge_table_offers_its_endpoints_as_columns() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        concat!(
+            "DEFINE TABLE knows TYPE RELATION IN person OUT person;\n",
+            "SELECT  FROM knows;",
+        ),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 1, 7).await;
+
+    let found = labels(&items);
+    for column in ["id", "in", "out"] {
+        assert!(
+            found.contains(&column),
+            "an edge must offer `{column}`, got {found:?}"
+        );
+    }
+}
+
+/// A declared column of the same name wins, so it is not listed twice.
+#[tokio::test]
+async fn a_declared_id_is_not_duplicated_by_the_implicit_one() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        concat!(
+            "DEFINE TABLE person SCHEMAFULL;\n",
+            "DEFINE FIELD id ON person TYPE string;\n",
+            "SELECT  FROM person;",
+        ),
+    )
+    .await;
+
+    let items = complete(&core, "a.surql", 2, 7).await;
+
+    let found = labels(&items);
+    assert_eq!(
+        found.iter().filter(|label| **label == "id").count(),
+        1,
+        "got {found:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Hovering a column
+//
+// A column name means nothing on its own — `name` belongs to whichever table
+// the statement reads — so the global token lookup that answers for tables,
+// functions and params could never answer for one. Hovering a column returned
+// nothing at all.
+// ──────────────────────────────────────────────────────────────────────
+
+const HOVER_SCHEMA: &str = concat!(
+    "DEFINE TABLE person SCHEMAFULL;\n",
+    "DEFINE FIELD name ON person TYPE string COMMENT 'The display name';\n",
+    "DEFINE FIELD address.street ON person TYPE string;\n",
+    "DEFINE INDEX person_name ON person FIELDS name UNIQUE;\n",
+);
+
+/// Hover text at a column of the line that follows `HOVER_SCHEMA`.
+async fn column_hover(core: &common::TestCore, character: u32) -> String {
+    hover_text(core, "a.surql", 4, character).await
+}
+
+#[tokio::test]
+async fn hovering_a_column_shows_what_the_schema_stores() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT id, name, address.street FROM person;";
+    open(&core, "a.surql", &format!("{HOVER_SCHEMA}{query}")).await;
+
+    // A cursor *inside* `name`, which starts at column 11.
+    let hover = column_hover(&core, 15).await;
+    for expected in [
+        "FIELD person.name", // named with its table, as a table hover is
+        "The display name",  // the COMMENT
+        "Type: `string`",    // the declared type
+        "Permissions",       // the same posture line a table hover carries
+        "person_name",       // and the index that covers it
+    ] {
+        assert!(
+            hover.contains(expected),
+            "hovering `name` must report {expected:?}, got {hover}"
+        );
+    }
+}
+
+/// A nested column is stored under its whole path, and `.` is not a token
+/// character — so the segment under the pointer had to be widened to the path
+/// or it matched nothing. Either end must give the same answer.
+#[tokio::test]
+async fn hovering_either_half_of_a_nested_column_resolves_the_whole_path() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT id, name, address.street FROM person;";
+    open(&core, "a.surql", &format!("{HOVER_SCHEMA}{query}")).await;
+
+    // `address` spans 17..24, `street` spans 25..31.
+    for (what, character) in [("address", 24), ("street", 28), ("street end", 31)] {
+        let hover = column_hover(&core, character).await;
+        assert!(
+            hover.contains("FIELD person.address.street"),
+            "hovering {what} must resolve the whole path, got {hover}"
+        );
+    }
+}
+
+/// `id` exists on every record and no `DEFINE FIELD` declares it.
+#[tokio::test]
+async fn hovering_the_implicit_id_column_explains_it() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT id, name, address.street FROM person;";
+    open(&core, "a.surql", &format!("{HOVER_SCHEMA}{query}")).await;
+
+    let hover = column_hover(&core, 9).await;
+    assert!(hover.contains("FIELD person.id"), "got {hover}");
+    assert!(hover.contains("Source: built-in"), "got {hover}");
+}
+
+/// Written out as `table.column`, which names its own table rather than
+/// borrowing the statement's.
+#[tokio::test]
+async fn hovering_a_qualified_column_resolves_through_its_table() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{HOVER_SCHEMA}SELECT person.name FROM person;"),
+    )
+    .await;
+
+    let hover = column_hover(&core, 18).await;
+    assert!(hover.contains("FIELD person.name"), "got {hover}");
+}
+
+/// The table itself must still hover as a table. A column and a table can share
+/// a name, and the column wins only where a column is what the pointer is on.
+#[tokio::test]
+async fn hovering_the_table_still_reports_the_table() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "SELECT id, name, address.street FROM person;";
+    open(&core, "a.surql", &format!("{HOVER_SCHEMA}{query}")).await;
+
+    // `person` after `FROM` spans 37..43.
+    let hover = column_hover(&core, 43).await;
+    assert!(hover.contains("TABLE person"), "got {hover}");
+    assert!(!hover.contains("FIELD"), "got {hover}");
+}
+
+/// A name that is no column of the statement's table still resolves the way it
+/// always did, rather than being claimed as a column.
+#[tokio::test]
+async fn a_non_column_token_is_unaffected() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &format!("{HOVER_SCHEMA}SELECT string::len(name) FROM person;"),
+    )
+    .await;
+
+    // `string::len` spans 7..18.
+    let hover = column_hover(&core, 18).await;
+    assert!(hover.contains("string::len"), "got {hover}");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Reading a member off a value, end to end
+// ──────────────────────────────────────────────────────────────────────
+
+/// The reported query, verbatim.
+const ROW_QUERY: &str = concat!(
+    "DEFINE TABLE person SCHEMAFULL;\n",                   // 0
+    "DEFINE FIELD name ON person TYPE string;\n",          // 1
+    "DEFINE FIELD age ON person TYPE int;\n",              // 2
+    "LET $people = (SELECT id, name, age FROM person);\n", // 3
+    "FOR $person IN $people {\n",                          // 4
+    "    LET $upper = array::at([], $person.age);\n",      // 5
+    "};\n",                                                // 6
+);
+
+/// `$person.age` spans a known column of the row the query built.
+#[tokio::test]
+async fn hovering_a_property_of_a_bound_row_resolves_it() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", ROW_QUERY).await;
+
+    let line = "    LET $upper = array::at([], $person.age);";
+    let age = line.find(".age").expect("the property") + 1;
+
+    // Every column of the word, including the first — which used to be dead
+    // because the character before it is the `.`.
+    for offset in 0..3u32 {
+        let hover = hover_text(&core, "a.surql", 5, age as u32 + offset).await;
+        assert!(
+            hover.contains("age") && hover.contains("int"),
+            "hovering `age` at +{offset} must report its type, got {hover}"
+        );
+    }
+}
+
+/// After the `.`, the row's own columns are what is legal — and they lead.
+#[tokio::test]
+async fn a_property_completes_after_a_dot_on_a_bound_row() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", ROW_QUERY).await;
+
+    let line = "    LET $upper = array::at([], $person.age);";
+    let after_dot = line.find(".age").expect("the property") + 1;
+
+    let items = complete(&core, "a.surql", 5, after_dot as u32).await;
+    let found = labels(&items);
+
+    assert_eq!(
+        &found[..3],
+        &["id", "name", "age"],
+        "the row's columns lead, got {found:?}"
+    );
+    assert!(
+        found.len() > 3,
+        "methods are still offered below them, got {found:?}"
+    );
+    assert!(
+        !found.iter().any(|label| label.starts_with('$')),
+        "a member slot offers no variables, got {found:?}"
+    );
+}
+
+/// Half-typed, the list narrows to the matching column.
+#[tokio::test]
+async fn a_half_typed_property_filters_the_members() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "a.surql",
+        &ROW_QUERY.replace("$person.age", "$person.na"),
+    )
+    .await;
+
+    let line = "    LET $upper = array::at([], $person.na);";
+    let end = line.find(".na").expect("the property") + 3;
+
+    let items = complete(&core, "a.surql", 5, end as u32).await;
+
+    let found = labels(&items);
+    assert!(found.contains(&"name"), "got {found:?}");
+    assert!(!found.contains(&"age"), "got {found:?}");
+}
+
+/// A record points at a declared table, so its columns complete too — and the
+/// hover is the schema's, which carries what a bare type cannot.
+#[tokio::test]
+async fn a_record_valued_variable_completes_and_hovers_its_columns() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let query = "LET $p = (SELECT VALUE id FROM ONLY person);\nLET $n = $p.name;";
+    open(
+        &core,
+        "a.surql",
+        &format!("{}{query}", &ROW_QUERY[..ROW_QUERY.find("LET").unwrap()]),
+    )
+    .await;
+
+    // Line 4 is `LET $n = $p.name;`.
+    let line = "LET $n = $p.name;";
+    let dot = line.find(".name").expect("the property");
+
+    let items = complete(&core, "a.surql", 4, dot as u32 + 1).await;
+
+    let found = labels(&items);
+    assert!(found.contains(&"name"), "got {found:?}");
+    assert!(found.contains(&"age"), "got {found:?}");
+
+    let hover = hover_text(&core, "a.surql", 4, dot as u32 + 3).await;
+    assert!(
+        hover.contains("FIELD person.name"),
+        "a record's column hovers as the declared column, got {hover}"
+    );
+}
+
+/// Hovering the first character of an ordinary word must work too — the same
+/// fix, and it was broken for every kind of token, not only properties.
+#[tokio::test]
+async fn hovering_the_first_character_of_a_word_resolves_it() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "a.surql", ROW_QUERY).await;
+
+    // `person` after `FROM` on line 3.
+    let line = "LET $people = (SELECT id, name, age FROM person);";
+    let person = line.rfind("person").expect("the table");
+
+    let hover = hover_text(&core, "a.surql", 3, person as u32).await;
+    assert!(
+        hover.contains("TABLE person"),
+        "the first glyph of a word must resolve, got {hover}"
+    );
+}

@@ -284,10 +284,19 @@ fn token_bounds(source: &str, lines: &LineIndex, position: Position) -> Option<(
         return None;
     }
     let offset = lines.offset(source, position);
-    let (cursor_start, cursor_char) = char_before(source, offset)?;
-    if !is_token_char(cursor_char) {
-        return None;
-    }
+    // The character *before* the cursor first: a cursor sitting just past a word
+    // belongs to that word, which is where a caret usually is.
+    //
+    // Then the character *at* the cursor. A hover position is a glyph the mouse
+    // is over, not a caret, and the first glyph of a word has a non-token
+    // character before it — so `person` resolved from its second letter onward
+    // and `.age` not from the `a` at all. Half of every word was dead.
+    let (cursor_start, cursor_char) = char_before(source, offset)
+        .filter(|(_, ch)| is_token_char(*ch))
+        .or_else(|| {
+            let ch = source.get(offset..)?.chars().next()?;
+            is_token_char(ch).then_some((offset, ch))
+        })?;
 
     let mut start = cursor_start;
     while start > 0 {
@@ -306,7 +315,64 @@ fn token_bounds(source: &str, lines: &LineIndex, position: Position) -> Option<(
         end += ch.len_utf8();
     }
 
-    Some((start, end))
+    narrow_to_hop(source, start, end, cursor_start)
+}
+
+/// The arrow spellings that separate one graph hop from the next.
+///
+/// Longest first, because `<->` starts with `<-` and ends with `->`; a
+/// shortest-first scan would split it into two arrows around an empty name.
+const HOP_ARROWS: [&str; 4] = ["<->", "->", "<-", "<~"];
+
+/// True when `span` holds a graph arrow, and is therefore a traversal rather
+/// than one name.
+fn holds_arrow(span: &str) -> bool {
+    HOP_ARROWS.iter().any(|arrow| span.contains(arrow))
+}
+
+/// Narrow a token span to the single graph hop that `cursor` falls in.
+///
+/// [`is_token_char`] deliberately accepts `-`, `<` and `>` so that
+/// `record<person>` and a hyphenated table name scan as one token. The cost is
+/// that `->knows->person` scans as one token too, so hovering `knows` used to
+/// ask the model about the whole traversal — which matches no table, no field
+/// and no function, and so answered nothing. Splitting on the arrows *alone*
+/// fixes the traversal without touching either of the shapes that need those
+/// characters.
+///
+/// Returns `None` when the cursor is on an arrow, which names nothing.
+fn narrow_to_hop(source: &str, start: usize, end: usize, cursor: usize) -> Option<(usize, usize)> {
+    // An arrow can run *past* the token's end: `~` is not a token character, so
+    // `a<~b` scans as the token `a<` and the `<~` would be invisible inside it.
+    // Two extra bytes cover the longest arrow that can start on the token's
+    // last byte. Arrows are ASCII, so only the slice end needs rounding.
+    let scan_end = ceil_boundary(source, end.saturating_add(2).min(source.len()));
+    if !holds_arrow(&source[start..scan_end]) {
+        return Some((start, end));
+    }
+
+    let mut segment_start = start;
+    let mut index = start;
+    while index < end {
+        let rest = &source[index..scan_end];
+        let Some(arrow) = HOP_ARROWS.iter().find(|arrow| rest.starts_with(**arrow)) else {
+            // Not an arrow, so step over one character — names may be
+            // multi-byte, so this cannot step by one byte.
+            index += rest.chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        if cursor < index {
+            // The cursor was in the segment this arrow closes.
+            return (segment_start < index).then_some((segment_start, index));
+        }
+        if cursor < index + arrow.len() {
+            return None;
+        }
+        index += arrow.len();
+        segment_start = index;
+    }
+
+    (segment_start < end).then_some((segment_start, end))
 }
 
 pub fn is_token_char(ch: char) -> bool {
@@ -318,6 +384,12 @@ pub fn is_token_char(ch: char) -> bool {
 /// Returns an empty string when the cursor does not follow a token character —
 /// the user is starting a fresh token, and returning the previous keyword would
 /// filter every candidate against it.
+///
+/// A graph arrow ends the prefix for the same reason it ends a token: at
+/// `SELECT * FROM person->|` the author has started a *new* name, so the prefix
+/// is empty, not `person->`. Before this, every completion builder filtered its
+/// candidates against `person->`, none matched, and the popup came back empty —
+/// which is what made a traversal look like it offered nothing at all.
 pub fn token_prefix(source: &str, lines: &LineIndex, position: Position) -> Option<String> {
     if source.is_empty() {
         return Some(String::new());
@@ -346,7 +418,22 @@ pub fn token_prefix(source: &str, lines: &LineIndex, position: Position) -> Opti
             _ => break,
         }
     }
-    source.get(start..end).map(ToOwned::to_owned)
+    let prefix = source.get(start..end)?;
+    Some(after_last_arrow(prefix).to_owned())
+}
+
+/// The text after the last graph arrow in `prefix`, or all of it when there is
+/// none.
+///
+/// Takes the *furthest* end across all four spellings rather than the first
+/// match, because they overlap: inside `<->`, `rfind("<-")` alone would stop at
+/// offset 2 and leave a stray `>`.
+pub fn after_last_arrow(prefix: &str) -> &str {
+    HOP_ARROWS
+        .iter()
+        .filter_map(|arrow| prefix.rfind(arrow).map(|at| at + arrow.len()))
+        .max()
+        .map_or(prefix, |cut| &prefix[cut..])
 }
 
 pub fn token_at(source: &str, lines: &LineIndex, position: Position) -> Option<String> {
@@ -357,6 +444,52 @@ pub fn token_at(source: &str, lines: &LineIndex, position: Position) -> Option<S
 pub fn word_range(source: &str, lines: &LineIndex, position: Position) -> Option<Range> {
     let (start, end) = token_bounds(source, lines, position)?;
     Some(lines.range(source, start, end))
+}
+
+/// The whole dotted idiom the cursor sits in, `address.street` rather than the
+/// one segment under the pointer.
+///
+/// `.` is not a token character, so [`token_at`] stops at it — and a nested
+/// field is stored under its *full* path, so `street` alone matches nothing.
+/// Both ends are walked so the answer is the same wherever in the path the
+/// pointer rests.
+pub fn dotted_path_at(source: &str, lines: &LineIndex, position: Position) -> Option<String> {
+    let (mut start, mut end) = token_bounds(source, lines, position)?;
+
+    // Leftward: a `.` preceded by a name, as many times as there are segments.
+    while source[..start].ends_with('.') {
+        let dot = start - 1;
+        let mut name = dot;
+        while let Some((at, ch)) = preceding_char(source, name) {
+            if !is_token_char(ch) {
+                break;
+            }
+            name = at;
+        }
+        // A `.` with nothing before it is not a path — `{ a: 1 }.b` or a
+        // leading decimal point. Stop rather than swallow it.
+        if name == dot {
+            break;
+        }
+        start = name;
+    }
+
+    while source[end..].starts_with('.') {
+        let after = end + 1;
+        let mut name = after;
+        for ch in source[after..].chars() {
+            if !is_token_char(ch) {
+                break;
+            }
+            name += ch.len_utf8();
+        }
+        if name == after {
+            break;
+        }
+        end = name;
+    }
+
+    source.get(start..end).map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -511,6 +644,13 @@ mod tests {
     // verbatim. They are the specification for the rewrites: the rewrites must
     // not change which token the cursor resolves to, only what it costs to find
     // out. Delete these when the behaviour is deliberately changed, not before.
+    //
+    // Graph-hop narrowing *is* such a deliberate change, so each reference now
+    // ends by calling the same helper the real implementation does. That part
+    // is therefore not cross-checked here — `narrow_to_hop` and
+    // `after_last_arrow` have their own direct tests below. What these still
+    // check independently, and what they were written for, is the offset
+    // scanning: which characters belong to the token in the first place.
     // ──────────────────────────────────────────────────────────────────
 
     fn token_prefix_scanning(source: &str, position: Position) -> Option<String> {
@@ -538,7 +678,9 @@ mod tests {
             .get(cursor_index)
             .map(|(byte, _)| *byte)
             .unwrap_or(source.len());
-        source.get(start_byte..end_byte).map(ToOwned::to_owned)
+        source
+            .get(start_byte..end_byte)
+            .map(|prefix| super::after_last_arrow(prefix).to_owned())
     }
 
     /// The shared body of the old `token_at` and `word_range`.
@@ -548,13 +690,22 @@ mod tests {
         if chars.is_empty() {
             return None;
         }
-        let index = chars
+        let before = chars
             .partition_point(|(byte, _)| *byte < offset)
             .saturating_sub(1);
+        // The character before the cursor, else the one at it — see
+        // `token_bounds`, whose rule this mirrors.
+        let index = match chars.get(before) {
+            Some((_, ch)) if super::is_token_char(*ch) => before,
+            // Exactly at the cursor, not merely after it: `before` clamps to 0
+            // at the start of the document, where the next character can be
+            // several bytes along and is not the one under the pointer.
+            _ => match chars.get(before + 1) {
+                Some((byte, ch)) if super::is_token_char(*ch) && *byte == offset => before + 1,
+                _ => return None,
+            },
+        };
         let current = chars.get(index)?;
-        if !super::is_token_char(current.1) {
-            return None;
-        }
         let mut start = index;
         while start > 0 && super::is_token_char(chars[start - 1].1) {
             start -= 1;
@@ -568,7 +719,7 @@ mod tests {
             .get(end)
             .map(|(byte, _)| *byte)
             .unwrap_or(source.len());
-        Some((start_byte, end_byte))
+        super::narrow_to_hop(source, start_byte, end_byte, current.0)
     }
 
     /// Cursor positions worth probing for a given source: every line, and every
@@ -611,6 +762,18 @@ mod tests {
             "🚀token",
             "token🚀",
             "\n\n\n",
+            // Graph traversals, in every arrow spelling. The hop narrowing
+            // reads bytes, so a multi-byte name beside an arrow is the case
+            // that would break it.
+            "SELECT ->knows->person AS friends FROM person",
+            "SELECT <-knows<-person FROM person",
+            "SELECT <->knows<->person FROM person",
+            "SELECT <~knows<~person FROM person",
+            "person:alice->knows->person",
+            "->naïve_edge->🚀table",
+            "my-table->knows",
+            "->",
+            "a<->b",
         ]
     }
 
@@ -644,6 +807,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Graph-hop narrowing.
+    //
+    // `is_token_char` accepts `-`, `<` and `>`, so a traversal scans as one
+    // token. These pin the split: a traversal resolves per hop, and the two
+    // shapes that need those characters keep resolving whole.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// `token_at` with the cursor just after the given needle's first
+    /// occurrence.
+    fn token_after(source: &str, needle: &str) -> Option<String> {
+        let at = source.find(needle).expect("needle in source") + needle.len();
+        let index = LineIndex::new(source);
+        super::token_at(source, &index, index.position(source, at))
+    }
+
+    #[test]
+    fn a_traversal_resolves_one_hop_at_a_time() {
+        let source = "SELECT ->is_friends_with->person AS friends FROM person";
+        assert_eq!(
+            token_after(source, "is_friends_with"),
+            Some("is_friends_with".to_string()),
+            "the edge name must resolve alone, not as the whole traversal"
+        );
+        assert_eq!(
+            token_after(source, "->is_friends_with->person"),
+            Some("person".to_string()),
+            "the far table must resolve alone too"
+        );
+    }
+
+    #[test]
+    fn every_arrow_spelling_splits_a_hop() {
+        for arrow in ["->", "<-", "<->", "<~"] {
+            let source = format!("a{arrow}knows");
+            assert_eq!(
+                token_after(&source, "knows"),
+                Some("knows".to_string()),
+                "`{arrow}` must end the previous hop"
+            );
+            assert_eq!(
+                token_after(&source, "a"),
+                Some("a".to_string()),
+                "`{arrow}` must end the hop before it, in {source:?}"
+            );
+        }
+    }
+
+    /// `<->` starts with `<-` and ends with `->`. A shortest-first split would
+    /// read it as two arrows around an empty name.
+    #[test]
+    fn a_bidirectional_arrow_is_one_arrow() {
+        assert_eq!(token_after("a<->b", "a"), Some("a".to_string()));
+        assert_eq!(token_after("a<->b", "<->"), None, "the arrow names nothing");
+        assert_eq!(token_after("a<->b", "<->b"), Some("b".to_string()));
+    }
+
+    /// The two shapes that put `-`, `<` or `>` inside a real name. Splitting on
+    /// those characters rather than on the arrows would break both.
+    #[test]
+    fn a_name_holding_an_arrow_character_stays_whole() {
+        assert_eq!(
+            token_after("my-table", "my-table"),
+            Some("my-table".to_string()),
+            "a hyphen is part of the name"
+        );
+        assert_eq!(
+            token_after("LET $x: record<person> = 1", "record<person>"),
+            Some("record<person>".to_string()),
+            "a record type is one token"
+        );
+        assert_eq!(
+            token_after("my-table->knows", "my-table"),
+            Some("my-table".to_string()),
+            "a hyphenated name beside an arrow keeps its hyphen"
+        );
+    }
+
+    #[test]
+    fn the_completion_prefix_restarts_after_an_arrow() {
+        for (prefix, expected) in [
+            ("person->", ""),
+            ("person->kno", "kno"),
+            ("->knows->per", "per"),
+            ("a<->b", "b"),
+            ("a<~b", "b"),
+            ("my-table", "my-table"),
+            ("record<person", "record<person"),
+        ] {
+            assert_eq!(
+                super::after_last_arrow(prefix),
+                expected,
+                "prefix {prefix:?}"
+            );
+        }
+    }
+
+    /// The whole point: before the split, every completion builder filtered
+    /// against `person->`, matched nothing, and returned an empty popup.
+    #[test]
+    fn a_cursor_after_an_arrow_has_an_empty_prefix() {
+        let source = "SELECT * FROM person->";
+        let index = LineIndex::new(source);
+        assert_eq!(
+            super::token_prefix(source, &index, index.position(source, source.len())),
+            Some(String::new())
+        );
     }
 
     #[test]
