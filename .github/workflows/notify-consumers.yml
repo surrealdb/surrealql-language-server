@@ -1,0 +1,111 @@
+# Tell the editor-extension repos about a new LSP release, so each opens a
+# pull request that bumps its pinned LSP version.
+#
+# Deliberately a separate file from ci.yml: the npm trusted publisher is
+# pinned to that file name, so ci.yml must not be renamed or restructured.
+#
+# Why this waits for assets instead of trusting the `published` event: a
+# release here is published by a person in the GitHub UI, which creates the
+# tag, and only then does CI build the binaries. Measured on v0.5.2, the last
+# asset landed 17m32s after publish. The event fires on an EMPTY release.
+# And the CI run's conclusion is not a usable gate either — the v0.5.2 run
+# concluded `failure` (an npm step) while all four binaries landed fine. The
+# only reliable signal is the four asset names being present.
+name: Notify consumers
+
+on:
+    release:
+        types: [published]
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: 'Release tag to announce (for example v0.5.2)'
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    dispatch:
+        runs-on: ubuntu-latest
+        # Prereleases and drafts are for testing; consumers bundle stable
+        # releases only. A manual run skips this guard on purpose.
+        if: github.event_name == 'workflow_dispatch' || (!github.event.release.prerelease && !github.event.release.draft)
+        steps:
+            - name: Resolve the tag
+              id: tag
+              env:
+                  EVENT_TAG: ${{ github.event.release.tag_name }}
+                  INPUT_TAG: ${{ inputs.tag }}
+              run: |
+                  TAG="${INPUT_TAG:-$EVENT_TAG}"
+                  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                      echo "::error::Tag '$TAG' must match vMAJOR.MINOR.PATCH"
+                      exit 1
+                  fi
+                  echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+            - name: Wait for the four release assets
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ steps.tag.outputs.tag }}
+              run: |
+                  # The four binaries ci.yml uploads. Do NOT add the npm .tgz
+                  # here: it has never landed on any release, and waiting for
+                  # it would time out on every real release.
+                  expected=(
+                      surrealql-language-server-linux-amd64
+                      surrealql-language-server-linux-arm64
+                      surrealql-language-server-macos-arm64
+                      surrealql-language-server-windows-amd64.exe
+                  )
+                  # 90 polls x 30 s = 45 minutes, over double the measured
+                  # worst case (17m32s, the Windows leg).
+                  for attempt in $(seq 1 90); do
+                      names=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+                          --jq '.assets[].name' 2>/dev/null || true)
+                      missing=0
+                      for name in "${expected[@]}"; do
+                          grep -qxF "$name" <<<"$names" || missing=$((missing + 1))
+                      done
+                      if [[ "$missing" -eq 0 ]]; then
+                          echo "All ${#expected[@]} assets present after $attempt poll(s)."
+                          exit 0
+                      fi
+                      echo "Poll $attempt/90: $missing asset(s) still missing."
+                      sleep 30
+                  done
+                  echo "::error::Timed out after 45 minutes with assets missing on ${TAG}."
+                  echo "::error::Check the tag build in Actions, then re-run this workflow manually."
+                  exit 1
+
+            - name: Mint an installation token
+              id: app
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+              with:
+                  app-id: ${{ secrets.LSP_BUMP_APP_ID }}
+                  private-key: ${{ secrets.LSP_BUMP_APP_PRIVATE_KEY }}
+                  owner: surrealdb
+                  repositories: surrealql-vsx,surrealql-jetbrains,surrealql-zed
+
+            - name: Dispatch to the consumer repos
+              env:
+                  GH_TOKEN: ${{ steps.app.outputs.token }}
+                  TAG: ${{ steps.tag.outputs.tag }}
+              run: |
+                  failed=0
+                  for repo in surrealql-vsx surrealql-jetbrains surrealql-zed; do
+                      if gh api "repos/surrealdb/${repo}/dispatches" \
+                          --method POST \
+                          --field event_type=lsp-release \
+                          --field "client_payload[tag]=${TAG}"; then
+                          echo "Dispatched lsp-release (${TAG}) to surrealdb/${repo}."
+                      else
+                          echo "::error::Dispatch to surrealdb/${repo} failed."
+                          failed=$((failed + 1))
+                      fi
+                  done
+                  # One failed repo must not silently swallow the other two:
+                  # every dispatch is attempted, then the job reports honestly.
+                  exit "$failed"
