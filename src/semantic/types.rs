@@ -5,6 +5,7 @@ use ls_types::{Diagnostic, DocumentSymbol, Location, Range, SymbolKind, Uri};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Tree;
 
+use crate::semantic::text::LineIndex;
 use crate::semantic::type_expr::TypeExpr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -192,7 +193,6 @@ pub struct QueryFact {
     pub touched_fields: Vec<String>,
     pub dynamic: bool,
     pub location: Location,
-    pub source_preview: String,
     /// Tight token ranges for [`Self::target_tables`] entries.
     /// `#[serde(default)]` keeps previously-serialized facts loading.
     #[serde(default)]
@@ -225,6 +225,12 @@ pub struct DocumentAnalysis {
     /// foundation for incremental re-parsing once the server moves to
     /// incremental document sync.
     pub tree: Tree,
+    /// Line start offsets for [`Self::text`], built once per analysis so every
+    /// byte-offset-to-[`Position`] conversion is a binary search rather than a
+    /// scan from byte 0. Request handlers reuse it for cursor lookups too.
+    ///
+    /// [`Position`]: ls_types::Position
+    pub line_index: LineIndex,
     pub tables: Vec<TableDef>,
     pub events: Vec<EventDef>,
     pub indexes: Vec<IndexDef>,
@@ -293,6 +299,44 @@ pub struct MergedSemanticModel {
     pub inferred_function_returns: HashMap<String, TypeExpr>,
     pub workspace_symbols: Vec<DocumentSymbol>,
     pub query_facts: HashMap<Uri, Vec<QueryFact>>,
+    /// The field names defined on each table — the keys of [`Self::fields`]
+    /// grouped by their table half.
+    ///
+    /// Derived, and maintained by
+    /// [`MergedSemanticModel::insert_field`][insert_field] alongside
+    /// [`Self::fields`]. Insert through that method rather than writing to
+    /// `fields` directly, or a lookup will miss the field.
+    ///
+    /// Exists because `fields_for_table` filtered the whole field map on every
+    /// call, and `table_completion_items` calls it once per table.
+    ///
+    /// [insert_field]: MergedSemanticModel::insert_field
+    pub fields_by_table: HashMap<String, Vec<String>>,
+    /// How many query facts across the workspace target each table name.
+    ///
+    /// Derived from [`Self::query_facts`] by
+    /// [`MergedSemanticModel::reindex_target_usage`][reindex]. The
+    /// unknown-table check needs this per inferred target in the document being
+    /// diagnosed, and counting it on demand meant flattening every fact in the
+    /// workspace each time.
+    ///
+    /// [reindex]: MergedSemanticModel::reindex_target_usage
+    pub target_usage: HashMap<String, usize>,
+    /// The names of the *explicitly defined* tables — the only candidates a
+    /// "did you mean" sweep may offer.
+    ///
+    /// Derived, and maintained by
+    /// [`MergedSemanticModel::insert_table`][insert_table] alongside
+    /// [`Self::tables`]. Insert through that method rather than writing to
+    /// `tables` directly, or the sweep will not see the table.
+    ///
+    /// Exists because the sweep read `tables.values()` and filtered on
+    /// `explicit` afterwards. In a workspace where most tables are inferred from
+    /// usage that walks the whole map — thousands of ~230-byte entries streamed
+    /// to read one `bool` — to reach a candidate set a fraction of the size.
+    ///
+    /// [insert_table]: MergedSemanticModel::insert_table
+    pub explicit_tables: Vec<String>,
     /// True when the live-metadata fetch reported errors while this
     /// model was built — remote tables may be missing, so
     /// unknown-name judgments are unreliable until recovery.

@@ -65,6 +65,14 @@ cc = '1.2.56'
 [dev-dependencies]
 pretty_assertions = '1.4.1'
 
+# Latency benchmarks for the per-edit operations. `harness = false` keeps this
+# a plain `main`, so no benchmarking framework enters the dev-dependency graph
+# — that graph is shared with the wasm32 target. The binary exits non-zero when
+# a target in `docs/perf-plan.md` regresses, so CI can gate on `cargo bench`.
+[[bench]]
+name = 'latency'
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -52,6 +52,28 @@ constants together.
   only inspects a subtree sees a well-formed fragment. `has_broken_sibling`
   in `semantic::infer` exists for exactly this shape.
 
+- **A `SET` target cannot be a nested field.** `FieldAssignment` is
+  `seq($.Ident, alias($._assignmentOp, $.Operator), $._value)`, so the
+  assigned-to side is a *single* identifier. `CREATE person SET
+  name.first = 'John'` therefore reports ``Invalid SurrealQL syntax near
+  `.first`.`` on valid SurrealQL — the `.first` becomes an `ERROR` sibling
+  inside the `FieldAssignment`. The engine accepts nested targets, and
+  `DEFINE FIELD name.first ON person` already parses (that rule uses
+  `Idiom`), so a schema can declare a field that no `SET` can assign.
+
+  Fix is one token in `grammar.js` — `$.Ident` → `$.Idiom` in
+  `FieldAssignment` — and it regenerates with no new conflicts. Verified
+  against this repo's suite and the SurrealDB corpus sweep. It is a
+  *cross-repo* change: it lands in `surrealql-tree-sitter`, then the pin
+  moves here.
+
+  The analyzer already reads both shapes, so the pin can move without a
+  matching code change: `field_assignment_target` in
+  [`src/semantic/analyzer.rs`](../src/semantic/analyzer.rs) accepts an
+  `Ident` (pinned revision) or an `Idiom` (fixed revision). Note the
+  fixed grammar wraps *every* target in an `Idiom`, including the plain
+  `SET age = 29` case.
+
 - **An empty argument list is a field access.** `'abc'.slice(` parses as
   `Path(String, Subscript(Ident))` with the `(` left over as an `ERROR`
   sibling; only once an argument is typed does it become

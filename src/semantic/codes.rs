@@ -66,6 +66,43 @@ pub const FIELD_TYPE: &str = "field-type";
 /// `analysis.enable_type_checking` — see [`crate::semantic::type_name`].
 pub const UNKNOWN_TYPE: &str = "unknown-type";
 
+/// The codes whose behavior on a `SCHEMALESS` table the
+/// `analysis.schemalessDiagnostics` setting decides. Every other code is
+/// unconditional: it judges an expression, not the schema, so a loose schema
+/// says nothing about whether it is right.
+pub const SCHEMALESS_SCOPED_CODES: &[&str] = &[
+    UNKNOWN_FIELD,
+    PERMISSION_DENIED,
+    PERMISSION_UNKNOWN,
+    FIELD_TYPE,
+    UNKNOWN_TYPE,
+];
+
+/// Whether `code` is reported on a table declared `SCHEMALESS`, under the
+/// `analysis.schemalessDiagnostics` value `mode`.
+///
+/// Stated in the positive so one predicate drives both directions: the
+/// `unknown-field` check is an *allowlist* (it fires only where the schema is
+/// closed, [`crate::semantic::model`]), while the other four are emitted
+/// unconditionally and have to be filtered out.
+///
+/// `strict` answers `true` for everything — it is the opt-in that makes a
+/// `SCHEMALESS` table behave exactly like a `SCHEMAFULL` one. `errors` keeps
+/// only the two faults the engine itself raises: it coerces `DEFAULT`/`VALUE`/
+/// `COMPUTED` to the declared type regardless of schema mode ([`FIELD_TYPE`]),
+/// and it refuses to parse an unknown type name at all ([`UNKNOWN_TYPE`]).
+///
+/// An unrecognized `mode` answers as `quiet`, the default. `validate_and_repair`
+/// in [`crate::config`] already replaced it and warned, so this is unreachable
+/// in practice.
+pub fn reports_on_schemaless(code: &str, mode: &str) -> bool {
+    match mode {
+        "strict" => true,
+        "errors" => matches!(code, FIELD_TYPE | UNKNOWN_TYPE),
+        _ => false,
+    }
+}
+
 /// Wrap a code constant in the LSP `Diagnostic.code` representation.
 pub fn as_code(value: &str) -> Option<NumberOrString> {
     Some(NumberOrString::String(value.to_string()))
@@ -74,4 +111,47 @@ pub fn as_code(value: &str) -> Option<NumberOrString> {
 /// True when the diagnostic carries the given stable code.
 pub fn has_code(diagnostic: &ls_types::Diagnostic, code: &str) -> bool {
     matches!(&diagnostic.code, Some(NumberOrString::String(value)) if value == code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_reports_nothing_in_scope() {
+        for code in SCHEMALESS_SCOPED_CODES {
+            assert!(
+                !reports_on_schemaless(code, "quiet"),
+                "`{code}` must stay silent under `quiet`"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_reports_only_the_faults_the_engine_raises() {
+        assert!(reports_on_schemaless(FIELD_TYPE, "errors"));
+        assert!(reports_on_schemaless(UNKNOWN_TYPE, "errors"));
+        assert!(!reports_on_schemaless(UNKNOWN_FIELD, "errors"));
+        assert!(!reports_on_schemaless(PERMISSION_DENIED, "errors"));
+        assert!(!reports_on_schemaless(PERMISSION_UNKNOWN, "errors"));
+    }
+
+    #[test]
+    fn strict_reports_everything_in_scope() {
+        for code in SCHEMALESS_SCOPED_CODES {
+            assert!(
+                reports_on_schemaless(code, "strict"),
+                "`{code}` must report under `strict`"
+            );
+        }
+    }
+
+    /// An unknown value must not accidentally select `strict`; the config
+    /// layer repairs it to the default, and this is the belt-and-braces half.
+    #[test]
+    fn an_unknown_mode_behaves_as_quiet() {
+        for code in SCHEMALESS_SCOPED_CODES {
+            assert!(!reports_on_schemaless(code, "nonsense"));
+        }
+    }
 }

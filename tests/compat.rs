@@ -23,7 +23,7 @@ fn server_capabilities_golden() {
         "textDocumentSync": 1,
         "hoverProvider": true,
         "completionProvider": {
-            "resolveProvider": false,
+            "resolveProvider": true,
             "triggerCharacters": [".", ":", "<", "$", "("],
         },
         "signatureHelpProvider": {
@@ -244,6 +244,9 @@ fn default_settings_are_stable() {
     assert!(settings.analysis.enable_permission_analysis);
     assert!(settings.analysis.enable_aggressive_schema_inference);
     assert!(settings.analysis.enable_code_actions);
+    assert!(settings.analysis.enable_type_checking);
+    assert_eq!(settings.analysis.schemaless_diagnostics, "quiet");
+    assert_eq!(settings.analysis.max_syntax_diagnostics, 2000);
     assert_eq!(settings.active_auth_context.as_deref(), Some("viewer"));
     assert_eq!(settings.auth_contexts.len(), 1);
     assert_eq!(settings.auth_contexts[0].name, "viewer");

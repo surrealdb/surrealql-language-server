@@ -213,6 +213,10 @@ where
             Ok(params) => Outcome::from_value(core.completion(params).await),
             Err(error) => error,
         },
+        "completionItem/resolve" => match decode::<CompletionItem>(params) {
+            Ok(item) => Outcome::from_value(Some(core.completion_resolve(item).await)),
+            Err(error) => error,
+        },
         "textDocument/hover" => match decode::<HoverParams>(params) {
             Ok(params) => Outcome::from_value(core.hover(params).await),
             Err(error) => error,

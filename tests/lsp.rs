@@ -3,10 +3,13 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use surrealql_language_server::config::{AuthContext, ServerSettings};
-use surrealql_language_server::semantic::analyzer::analyze_document;
+use surrealql_language_server::semantic::analyzer::{
+    DEFAULT_MAX_SYNTAX_DIAGNOSTICS, analyze_document, analyze_document_with_limit,
+};
 use surrealql_language_server::semantic::model::{
     function_signature, is_record_type_context, param_label,
 };
+use surrealql_language_server::semantic::text::LineIndex;
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
     DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, MergedSemanticModel, PermissionMode,
@@ -342,12 +345,78 @@ fn pathological_input_caps_syntax_diagnostics() {
     let u = uri("pathological.surql");
     // Hundreds of broken statements — the cap keeps the problems
     // panel usable instead of publishing thousands of entries.
-    let text = "@@@ ;\n".repeat(500);
+    let text = "@@@ ;\n".repeat(5000);
     let analysis = analyze_document(u, &text, SymbolOrigin::Local).expect("analysis");
     assert!(
-        analysis.syntax_diagnostics.len() <= 100,
-        "syntax diagnostics must be capped at 100, got {}",
+        analysis.syntax_diagnostics.len() <= DEFAULT_MAX_SYNTAX_DIAGNOSTICS,
+        "syntax diagnostics must be capped at the default, got {}",
         analysis.syntax_diagnostics.len()
+    );
+}
+
+/// The cap counts diagnostics, not lines, and 100 was low enough that a large
+/// schema file mid-edit hit it and looked like the server had given up.
+#[test]
+fn the_default_cap_is_well_past_the_old_hundred() {
+    let text = "@@@ ;\n".repeat(500);
+    let analysis =
+        analyze_document(uri("many.surql"), &text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.len() > 100,
+        "the old cap of 100 must no longer bind, got {}",
+        analysis.syntax_diagnostics.len()
+    );
+}
+
+#[test]
+fn the_cap_is_configurable() {
+    let text = "@@@ ;\n".repeat(500);
+    let analysis = analyze_document_with_limit(uri("capped.surql"), &text, SymbolOrigin::Local, 7)
+        .expect("analysis");
+    assert_eq!(analysis.syntax_diagnostics.len(), 7);
+}
+
+/// `0` is the documented "report every one" value.
+#[test]
+fn a_zero_cap_reports_every_diagnostic() {
+    let text = "@@@ ;\n".repeat(500);
+    let capped = analyze_document_with_limit(uri("c.surql"), &text, SymbolOrigin::Local, 50)
+        .expect("analysis");
+    let uncapped = analyze_document_with_limit(uri("u.surql"), &text, SymbolOrigin::Local, 0)
+        .expect("analysis");
+    assert_eq!(capped.syntax_diagnostics.len(), 50);
+    assert!(
+        uncapped.syntax_diagnostics.len() > capped.syntax_diagnostics.len(),
+        "0 must not cap: got {}",
+        uncapped.syntax_diagnostics.len()
+    );
+}
+
+/// Nothing anywhere limits document *length* — a long but valid file is
+/// analyzed in full however many lines it has.
+///
+/// Kept to a few hundred statements because this is a correctness test and a
+/// bigger document proves nothing more. It used to be kept small out of
+/// necessity: `analyze_document` was quadratic in document length, because
+/// `offset_to_position` rescanned from byte 0 for every range. `LineIndex`
+/// removed that, and the cost is now linear — see `benches/latency.rs`.
+#[test]
+fn a_long_clean_document_is_fully_analyzed() {
+    let text = (0..300)
+        .map(|index| format!("DEFINE FIELD f{index} ON person TYPE string;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let analysis =
+        analyze_document(uri("long.surql"), &text, SymbolOrigin::Local).expect("analysis");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "a long valid document must produce no syntax diagnostics: {:?}",
+        &analysis.syntax_diagnostics[..analysis.syntax_diagnostics.len().min(3)]
+    );
+    assert_eq!(
+        analysis.fields.len(),
+        300,
+        "every field must be extracted regardless of document length"
     );
 }
 
@@ -699,6 +768,7 @@ fn hover_for_js_function_shows_javascript_badge() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -756,6 +826,7 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -812,6 +883,7 @@ fn hover_for_table_shows_schema_and_permissions() {
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
+            line_index: LineIndex::default(),
             tables: vec![TableDef {
                 name: "account".to_string(),
                 schema_mode: Some("schemafull".to_string()),
@@ -888,6 +960,7 @@ fn completion_includes_user_js_function() {
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
+            line_index: LineIndex::default(),
             tables: Vec::new(),
             events: Vec::new(),
             indexes: Vec::new(),
@@ -937,19 +1010,16 @@ fn completion_includes_keywords_and_builtins() {
 #[test]
 fn completion_in_record_type_context_shows_only_tables() {
     let mut model = MergedSemanticModel::default();
-    model.tables.insert(
-        "person".to_string(),
-        TableDef {
-            name: "person".to_string(),
-            schema_mode: Some("schemafull".to_string()),
-            comment: None,
-            permissions: Vec::new(),
-            origin: SymbolOrigin::Local,
-            explicit: true,
-            inference: None,
-            location: empty_location("schema.surql"),
-        },
-    );
+    model.insert_table(TableDef {
+        name: "person".to_string(),
+        schema_mode: Some("schemafull".to_string()),
+        comment: None,
+        permissions: Vec::new(),
+        origin: SymbolOrigin::Local,
+        explicit: true,
+        inference: None,
+        location: empty_location("schema.surql"),
+    });
     let items = model.completion_items("per", true, None, None, None);
     assert!(items.iter().any(|i| i.label == "person"));
     // Keywords should not appear in record type context
@@ -963,27 +1033,23 @@ fn completion_in_record_type_context_shows_only_tables() {
 #[test]
 fn completion_for_fields_scoped_to_statement_target_table() {
     let mut model = MergedSemanticModel::default();
-    model.fields.insert(
-        ("product".to_string(), "price".to_string()),
-        FieldDef {
-            table: "product".to_string(),
-            name: "price".to_string(),
-            type_expr: Some(TypeExpr::Scalar("number".to_string())),
-            comment: None,
-            permissions: Vec::new(),
-            origin: SymbolOrigin::Local,
-            explicit: true,
-            inference: None,
-            location: empty_location("schema.surql"),
-        },
-    );
+    model.insert_field(FieldDef {
+        table: "product".to_string(),
+        name: "price".to_string(),
+        type_expr: Some(TypeExpr::Scalar("number".to_string())),
+        comment: None,
+        permissions: Vec::new(),
+        origin: SymbolOrigin::Local,
+        explicit: true,
+        inference: None,
+        location: empty_location("schema.surql"),
+    });
     let fact = QueryFact {
         action: QueryAction::Select,
         target_tables: vec!["product".to_string()],
         touched_fields: Vec::new(),
         dynamic: false,
         location: empty_location("schema.surql"),
-        source_preview: "SELECT price FROM product".to_string(),
         target_refs: Vec::new(),
         field_refs: Vec::new(),
         target_resolution: TargetResolution::Static,
@@ -1012,11 +1078,12 @@ fn no_diagnostics_for_allowed_permission() {
         location: empty_location("schema.surql"),
     };
     let mut model = MergedSemanticModel::default();
-    model.tables.insert("thing".to_string(), table);
+    model.insert_table(table);
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1031,7 +1098,6 @@ fn no_diagnostics_for_allowed_permission() {
             touched_fields: Vec::new(),
             dynamic: false,
             location: empty_location("query.surql"),
-            source_preview: "SELECT * FROM thing".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -1066,11 +1132,12 @@ fn error_diagnostic_for_denied_permission() {
         location: empty_location("schema.surql"),
     };
     let mut model = MergedSemanticModel::default();
-    model.tables.insert("secret".to_string(), table);
+    model.insert_table(table);
     let analysis = DocumentAnalysis {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1085,7 +1152,6 @@ fn error_diagnostic_for_denied_permission() {
             touched_fields: Vec::new(),
             dynamic: false,
             location: empty_location("query.surql"),
-            source_preview: "CREATE secret".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -1114,6 +1180,7 @@ fn warning_for_unknown_table_in_query() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1128,7 +1195,6 @@ fn warning_for_unknown_table_in_query() {
             touched_fields: Vec::new(),
             dynamic: false,
             location: empty_location("query.surql"),
-            source_preview: "SELECT * FROM totally_unknown_table".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -1198,11 +1264,12 @@ fn role_based_permission_allowed_for_matching_context() {
         location: empty_location("schema.surql"),
     };
     let mut model = MergedSemanticModel::default();
-    model.tables.insert("orders".to_string(), table);
+    model.insert_table(table);
     let analysis = DocumentAnalysis {
         uri: u,
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1217,7 +1284,6 @@ fn role_based_permission_allowed_for_matching_context() {
             touched_fields: Vec::new(),
             dynamic: false,
             location: empty_location("query.surql"),
-            source_preview: "SELECT * FROM orders".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -1368,6 +1434,7 @@ fn local_function_overrides_remote() {
         uri: uri("remote.surql"),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1399,6 +1466,7 @@ fn local_function_overrides_remote() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: Vec::new(),
         events: Vec::new(),
         indexes: Vec::new(),
@@ -1441,14 +1509,18 @@ fn local_function_overrides_remote() {
 fn record_type_context_detected_mid_expression() {
     let source = "DEFINE FIELD owner ON TABLE event TYPE option<record<us";
     let pos = Position::new(0, source.len() as u32);
-    assert!(is_record_type_context(source, pos));
+    assert!(is_record_type_context(source, &LineIndex::new(source), pos));
 }
 
 #[test]
 fn record_type_context_not_detected_after_closing_angle() {
     let source = "DEFINE FIELD owner ON TABLE event TYPE option<record<user>> SELECT";
     let pos = Position::new(0, source.len() as u32);
-    assert!(!is_record_type_context(source, pos));
+    assert!(!is_record_type_context(
+        source,
+        &LineIndex::new(source),
+        pos
+    ));
 }
 
 #[test]
@@ -1461,6 +1533,7 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
             uri: u.clone(),
             text: String::new(),
             tree: tree_of(""),
+            line_index: LineIndex::default(),
             tables: vec![TableDef {
                 name: "invoice".to_string(),
                 schema_mode: None,
@@ -1530,6 +1603,7 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
         uri: u.clone(),
         text: String::new(),
         tree: tree_of(""),
+        line_index: LineIndex::default(),
         tables: vec![TableDef {
             name: "widget".to_string(),
             schema_mode: Some("schemafull".to_string()),
@@ -1856,7 +1930,10 @@ fn decode(tokens: Vec<SemanticToken>, source: &str) -> Vec<Tok> {
 }
 
 fn decode_tokens(source: &str) -> Vec<Tok> {
-    decode(collect_semantic_tokens(&tree_of(source), source), source)
+    decode(
+        collect_semantic_tokens(&tree_of(source), source, &LineIndex::new(source)),
+        source,
+    )
 }
 
 /// The first token whose text equals `needle`.
@@ -1946,7 +2023,7 @@ fn semantic_tokens_split_multiline_block_comment_per_line() {
 
 #[test]
 fn semantic_tokens_empty_for_blank_document() {
-    assert!(collect_semantic_tokens(&tree_of(""), "").is_empty());
+    assert!(collect_semantic_tokens(&tree_of(""), "", &LineIndex::new("")).is_empty());
 }
 
 // keyword=0 function=1 parameter=2 type=3 string=4 number=5 comment=6 variable=7
@@ -2010,7 +2087,7 @@ fn semantic_tokens_range_limits_to_viewport() {
     // Request only the middle line.
     let range = Range::new(Position::new(1, 0), Position::new(1, 9));
     let tokens = decode(
-        collect_semantic_tokens_range(&tree_of(source), source, range),
+        collect_semantic_tokens_range(&tree_of(source), source, &LineIndex::new(source), range),
         source,
     );
     let keywords: Vec<&str> = tokens
@@ -2155,12 +2232,42 @@ fn adversarial_fixture_resolves_select_targets() {
 /// Analyze `source`, build a one-document model, and return its semantic
 /// diagnostics.
 fn diagnostics_for(source: &str) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+    diagnostics_for_with(source, &ServerSettings::default())
+}
+
+/// Like [`diagnostics_for`], but under caller-chosen settings, and covering the
+/// syntax pass as well so `unknown-type` is visible. Mirrors what
+/// `diagnostics_for_document` assembles in `src/core/server.rs`, which is the
+/// only place the schemaless filter runs in the real server.
+fn diagnostics_for_with(
+    source: &str,
+    settings: &ServerSettings,
+) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
     let analysis =
         analyze_document(uri("check.surql"), source, SymbolOrigin::Local).expect("analysis");
     let workspace = workspace_from(vec![analysis.clone()]);
     let model = MergedSemanticModel::build(&workspace, &Default::default());
-    model.semantic_diagnostics(&analysis, &ServerSettings::default())
+    let mut diagnostics = analysis.syntax_diagnostics.clone();
+    diagnostics.extend(model.semantic_diagnostics(&analysis, settings));
+    model.apply_schemaless_policy(&mut diagnostics, settings);
+    diagnostics
 }
+
+fn settings_with_schemaless(mode: &str) -> ServerSettings {
+    let mut settings = ServerSettings::default();
+    settings.analysis.schemaless_diagnostics = mode.to_string();
+    settings
+}
+
+/// One SCHEMALESS table carrying every fault the policy governs: an ad-hoc
+/// field (`unknown-field`), a `DEFAULT` that cannot coerce (`field-type`), a
+/// type name the parser rejects (`unknown-type`), and a write with no
+/// permission rule (`permission-unknown`).
+const SCHEMALESS_FAULTS: &str = "DEFINE TABLE person SCHEMALESS;\n\
+     DEFINE FIELD name ON person TYPE string;\n\
+     DEFINE FIELD age ON person TYPE int DEFAULT \"not a number\";\n\
+     DEFINE FIELD tag ON person TYPE strng;\n\
+     CREATE person SET name = \"bob\", nickname = \"b\";";
 
 fn codes_of(diagnostics: &[tower_lsp_server::ls_types::Diagnostic]) -> Vec<String> {
     diagnostics
@@ -5152,4 +5259,205 @@ fn a_wrong_engine_declaration_is_corrected() {
         inferred_type_of("LET $h = crypto::sha256('tobie');", "$h"),
         "string"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// analysis.schemalessDiagnostics
+// ──────────────────────────────────────────────────────────────────────
+
+/// The default. A declared SCHEMALESS table is a statement that the author
+/// does not want the schema policed, so none of the scoped codes report.
+#[test]
+fn quiet_reports_nothing_on_a_schemaless_table() {
+    let codes = codes_of(&diagnostics_for_with(
+        SCHEMALESS_FAULTS,
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(
+        codes.is_empty(),
+        "`quiet` must silence every scoped code: {codes:?}"
+    );
+}
+
+/// The middle setting keeps the two faults the engine itself raises: it
+/// coerces DEFAULT to the declared type, and it refuses to parse an unknown
+/// type name at all.
+#[test]
+fn errors_keeps_only_the_faults_the_engine_raises() {
+    let codes = codes_of(&diagnostics_for_with(
+        SCHEMALESS_FAULTS,
+        &settings_with_schemaless("errors"),
+    ));
+    assert!(codes.contains(&"field-type".to_string()), "{codes:?}");
+    assert!(codes.contains(&"unknown-type".to_string()), "{codes:?}");
+    assert!(!codes.contains(&"unknown-field".to_string()), "{codes:?}");
+    assert!(
+        !codes.contains(&"permission-unknown".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// The opt-in: a SCHEMALESS table is checked exactly as a SCHEMAFULL one is,
+/// down to the same set of codes.
+#[test]
+fn strict_treats_a_schemaless_table_like_a_schemafull_one() {
+    let mut schemaless = codes_of(&diagnostics_for_with(
+        SCHEMALESS_FAULTS,
+        &settings_with_schemaless("strict"),
+    ));
+    let mut schemafull = codes_of(&diagnostics_for_with(
+        &SCHEMALESS_FAULTS.replace("SCHEMALESS", "SCHEMAFULL"),
+        &settings_with_schemaless("strict"),
+    ));
+    schemaless.sort();
+    schemafull.sort();
+    assert_eq!(schemaless, schemafull);
+    assert!(
+        schemaless.contains(&"unknown-field".to_string()),
+        "{schemaless:?}"
+    );
+    assert!(
+        schemaless.contains(&"permission-unknown".to_string()),
+        "{schemaless:?}"
+    );
+}
+
+/// The setting must not leak onto a closed schema: SCHEMAFULL keeps every
+/// diagnostic under every value, including the quiet default.
+#[test]
+fn a_schemafull_table_is_unaffected_by_the_setting() {
+    let source = SCHEMALESS_FAULTS.replace("SCHEMALESS", "SCHEMAFULL");
+    for mode in ["quiet", "errors", "strict"] {
+        let codes = codes_of(&diagnostics_for_with(
+            &source,
+            &settings_with_schemaless(mode),
+        ));
+        for expected in [
+            "unknown-field",
+            "field-type",
+            "unknown-type",
+            "permission-unknown",
+        ] {
+            assert!(
+                codes.contains(&expected.to_string()),
+                "SCHEMAFULL must keep `{expected}` under `{mode}`: {codes:?}"
+            );
+        }
+    }
+}
+
+/// The policy is keyed on the keyword, not on SurrealDB's effective schema
+/// mode. A bare `DEFINE TABLE` is schemaless to the engine but carries no
+/// declaration, so it keeps the behaviour it had before this setting existed.
+#[test]
+fn a_bare_define_table_is_not_treated_as_schemaless() {
+    let source = SCHEMALESS_FAULTS.replace(" SCHEMALESS", "");
+    let codes = codes_of(&diagnostics_for_with(
+        &source,
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(codes.contains(&"field-type".to_string()), "{codes:?}");
+    assert!(codes.contains(&"unknown-type".to_string()), "{codes:?}");
+    assert!(
+        codes.contains(&"permission-unknown".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// An `unknown-type` outside a DEFINE FIELD belongs to no table, so no schema
+/// mode can hide it however quiet the setting is.
+#[test]
+fn a_tableless_unknown_type_is_never_hidden() {
+    let codes = codes_of(&diagnostics_for_with(
+        "DEFINE TABLE person SCHEMALESS;\nLET $a: strng = 1;",
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(codes.contains(&"unknown-type".to_string()), "{codes:?}");
+}
+
+/// A DEFINE FIELD on a table with no DEFINE TABLE has no known schema mode,
+/// so nothing may be hidden on the strength of one.
+#[test]
+fn an_undeclared_table_hides_nothing() {
+    let codes = codes_of(&diagnostics_for_with(
+        "DEFINE FIELD age ON person TYPE int DEFAULT \"not a number\";",
+        &settings_with_schemaless("quiet"),
+    ));
+    assert!(codes.contains(&"field-type".to_string()), "{codes:?}");
+}
+
+/// `enablePermissionAnalysis` was accepted but never read before this change.
+#[test]
+fn disabling_permission_analysis_removes_permission_diagnostics() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\nCREATE person SET id = 1;";
+    let mut settings = ServerSettings::default();
+    assert!(
+        codes_of(&diagnostics_for_with(source, &settings))
+            .contains(&"permission-unknown".to_string()),
+        "the flag defaults to on"
+    );
+
+    settings.analysis.enable_permission_analysis = false;
+    let codes = codes_of(&diagnostics_for_with(source, &settings));
+    assert!(
+        !codes.contains(&"permission-unknown".to_string()),
+        "{codes:?}"
+    );
+    assert!(
+        !codes.contains(&"permission-denied".to_string()),
+        "{codes:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Nested `SET` targets (`SET name.first = …`)
+// ──────────────────────────────────────────────────────────────────────
+
+/// `FieldAssignment` at the pinned grammar revision takes a single `Ident`, so
+/// a nested target does not parse — see `docs/grammar-gaps.md`. The analyzer
+/// reads both shapes, so this test asserts the outcome for whichever grammar
+/// it is built against, and starts enforcing the fixed behaviour by itself the
+/// moment the pin moves.
+#[test]
+fn a_nested_set_target_is_extracted_whole_once_the_grammar_parses_it() {
+    let source = "UPDATE person SET name.first = 'Jane';";
+    let analysis =
+        analyze_document(uri("nested.surql"), source, SymbolOrigin::Local).expect("analysis");
+
+    if !analysis.syntax_diagnostics.is_empty() {
+        // Pinned grammar: the known gap. Pin the shape of the gap itself so
+        // this cannot quietly become a different failure.
+        assert!(
+            analysis
+                .syntax_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(".first")),
+            "the only expected parse failure here is the nested target: {:?}",
+            analysis.syntax_diagnostics
+        );
+        return;
+    }
+
+    let touched = &analysis.query_facts[0].touched_fields;
+    assert!(
+        touched.contains(&"name.first".to_string()),
+        "the target must be kept whole, not truncated to `name`: {touched:?}"
+    );
+}
+
+/// A plain single-identifier target must keep working under both grammars —
+/// the fixed one wraps it in an `Idiom`, which must not change what is read.
+#[test]
+fn a_plain_set_target_is_unaffected_by_the_target_shape() {
+    let source = "UPDATE person SET age = 29;";
+    let analysis =
+        analyze_document(uri("plain.surql"), source, SymbolOrigin::Local).expect("analysis");
+
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "{source} must parse"
+    );
+    assert_eq!(analysis.query_facts[0].touched_fields, vec!["age"]);
+    assert_eq!(analysis.fields.len(), 1);
+    assert_eq!(analysis.fields[0].name, "age");
 }

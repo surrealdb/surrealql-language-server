@@ -15,7 +15,7 @@ use crate::grammar::{
     builtin_signature,
 };
 use crate::semantic::codes;
-use crate::semantic::text::compact_preview;
+use crate::semantic::text::{LineIndex, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
@@ -52,6 +52,8 @@ impl MergedSemanticModel {
                 }
             }
         }
+
+        model.reindex_target_usage();
 
         let function_names = model.functions.keys().cloned().collect::<Vec<_>>();
         for name in function_names {
@@ -159,10 +161,14 @@ impl MergedSemanticModel {
     /// fields, params, etc). Use when the cursor is positioned in a slot
     /// that syntactically only accepts a table name (e.g. right after
     /// `SELECT * FROM `, `INSERT INTO `, `UPDATE `).
+    /// `_active_context` is unused now that the hover text is built in
+    /// [`Self::resolve_completion_item`], which reads the context itself. The
+    /// parameter stays so the call sites keep their shape, matching
+    /// [`Self::column_completion_items`].
     pub fn table_completion_items(
         &self,
         prefix: &str,
-        active_context: Option<&AuthContext>,
+        _active_context: Option<&AuthContext>,
     ) -> Vec<CompletionItem> {
         self.table_names_by_priority()
             .into_iter()
@@ -178,10 +184,12 @@ impl MergedSemanticModel {
                         .unwrap_or_else(|| "inferred".to_string()),
                     origin_label(table.origin)
                 )),
-                documentation: Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format_table_hover(table, self, active_context),
-                })),
+                // No `documentation` here. The client shows it for the one item
+                // the user highlights, and asks for it through
+                // `completionItem/resolve`; rendering the hover markdown for
+                // every table meant a schema-sized cost on every keystroke that
+                // opened the dropdown. `data` carries what resolve needs.
+                data: Some(serde_json::json!({ "table": table.name })),
                 sort_text: Some(format!(
                     "0-{}-{}",
                     symbol_priority(table.origin),
@@ -190,6 +198,33 @@ impl MergedSemanticModel {
                 ..CompletionItem::default()
             })
             .collect()
+    }
+
+    /// Fill in the documentation for one completion item, on demand.
+    ///
+    /// Returns the item unchanged when it carries no `data.table` — every other
+    /// completion kind still ships whatever it was built with.
+    pub fn resolve_completion_item(
+        &self,
+        mut item: CompletionItem,
+        active_context: Option<&AuthContext>,
+    ) -> CompletionItem {
+        if item.documentation.is_some() {
+            return item;
+        }
+        let table_name = item
+            .data
+            .as_ref()
+            .and_then(|data| data.get("table"))
+            .and_then(|name| name.as_str());
+        let Some(table) = table_name.and_then(|name| self.tables.get(name)) else {
+            return item;
+        };
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format_table_hover(table, self, active_context),
+        }));
+        item
     }
 
     /// The `DEFINE ANALYZER` names, for the slots that reference one.
@@ -217,11 +252,76 @@ impl MergedSemanticModel {
         items
     }
 
-    pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
-        let mut fields = self
+    /// Insert or merge one field, keeping [`MergedSemanticModel::fields_by_table`]
+    /// in step. This is the only correct way to add a field to the model.
+    pub fn insert_field(&mut self, field: FieldDef) {
+        let key = (field.table.clone(), field.name.clone());
+        let is_new = !self.fields.contains_key(&key);
+        let replace = self
             .fields
-            .values()
-            .filter(|field| field.table == table)
+            .get(&key)
+            .map(|current| should_replace_field(current, &field))
+            .unwrap_or(true);
+        if is_new {
+            self.fields_by_table
+                .entry(field.table.clone())
+                .or_default()
+                .push(field.name.clone());
+        }
+        if replace {
+            self.fields.insert(key, field);
+        }
+    }
+
+    /// Insert or merge one table, keeping
+    /// [`MergedSemanticModel::explicit_tables`] in step. This is the only
+    /// correct way to add a table to the model.
+    ///
+    /// A table's `explicit` flag only ever moves inferred → explicit — an
+    /// explicit definition replaces an inferred one but never the reverse, see
+    /// [`should_replace_table`] — so a name is appended at most once and never
+    /// has to be removed.
+    pub fn insert_table(&mut self, table: TableDef) {
+        let replace = self
+            .tables
+            .get(&table.name)
+            .map(|current| should_replace_table(current, &table))
+            .unwrap_or(true);
+        if !replace {
+            return;
+        }
+        let was_explicit = self
+            .tables
+            .get(&table.name)
+            .is_some_and(|current| current.explicit);
+        if table.explicit && !was_explicit {
+            self.explicit_tables.push(table.name.clone());
+        }
+        self.tables.insert(table.name.clone(), table);
+    }
+
+    /// Recount [`MergedSemanticModel::target_usage`] from
+    /// [`MergedSemanticModel::query_facts`]. One pass over the facts, run once
+    /// per build rather than once per inferred target.
+    pub fn reindex_target_usage(&mut self) {
+        self.target_usage.clear();
+        for fact in self.query_facts.values().flatten() {
+            for table in &fact.target_tables {
+                *self.target_usage.entry(table.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    pub fn fields_for_table(&self, table: &str) -> Vec<&FieldDef> {
+        // Only this table's fields, looked up by name, rather than a filter over
+        // every field in the workspace. The sort is unchanged: origin priority
+        // first so a local definition outranks an inferred one, then name.
+        let Some(names) = self.fields_by_table.get(table) else {
+            return Vec::new();
+        };
+        let mut fields = names
+            .iter()
+            .filter_map(|name| self.fields.get(&(table.to_string(), name.clone())))
             .collect::<Vec<_>>();
         fields.sort_by(|left, right| {
             symbol_priority(right.origin)
@@ -262,8 +362,9 @@ impl MergedSemanticModel {
     pub fn find_nearest_table(&self, unknown: &str) -> Option<&TableDef> {
         self.tables
             .values()
+            .filter(|table| can_reach_near_miss_threshold(unknown, &table.name))
             .map(|table| (table, jaro_winkler(unknown, &table.name)))
-            .filter(|(_, score)| *score > 0.86)
+            .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
             .max_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
@@ -283,7 +384,7 @@ impl MergedSemanticModel {
         position: Position,
         prefix: &str,
     ) -> Vec<CompletionItem> {
-        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
         let bindings = crate::semantic::infer::resolve_bindings(analysis, self);
         bindings
             .visible_at(offset)
@@ -321,7 +422,7 @@ impl MergedSemanticModel {
         position: Position,
         prefix: &str,
     ) -> Vec<CompletionItem> {
-        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
         let Some(dot) = method_dot_offset(&analysis.text, offset) else {
             return Vec::new();
         };
@@ -337,6 +438,7 @@ impl MergedSemanticModel {
                 let ctx = crate::semantic::infer::TypeCtx {
                     model: self,
                     source: &analysis.text,
+                    lines: &analysis.line_index,
                     bindings: &bindings,
                 };
                 crate::semantic::infer::infer_expr_type(node, &ctx)
@@ -416,7 +518,7 @@ impl MergedSemanticModel {
         token: &str,
         active_context: Option<&AuthContext>,
     ) -> Option<String> {
-        let offset = crate::semantic::text::position_to_offset(&analysis.text, position);
+        let offset = analysis.line_index.offset(&analysis.text, position);
 
         // A method resolves through its receiver, not through the global function
         // tables. This must run before `hover_markdown_for_token`, which sees only
@@ -443,6 +545,7 @@ impl MergedSemanticModel {
         let ctx = crate::semantic::infer::TypeCtx {
             model: self,
             source: &analysis.text,
+            lines: &analysis.line_index,
             bindings: &bindings,
         };
         let receiver_type = crate::semantic::infer::infer_expr_type(receiver, &ctx);
@@ -483,17 +586,23 @@ impl MergedSemanticModel {
     /// tables qualify as "did you mean" candidates — suggesting an
     /// inferred name would just echo another usage site back.
     fn find_nearest_explicit_table(&self, unknown: &str) -> Option<&TableDef> {
-        self.tables
-            .values()
-            .filter(|table| table.explicit && table.name != unknown)
-            .map(|table| (table, jaro_winkler(unknown, &table.name)))
-            .filter(|(_, score)| *score > 0.86)
+        // Over `explicit_tables`, not `tables.values()`. The candidates are a
+        // contiguous run of names; the alternative walked every inferred table
+        // in the workspace to discard it on the next line.
+        let best = self
+            .explicit_tables
+            .iter()
+            .filter(|name| name.as_str() != unknown)
+            .filter(|name| can_reach_near_miss_threshold(unknown, name))
+            .map(|name| (name, jaro_winkler(unknown, name)))
+            .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
             .max_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(table, _)| table)
+            .map(|(name, _)| name)?;
+        self.tables.get(best)
     }
 
     /// Like [`Self::find_nearest_explicit_table`], but restricted to
@@ -511,23 +620,27 @@ impl MergedSemanticModel {
     /// name used in several statements is a deliberate table, not a
     /// one-off typo.
     fn target_usage_count(&self, name: &str) -> usize {
-        self.query_facts
-            .values()
-            .flatten()
-            .filter(|fact| fact.target_tables.iter().any(|table| table == name))
-            .count()
+        self.target_usage.get(name).copied().unwrap_or(0)
     }
 
     /// Nearest explicitly defined field on `table` — the unknown-field
     /// "did you mean" candidate.
     fn find_nearest_explicit_field(&self, table: &str, unknown: &str) -> Option<&FieldDef> {
-        self.fields
+        // Via `fields_by_table` rather than a filter over every field in the
+        // workspace — the same reason `fields_for_table` uses it.
+        let names = self
+            .fields_by_table
+            .get(table)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        names
             .iter()
-            .filter(|((field_table, _), field)| {
-                field_table == table && field.explicit && field.name != unknown
-            })
-            .map(|(_, field)| (field, jaro_winkler(unknown, &field.name)))
-            .filter(|(_, score)| *score > 0.86)
+            .filter(|name| name.as_str() != unknown)
+            .filter(|name| can_reach_near_miss_threshold(unknown, name))
+            .filter_map(|name| self.fields.get(&(table.to_string(), name.clone())))
+            .filter(|field| field.explicit)
+            .map(|field| (field, jaro_winkler(unknown, &field.name)))
+            .filter(|(_, score)| *score > NEAR_MISS_THRESHOLD)
             .max_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
@@ -889,6 +1002,66 @@ impl MergedSemanticModel {
         items
     }
 
+    /// True when `table` is a declared `SCHEMALESS` table and the active
+    /// `analysis.schemalessDiagnostics` value says `code` must not be reported
+    /// on it.
+    ///
+    /// Deliberately keyed on the **keyword**, not on SurrealDB's effective
+    /// schema mode. A bare `DEFINE TABLE t` is schemaless to the engine, but it
+    /// leaves `schema_mode` unset, and this setting exists to honor a signal the
+    /// author wrote down. Writing `SCHEMALESS` is that signal; omitting the
+    /// clause is not. Keeping the two apart also leaves the checks on a bare
+    /// `DEFINE TABLE` exactly as they were before this setting existed.
+    ///
+    /// An unknown or inferred table answers `false`: nothing may be hidden on
+    /// the strength of a schema mode nobody declared.
+    pub fn schemaless_hides(&self, table: &str, code: &str, settings: &ServerSettings) -> bool {
+        let Some(table_def) = self.tables.get(table) else {
+            return false;
+        };
+        if !table_def.explicit || !is_schemaless(table_def) {
+            return false;
+        }
+        !codes::reports_on_schemaless(code, &settings.analysis.schemaless_diagnostics)
+    }
+
+    /// Drop the diagnostics that [`Self::schemaless_hides`] covers but that no
+    /// emission site could filter for itself.
+    ///
+    /// Only `unknown-type` needs this. It is raised by the syntax pass
+    /// ([`crate::semantic::analyzer`]), which reads one document and cannot see
+    /// the merged model, so it records the table it belongs to in
+    /// `Diagnostic.data` and the decision is deferred to here. Every other code
+    /// in [`codes::SCHEMALESS_SCOPED_CODES`] is filtered where it is emitted.
+    ///
+    /// This is a method on the model rather than a private helper in the server
+    /// so the diagnostic tests can exercise it without an LSP round trip.
+    pub fn apply_schemaless_policy(
+        &self,
+        diagnostics: &mut Vec<Diagnostic>,
+        settings: &ServerSettings,
+    ) {
+        // Cheap exit on the setting that changes nothing, so the common
+        // `strict` case does not walk the list at all.
+        if settings.analysis.schemaless_diagnostics == "strict" {
+            return;
+        }
+        diagnostics.retain(|diagnostic| {
+            if !codes::has_code(diagnostic, codes::UNKNOWN_TYPE) {
+                return true;
+            }
+            let Some(table) = diagnostic
+                .data
+                .as_ref()
+                .and_then(|data| data.get("table"))
+                .and_then(|value| value.as_str())
+            else {
+                return true;
+            };
+            !self.schemaless_hides(table, codes::UNKNOWN_TYPE, settings)
+        });
+    }
+
     pub fn semantic_diagnostics(
         &self,
         analysis: &DocumentAnalysis,
@@ -980,26 +1153,44 @@ impl MergedSemanticModel {
                 // `WHERE $auth.id = id`) that can't be evaluated
                 // without the actual record, so the diagnostics tend
                 // to be noisy false-positives in the editor.
-                if !matches!(fact.action, QueryAction::Select | QueryAction::Relate) {
+                if settings.analysis.enable_permission_analysis
+                    && !matches!(fact.action, QueryAction::Select | QueryAction::Relate)
+                {
                     let permission = self.evaluate_permissions(fact, table_def, active_context);
                     match permission.result {
-                        AccessResult::Denied => diagnostics.push(Diagnostic {
-                            range: table_range,
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: codes::as_code(codes::PERMISSION_DENIED),
-                            source: Some("surreal-language-server".to_string()),
-                            message: permission.message,
-                            ..Diagnostic::default()
-                        }),
-                        AccessResult::Unknown => diagnostics.push(Diagnostic {
-                            range: table_range,
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            code: codes::as_code(codes::PERMISSION_UNKNOWN),
-                            source: Some("surreal-language-server".to_string()),
-                            message: permission.message,
-                            ..Diagnostic::default()
-                        }),
-                        AccessResult::Allowed => {}
+                        AccessResult::Denied
+                            if !self.schemaless_hides(
+                                table,
+                                codes::PERMISSION_DENIED,
+                                settings,
+                            ) =>
+                        {
+                            diagnostics.push(Diagnostic {
+                                range: table_range,
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                code: codes::as_code(codes::PERMISSION_DENIED),
+                                source: Some("surreal-language-server".to_string()),
+                                message: permission.message,
+                                ..Diagnostic::default()
+                            })
+                        }
+                        AccessResult::Unknown
+                            if !self.schemaless_hides(
+                                table,
+                                codes::PERMISSION_UNKNOWN,
+                                settings,
+                            ) =>
+                        {
+                            diagnostics.push(Diagnostic {
+                                range: table_range,
+                                severity: Some(DiagnosticSeverity::WARNING),
+                                code: codes::as_code(codes::PERMISSION_UNKNOWN),
+                                source: Some("surreal-language-server".to_string()),
+                                message: permission.message,
+                                ..Diagnostic::default()
+                            })
+                        }
+                        _ => {}
                     }
                 }
 
@@ -1010,11 +1201,19 @@ impl MergedSemanticModel {
                 // target list mixes the subject tables with the edge
                 // table, so SET fields (which belong to the edge)
                 // would be checked against the wrong schemas.
-                let schemafull = table_def
-                    .schema_mode
-                    .as_deref()
-                    .is_some_and(|mode| mode.eq_ignore_ascii_case("schemafull"));
-                if !(table_def.explicit && schemafull) || fact.action == QueryAction::Relate {
+                //
+                // `analysis.schemalessDiagnostics: "strict"` opts a declared
+                // SCHEMALESS table into the same check. That is off by default
+                // precisely because an ad-hoc field there is legal SurrealQL —
+                // it exists for authors who treat their SCHEMALESS tables as
+                // closed by convention.
+                let closed_schema = is_schemafull(table_def)
+                    || (is_schemaless(table_def)
+                        && codes::reports_on_schemaless(
+                            codes::UNKNOWN_FIELD,
+                            &settings.analysis.schemaless_diagnostics,
+                        ));
+                if !(table_def.explicit && closed_schema) || fact.action == QueryAction::Relate {
                     continue;
                 }
                 for field in &fact.touched_fields {
@@ -1154,7 +1353,8 @@ impl MergedSemanticModel {
             // range, and the engine records the replacement, so the fix needs no
             // payload beyond the text already there.
             if codes::has_code(diagnostic, codes::RENAMED_FUNCTION)
-                && let Some(old) = text_in_range(&analysis.text, diagnostic.range)
+                && let Some(old) =
+                    text_in_range(&analysis.text, &analysis.line_index, diagnostic.range)
                 && let Some(current) = crate::grammar::renamed_builtin(old.trim())
             {
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
@@ -1389,7 +1589,7 @@ impl MergedSemanticModel {
         // with many overlapping definitions (saved + open + remote merged
         // together) this skips a lot of throwaway allocations.
         for table in &analysis.tables {
-            merge_table(&mut self.tables, table);
+            self.insert_table(table.clone());
         }
         for event in &analysis.events {
             merge_event(&mut self.events, event);
@@ -1398,7 +1598,7 @@ impl MergedSemanticModel {
             merge_index(&mut self.indexes, index);
         }
         for field in &analysis.fields {
-            merge_field(&mut self.fields, field);
+            self.insert_field(field.clone());
         }
         for function in &analysis.functions {
             merge_function(&mut self.functions, function);
@@ -1589,16 +1789,6 @@ fn unknown_type_payload(diagnostic: &Diagnostic) -> Option<(String, Option<Strin
     Some((name.to_string(), suggestion))
 }
 
-fn merge_table(target: &mut HashMap<String, TableDef>, candidate: &TableDef) {
-    let replace = target
-        .get(&candidate.name)
-        .map(|current| should_replace_table(current, candidate))
-        .unwrap_or(true);
-    if replace {
-        target.insert(candidate.name.clone(), candidate.clone());
-    }
-}
-
 fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: &EventDef) {
     if let Some(current) = target.get(&(candidate.table.clone(), candidate.name.clone())) {
         if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
@@ -1621,17 +1811,6 @@ fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: &Ind
         (candidate.table.clone(), candidate.name.clone()),
         candidate.clone(),
     );
-}
-
-fn merge_field(target: &mut HashMap<(String, String), FieldDef>, candidate: &FieldDef) {
-    let key = (candidate.table.clone(), candidate.name.clone());
-    let replace = target
-        .get(&key)
-        .map(|current| should_replace_field(current, candidate))
-        .unwrap_or(true);
-    if replace {
-        target.insert(key, candidate.clone());
-    }
 }
 
 fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: &FunctionDef) {
@@ -1691,6 +1870,139 @@ fn should_replace_table(current: &TableDef, candidate: &TableDef) -> bool {
     )
 }
 
+/// `(numerator, denominator)` of `3 * T(p) - 1`, indexed by the common-prefix
+/// length `p`, as exact rationals so the prefilter needs no floating point.
+///
+/// `T(p)` is the Jaro score a pair must exceed for jaro-winkler to clear
+/// [`NEAR_MISS_THRESHOLD`] given a prefix of `p`. See
+/// [`can_reach_near_miss_threshold`] for the derivation. `p` is capped at 4
+/// because that is the longest prefix Winkler rewards.
+/// The jaro-winkler score a name must exceed to be offered as a "did you mean"
+/// near-miss.
+///
+/// One constant rather than a literal per sweep: [`can_reach_near_miss_threshold`]
+/// derives its pruning bound from this number, so a sweep using a different gate
+/// would silently lose suggestions the prefilter had already discarded.
+pub const NEAR_MISS_THRESHOLD: f64 = 0.86;
+
+const JARO_REQUIREMENT: [(u64, u64); 5] = [
+    (79, 50), // p = 0 -> T = 43/50,  3T-1 = 79/50 = 1.58
+    (23, 15), // p = 1 -> T = 38/45,  3T-1 = 23/15 = 1.533
+    (59, 40), // p = 2 -> T = 33/40,  3T-1 = 59/40 = 1.475
+    (7, 5),   // p = 3 -> T =   4/5,  3T-1 =   7/5 = 1.4
+    (13, 10), // p = 4 -> T = 23/30,  3T-1 = 13/10 = 1.3
+];
+
+/// Whether jaro-winkler *could* score two names above [`NEAR_MISS_THRESHOLD`].
+///
+/// Cheap, and sound: it never rejects a pair the full comparison would have
+/// accepted, so it changes which suggestions are *found* not at all — only how
+/// long it takes to not find them. `can_reach_near_miss_threshold_is_sound`
+/// checks that against `strsim` itself over a generated corpus.
+///
+/// # Derivation
+///
+/// Winkler is `JW = J + 0.1 * p * (1 - J)` where `p = min(4, common prefix)`.
+/// For a fixed `p` that is strictly increasing in `J` (the slope is
+/// `1 - 0.1p >= 0.6`), so
+///
+/// ```text
+/// JW > 0.86  <=>  J > T(p) = (0.86 - 0.1p) / (1 - 0.1p)
+/// ```
+///
+/// Jaro is `(m/a + m/b + (m-t)/m) / 3` for `m` matches and `t` transpositions.
+/// Since `t >= 0` the third term is at most 1, so a pair can only pass if
+///
+/// ```text
+/// m * (a + b) > (3 * T(p) - 1) * a * b
+/// ```
+///
+/// Two upper bounds on `m` make that testable without running Jaro. Both bound
+/// the *maximum* matching, and `strsim`'s greedy first-match rule finds no more
+/// than the maximum, so both are safe:
+///
+/// * `m <= min(a, b)` — the length-ratio stage, which reduces to
+///   `min / max > 3 * T(p) - 2`. Cheapest, and rejects the pathological
+///   two-character-against-thirty case.
+/// * `m <= sum over characters of min(count_a[c], count_b[c])` — the multiset
+///   stage. A Jaro match pairs equal characters and uses each position once, so
+///   per character class it cannot exceed the smaller count.
+///
+/// # Why the prefix has to be exact
+///
+/// Assuming the *worst-case* prefix (`p = 4`) collapses the requirement to the
+/// weakest row and makes the filter useless: it keeps 100% of a real workload
+/// where the exact-`p` version keeps 0.4%. Names that share no prefix face
+/// `T(0) = 0.86` rather than `T(4) = 0.767`, which is what does the pruning.
+///
+/// Note that a bound on the *difference* of the lengths is **not** available at
+/// any `p`: `person` and `personaddress` differ by 7 characters and still score
+/// 0.892.
+fn can_reach_near_miss_threshold(unknown: &str, candidate: &str) -> bool {
+    let (a, b) = (unknown.len() as u64, candidate.len() as u64);
+    if a == 0 || b == 0 {
+        return false;
+    }
+
+    // Byte lengths, and byte-wise prefix, rather than characters. For non-ASCII
+    // input the byte length is >= the character count and the byte prefix is
+    // <= the character prefix, and both errors loosen the bound, so the filter
+    // stays sound. Identifier names are ASCII in practice.
+    let prefix = unknown
+        .as_bytes()
+        .iter()
+        .zip(candidate.as_bytes())
+        .take(4)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let (numerator, denominator) = JARO_REQUIREMENT[prefix];
+
+    // Stage 1, `min / max > 3T(p) - 2`, i.e.
+    // `min * denominator > (numerator - denominator) * max`.
+    let (shorter, longer) = if a <= b { (a, b) } else { (b, a) };
+    if shorter * denominator <= (numerator - denominator) * longer {
+        return false;
+    }
+
+    // Stage 2, `m * (a + b) > (3T(p) - 1) * a * b` with `m` bounded by the
+    // character-multiset intersection.
+    let matchable = multiset_intersection(unknown, candidate);
+    matchable * (a + b) * denominator > numerator * a * b
+}
+
+/// The size of the character-multiset intersection: an upper bound on how many
+/// characters Jaro could possibly match.
+///
+/// Case-sensitive, because `jaro_winkler` is. Folding both sides would still be
+/// sound (it can only raise the bound) but would prune less.
+fn multiset_intersection(left: &str, right: &str) -> u64 {
+    // ASCII identifiers are the overwhelming case, so count bytes into a fixed
+    // table and avoid a map allocation. Anything non-ASCII lands in one shared
+    // bucket, which over-counts and therefore only loosens the bound.
+    let mut counts = [0i32; 129];
+    const OTHER: usize = 128;
+    for byte in left.bytes() {
+        counts[if byte.is_ascii() {
+            byte as usize
+        } else {
+            OTHER
+        }] += 1;
+    }
+    let mut shared = 0u64;
+    for byte in right.bytes() {
+        let slot = if byte.is_ascii() {
+            byte as usize
+        } else {
+            OTHER
+        };
+        if counts[slot] > 0 {
+            counts[slot] -= 1;
+            shared += 1;
+        }
+    }
+    shared
+}
+
 fn should_replace_field(current: &FieldDef, candidate: &FieldDef) -> bool {
     replacement_score(
         candidate.explicit,
@@ -1743,6 +2055,25 @@ fn symbol_priority(origin: SymbolOrigin) -> usize {
         SymbolOrigin::Inferred => 2,
         SymbolOrigin::Builtin => 1,
     }
+}
+
+/// True when the table declares `SCHEMAFULL`. The schema is closed, so a field
+/// with no `DEFINE FIELD` is a fault.
+fn is_schemafull(table: &TableDef) -> bool {
+    table
+        .schema_mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("schemafull"))
+}
+
+/// True when the table declares `SCHEMALESS`. An absent clause is *not*
+/// schemaless here — see [`MergedSemanticModel::schemaless_hides`] for why the
+/// keyword and the engine's effective mode are kept apart.
+fn is_schemaless(table: &TableDef) -> bool {
+    table
+        .schema_mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("schemaless"))
 }
 
 fn format_table_hover(
@@ -1879,9 +2210,13 @@ fn format_builtin_function_hover(function: &BuiltinFunction, token: &str) -> Str
 /// what we honestly have. Better than the nothing this used to return for 18 of
 /// the 20 advertised namespaces.
 /// The source text an LSP range covers.
-fn text_in_range(source: &str, range: ls_types::Range) -> Option<&str> {
-    let start = crate::semantic::text::position_to_offset(source, range.start);
-    let end = crate::semantic::text::position_to_offset(source, range.end);
+fn text_in_range<'a>(
+    source: &'a str,
+    lines: &LineIndex,
+    range: ls_types::Range,
+) -> Option<&'a str> {
+    let start = lines.offset(source, range.start);
+    let end = lines.offset(source, range.end);
     source.get(start..end)
 }
 
@@ -2245,8 +2580,8 @@ fn normalize_completion_table_name(value: &str) -> Option<String> {
     }
 }
 
-pub fn is_record_type_context(source: &str, position: Position) -> bool {
-    let prefix = &source[..crate::semantic::text::position_to_offset(source, position)];
+pub fn is_record_type_context(source: &str, lines: &LineIndex, position: Position) -> bool {
+    let prefix = &source[..lines.offset(source, position)];
     prefix
         .rsplit_once("record<")
         .map(|(_, suffix)| !suffix.contains('>'))
@@ -2299,9 +2634,13 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use ls_types::{DiagnosticSeverity, Location, Position, Range, Uri};
+    use ls_types::{
+        CompletionItem, DiagnosticSeverity, Documentation, Location, MarkupKind, Position, Range,
+        Uri,
+    };
 
     use crate::config::{AuthContext, ServerSettings};
+    use crate::semantic::text::LineIndex;
     use crate::semantic::types::{
         DocumentAnalysis, EventDef, FunctionDef, IndexDef, PermissionMode, PermissionRule,
         QueryAction, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
@@ -2346,6 +2685,7 @@ mod tests {
             uri,
             text: String::new(),
             tree: empty_tree(),
+            line_index: LineIndex::default(),
             tables: vec![inferred, explicit.clone()],
             events: Vec::new(),
             indexes: Vec::new(),
@@ -2403,7 +2743,7 @@ mod tests {
             ),
         };
         let mut model = MergedSemanticModel::default();
-        model.tables.insert("person".to_string(), table);
+        model.insert_table(table);
         let fact = crate::semantic::types::QueryFact {
             action: QueryAction::Select,
             target_tables: vec!["person".to_string()],
@@ -2413,7 +2753,6 @@ mod tests {
                 Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 Range::default(),
             ),
-            source_preview: "SELECT * FROM person".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -2423,6 +2762,7 @@ mod tests {
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -2468,13 +2808,14 @@ mod tests {
             ),
         };
         let mut model = MergedSemanticModel::default();
-        model.tables.insert("person".to_string(), table);
+        model.insert_table(table);
 
         let diagnostics = model.semantic_diagnostics(
             &DocumentAnalysis {
                 uri: Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -2492,7 +2833,6 @@ mod tests {
                         Uri::from_str("file:///workspace/query.surql").expect("valid uri"),
                         Range::default(),
                     ),
-                    source_preview: "CREATE person".to_string(),
                     target_refs: Vec::new(),
                     field_refs: Vec::new(),
                     target_resolution: TargetResolution::Static,
@@ -2552,7 +2892,7 @@ mod tests {
             ),
         };
         let mut model = MergedSemanticModel::default();
-        model.tables.insert("person".to_string(), person);
+        model.insert_table(person);
 
         let analysis_uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
         let make_fact = |action: QueryAction| crate::semantic::types::QueryFact {
@@ -2561,7 +2901,6 @@ mod tests {
             touched_fields: Vec::new(),
             dynamic: false,
             location: Location::new(analysis_uri.clone(), Range::default()),
-            source_preview: String::new(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -2572,6 +2911,7 @@ mod tests {
                 uri: analysis_uri.clone(),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: Vec::new(),
                 events: Vec::new(),
                 indexes: Vec::new(),
@@ -2607,6 +2947,7 @@ mod tests {
                 uri: uri.clone(),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
@@ -2655,6 +2996,7 @@ mod tests {
                 uri: Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 text: String::new(),
                 tree: empty_tree(),
+                line_index: LineIndex::default(),
                 tables: vec![TableDef {
                     name: "person".to_string(),
                     schema_mode: Some("schemafull".to_string()),
@@ -2690,6 +3032,7 @@ mod tests {
             uri: uri.clone(),
             text: String::new(),
             tree: empty_tree(),
+            line_index: LineIndex::default(),
             tables: vec![TableDef {
                 name: "person".to_string(),
                 schema_mode: Some("schemafull".to_string()),
@@ -2836,38 +3179,32 @@ mod tests {
     fn completion_items_include_statement_fields_for_select_update_create() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
-        model.fields.insert(
-            ("person".to_string(), "email".to_string()),
-            crate::semantic::types::FieldDef {
-                table: "person".to_string(),
-                name: "email".to_string(),
-                type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
-                    "string".to_string(),
-                )),
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
-        model.fields.insert(
-            ("company".to_string(), "email".to_string()),
-            crate::semantic::types::FieldDef {
-                table: "company".to_string(),
-                name: "email".to_string(),
-                type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
-                    "string".to_string(),
-                )),
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
+        model.insert_field(crate::semantic::types::FieldDef {
+            table: "person".to_string(),
+            name: "email".to_string(),
+            type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                "string".to_string(),
+            )),
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
+        model.insert_field(crate::semantic::types::FieldDef {
+            table: "company".to_string(),
+            name: "email".to_string(),
+            type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                "string".to_string(),
+            )),
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
 
         let single_table = crate::semantic::types::QueryFact {
             action: QueryAction::Select,
@@ -2875,7 +3212,6 @@ mod tests {
             touched_fields: Vec::new(),
             dynamic: false,
             location: Location::new(uri.clone(), Range::default()),
-            source_preview: "SELECT email FROM person".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -2897,7 +3233,6 @@ mod tests {
             touched_fields: Vec::new(),
             dynamic: false,
             location: Location::new(uri.clone(), Range::default()),
-            source_preview: "SELECT * FROM person, company".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -2924,19 +3259,16 @@ mod tests {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
         // Tables and functions should NOT leak into the column-only output.
-        model.tables.insert(
-            "person".to_string(),
-            TableDef {
-                name: "person".to_string(),
-                schema_mode: Some("schemafull".to_string()),
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
+        model.insert_table(TableDef {
+            name: "person".to_string(),
+            schema_mode: Some("schemafull".to_string()),
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
         model.functions.insert(
             "fn::greet".to_string(),
             FunctionDef {
@@ -2956,22 +3288,19 @@ mod tests {
             },
         );
         for field_name in ["email", "name"] {
-            model.fields.insert(
-                ("person".to_string(), field_name.to_string()),
-                crate::semantic::types::FieldDef {
-                    table: "person".to_string(),
-                    name: field_name.to_string(),
-                    type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
-                        "string".to_string(),
-                    )),
-                    comment: None,
-                    permissions: Vec::new(),
-                    origin: SymbolOrigin::Local,
-                    explicit: true,
-                    inference: None,
-                    location: Location::new(uri.clone(), Range::default()),
-                },
-            );
+            model.insert_field(crate::semantic::types::FieldDef {
+                table: "person".to_string(),
+                name: field_name.to_string(),
+                type_expr: Some(crate::semantic::type_expr::TypeExpr::Scalar(
+                    "string".to_string(),
+                )),
+                comment: None,
+                permissions: Vec::new(),
+                origin: SymbolOrigin::Local,
+                explicit: true,
+                inference: None,
+                location: Location::new(uri.clone(), Range::default()),
+            });
         }
 
         let items = model.column_completion_items("", &["person".to_string()], false, None);
@@ -2997,20 +3326,17 @@ mod tests {
     fn field_sort_text_puts_fields_above_functions_in_loose_mode() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
-        model.fields.insert(
-            ("person".to_string(), "email".to_string()),
-            crate::semantic::types::FieldDef {
-                table: "person".to_string(),
-                name: "email".to_string(),
-                type_expr: None,
-                comment: None,
-                permissions: Vec::new(),
-                origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(uri.clone(), Range::default()),
-            },
-        );
+        model.insert_field(crate::semantic::types::FieldDef {
+            table: "person".to_string(),
+            name: "email".to_string(),
+            type_expr: None,
+            comment: None,
+            permissions: Vec::new(),
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(uri.clone(), Range::default()),
+        });
         model.functions.insert(
             "fn::greet".to_string(),
             FunctionDef {
@@ -3039,7 +3365,6 @@ mod tests {
                 Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
                 Range::default(),
             ),
-            source_preview: "SELECT email FROM person".to_string(),
             target_refs: Vec::new(),
             field_refs: Vec::new(),
             target_resolution: TargetResolution::Static,
@@ -3090,42 +3415,254 @@ mod tests {
         assert!(model.rename_edits("fn::remote", "fn::renamed").is_none());
     }
 
+    /// A table item ships without documentation, and resolve puts back exactly
+    /// what the eager version used to inline. Without this, moving the hover
+    /// text behind `completionItem/resolve` would read as a speed-up while
+    /// quietly dropping the documentation.
+    #[test]
+    fn resolve_restores_the_documentation_the_item_ships_without() {
+        let (model, _) = model_with_person_table();
+
+        let items = model.table_completion_items("", None);
+        let item = items
+            .iter()
+            .find(|item| item.label == "person")
+            .expect("person is offered")
+            .clone();
+        assert!(
+            item.documentation.is_none(),
+            "the item must not carry documentation before resolve"
+        );
+
+        let resolved = model.resolve_completion_item(item, None);
+        let Some(Documentation::MarkupContent(markup)) = resolved.documentation else {
+            panic!("resolve did not attach markdown documentation");
+        };
+        assert_eq!(markup.kind, MarkupKind::Markdown);
+        assert_eq!(
+            markup.value,
+            super::format_table_hover(model.tables.get("person").expect("present"), &model, None),
+            "resolve must produce the same text the eager version inlined"
+        );
+    }
+
+    /// An item that is not a table, or already carries documentation, comes back
+    /// untouched. A resolve that dropped fields would break the client.
+    #[test]
+    fn resolve_leaves_other_items_alone() {
+        let (model, _) = model_with_person_table();
+
+        let keyword = CompletionItem {
+            label: "SELECT".to_string(),
+            ..CompletionItem::default()
+        };
+        assert_eq!(
+            model.resolve_completion_item(keyword.clone(), None),
+            keyword
+        );
+
+        let already = CompletionItem {
+            label: "person".to_string(),
+            documentation: Some(Documentation::String("kept".to_string())),
+            data: Some(serde_json::json!({ "table": "person" })),
+            ..CompletionItem::default()
+        };
+        assert_eq!(
+            model.resolve_completion_item(already.clone(), None),
+            already,
+            "an item that already has documentation must not be rewritten"
+        );
+    }
+
+    /// The prefilter must never reject a pair `jaro_winkler` would have scored
+    /// above the gate, over a corpus wide enough to catch a wrong inequality.
+    ///
+    /// This is the same oracle pattern as the `LineIndex` tests: `strsim` is the
+    /// specification, and the fast path has to agree with it. A rejection above
+    /// the threshold is a silently lost "did you mean" suggestion, which is why
+    /// this sweeps thousands of pairs rather than a handful of named ones.
+    #[test]
+    fn the_prefilter_never_rejects_a_pair_above_the_threshold() {
+        // Deliberately dense in near-misses: a tiny alphabet produces many pairs
+        // that genuinely score above 0.86, so the test has something to catch.
+        let alphabet = ["a", "b", "c", "_", "0"];
+        let mut names: Vec<String> = Vec::new();
+        for len in 2..=6 {
+            for seed in 0..90u32 {
+                let mut name = String::new();
+                let mut value = seed;
+                for _ in 0..len {
+                    name.push_str(alphabet[(value % alphabet.len() as u32) as usize]);
+                    value /= alphabet.len() as u32;
+                }
+                names.push(name);
+            }
+        }
+        // Plus realistic identifiers, including the abbreviation shapes.
+        for extra in [
+            "person",
+            "persn",
+            "prson",
+            "persons",
+            "personaddress",
+            "user",
+            "userdata",
+            "username",
+            "acct",
+            "accounts",
+            "order",
+            "orders",
+            "oders",
+            "address",
+            "addres",
+            "item",
+            "itemvariant",
+            "product",
+            "prodcut",
+            "id",
+            "customer_billing_address_line",
+            "str",
+            "string",
+            "rec",
+            "record",
+        ] {
+            names.push(extra.to_string());
+        }
+
+        let mut above_threshold = 0usize;
+        let mut rejected = 0usize;
+        for unknown in &names {
+            for candidate in &names {
+                if unknown == candidate {
+                    continue;
+                }
+                let score = strsim::jaro_winkler(unknown, candidate);
+                let kept = super::can_reach_near_miss_threshold(unknown, candidate);
+                if score > super::NEAR_MISS_THRESHOLD {
+                    above_threshold += 1;
+                    assert!(
+                        kept,
+                        "prefilter rejected {unknown:?} vs {candidate:?}, which scores {score:.4}"
+                    );
+                }
+                if !kept {
+                    rejected += 1;
+                }
+            }
+        }
+
+        // The corpus has to actually contain near-misses, or the assertion above
+        // is vacuous, and the filter has to actually reject things, or it is not
+        // doing any work.
+        assert!(
+            above_threshold > 500,
+            "corpus produced only {above_threshold} pairs above the threshold — too few to prove anything"
+        );
+        assert!(
+            rejected > 1000,
+            "prefilter rejected only {rejected} pairs — it is not pruning"
+        );
+    }
+
+    /// The prefilter has to prune the shape that made the sweep slow: names that
+    /// share most of their characters but no prefix.
+    #[test]
+    fn the_prefilter_prunes_names_that_share_no_prefix() {
+        let unknowns: Vec<String> = (0..20).map(|t| format!("undeclared_d0_t{t}")).collect();
+        let candidates: Vec<String> = (0..200)
+            .flat_map(|d| (0..5).map(move |t| format!("real_d{d}_t{t}")))
+            .collect();
+
+        let total = unknowns.len() * candidates.len();
+        let surviving = unknowns
+            .iter()
+            .flat_map(|unknown| candidates.iter().map(move |candidate| (unknown, candidate)))
+            .filter(|(unknown, candidate)| super::can_reach_near_miss_threshold(unknown, candidate))
+            .count();
+
+        // None of these pairs is a genuine near-miss, so every survivor is
+        // wasted work. The prefix is what does the pruning: `u` against `r`
+        // means p = 0, which demands a much higher Jaro score.
+        assert!(
+            surviving * 100 < total,
+            "{surviving} of {total} pairs survived; the prefilter must drop over 99%"
+        );
+    }
+
+    /// The length prefilter must never reject a pair that jaro-winkler would
+    /// have scored above the gate. The named pairs are the trap: they differ in
+    /// length by 4 to 7 characters and still score above 0.86, so a prefilter
+    /// keyed on the *difference* of the lengths would drop real near-misses.
+    #[test]
+    fn the_length_prefilter_never_rejects_a_real_near_miss() {
+        let pairs = [
+            ("user", "userdata"),
+            ("user", "username"),
+            ("acct", "accounts"),
+            ("item", "itemvariant"),
+            ("person", "personaddress"),
+            ("persn", "person"),
+            ("oders", "orders"),
+        ];
+        for (unknown, candidate) in pairs {
+            let score = strsim::jaro_winkler(unknown, candidate);
+            if score > super::NEAR_MISS_THRESHOLD {
+                assert!(
+                    super::can_reach_near_miss_threshold(unknown, candidate),
+                    "prefilter rejected {unknown:?} vs {candidate:?}, which scores {score:.3}"
+                );
+            }
+        }
+    }
+
+    /// It does still reject the hopeless case, or it would not be worth having.
+    #[test]
+    fn the_length_prefilter_rejects_a_hopeless_pair() {
+        assert!(!super::can_reach_near_miss_threshold(
+            "id",
+            "customer_billing_address_line"
+        ));
+        assert!(super::can_reach_near_miss_threshold("person", "persons"));
+    }
+
     #[test]
     fn detects_nested_record_type_context() {
         let source = "DEFINE FIELD friends ON TABLE person TYPE array<record<per";
         let position = Position::new(0, source.len() as u32);
-        assert!(is_record_type_context(source, position));
+        assert!(is_record_type_context(
+            source,
+            &LineIndex::new(source),
+            position
+        ));
     }
 
     fn model_with_person_table() -> (MergedSemanticModel, DocumentAnalysis) {
         let uri = Uri::from_str("file:///workspace/query.surql").expect("valid uri");
         let mut model = MergedSemanticModel::default();
-        model.tables.insert(
-            "person".to_string(),
-            TableDef {
-                name: "person".to_string(),
-                schema_mode: None,
-                comment: None,
-                permissions: vec![PermissionRule {
-                    actions: vec![QueryAction::Select],
-                    mode: PermissionMode::Full,
-                    raw: "PERMISSIONS FULL".to_string(),
-                    origin: SymbolOrigin::Local,
-                    location: None,
-                }],
+        model.insert_table(TableDef {
+            name: "person".to_string(),
+            schema_mode: None,
+            comment: None,
+            permissions: vec![PermissionRule {
+                actions: vec![QueryAction::Select],
+                mode: PermissionMode::Full,
+                raw: "PERMISSIONS FULL".to_string(),
                 origin: SymbolOrigin::Local,
-                explicit: true,
-                inference: None,
-                location: Location::new(
-                    Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
-                    Range::default(),
-                ),
-            },
-        );
+                location: None,
+            }],
+            origin: SymbolOrigin::Local,
+            explicit: true,
+            inference: None,
+            location: Location::new(
+                Uri::from_str("file:///workspace/schema.surql").expect("valid uri"),
+                Range::default(),
+            ),
+        });
         let analysis = DocumentAnalysis {
             uri,
             text: String::new(),
             tree: empty_tree(),
+            line_index: LineIndex::default(),
             tables: Vec::new(),
             events: Vec::new(),
             indexes: Vec::new(),

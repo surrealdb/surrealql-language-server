@@ -27,6 +27,17 @@ pub struct ServerState {
     pub workspace_folders: Vec<PathBuf>,
     pub saved_workspace: Arc<WorkspaceIndex>,
     pub open_documents: HashMap<Uri, Arc<DocumentAnalysis>>,
+    /// The newest `didChange` version seen for each open document.
+    ///
+    /// Two things read it. The debounce uses it to decide whether the edit it
+    /// waited for is still the newest one, and the publish step uses it to drop
+    /// a result computed from text the client has already replaced. Without it,
+    /// running the analysis off the reactor would let an older version finish
+    /// last and overwrite a newer one.
+    ///
+    /// `didOpen` does not record a version: it is never delayed, so there is
+    /// nothing to supersede.
+    pub document_versions: HashMap<Uri, i32>,
     pub live_metadata: Arc<LiveMetadataSnapshot>,
     pub model: Arc<MergedSemanticModel>,
     /// Fingerprint of the last successful workspace walk. When the new

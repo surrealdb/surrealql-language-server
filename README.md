@@ -146,6 +146,65 @@ cargo test
 
 The server communicates over `stdio` and works with any LSP-compatible editor.
 
+### Settings
+
+Settings arrive via `initializationOptions` or `workspace/didChangeConfiguration`,
+either under a `surrealql` key or at the root. Every key accepts both `camelCase`
+and `snake_case`. An unknown key is reported through `window/logMessage` with a
+did-you-mean suggestion rather than ignored.
+
+#### `analysis.schemalessDiagnostics`
+
+Decides which diagnostics apply to a table declared `SCHEMALESS`, where ad-hoc
+fields are legal SurrealQL.
+
+| Value | Behavior |
+| --- | --- |
+| `quiet` *(default)* | Report none of `unknown-field`, `field-type`, `unknown-type`, `permission-denied`, `permission-unknown` on such a table. |
+| `errors` | Report only `field-type` and `unknown-type` — the two faults SurrealDB itself raises. The advisory three stay quiet. |
+| `strict` | No exemption: check a `SCHEMALESS` table exactly as a `SCHEMAFULL` one. |
+
+```jsonc
+{ "surrealql": { "analysis": { "schemalessDiagnostics": "errors" } } }
+```
+
+`errors` is worth preferring over the default if you want a quiet editor without
+hiding real failures. SurrealDB coerces `DEFAULT`, `VALUE` and `COMPUTED` to the
+declared type on a `SCHEMALESS` table too, and it refuses to parse an unknown
+type name at all — so under `quiet` a file that always fails can look clean.
+
+The setting keys on the **keyword**. A bare `DEFINE TABLE t` is schemaless to the
+engine, but it declares nothing, so it keeps the diagnostics it would have had
+anyway.
+
+#### `analysis.maxSyntaxDiagnostics`
+
+Upper bound on **syntax** diagnostics (`parse`, `unknown-type`) per document, so
+a pathological buffer cannot flood the problems panel. Default `2000`, raised
+from `100`. Set it to `0` to report every one.
+
+```jsonc
+{ "surrealql": { "analysis": { "maxSyntaxDiagnostics": 0 } } }
+```
+
+This counts **diagnostics, not lines** — no setting limits how long a document
+may be. Semantic and type diagnostics are uncapped; they are derived from the
+definitions and query facts in the file, so the code itself bounds them.
+
+Two unrelated limits do apply to the *workspace scan*, and neither is
+configurable: files over 2 MB are skipped, and at most 5,000 `.surql` files are
+indexed. Both are reported through `window/logMessage` when they bite. They
+affect which files contribute schema, not the diagnostics on the file you have
+open.
+
+#### Other analysis settings
+
+| Key | Default | Effect when `false` |
+| --- | --- | --- |
+| `analysis.enableTypeChecking` | `true` | Turns off the whole type pass: `argument-type`, `argument-count`, `let-type`, `return-type`, `operator-type`, `unknown-method`, `undefined-variable`, `field-type`, `renamed-function`, `not-callable`. `unknown-type` survives — it is a syntax fault. |
+| `analysis.enablePermissionAnalysis` | `true` | Turns off `permission-denied` and `permission-unknown` on every table. |
+| `analysis.externalParams` | `[]` | Not a toggle: names the variables your caller binds at runtime (`db.query(sql).bind(("id", id))`, or Surrealist's variables panel) so `undefined-variable` does not flag them. |
+
 ## Grammar Development
 
 The tree-sitter grammar lives in the sibling [`surrealql-tree-sitter`](https://github.com/surrealdb/surrealql-tree-sitter) repo. After editing `grammar.js`:

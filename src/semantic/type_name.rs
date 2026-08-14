@@ -90,7 +90,7 @@ pub fn takes_foreign_arguments(name: &str) -> bool {
 ///
 /// Two guards, both borrowed from [`super::analyzer`]'s `keyword_typo_hint`:
 ///
-/// * a `jaro_winkler` score above 0.86, and
+/// * a `jaro_winkler` score above [`NEAR_MISS_THRESHOLD`], and
 /// * a length difference of three characters or less.
 ///
 /// The length guard is what makes this safe on a list of very short words. Without
@@ -98,6 +98,20 @@ pub fn takes_foreign_arguments(name: &str) -> bool {
 /// than two because the useful abbreviations are exactly three characters short of
 /// their target — `str`, `rec`, `num` and `obj` all land on the right name at 0.88,
 /// while unrelated words (`text`, `json`, `char`) stay well under the threshold.
+///
+/// # This length guard is a recall choice, not a fast path
+///
+/// Do not copy the `abs_diff(len) <= 3` shape into a sweep over user-defined
+/// names. It is **not** sound as a prefilter: `person` and `personaddress` differ
+/// by 7 characters and still score 0.892, so on a table or field sweep it would
+/// silently drop real near-misses. It is defensible here only because
+/// [`KIND_NAMES`] is a closed list of 25 short words where a loose match is worse
+/// than no match, and because 25 candidates cost nothing to score.
+///
+/// The sound prefilter, for the sweeps where speed matters, is
+/// [`crate::semantic::model::can_reach_near_miss_threshold`].
+///
+/// [`NEAR_MISS_THRESHOLD`]: crate::semantic::model::NEAR_MISS_THRESHOLD
 pub fn nearest(name: &str) -> Option<&'static str> {
     KIND_NAMES
         .iter()
@@ -108,7 +122,7 @@ pub fn nearest(name: &str) -> Option<&'static str> {
                 *known,
             )
         })
-        .filter(|(score, _)| *score > 0.86)
+        .filter(|(score, _)| *score > crate::semantic::model::NEAR_MISS_THRESHOLD)
         .max_by(|left, right| {
             left.0
                 .partial_cmp(&right.0)
