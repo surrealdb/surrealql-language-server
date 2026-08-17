@@ -1785,7 +1785,7 @@ fn location(uri: &Uri, source: &str, lines: &LineIndex, node: Node<'_>) -> Locat
 /// facts and definitions they are derived from, so they need no cap.
 ///
 /// Overridable per client through `analysis.maxSyntaxDiagnostics`; raised from
-/// 100 in 0.5.3, because a large schema file mid-edit legitimately exceeds a
+/// 100 in 0.6.0, because a large schema file mid-edit legitimately exceeds a
 /// hundred parse errors and the truncation read as "the server stopped working".
 pub const DEFAULT_MAX_SYNTAX_DIAGNOSTICS: usize = 2000;
 
