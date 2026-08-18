@@ -84,4 +84,5 @@ fmt-check: ## Check formatting without modifying files (CI parity)
 clean: ## Remove cargo artifacts and generated pkg/ output
 	$(CARGO) clean
 	rm -f pkg/$(OUT_NAME).js pkg/$(OUT_NAME).d.ts \
-		pkg/$(OUT_NAME)_bg.wasm pkg/$(OUT_NAME)_bg.wasm.d.ts pkg/LICENSE
+		pkg/$(OUT_NAME)_bg.wasm pkg/$(OUT_NAME)_bg.wasm.d.ts pkg/LICENSE \
+		pkg/builtins.json
