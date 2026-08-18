@@ -51,6 +51,20 @@ constants together.
   *around* a `BinaryExpression` rather than inside one, so a guard that
   only inspects a subtree sees a well-formed fragment. `has_broken_sibling`
   in `semantic::infer` exists for exactly this shape.
+- **A union type does not parse in a `LET` annotation.** The
+  `ParamDefinition` type slot takes a single type expression, so
+  `LET $a: int | float = 2;` raises a false `parse` diagnostic on
+  SurrealQL the engine accepts. Tracked by
+  `adds_nothing_where_the_grammar_already_fails_to_parse` in
+  [`tests/lsp.rs`](../tests/lsp.rs), which also pins that the type
+  checker adds no second diagnostic on top of the failed parse.
+- **A sized collection type does not parse.** `LET $b: array<float, 10> = 2;`
+  is valid SurrealQL (the second argument bounds the length), but the
+  pinned grammar rejects it, so it too surfaces as a false `parse`
+  error — at least in the `ParamDefinition` slot the tracked examples
+  use. Same tracker test as the union gap; like the nested `SET`
+  target below, the real fix is cross-repo in `surrealql-tree-sitter`,
+  after which the pin moves here.
 
 - **A `SET` target cannot be a nested field.** `FieldAssignment` is
   `seq($.Ident, alias($._assignmentOp, $.Operator), $._value)`, so the
