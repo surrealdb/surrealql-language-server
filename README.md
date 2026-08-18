@@ -109,7 +109,8 @@ cargo test
 │   │   ├── client.rs         # LspNotifier / WorkspaceLoader / MetadataProvider traits
 │   │   ├── state.rs          # shared server state
 │   │   └── completion_context.rs
-│   ├── native/               # tower-lsp adapter, walkdir loader, SurrealDB metadata
+│   ├── native/               # tower-lsp adapter, walkdir loader, SurrealDB metadata,
+│   │                         #   and the headless `check` subcommand (check.rs)
 │   ├── wasm/                 # wasm-bindgen adapter (Surrealist)
 │   └── semantic/
 │       ├── analyzer.rs       # document analysis (parse + extract + syntax diagnostics)
@@ -125,18 +126,26 @@ cargo test
 │       ├── returns.rs        # return types, from the function registry
 │       ├── methods.rs        # method receiver tables
 │       ├── probe.rs          # `verify-returns`: checks the engine by running it
-│       └── emit.rs           # joins them and renders the catalogue
+│       ├── emit.rs           # joins them and renders the catalogue as Rust
+│       └── emit_json.rs      # renders the same catalogue as builtins.json
 ├── tests/
 │   ├── lsp.rs                # analyzer/model integration tests
 │   ├── core_server.rs        # end-to-end server tests (mock notifier)
 │   ├── dispatch.rs           # JSON-RPC wire tests
+│   ├── check.rs              # end-to-end tests for the check subcommand
 │   ├── conformance.rs        # silence sweep over SurrealDB's own corpus
 │   ├── generated_catalogue.rs # catalogue freshness + shape invariants
 │   ├── compat.rs             # backwards-compatibility tripwires
 │   └── common/               # shared mocks for the three boundary traits
 ├── docs/
+│   ├── ai-plan.md            # opportunity map for the AI-agent surfaces
+│   ├── grammar-gaps.md       # known gaps at the pinned grammar revision
 │   ├── pain-points.md        # audited pain-point catalog + status
-│   └── grammar-gaps.md       # known gaps at the pinned grammar revision
+│   ├── perf-baseline.md      # latency baseline measurements
+│   └── perf-plan.md          # latency targets `cargo bench` gates on
+├── AGENTS.md                 # agent-facing contract: check loop, codes, gaps
+├── llms.txt                  # machine-readable resource index
+├── builtins.json             # @generated catalogue-as-data — do not edit by hand
 ├── build.rs                  # compiles tree-sitter grammar (C)
 └── scripts/
     └── setup-grammar.sh      # clones/updates the grammar sibling repo
@@ -205,6 +214,53 @@ open.
 | `analysis.enablePermissionAnalysis` | `true` | Turns off `permission-denied` and `permission-unknown` on every table. |
 | `analysis.externalParams` | `[]` | Not a toggle: names the variables your caller binds at runtime (`db.query(sql).bind(("id", id))`, or Surrealist's variables panel) so `undefined-variable` does not flag them. |
 
+## Using with AI agents
+
+The same analysis the editor shows is available headless, so coding agents,
+CI jobs and pre-commit hooks can run the generate → check → repair loop:
+
+```bash
+surrealql-language-server check queries/
+surrealql-language-server check --stdin --stdin-filename src/feed.surql --workspace schema/
+surrealql-language-server check queries/ --format json --fail-on warning
+```
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Ran to completion; nothing at or above `--fail-on` (default `error`). |
+| 1 | Ran to completion; diagnostics at or above the threshold. |
+| 2 | Usage error, unreadable input, or a skipped target file. |
+
+`--format json` prints one object whose diagnostics are LSP wire objects
+verbatim (stable codes, 0-based UTF-16 ranges, structured `data` hints),
+plus a `summary`, the `scan` losses, and the `exitCode`:
+
+```jsonc
+{
+  "files": [{ "path": "queries/feed.surql", "diagnostics": [ /* LSP Diagnostic */ ] }],
+  "summary": { "filesChecked": 1, "errors": 0, "warnings": 1, "information": 0, "hints": 0 },
+  "scan": { "walkErrors": 0, "skippedOversize": 0, "skippedUnreadable": 0, "fileCapHit": false },
+  "exitCode": 0
+}
+```
+
+[`AGENTS.md`](AGENTS.md) is the agent-facing contract: the check loop, the
+diagnostic-code table, and the known grammar gaps an agent must not "fix".
+[`llms.txt`](llms.txt) indexes the machine-consumable resources, including
+[`builtins.json`](builtins.json).
+
+Recipes:
+
+- **CI**: run `check` over your `.surql` directories with
+  `--fail-on warning`; exit codes 1 and 2 fail the job.
+- **pre-commit**: `surrealql-language-server check $(git diff --cached --name-only -- '*.surql')`
+  (skip when the list is empty).
+- **Claude Code**: add "Run `surrealql-language-server check <file>` after
+  every `.surql` edit" to `CLAUDE.md`, or point it at [`AGENTS.md`](AGENTS.md).
+- **Cursor**: the same instruction in `.cursor/rules`.
+- **Zed**: the extension already ships this server for editing; use `check`
+  for the headless loop.
+
 ## Grammar Development
 
 The tree-sitter grammar lives in the sibling [`surrealql-tree-sitter`](https://github.com/surrealdb/surrealql-tree-sitter) repo. After editing `grammar.js`:
@@ -226,7 +282,15 @@ make builtins            # or: cargo xtask generate-builtins --surrealdb ../surr
 make builtins-check      # compare without writing
 ```
 
-Pass `--surrealdb <path>` or set `SURREALDB_DIR` (`make builtins SURREALDB=/path/to/surrealdb`). The checkout must be at the revision the catalogue header records. `--check` is what `tests/generated_catalogue.rs` runs. Never edit the generated file by hand.
+Pass `--surrealdb <path>` or set `SURREALDB_DIR` (`make builtins SURREALDB=/path/to/surrealdb`). The checkout must be at the revision the catalogue header records. `--check` is what `tests/generated_catalogue.rs` runs. Never edit the generated files by hand.
+
+The same generator run also writes [`builtins.json`](builtins.json) — the
+catalogue as data, for anyone building SurrealQL tooling outside this crate.
+It is committed, freshness-checked in CI alongside the Rust rendering,
+attached to every GitHub release, and shipped in the npm package
+(`@surrealdb/surrealql-language-server/builtins.json`). One encoding rule
+matters to consumers: `params: null` means the signature is unknown —
+never read it as zero-arity.
 
 These targets do not need the grammar checkout: `cargo run --package xtask` never builds the root package, so `build.rs` does not run.
 
@@ -259,6 +323,8 @@ Release checklist:
 1. Bump `version` in [`Cargo.toml`](Cargo.toml) and [`pkg/package.json`](pkg/package.json).
 2. Push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. Confirm the `wasm` CI job succeeds and the package appears on npm.
+4. Confirm the release assets include the platform binaries, the npm `.tgz`,
+   and `builtins.json`.
 
 npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC from GitHub Actions). Before the first publish, an `@surrealdb` org admin must configure a trusted publisher on the package's npm **Access** page ([`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server)) with:
 
