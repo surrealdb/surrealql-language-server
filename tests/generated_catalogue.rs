@@ -11,8 +11,8 @@ use std::process::Command;
 
 use surrealql_language_server::grammar::ParamForm;
 use surrealql_language_server::grammar_generated::{
-    GENERATED_CONSTANTS, GENERATED_FUNCTIONS, GENERATED_NAMESPACES, PARSES_BUT_NOT_CALLABLE,
-    RENAMED_FUNCTIONS, SURREALDB_REVISION,
+    GENERATED_CONSTANTS, GENERATED_FUNCTIONS, GENERATED_NAMESPACES, GENERATED_RECEIVERS,
+    PARSES_BUT_NOT_CALLABLE, RENAMED_FUNCTIONS, SURREALDB_REVISION,
 };
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 
@@ -373,4 +373,93 @@ fn the_two_return_type_tables_never_contradict_each_other() {
         compared >= 60,
         "only {compared} entries were comparable, so this guard proved little"
     );
+}
+
+// ---------------------------------------------------------------------------
+// builtins.json — the same catalogue as a published data artifact
+// ---------------------------------------------------------------------------
+
+/// The committed `builtins.json`, parsed. Like the shape checks above, these
+/// tests need no SurrealDB checkout: freshness against the engine is
+/// [`the_committed_catalogue_matches_the_generator`]'s job, and it now covers
+/// both generated files.
+fn committed_builtins_json() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins.json");
+    let text = std::fs::read_to_string(&path).expect("builtins.json is committed");
+    serde_json::from_str(&text).expect("builtins.json is valid JSON")
+}
+
+#[test]
+fn the_json_artifact_mirrors_the_rust_catalogue() {
+    let json = committed_builtins_json();
+    assert_eq!(json["meta"]["surrealdbRevision"], SURREALDB_REVISION);
+    assert_eq!(
+        json["meta"]["languageServerVersion"],
+        env!("CARGO_PKG_VERSION"),
+        "the artifact must record the release that produced it"
+    );
+    let functions = json["functions"].as_array().expect("functions");
+    assert_eq!(functions.len(), GENERATED_FUNCTIONS.len());
+    assert_eq!(
+        json["constants"].as_array().expect("constants").len(),
+        GENERATED_CONSTANTS.len()
+    );
+    assert_eq!(
+        json["renames"].as_array().expect("renames").len(),
+        RENAMED_FUNCTIONS.len()
+    );
+    assert_eq!(
+        json["namespaces"].as_array().expect("namespaces").len(),
+        GENERATED_NAMESPACES.len()
+    );
+}
+
+#[test]
+fn an_unknown_signature_is_null_params_never_an_empty_list() {
+    // The Rust catalogue carries `signature_known` beside `params`, and
+    // `grammar.rs` warns every consumer that `&[]` without it means unknown,
+    // not zero-arity. The JSON encodes the unknown state structurally —
+    // `params: null` — so a consumer cannot misread it. This holds the two
+    // encodings equivalent for every function.
+    let json = committed_builtins_json();
+    for function in json["functions"].as_array().expect("functions") {
+        let name = function["name"]
+            .as_str()
+            .expect("every function has a name");
+        let rust = GENERATED_FUNCTIONS
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is in the JSON but not the Rust catalogue"));
+        assert_eq!(
+            function["params"].is_null(),
+            !rust.signature_known,
+            "`{name}`: params must be null exactly when the signature is unknown"
+        );
+    }
+}
+
+#[test]
+fn the_json_receivers_match_the_rust_method_tables() {
+    let json = committed_builtins_json();
+    let receivers = json["receivers"].as_array().expect("receivers");
+    assert_eq!(receivers.len(), GENERATED_RECEIVERS.len());
+    let json_arms: usize = receivers
+        .iter()
+        .map(|receiver| receiver["methods"].as_array().expect("methods").len())
+        .sum();
+    let rust_arms: usize = GENERATED_RECEIVERS
+        .iter()
+        .map(|receiver| receiver.methods.len())
+        .sum();
+    assert_eq!(json_arms, rust_arms);
+    // The catch-all table is `""` in Rust and `null` in JSON.
+    for (json_receiver, rust_receiver) in receivers.iter().zip(GENERATED_RECEIVERS.iter()) {
+        match rust_receiver.kind {
+            "" => assert!(
+                json_receiver["kind"].is_null(),
+                "the catch-all receiver encodes as null"
+            ),
+            kind => assert_eq!(json_receiver["kind"], kind),
+        }
+    }
 }

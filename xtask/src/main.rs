@@ -25,6 +25,7 @@
 #![recursion_limit = "512"]
 
 mod emit;
+mod emit_json;
 mod engine_tables;
 mod kinds;
 mod methods;
@@ -38,6 +39,11 @@ use std::process::ExitCode;
 
 /// Where the generated catalogue lives, relative to the repository root.
 const OUTPUT: &str = "src/grammar_generated.rs";
+
+/// The same catalogue as data, relative to the repository root. Committed
+/// like [`OUTPUT`], attached to releases and shipped in the npm package —
+/// see `docs/ai-plan.md`, phase 1.
+const JSON_OUTPUT: &str = "builtins.json";
 
 fn main() -> ExitCode {
     match run() {
@@ -83,25 +89,58 @@ fn run() -> Result<String, String> {
         return verify_returns(&surrealdb);
     }
 
-    let generated = generate(&surrealdb)?;
-    let output = repository_root().join(OUTPUT);
+    // One catalogue, two renderings: the Rust source the checker compiles
+    // against, and the JSON artifact releases publish. Generating both from
+    // the same build means they cannot drift.
+    let catalogue = build_catalogue(&surrealdb)?;
+    let generated_rs = rustfmt(&emit::render(&catalogue))?;
+    let generated_json = emit_json::render(&catalogue, &language_server_version()?);
+    let outputs = [(OUTPUT, generated_rs), (JSON_OUTPUT, generated_json)];
 
     if check_only {
-        let committed = std::fs::read_to_string(&output)
-            .map_err(|error| format!("cannot read {}: {error}", output.display()))?;
-        if committed == generated {
-            return Ok(format!("{OUTPUT} is up to date"));
+        let mut stale = Vec::new();
+        for (name, generated) in &outputs {
+            let path = repository_root().join(name);
+            let committed = std::fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            if &committed != generated {
+                stale.push(*name);
+            }
+        }
+        if stale.is_empty() {
+            return Ok(format!("{OUTPUT} and {JSON_OUTPUT} are up to date"));
         }
         return Err(format!(
-            "{OUTPUT} is stale. Regenerate it:\n    \
+            "{} stale. Regenerate:\n    \
              cargo xtask generate-builtins --surrealdb {}",
+            stale.join(" and "),
             surrealdb.display()
         ));
     }
 
-    std::fs::write(&output, &generated)
-        .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
-    Ok(format!("wrote {OUTPUT} ({} bytes)", generated.len()))
+    let mut written = Vec::new();
+    for (name, generated) in &outputs {
+        let path = repository_root().join(name);
+        std::fs::write(&path, generated)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        written.push(format!("{name} ({} bytes)", generated.len()));
+    }
+    Ok(format!("wrote {}", written.join(" and ")))
+}
+
+/// The published crate version, from the root `Cargo.toml`. The JSON artifact
+/// records it so a consumer can tell which release produced the file —
+/// xtask's own version is a meaningless `0.0.0`.
+fn language_server_version() -> Result<String, String> {
+    let manifest = repository_root().join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("cannot read {}: {error}", manifest.display()))?;
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("version"))
+        .filter_map(|rest| rest.trim().strip_prefix('='))
+        .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+        .next()
+        .ok_or_else(|| format!("no `version = …` line in {}", manifest.display()))
 }
 
 /// Call every builtin and compare the answer with the recorded return type.
@@ -128,10 +167,6 @@ fn verify_returns(_surrealdb: &Path) -> Result<String, String> {
     Err("`verify-returns` needs the engine. Re-run it with:\n    \
          cargo run -p xtask --features probe -- verify-returns --surrealdb <path>"
         .to_string())
-}
-
-fn generate(surrealdb: &Path) -> Result<String, String> {
-    rustfmt(&emit::render(&build_catalogue(surrealdb)?))
 }
 
 /// Read the engine's tables and join them, with the coverage gates applied.
