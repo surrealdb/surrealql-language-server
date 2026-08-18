@@ -2256,9 +2256,10 @@ fn diagnostics_for(source: &str) -> Vec<tower_lsp_server::ls_types::Diagnostic> 
 }
 
 /// Like [`diagnostics_for`], but under caller-chosen settings, and covering the
-/// syntax pass as well so `unknown-type` is visible. Mirrors what
-/// `diagnostics_for_document` assembles in `src/core/server.rs`, which is the
-/// only place the schemaless filter runs in the real server.
+/// syntax pass as well so `unknown-type` is visible. Calls the same
+/// [`MergedSemanticModel::document_diagnostics`] the real server publishes
+/// from, so the assembly order (syntax, semantic, schemaless filter) cannot
+/// drift between the test and the server.
 fn diagnostics_for_with(
     source: &str,
     settings: &ServerSettings,
@@ -2267,10 +2268,7 @@ fn diagnostics_for_with(
         analyze_document(uri("check.surql"), source, SymbolOrigin::Local).expect("analysis");
     let workspace = workspace_from(vec![analysis.clone()]);
     let model = MergedSemanticModel::build(&workspace, &Default::default());
-    let mut diagnostics = analysis.syntax_diagnostics.clone();
-    diagnostics.extend(model.semantic_diagnostics(&analysis, settings));
-    model.apply_schemaless_policy(&mut diagnostics, settings);
-    diagnostics
+    model.document_diagnostics(&analysis, settings)
 }
 
 fn settings_with_schemaless(mode: &str) -> ServerSettings {
