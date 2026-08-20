@@ -172,3 +172,21 @@ jobs:
               uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
               with:
                   files: pkg/*.tgz
+
+    # builtins.json is committed and freshness-checked by the `rust` job on
+    # every push, so this job only attaches the already-correct file to the
+    # release — no toolchain, no sibling checkouts. It is deliberately not
+    # part of the `release` matrix (four runners would race to upload one
+    # file) and not folded into `wasm` (that leg has failed on npm before,
+    # and the data artifact should not share its fate).
+    builtins:
+        if: startsWith(github.ref, 'refs/tags/v')
+        permissions:
+            contents: write
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Upload builtins.json to the GitHub Release
+              uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+              with:
+                  files: builtins.json
