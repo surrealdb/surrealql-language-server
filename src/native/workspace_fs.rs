@@ -17,12 +17,14 @@ use crate::semantic::analyzer::analyze_document;
 use crate::semantic::types::{DocumentAnalysis, SymbolOrigin, WorkspaceIndex, WorkspaceScanStats};
 
 /// Skip files larger than this — pathological generated SurrealQL dumps
-/// would otherwise blow up parser memory at startup.
-const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+/// would otherwise blow up parser memory at startup. Shared with the
+/// `check` subcommand so both surfaces skip identically.
+pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Hard cap on the total number of `.surql` / `.surrealql` files we
-/// ingest, to keep cold start bounded on huge monorepos.
-const MAX_WORKSPACE_FILES: usize = 5000;
+/// ingest, to keep cold start bounded on huge monorepos. Shared with the
+/// `check` subcommand.
+pub(crate) const MAX_WORKSPACE_FILES: usize = 5000;
 
 #[derive(Default)]
 pub struct FilesystemWorkspaceLoader;
@@ -148,7 +150,7 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
     index
 }
 
-fn should_descend(path: &Path) -> bool {
+pub(crate) fn should_descend(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
         !matches!(
             name,
