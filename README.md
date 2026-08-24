@@ -203,7 +203,206 @@ open.
 | --- | --- | --- |
 | `analysis.enableTypeChecking` | `true` | Turns off the whole type pass: `argument-type`, `argument-count`, `let-type`, `return-type`, `operator-type`, `unknown-method`, `undefined-variable`, `field-type`, `renamed-function`, `not-callable`. `unknown-type` survives — it is a syntax fault. |
 | `analysis.enablePermissionAnalysis` | `true` | Turns off `permission-denied` and `permission-unknown` on every table. |
+| `analysis.enableCodeActions` | `true` | `textDocument/codeAction` returns an empty list. The capability stays advertised — a client reads that once, at `initialize`. |
+| `analysis.enableAggressiveSchemaInference` | `true` | Nothing. Accepted for compatibility and has no effect. |
 | `analysis.externalParams` | `[]` | Not a toggle: names the variables your caller binds at runtime (`db.query(sql).bind(("id", id))`, or Surrealist's variables panel) so `undefined-variable` does not flag them. |
+
+## Formatting
+
+`textDocument/formatting` and `textDocument/rangeFormatting`, plus
+`surrealql-language-server format` on the command line.
+
+The formatter walks the parse tree's leaves and decides only what goes *between*
+them. It cannot reflow a long line, and it also cannot lose, reorder or invent a
+token — the property that matters in a tool that rewrites a schema.
+
+**A file the grammar cannot parse is returned exactly as it was.** Format-on-save
+fires while you are still typing, and text nobody can safely read is text nobody
+should rewrite. Across SurrealDB's own 1,897-file corpus the formatter changes
+588 files, leaves 703 already-canonical, and refuses 606 that do not parse at the
+pinned grammar.
+
+Range formatting widens the request to whole statements first; half a statement
+is not something a token-stream formatter can lay out.
+
+## Editing model
+
+`textDocument/didChange` is incremental. An edit is applied to the authoritative
+buffer synchronously and in arrival order; only the analysis that follows is
+spawned and debounced (`analysis.diagnosticDebounceMs`, default 200 ms). Under
+incremental sync a change carries a range into the previous text, so two
+notifications landing out of order would corrupt the document.
+
+tree-sitter reuses the previous parse tree: edits since that tree was produced
+are accumulated and replayed against it, and the accumulator is cleared in the
+same critical section that stores a new tree — so an analysis dropped as
+superseded leaves the two in step.
+
+`textDocument/semanticTokens/full/delta` returns the changed run rather than
+every token in the file. `$/progress` reports the workspace walk and the
+`INFO FOR DB` fetch, both of which can take seconds.
+
+## Command line
+
+The same analysis the editor gets, from a terminal — so a build pipeline can
+fail on it.
+
+```bash
+surrealql-language-server check                 # the working directory
+surrealql-language-server check schema/ q.surql # directories and files
+surrealql-language-server check --format json   # machine-readable
+surrealql-language-server rules                 # every rule
+surrealql-language-server explain unknown-table # one rule, in full
+surrealql-language-server format schema/        # format in place
+surrealql-language-server format --check        # exit 1 if anything would change
+```
+
+Run with no arguments it serves LSP over stdio, exactly as before — no editor
+integration changes.
+
+`check` exits `0` when nothing is reported, `1` when any finding is an error,
+and `2` on a usage or file error. It reads `surrealql.toml` from the first
+directory argument unless `--no-config` is given, and `--rule ID=SEVERITY`
+overrides one rule above everything else.
+
+Human output is 1-based, the way an editor shows a position. JSON output is
+0-based, matching the Language Server Protocol.
+
+A command-line run has no database connection, so rules needing live metadata
+stand down rather than guessing: `unknown-table` does not fire there. Point the
+editor at a database for those. Everything else runs, including the permission
+rules — the auth context comes from the settings, which a command-line run has
+as much as the editor does.
+
+#### `surrealql.toml`
+
+A `surrealql.toml` in the workspace root sets analysis policy for everyone who
+opens the repository, and for anything that reads the same file in a build
+pipeline.
+
+```toml
+[analysis]
+schemalessDiagnostics = "errors"
+externalParams = ["id", "limit"]
+
+[analysis.ruleSeverity]
+unknown-field = "error"
+permission-unknown = "off"
+```
+
+The keys are the LSP settings keys, so one reference covers both. `surrealql.toml`
+is tried first and `.surrealql.toml` second; only the first workspace folder is
+consulted. A file that is not valid TOML is refused whole, with a warning —
+applying the half that parsed would leave nobody able to say which policy is in
+force.
+
+**Settings precedence**, lowest first: built-in defaults, then `surrealql.toml`,
+then the editor's LSP settings, then the `SURREALDB_*` environment variables for
+connection fields that are still unset. The merge is per key, so an editor
+setting for one rule does not discard the rest of the committed policy.
+
+#### Suppressing a rule in the source
+
+A comment silences a rule where it sits, without changing anything for the rest
+of the workspace.
+
+```surql
+-- surql-ignore-file: permission-unknown, dynamic-target
+
+-- surql-ignore: unknown-field
+CREATE person SET nickname = "b";
+
+CREATE person SET nickname = "b";  -- surql-ignore: unknown-field
+```
+
+- A directive on its own line covers the next line that holds code. It may sit
+  above other comments and blank lines and still reach the statement.
+- A directive at the end of a line covers that line.
+- `surql-ignore-file` covers the whole document. It is only honoured above the
+  first statement — below that a reader would have to scroll past code to
+  discover the file is muted, so it is inert there.
+- A comma-separated list covers several rules. A bare `-- surql-ignore` with no
+  list covers every rule on the line.
+- All four comment forms work: `--`, `//`, `#` and `/* … */`.
+
+Directives are read from the parse tree, not by scanning text, so a directive
+inside a string literal is just a string.
+
+A directive that silences nothing is reported as `unused-suppression` — a hint,
+tagged so an editor greys it out. That catches a comment which outlived the fault
+it covered, and a rule id with a typo in it. For a file that keeps directives
+deliberately, `-- surql-ignore-file: unused-suppression` turns it off; a line
+directive cannot, because a line directive's scope is the next line of *code*.
+
+#### Diagnostic rules
+
+Every diagnostic carries a stable `code`. [`docs/rules.md`](docs/rules.md) has a
+page for each one, and clients that support `codeDescription` link straight to
+it from the problems panel.
+
+| Rule | Category | Default | Fix |
+| --- | --- | --- | --- |
+| [`argument-count`](#argument-count) | types | error | — |
+| [`argument-type`](#argument-type) | types | error | — |
+| [`duplicate-definition`](#duplicate-definition) | schema | warning | — |
+| [`dynamic-target`](#dynamic-target) | schema | warning | — |
+| [`field-type`](#field-type) | types | error | — |
+| [`let-type`](#let-type) | types | error | — |
+| [`not-callable`](#not-callable) | types | warning | — |
+| [`operator-type`](#operator-type) | types | error | — |
+| [`permission-denied`](#permission-denied) | permissions | error | — |
+| [`permission-unknown`](#permission-unknown) | permissions | warning | — |
+| [`renamed-function`](#renamed-function) | types | warning | automatic |
+| [`return-type`](#return-type) | types | error | — |
+| [`undefined-variable`](#undefined-variable) | types | error | — |
+| [`unknown-field`](#unknown-field) | schema | warning | — |
+| [`unknown-table`](#unknown-table) | schema | warning | suggested |
+| [`unknown-index-field`](#unknown-index-field) | schema | warning | — |
+| [`unknown-analyzer`](#unknown-analyzer) | schema | warning | — |
+| [`unknown-function`](#unknown-function) | types | error | suggested |
+| [`relation-endpoint`](#relation-endpoint) | schema | error | — |
+| [`unused-binding`](#unused-binding) | types | hint | — |
+| [`unused-suppression`](#unused-suppression) | syntax | hint | — |
+| [`unknown-method`](#unknown-method) | types | error | — |
+| [`unknown-type`](#unknown-type) | syntax | error | suggested |
+| [`parse`](#parse) | syntax | error | — |
+
+#### `analysis.ruleSeverity`
+
+Sets the severity of one rule, keyed by the id that appears in
+`Diagnostic.code`. Accepted values are `off`, `hint`, `info`, `warning` and
+`error`.
+
+```json
+{
+  "surrealql": {
+    "analysis": {
+      "ruleSeverity": {
+        "unknown-field": "error",
+        "permission-unknown": "off"
+      }
+    }
+  }
+}
+```
+
+**Precedence**, lowest first:
+
+1. The rule's default severity.
+2. `analysis.enableTypeChecking` and `analysis.enablePermissionAnalysis`, which
+   turn a whole category off.
+3. `analysis.ruleSeverity`, which wins over both. An explicit severity here
+   re-enables a single rule inside a category a switch turned off — so
+   `enableTypeChecking: false` plus `{"let-type": "warning"}` reports
+   `let-type` and nothing else from the type pass.
+4. What the run has available. A rule that needs information this run does not
+   have stays off whatever the settings say: `unknown-table` needs live
+   database metadata, so it does not fire in a run without a database, however
+   it is configured.
+
+An unknown rule id or an unknown severity is dropped with a warning through
+`window/logMessage`, with a did-you-mean hint where one is close enough. A bad
+entry never changes another rule.
 
 ## Grammar Development
 

@@ -33,6 +33,7 @@ use crate::semantic::assign::{
 };
 use crate::semantic::codes;
 use crate::semantic::node_kind as k;
+use crate::semantic::rules::{self, RuleSet};
 use crate::semantic::text::LineIndex;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
@@ -1658,7 +1659,16 @@ pub fn type_diagnostics(
     model: &MergedSemanticModel,
     settings: &ServerSettings,
 ) -> Vec<Diagnostic> {
-    if !settings.analysis.enable_type_checking {
+    // Gated on the most permissive environment, not on the caller's: this
+    // decides what work to *do*, and skipping work another caller could use
+    // would lose a diagnostic. Trimming the result to the caller's real
+    // environment is `RuleSet::apply`'s job, at the end of the pipeline.
+    let rules = RuleSet::resolve(settings, rules::SERVER_ENVIRONMENT);
+
+    // Whole-pass early-out, before `resolve_bindings`. That call is the
+    // expensive half, and the boolean this replaces returned here too — so a
+    // disabled type check stays exactly as cheap as it was.
+    if !rules.any_enabled(rules::TYPE_PASS) {
         return Vec::new();
     }
 
@@ -1671,12 +1681,24 @@ pub fn type_diagnostics(
     };
     let mut diagnostics = Vec::new();
     let root = analysis.tree.root_node();
-    check_calls(root, &ctx, &mut diagnostics);
-    check_let_annotations(root, &ctx, &mut diagnostics);
-    check_field_clauses(root, &ctx, settings, &mut diagnostics);
-    check_function_returns(root, &ctx, &mut diagnostics);
-    check_variables(root, &ctx, settings, &mut diagnostics);
-    check_binary_expressions(root, &ctx, &mut diagnostics);
+    if rules.any_enabled(rules::CHECK_CALLS) {
+        check_calls(root, &ctx, &mut diagnostics);
+    }
+    if rules.any_enabled(rules::CHECK_LET_ANNOTATIONS) {
+        check_let_annotations(root, &ctx, &mut diagnostics);
+    }
+    if rules.any_enabled(rules::CHECK_FIELD_CLAUSES) {
+        check_field_clauses(root, &ctx, settings, &mut diagnostics);
+    }
+    if rules.any_enabled(rules::CHECK_FUNCTION_RETURNS) {
+        check_function_returns(root, &ctx, &mut diagnostics);
+    }
+    if rules.any_enabled(rules::CHECK_VARIABLES) {
+        check_variables(root, &ctx, settings, &mut diagnostics);
+    }
+    if rules.any_enabled(rules::CHECK_BINARY_EXPRESSIONS) {
+        check_binary_expressions(root, &ctx, &mut diagnostics);
+    }
     diagnostics
 }
 
@@ -2358,8 +2380,92 @@ fn check_one_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) 
     // the builtins — so the two paths are exclusive rather than ordered.
     match ctx.model.functions.get(name) {
         Some(function) => check_user_call(name, function, node, arg_list, &args, ctx, out),
-        None => check_builtin_call(name, arg_list, &args, ctx, out),
+        None => {
+            if builtin_signature(name).is_none() {
+                report_unknown_function(name, node, ctx, out);
+                return;
+            }
+            check_builtin_call(name, arg_list, &args, ctx, out)
+        }
     }
+}
+
+/// A call to a name that is neither a builtin nor defined in the workspace.
+///
+/// This used to be silent: `check_builtin_call` returned early when the name
+/// had no signature, so `fn::does_not_exist()` and `strng::len()` alike
+/// produced nothing at all.
+///
+/// Two names are deliberately exempt. A name in a namespace the catalogue does
+/// not model cannot be judged — the generator skips whole namespaces such as
+/// `api::`, and reporting those would be a wall of false positives. And a name
+/// whose signature the generator could not read is *known* to exist; it is
+/// only its shape that is missing.
+fn report_unknown_function(
+    name: &str,
+    node: Node<'_>,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !judgeable_namespace(name) {
+        return;
+    }
+    let Some(name_node) = k::find_child(node, k::FUNCTION_NAME) else {
+        return;
+    };
+    let suggestion = nearest_callable(name, ctx);
+    let message = match &suggestion {
+        Some(candidate) => format!("Unknown function `{name}`. Did you mean `{candidate}`?"),
+        None => format!("Unknown function `{name}`."),
+    };
+    let mut diagnostic = diagnostic(node_range(ctx, name_node), codes::UNKNOWN_FUNCTION, message);
+    diagnostic.data = Some(serde_json::json!({
+        "function": name,
+        "suggestion": suggestion,
+    }));
+    out.push(diagnostic);
+}
+
+/// Whether the catalogue is complete enough to call this name unknown.
+///
+/// A `fn::` name is always judgeable: the workspace is the only source, and the
+/// merged model has all of it. A builtin is judgeable only when its namespace
+/// appears in the catalogue at all — otherwise the absence says nothing about
+/// the engine.
+fn judgeable_namespace(name: &str) -> bool {
+    if name.starts_with("fn::") {
+        return true;
+    }
+    let Some((namespace, _)) = name.rsplit_once("::") else {
+        // A bare, un-namespaced name is not a builtin call shape.
+        return false;
+    };
+    crate::grammar::GENERATED_FUNCTION_TABLE
+        .iter()
+        .any(|function| {
+            function
+                .name
+                .rsplit_once("::")
+                .is_some_and(|(candidate, _)| candidate == namespace)
+        })
+}
+
+/// The closest name in the catalogue or the workspace, if one is close enough.
+fn nearest_callable(name: &str, ctx: &TypeCtx<'_>) -> Option<String> {
+    let builtins = crate::grammar::GENERATED_FUNCTION_TABLE
+        .iter()
+        .map(|function| function.name.to_string());
+    let user = ctx.model.functions.keys().cloned();
+    builtins
+        .chain(user)
+        .map(|candidate| (strsim::jaro_winkler(name, &candidate), candidate))
+        .filter(|(score, _)| *score >= 0.9)
+        .max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, candidate)| candidate)
 }
 
 /// Method-call syntax: `'abc'.len()`, `[1, 2].at(0)`.

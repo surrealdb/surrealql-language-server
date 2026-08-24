@@ -37,7 +37,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
                   toolchain: 1.94.0
-                  components: rustfmt
+                  components: rustfmt, clippy
             - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
               name: Cache Rust Artifacts
             - name: Check formatting
@@ -49,8 +49,32 @@ jobs:
             # where a SurrealDB layout change shows up first.
             - name: Run generator tests
               run: cargo test -p xtask
+            # Warnings only for now: the tree carries 23 pre-existing ones, and
+            # failing on them would block every pull request before anyone has
+            # a chance to clear them. Change `-W` to `-D` once the count is
+            # zero — the point of adding this now is that the number cannot
+            # grow unnoticed.
+            - name: Lint
+              run: cargo clippy --all-targets -- -W warnings
+            # The benchmark harness exits non-zero on a regression. It is not a
+            # gate yet: `analyze_document` clears its 60 ms budget by about
+            # 1 ms and fails intermittently on a slower runner. See
+            # `docs/perf-baseline.md`; the next lever is
+            # `collect_node_diagnostics`.
+            - name: Benchmarks
+              run: cargo bench || true
+            # The browser build has its own toolchain and its own C shims, and
+            # it used to be built only on a release tag — so a break was
+            # invisible until the npm publish failed.
+            - name: Check the browser build
+              run: |
+                  rustup target add wasm32-unknown-unknown
+                  cargo check --target wasm32-unknown-unknown --no-default-features
 
     release:
+        # A red test job must not ship a binary. Nothing gated these three, so
+        # a failing suite still produced a release.
+        needs: rust
         if: startsWith(github.ref, 'refs/tags/v')
         permissions:
             contents: write
@@ -103,7 +127,7 @@ jobs:
 
     publish:
         if: startsWith(github.ref, 'refs/tags/v')
-        needs: release
+        needs: [rust, release]
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -123,6 +147,7 @@ jobs:
                   TREE_SITTER_SURREALQL_DIR: ${{ github.workspace }}/../surrealql-tree-sitter
 
     wasm:
+        needs: rust
         if: startsWith(github.ref, 'refs/tags/v')
         permissions:
             contents: write

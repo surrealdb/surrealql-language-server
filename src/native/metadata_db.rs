@@ -186,3 +186,103 @@ fn collect_define_strings(value: &JsonValue, target: &mut Vec<String>) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collected(value: JsonValue) -> Vec<String> {
+        let mut found = Vec::new();
+        collect_define_strings(&value, &mut found);
+        found
+    }
+
+    /// `INFO FOR DB` answers with a nested object whose leaves are the `DEFINE`
+    /// statements. The harvest has to reach them wherever they sit, because the
+    /// shape has moved between engine versions and this code cannot see which
+    /// version answered.
+    #[test]
+    fn defines_are_found_at_any_depth() {
+        let value = serde_json::json!({
+            "tables": {
+                "person": "DEFINE TABLE person SCHEMAFULL",
+                "nested": { "deeper": ["DEFINE FIELD email ON person TYPE string"] }
+            },
+            "functions": { "fn::f": "DEFINE FUNCTION fn::f() { RETURN 1; }" },
+        });
+        let found = collected(value);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|text| text.contains("DEFINE TABLE person"))
+        );
+        assert!(found.iter().any(|text| text.contains("DEFINE FIELD email")));
+        assert!(found.iter().any(|text| text.contains("DEFINE FUNCTION")));
+    }
+
+    /// A string that merely mentions `DEFINE` is not a definition. The check is
+    /// a prefix on the trimmed text, so a comment or a description cannot leak
+    /// into the schema.
+    #[test]
+    fn only_strings_that_start_with_define_are_taken() {
+        let value = serde_json::json!({
+            "a": "this DEFINE is inside a sentence",
+            "b": "  DEFINE TABLE indented SCHEMAFULL",
+            "c": "SELECT * FROM person",
+            "d": 42,
+            "e": null,
+            "f": true,
+        });
+        assert_eq!(
+            collected(value),
+            vec!["  DEFINE TABLE indented SCHEMAFULL".to_string()]
+        );
+    }
+
+    /// The same statement can appear under several keys — `INFO FOR DB` and
+    /// `INFO FOR TABLE` overlap. Duplicates would each be re-parsed and then
+    /// merged against themselves.
+    #[test]
+    fn duplicates_are_dropped() {
+        let value = serde_json::json!({
+            "one": "DEFINE TABLE person SCHEMAFULL",
+            "two": "DEFINE TABLE person SCHEMAFULL",
+            "three": ["DEFINE TABLE person SCHEMAFULL"],
+        });
+        assert_eq!(
+            collected(value),
+            vec!["DEFINE TABLE person SCHEMAFULL".to_string()]
+        );
+    }
+
+    /// Whitespace difference makes two statements distinct, deliberately: this
+    /// layer does not normalise SurrealQL, and pretending two spellings are one
+    /// would need a parse it does not do.
+    #[test]
+    fn whitespace_makes_two_statements_distinct() {
+        let value = serde_json::json!([
+            "DEFINE TABLE person SCHEMAFULL",
+            "DEFINE  TABLE person SCHEMAFULL",
+        ]);
+        assert_eq!(collected(value).len(), 2);
+    }
+
+    #[test]
+    fn an_empty_answer_yields_nothing() {
+        assert!(collected(serde_json::json!({})).is_empty());
+        assert!(collected(serde_json::json!([])).is_empty());
+        assert!(collected(JsonValue::Null).is_empty());
+    }
+
+    /// Deep nesting must not overflow the stack. `INFO FOR DB` is shallow in
+    /// practice, but this walks whatever the server sends.
+    #[test]
+    fn deep_nesting_is_survivable() {
+        let mut value = JsonValue::String("DEFINE TABLE deep SCHEMAFULL".to_string());
+        for _ in 0..200 {
+            value = serde_json::json!({ "next": value });
+        }
+        assert_eq!(collected(value).len(), 1);
+    }
+}

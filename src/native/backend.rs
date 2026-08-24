@@ -71,9 +71,16 @@ impl LanguageServer for Backend {
     /// completion-order, which is why the core carries a version per document
     /// and drops a result the client has already superseded.
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        // The edit is applied here, on the reactor, so two notifications cannot
+        // land out of order — under incremental sync that would corrupt the
+        // buffer. Only the analysis is spawned, which is the part the debounce
+        // is allowed to drop.
+        let Some((uri, text, version)) = self.core.apply_document_change(params).await else {
+            return;
+        };
         let core = Arc::clone(&self.core);
         tokio::spawn(async move {
-            core.did_change(params).await;
+            core.analyze_changed_document(uri, text, version).await;
         });
     }
 
@@ -121,11 +128,70 @@ impl LanguageServer for Backend {
         Ok(self.core.document_symbol(params).await)
     }
 
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move { core.did_change_watched_files(params).await });
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        Ok(self.core.document_diagnostic(params).await)
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        params: WorkspaceDiagnosticParams,
+    ) -> Result<WorkspaceDiagnosticReportResult> {
+        Ok(self.core.workspace_diagnostic(params).await)
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        Ok(self.core.formatting(params).await)
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        Ok(self.core.range_formatting(params).await)
+    }
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        Ok(Some(self.core.folding_range(params).await))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        Ok(Some(self.core.selection_range(params).await))
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        Ok(self.core.goto_type_definition(params).await)
+    }
+
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+        Ok(Some(self.core.document_link(params).await))
+    }
+
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         Ok(self.core.semantic_tokens_full(params).await)
+    }
+
+    async fn semantic_tokens_full_delta(
+        &self,
+        params: SemanticTokensDeltaParams,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        Ok(self.core.semantic_tokens_full_delta(params).await)
     }
 
     async fn semantic_tokens_range(

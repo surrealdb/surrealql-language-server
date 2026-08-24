@@ -1,0 +1,33 @@
+diff --git a/grammar.js b/grammar.js
+index 4d4f500..bdf7e8c 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -1377,7 +1377,27 @@ export default grammar({
+ 				choice(
+ 					alias($._kw_none, $.None),
+ 					alias($._kw_full, $.Literal),
+-					repeat1($.PermissionGroup),
++					// Groups separated by an *optional* comma, which is what
++					// the engine does:
++					//
++					//     loop {
++					//         parse_specific_permission(...)
++					//         self.eat(t!(","));            // optional
++					//         if !self.eat(t!("FOR")) { break }
++					//     }
++					//
++					// — `syn/parser/stmt/parts.rs::parse_permission`. So
++					// `FOR select FULL, FOR create NONE` and
++					// `FOR select FULL FOR create NONE` are both valid, and a
++					// group without its own `FOR` is not.
++					//
++					// `repeat1` accepted neither comma, so valid SurrealQL —
++					// the form SurrealDB's own language tests use throughout —
++					// reported a syntax error on the comma.
++					seq(
++						$.PermissionGroup,
++						repeat(seq(optional(','), $.PermissionGroup)),
++					),
+ 				),
+ 			),
+ 

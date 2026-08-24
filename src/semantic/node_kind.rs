@@ -66,6 +66,8 @@ pub const THROW_STATEMENT: &str = "ThrowStatement";
 // ---- Clauses -------------------------------------------------------------
 
 pub const ON_TABLE_CLAUSE: &str = "OnTableClause";
+/// `REMOVE <form> <name>`.
+pub const REMOVE_STATEMENT: &str = "RemoveStatement";
 pub const TYPE_CLAUSE: &str = "TypeClause";
 pub const COMMENT_CLAUSE: &str = "CommentClause";
 pub const CONTENT_CLAUSE: &str = "ContentClause";
@@ -114,6 +116,14 @@ pub const ENFORCED_CLAUSE: &str = "EnforcedClause";
 
 pub const PERMISSIONS_FOR_CLAUSE: &str = "PermissionsForClause";
 pub const PERMISSIONS_BASIC_CLAUSE: &str = "PermissionsBasicClause";
+/// One `FOR <actions> <mode>` inside a permissions clause.
+///
+/// The clause holds a group per `FOR`, and the actions and the mode live inside
+/// the group rather than beside it — reading only the clause's direct children
+/// found neither.
+pub const PERMISSION_GROUP: &str = "PermissionGroup";
+/// The `NONE` of `PERMISSIONS NONE`. A node of its own, not a keyword.
+pub const NONE_LITERAL: &str = "None";
 
 // ---- Values and expressions ----------------------------------------------
 

@@ -19,6 +19,7 @@
 
 pub mod config;
 pub mod core;
+pub mod format;
 pub mod grammar;
 /// The generated builtin catalogue. Written by
 /// `cargo xtask generate-builtins`; never edit it by hand.

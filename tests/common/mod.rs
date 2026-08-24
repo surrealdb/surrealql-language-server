@@ -90,6 +90,10 @@ impl LspNotifier for RecordingNotifier {
 #[derive(Default)]
 pub struct StaticWorkspace {
     pub index: WorkspaceIndex,
+    /// Stands in for a `surrealql.toml`, already converted to JSON. `None`
+    /// exercises the trait's default — which is what the browser host and
+    /// most tests use.
+    pub project_config: Option<serde_json::Value>,
 }
 
 #[async_trait]
@@ -100,6 +104,13 @@ impl WorkspaceLoader for StaticWorkspace {
 
     async fn read_document(&self, _uri: &Uri) -> Option<String> {
         None
+    }
+
+    async fn load_project_config(
+        &self,
+        _folders: &[PathBuf],
+    ) -> (Option<serde_json::Value>, Vec<String>) {
+        (self.project_config.clone(), Vec::new())
     }
 }
 
@@ -134,10 +145,65 @@ pub fn core_with(
     };
     let core = LanguageServerCore::new(
         notifier.clone(),
-        StaticWorkspace { index: workspace },
+        StaticWorkspace {
+            index: workspace,
+            project_config: None,
+        },
         provider.clone(),
     );
     (core, notifier, provider)
+}
+
+/// [`core_with`] plus a stand-in `surrealql.toml`.
+pub fn core_with_project_config(
+    project_config: serde_json::Value,
+) -> (TestCore, RecordingNotifier, RecordingMetadata) {
+    let notifier = RecordingNotifier::default();
+    let provider = RecordingMetadata::default();
+    let core = LanguageServerCore::new(
+        notifier.clone(),
+        StaticWorkspace {
+            index: WorkspaceIndex::default(),
+            project_config: Some(project_config),
+        },
+        provider.clone(),
+    );
+    (core, notifier, provider)
+}
+
+/// The capabilities a modern editor advertises.
+///
+/// The server now reads them and stays quiet about anything a client did not
+/// claim, so a test that expects a configuration pull or `relatedInformation`
+/// has to say the client supports it — exactly as a real client does.
+pub fn modern_client() -> tower_lsp_server::ls_types::ClientCapabilities {
+    use tower_lsp_server::ls_types::{
+        ClientCapabilities, PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
+        WorkspaceClientCapabilities,
+    };
+    ClientCapabilities {
+        workspace: Some(WorkspaceClientCapabilities {
+            configuration: Some(true),
+            ..Default::default()
+        }),
+        text_document: Some(TextDocumentClientCapabilities {
+            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
+                related_information: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// `initialize` with [`modern_client`] capabilities.
+pub async fn initialize_modern(core: &TestCore) {
+    core.initialize(tower_lsp_server::ls_types::InitializeParams {
+        capabilities: modern_client(),
+        ..Default::default()
+    })
+    .await;
 }
 
 pub fn uri(path: &str) -> Uri {

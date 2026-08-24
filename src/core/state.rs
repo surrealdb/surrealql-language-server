@@ -24,9 +24,40 @@ use crate::semantic::types::{
 #[derive(Debug, Default)]
 pub struct ServerState {
     pub settings: Arc<ServerSettings>,
+    /// What the client said it can do, at `initialize`.
+    ///
+    /// Read before sending anything optional. Requesting a capability the
+    /// client never advertised is at best a wasted round trip and at worst an
+    /// error the user sees; the server used to send `workspace/configuration`
+    /// to everybody and swallow the failure.
+    pub client_capabilities: ClientCapabilitySummary,
     pub workspace_folders: Vec<PathBuf>,
     pub saved_workspace: Arc<WorkspaceIndex>,
     pub open_documents: HashMap<Uri, Arc<DocumentAnalysis>>,
+    /// The authoritative text of each open document.
+    ///
+    /// Held apart from [`Self::open_documents`] because the two now move at
+    /// different times: an edit updates this synchronously and in arrival
+    /// order, while the analysis that produces a `DocumentAnalysis` is
+    /// debounced and may be dropped when a newer edit supersedes it. Under
+    /// incremental sync a range edit applies to *this* text, so it cannot wait
+    /// behind an analysis.
+    pub buffers: HashMap<Uri, String>,
+    /// Edits made since the tree in [`Self::open_documents`] was produced.
+    ///
+    /// tree-sitter can reuse a tree only if it is told exactly how the text
+    /// changed. The list is *not* cleared when an analysis is dropped as
+    /// superseded — the stored tree did not change either, so the next
+    /// analysis replays the whole list against it and is still correct. It is
+    /// cleared only in the same critical section that stores a new tree.
+    pub pending_edits: HashMap<Uri, Vec<tree_sitter::InputEdit>>,
+    /// The last semantic token set handed to the client, by result id.
+    ///
+    /// A delta request quotes the id it last received; without the tokens that
+    /// id stood for there is nothing to diff against, so the server answers in
+    /// full instead. One entry per document — a client only ever asks about the
+    /// most recent id.
+    pub last_semantic_tokens: HashMap<Uri, (String, Vec<ls_types::SemanticToken>)>,
     /// The newest `didChange` version seen for each open document.
     ///
     /// Two things read it. The debounce uses it to decide whether the edit it
@@ -58,6 +89,19 @@ pub struct ServerState {
     /// so a persistently bad configuration doesn't re-log on every
     /// pull. Same pattern as [`Self::last_metadata_errors`].
     pub last_settings_warnings: Option<Vec<String>>,
+}
+
+/// The parts of the client's advertised capabilities this server acts on.
+///
+/// A summary rather than the whole `ClientCapabilities` struct: only these two
+/// change what the server sends, and storing the rest would invite reading it
+/// somewhere that has not thought about the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientCapabilitySummary {
+    /// `workspace.configuration` — the client answers configuration pulls.
+    pub configuration: bool,
+    /// `textDocument.publishDiagnostics.relatedInformation`.
+    pub related_information: bool,
 }
 
 /// Stable signature of a workspace-folder set, used to short-circuit
