@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -82,8 +84,20 @@ impl MetadataSettings {
 pub struct AnalysisSettings {
     #[serde(default = "default_true", alias = "enable_permission_analysis")]
     pub enable_permission_analysis: bool,
+    /// Accepted for compatibility. It has no effect.
+    ///
+    /// Nothing has ever read it. It is kept rather than removed because
+    /// `tests/compat.rs` pins its parsing, its default and the fact that
+    /// setting it produces no warning — a client that has it in a settings file
+    /// must not start seeing errors. Remove it only in a release that says so.
     #[serde(default = "default_true", alias = "enable_aggressive_schema_inference")]
     pub enable_aggressive_schema_inference: bool,
+    /// Whether `textDocument/codeAction` returns anything.
+    ///
+    /// The capability stays advertised when this is `false`; the handler
+    /// returns an empty list. Withdrawing the capability would change the
+    /// advertised server shape based on a setting, and a client reads that
+    /// once at `initialize`.
     #[serde(default = "default_true", alias = "enable_code_actions")]
     pub enable_code_actions: bool,
     /// Report call arguments whose type cannot satisfy the declared
@@ -150,6 +164,19 @@ pub struct AnalysisSettings {
     /// here keeps the check strict everywhere else.
     #[serde(default, alias = "external_params")]
     pub external_params: Vec<String>,
+    /// Per-rule severity, keyed by the rule id that appears in
+    /// `Diagnostic.code` — see [`crate::semantic::rules`]. Accepted values are
+    /// `off`, `hint`, `info`, `warning` and `error`.
+    ///
+    /// This wins over the coarse booleans above, so a single rule can be turned
+    /// back on under `enableTypeChecking: false`, or turned off on its own
+    /// without disabling its whole category.
+    ///
+    /// A `BTreeMap` rather than a `HashMap` so equality and warning order are
+    /// deterministic — this struct derives `PartialEq` and the warnings are
+    /// deduplicated by signature.
+    #[serde(default, alias = "rule_severity")]
+    pub rule_severity: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -201,6 +228,7 @@ impl Default for AnalysisSettings {
             max_syntax_diagnostics: default_max_syntax_diagnostics(),
             diagnostic_debounce_ms: default_diagnostic_debounce_ms(),
             external_params: Vec::new(),
+            rule_severity: BTreeMap::new(),
         }
     }
 }
@@ -250,6 +278,49 @@ impl ServerSettings {
     /// forward these to the client via `window/logMessage` so a typo
     /// in the editor settings is no longer a silent no-op.
     pub fn from_sources_with_warnings(
+        initialization_options: Option<&Value>,
+        configuration: Option<&Value>,
+    ) -> (Self, Vec<String>) {
+        Self::from_sources_with_project(None, initialization_options, configuration)
+    }
+
+    /// [`Self::from_sources_with_warnings`] with a project-configuration layer
+    /// underneath the LSP payloads.
+    ///
+    /// Precedence is defaults, then the project file, then the LSP settings,
+    /// then the environment fallback for connection fields.
+    ///
+    /// The merge happens on the JSON `Value`, before deserialization, and it
+    /// has to: `parse_settings_value` *replaces* the settings from each source
+    /// rather than merging them, and a deserialized struct cannot tell an
+    /// explicitly-set `true` from a defaulted one. Merging afterwards would
+    /// therefore let the file overwrite an LSP value the user actually set.
+    ///
+    /// `project` arrives as JSON rather than TOML so this stays
+    /// target-agnostic: the native loader does the conversion, and a browser
+    /// host can push a value in the same shape.
+    pub fn from_sources_with_project(
+        project: Option<&Value>,
+        initialization_options: Option<&Value>,
+        configuration: Option<&Value>,
+    ) -> (Self, Vec<String>) {
+        let Some(project) = project.filter(|value| !value.is_null()) else {
+            return Self::from_lsp_sources(initialization_options, configuration);
+        };
+        // The file is entirely ours, so a `surrealql` wrapper is optional.
+        let base = project.get("surrealql").unwrap_or(project);
+
+        let merged_init = initialization_options.map(|value| layer_under(base, value));
+        let merged_config = configuration.map(|value| layer_under(base, value));
+
+        if merged_init.is_none() && merged_config.is_none() {
+            // No LSP payload at all: the file is the only source.
+            return Self::from_lsp_sources(Some(base), None);
+        }
+        Self::from_lsp_sources(merged_init.as_ref(), merged_config.as_ref())
+    }
+
+    fn from_lsp_sources(
         initialization_options: Option<&Value>,
         configuration: Option<&Value>,
     ) -> (Self, Vec<String>) {
@@ -307,7 +378,7 @@ impl ServerSettings {
     /// describe each repair. Unknown `metadata.mode` previously turned
     /// off both the workspace scan *and* the live DB fetch with no
     /// feedback at all.
-    fn validate_and_repair(&mut self) -> Vec<String> {
+    pub fn validate_and_repair(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
 
         if !ACCEPTED_METADATA_MODES.contains(&self.metadata.mode.as_str()) {
@@ -330,6 +401,31 @@ impl ServerSettings {
                 ACCEPTED_SCHEMALESS_DIAGNOSTICS.join(", "),
             ));
             self.analysis.schemaless_diagnostics = default_schemaless_diagnostics();
+        }
+
+        // `ruleSeverity` keys are rule ids and its values are severity names.
+        // Neither is a settings key, so `collect_unknown_keys` never reaches
+        // them — it checks the keys of `analysis` and does not descend. They
+        // are swept here instead, and a bad entry is dropped rather than
+        // guessed at: silently reading `"warn "` as `warning` would hide a
+        // typo that changes what a whole team sees.
+        {
+            let mut rejected = Vec::new();
+            self.analysis.rule_severity.retain(|id, value| {
+                let known_rule = crate::semantic::rules::rule(id).is_some();
+                let known_severity = crate::semantic::rules::parse_severity(value).is_some();
+                if !known_rule {
+                    rejected.push(unknown_rule_warning(id));
+                } else if !known_severity {
+                    rejected.push(format!(
+                        "unknown analysis.ruleSeverity value `{value}` for `{id}` was ignored \
+                         (accepted values: {})",
+                        crate::semantic::rules::ACCEPTED_RULE_SEVERITIES.join(", "),
+                    ));
+                }
+                known_rule && known_severity
+            });
+            warnings.extend(rejected);
         }
 
         if let Some(active) = &self.active_auth_context {
@@ -404,6 +500,42 @@ impl ConnectionSettings {
 /// payload that *tried* to configure `surrealql` but was malformed —
 /// previously that error was swallowed and the whole object silently
 /// dropped.
+/// Put `base` underneath `source`, preserving `source`'s shape.
+///
+/// A nested `{"surrealql": {…}}` source keeps its wrapper, so the unknown-key
+/// sweep still treats the inner object as entirely ours. A flat source stays
+/// flat, so unrelated editor keys at its root are still left alone.
+fn layer_under(base: &Value, source: &Value) -> Value {
+    match source.get("surrealql") {
+        Some(inner) => {
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert("surrealql".to_string(), deep_merge(base, inner));
+            Value::Object(wrapper)
+        }
+        None => deep_merge(base, source),
+    }
+}
+
+/// Recursive object merge. `overlay` wins at every leaf; a key present only in
+/// `base` survives.
+fn deep_merge(base: &Value, overlay: &Value) -> Value {
+    let (Some(base_object), Some(overlay_object)) = (base.as_object(), overlay.as_object()) else {
+        return overlay.clone();
+    };
+    let mut merged = base_object.clone();
+    for (key, value) in overlay_object {
+        match merged.get(key) {
+            Some(existing) if existing.is_object() && value.is_object() => {
+                merged.insert(key.clone(), deep_merge(existing, value));
+            }
+            _ => {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Value::Object(merged)
+}
+
 fn parse_settings_value(
     value: &Value,
     warnings: &mut Vec<String>,
@@ -484,6 +616,8 @@ const ANALYSIS_KEYS: &[&str] = &[
     "diagnostic_debounce_ms",
     "externalParams",
     "external_params",
+    "ruleSeverity",
+    "rule_severity",
 ];
 const AUTH_CONTEXT_KEYS: &[&str] = &[
     "name",
@@ -543,6 +677,28 @@ fn collect_unknown_keys(section: &Value, sweep_top_level: bool, warnings: &mut V
                 }
             }
         }
+    }
+}
+
+/// A rule id in `analysis.ruleSeverity` that no rule answers to.
+///
+/// Same shape as [`unknown_key_warning`], but the candidate set is the rule
+/// registry rather than a static key list.
+fn unknown_rule_warning(id: &str) -> String {
+    let suggestion = crate::semantic::rules::ids()
+        .map(|known| (strsim::jaro_winkler(id, known), known))
+        .filter(|(score, _)| *score >= 0.8)
+        .max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, known)| known);
+    match suggestion {
+        Some(known) => {
+            format!("unknown rule `{id}` in analysis.ruleSeverity — did you mean `{known}`?")
+        }
+        None => format!("unknown rule `{id}` in analysis.ruleSeverity was ignored"),
     }
 }
 
@@ -743,6 +899,84 @@ mod tests {
             settings.connection.endpoint.as_deref(),
             Some("ws://127.0.0.1:8000/rpc")
         );
+    }
+
+    #[test]
+    fn rule_severity_accepts_a_known_rule_and_severity() {
+        let value = json!({
+            "surrealql": {
+                "analysis": { "ruleSeverity": { "unknown-field": "error", "let-type": "off" } }
+            }
+        });
+        let (settings, warnings) = ServerSettings::from_sources_with_warnings(Some(&value), None);
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(
+            settings.analysis.rule_severity.get("unknown-field"),
+            Some(&"error".to_string())
+        );
+        assert_eq!(
+            settings.analysis.rule_severity.get("let-type"),
+            Some(&"off".to_string())
+        );
+    }
+
+    /// A rule id nobody answers to is dropped, not silently kept. Keeping it
+    /// would let a typo look like a configured rule that never fires.
+    #[test]
+    fn an_unknown_rule_id_is_dropped_with_a_hint() {
+        let value = json!({
+            "surrealql": { "analysis": { "ruleSeverity": { "unknown-feild": "off" } } }
+        });
+        let (settings, warnings) = ServerSettings::from_sources_with_warnings(Some(&value), None);
+        assert!(settings.analysis.rule_severity.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("unknown-feild") && warnings[0].contains("unknown-field"),
+            "expected a did-you-mean hint, got: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn an_unrecognisable_rule_id_is_dropped_without_a_hint() {
+        let value = json!({
+            "surrealql": { "analysis": { "ruleSeverity": { "zzzzzzzz": "off" } } }
+        });
+        let (settings, warnings) = ServerSettings::from_sources_with_warnings(Some(&value), None);
+        assert!(settings.analysis.rule_severity.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("was ignored"), "got: {}", warnings[0]);
+    }
+
+    /// A severity outside the vocabulary is dropped rather than guessed at.
+    /// Reading `"warn "` as `warning` would hide a typo that changes what a
+    /// whole team sees.
+    #[test]
+    fn an_unknown_severity_value_is_dropped_with_the_accepted_list() {
+        let value = json!({
+            "surrealql": { "analysis": { "ruleSeverity": { "let-type": "loud" } } }
+        });
+        let (settings, warnings) = ServerSettings::from_sources_with_warnings(Some(&value), None);
+        assert!(settings.analysis.rule_severity.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("`loud`") && warnings[0].contains("error"),
+            "expected the accepted list, got: {}",
+            warnings[0]
+        );
+    }
+
+    /// The keys inside `ruleSeverity` are rule ids, not settings keys. The
+    /// sweep must never report them as unknown settings.
+    #[test]
+    fn rule_severity_keys_are_not_swept_as_settings_keys() {
+        let value = json!({
+            "surrealql": {
+                "analysis": { "ruleSeverity": { "unknown-table": "warning" } }
+            }
+        });
+        let (_, warnings) = ServerSettings::from_sources_with_warnings(Some(&value), None);
+        assert_eq!(warnings, Vec::<String>::new());
     }
 
     #[test]

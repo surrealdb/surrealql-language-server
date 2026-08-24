@@ -40,6 +40,7 @@ tree-sitter = '0.26.6'
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 surrealdb = { version = '3.0.5', default-features = false, features = ['protocol-http', 'protocol-ws', 'rustls'] }
 tokio = { version = '1.48.0', features = ['io-std', 'macros', 'rt-multi-thread', 'sync', 'time'] }
+toml = { version = '0.9', default-features = false, features = ['parse', 'serde'] }
 tower-lsp-server = '0.23.0'
 walkdir = '2.5.0'
 

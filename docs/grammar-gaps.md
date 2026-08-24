@@ -21,6 +21,28 @@ constants together.
   lookahead table only exposes the alias — "expected *which* keyword"
   cannot be derived from parser states (that's why syntax hints use
   the build-generated `KEYWORDS` list instead).
+- **The grammar rejects far more valid SurrealQL than this document said.**
+  Measured over SurrealDB's corpus, 603 of 1,897 files carry a `parse`
+  diagnostic. Many are deliberately-invalid test inputs, but the shapes below
+  are systematic and each one is valid SurrealQL the grammar cannot read
+  (occurrence counts across the corpus):
+
+  | Shape | Count | Note |
+  |---|---|---|
+  | `EXPLAIN` / `EXPLAIN ANALYZE` | 390 | `SELECT … EXPLAIN`; absent from `grammar.js` entirely |
+  | `.*` | 55 | |
+  | closures `\|$x\| …` | ~50 | already listed below |
+  | `dec` suffix | 37 | already listed below |
+  | `FULLTEXT ANALYZER …` | 26 | index option |
+  | `,` between permission groups | 25 | fixed, see below |
+  | `VERSION $t` | 35 | `SELECT … VERSION $t` |
+
+  CAUTION: `tests/conformance.rs` filters `parse` out of its sweep, so **none of
+  this is visible to the corpus test**. Its comment says the grammar rejects
+  "two shapes it rejects although SurrealDB accepts them"; the real number is at
+  least seven, and `EXPLAIN` alone is 390 occurrences. A grammar false positive
+  can only be found by measuring the syntax pass directly.
+
 - **Error recovery is coarse.** A single typo often produces one ERROR
   node spanning the rest of the statement (or file); nested statements
   inside the error region may re-parse. The diagnostics layer clamps
@@ -73,6 +95,51 @@ constants together.
   `Ident` (pinned revision) or an `Idiom` (fixed revision). Note the
   fixed grammar wraps *every* target in an `Idiom`, including the plain
   `SET age = 29` case.
+
+- **Permission groups cannot be comma separated.** `PermissionsForClause` is
+  `repeat1($.PermissionGroup)`, so the comma in
+  `PERMISSIONS FOR select FULL, FOR create NONE` becomes an `ERROR` sibling and
+  valid SurrealQL reports ``Invalid SurrealQL syntax near `,`.`` SurrealDB's own
+  language tests use that form throughout — `table_import.surql`,
+  `field_permissions_import.surql`, `data_clause_uses_reduced_view_import.surql`
+  among others.
+
+  The engine's `parse_permission` (`syn/parser/stmt/parts.rs`) is a loop:
+
+  ```rust
+  loop {
+      parse_specific_permission(...)
+      self.eat(t!(","));               // optional
+      if !self.eat(t!("FOR")) { break }  // required to continue
+  }
+  ```
+
+  So the comma is **optional** and `FOR` is **required** on each group.
+  `FOR select FULL FOR create NONE` is valid too, and
+  `FOR select FULL, create WHERE …` is not.
+
+  Fix, verified: replace `repeat1($.PermissionGroup)` with
+  `seq($.PermissionGroup, repeat(seq(optional(','), $.PermissionGroup)))`. It
+  regenerates with no new conflicts. The patch is committed here as
+  [`permission-group-comma.patch`](permission-group-comma.patch), and it is a
+  *cross-repo* change: it lands in `surrealql-tree-sitter`, then the pin moves.
+
+  Measured against SurrealDB's 1,897-file corpus, before and after: files
+  carrying a `parse` diagnostic 603 → 594, total `parse` diagnostics
+  1837 → 1823, ``near `,`` `` specifically 25 → 11. The formatter, which refuses
+  anything it cannot parse, went from 588 files formatted to 591 and from 606
+  refused to 597.
+
+  NOTE: `the_pinned_grammar_rejects_comma_separated_permission_groups` in
+  `tests/lsp.rs` pins the *current* behaviour, so building against a grammar
+  that carries this fix makes that one test fail. That is the signal to invert
+  its two assertions and delete this entry. CI builds against the pin, so CI is
+  unaffected until the pin moves.
+
+  NOTE: one inline test in `src/semantic/analyzer.rs` carried
+  `PERMISSIONS FOR select FULL, create WHERE …` — no second `FOR`, which the
+  engine rejects. It passed only because the grammar rejected the comma outright
+  and kept the error region small. Corrected to the valid form.
 
 - **A graph hop names no fields.** `Lookup` is
   `seq(choice($.LookupRight, $.LookupLeft, $.LookupBoth), choice($.Ident,

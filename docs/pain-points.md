@@ -5,6 +5,51 @@
 - **Method**: 6 area explorations (diagnostics pipeline, LSP surface, native runtime, WASM runtime, semantic coverage, tests/docs/CI), each finding adversarially re-verified against the code, plus a completeness pass. 96 findings confirmed, 9 candidates refuted.
 - **Status column**: ✅ fixed in the 0.3.0 error-handling change · ⏳ deferred (tracked here) · ❌ won't-fix / by design.
 
+## Resolved since this audit
+
+This document was written at `25dfce17`. The cycle that added the rule registry,
+the command-line mode, the formatter and incremental sync closed most of it. The
+tables below keep their original wording with the status corrected inline; this
+list is the summary.
+
+**High severity.** H10 (WASM never built in PR CI) ✅. H12 (release jobs not
+gated on tests) ✅. H15 (incremental sync needs ordered edits) ✅ — the edit is
+applied on the reactor and only the analysis is spawned. H7's remaining rows D4
+(incremental sync) and D5 (incremental parse) ✅. H11 partly: `metadata_db` and
+`workspace_fs` now have unit tests; the WASM JS surface still has none. H14 (the
+merged-model rebuild) ⏳ **measured and deliberately not changed** — the build is
+1.5 ms at 200 documents, and it is the change whose failure mode is a silently
+wrong hover type.
+
+**Also fixed, and not in this document because nobody had found them yet:**
+
+- **Every `PERMISSIONS` clause mis-parsed.** `parse_permission_rule` read only
+  the direct children of `PermissionsForClause`, but the actions and the mode
+  live inside a `PermissionGroup`; `FULL` is a `Literal` node and `NONE` a
+  `None` node, neither of which is a keyword. Every form resolved to
+  `actions: [Execute], mode: Expression(<whole clause>)`, so `permission-denied`
+  could never fire, `PERMISSIONS FULL` never granted, and every table with a
+  clause reported `permission-unknown`. The existing unit test passed because it
+  hand-built the `TableDef` — the same shape as H1's dead typo detection.
+- **`unknown-field` reached only `SET` and `CONTENT`.** A misspelled column in a
+  `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `SPLIT`, `FETCH` or `OMIT` was
+  silent.
+- **`fn::does_not_exist()` was silent**, as was any misspelled builtin.
+- **`REMOVE TABLE person` left `person` in the model**, so every later query
+  against it looked fine.
+- **A client sending only `rootUri`** got an empty workspace-folder list, so
+  nothing was walked and no `surrealql.toml` was ever found.
+- **`didChangeConfiguration` discarded the project config file** entirely.
+- **Call hierarchy listed a caller twice** if it called twice.
+
+**Low severity, resolved:** `positionEncoding` is stated explicitly ·
+`DiagnosticTag::UNNECESSARY` is used by the unused-code rules ·
+`codeDescription` links every diagnostic to its rule page · formatting, folding
+range, selection range and pull diagnostics all exist · client capabilities are
+read · clippy runs in CI. **Still open:** code lens · `connection.access` unused
+· `shutdown()` no-op · symlinked directories not traversed · WASM ignores
+`enable_live_metadata` · grammar load failure is a silent total outage.
+
 ## High severity
 
 | # | Finding | Where | Status |
@@ -44,14 +89,14 @@
 
 ### Correctness / robustness (⏳ deferred unless noted)
 
-- `signature_help` brittle text scan (`rfind('(')` + comma count) — breaks on nested calls/strings (`core/server.rs:564`).
-- CRUD statements inside FOR/IF blocks never analyzed (`analyzer.rs:145`); INSERT produces no query facts (`analyzer.rs:116`); LET/FOR `$variable` scoping untracked (`analyzer.rs:565`); DEFINE ANALYZER/USER/NAMESPACE/DATABASE/MODEL/TOKEN/CONFIG unanalyzed (`analyzer.rs:61`).
-- Rename/references/document-highlight only cover custom functions (`core/server.rs:524,536`); call-hierarchy `fromRanges` point at definitions, not call sites (`core/server.rs:712`); call hierarchy resolves items by bare name.
-- Dead `analysis.*` config flags: `enable_permission_analysis`, `enable_code_actions`, `enable_aggressive_schema_inference` are accepted but never checked — the settings UI lies (`model.rs:481`, `core/server.rs:632`). ✅ partially: `enable_permission_analysis` now gates the permission block in `semantic_diagnostics`. ⏳ remaining: `enable_code_actions`, `enable_aggressive_schema_inference`.
+- ~~`signature_help` brittle text scan~~ ✅ replaced by a bracket-and-string-aware scan; the callee name is read by scanning back over name characters rather than splitting on whitespace, which used to pick up the enclosing call's text. Still a scan rather than a tree walk, deliberately: signature help is most useful on the `(` keystroke, and the grammar has no call node yet at that moment.
+- ~~CRUD statements inside FOR/IF blocks never analyzed~~ ✅ **stale row** — `collect_statements` descends into `LET`/`FOR`/`IF`/`RETURN`/`THROW` bodies. ~~INSERT produces no query facts~~ ✅ **stale row** — it has a `QueryAction::Create` arm. ~~LET/FOR `$variable` scoping untracked~~ ✅ **stale row** — `BindingTable` scopes `LET`, `FOR`, function and closure parameters by byte range. DEFINE ANALYZER/USER/NAMESPACE/DATABASE/MODEL/TOKEN/CONFIG unanalyzed — ✅ each now gets a named outline entry with a real `SymbolKind`; still no structured analysis of their bodies.
+- ~~Rename/references/document-highlight only cover custom functions~~ ✅ they reach tables, fields and parameters, honour `includeDeclaration`, distinguish WRITE from READ, and refuse to rename a `Remote` symbol. ~~Call-hierarchy `fromRanges` point at definitions~~ ✅ they point at the call sites, items carry identity in `data`, and a caller that calls twice is listed once with two sites.
+- Dead `analysis.*` config flags — ✅ resolved. `enable_code_actions` empties the code-action response (the capability stays advertised, because a client reads that once). `enable_aggressive_schema_inference` is documented as inert and kept, because `tests/compat.rs` pins its parsing, its default and its zero-warning behaviour.
 - `connection.access` accepted but never used for authentication (`config.rs:48`).
 - WASM ignores `enable_live_metadata`/db mode where native honors them (`wasm/host_data.rs:103`); a db-only metadata mode wipes host-pushed workspace documents in the browser (`core/server.rs:203`).
-- No `didChangeWatchedFiles` — externally created/deleted `.surql` files invisible until restart; live metadata reconnects and re-walks the whole DB on every save (`metadata_db.rs:73`).
-- node-kind constants have no grammar-drift check (`node_kind.rs:14`); the grammar SHA is pinned in four places with no consistency check; setup script doesn't verify the checkout matches the pin.
+- ~~No `didChangeWatchedFiles`~~ ✅ registered at startup for `**/*.surql` and `**/*.surrealql`, with an open buffer always winning. ⏳ live metadata still reconnects and re-walks the whole DB on every save.
+- node-kind constants have no grammar-drift check (`node_kind.rs:14`). ~~The grammar SHA is pinned in four places with no consistency check~~ ✅ `the_grammar_pin_is_the_same_everywhere` in `tests/compat.rs` checks all six. ⏳ the setup script still does not verify the checkout matches the pin.
 - ✅ Cargo/npm version skew (0.2.0 vs 0.2.1) realigned at 0.3.0.
 - ✅ README references to nonexistent files fixed; this document and `docs/grammar-gaps.md` created.
 - ✅ No LSP-pipeline integration tests → `tests/core_server.rs` + `tests/dispatch.rs` + `tests/compat.rs`.

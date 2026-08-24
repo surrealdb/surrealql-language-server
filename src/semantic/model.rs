@@ -4,7 +4,7 @@ use ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind,
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DocumentChanges, Documentation,
     Location, MarkupContent, MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
-    Range, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    Range, SymbolKind, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 use strsim::jaro_winkler;
 
@@ -15,6 +15,7 @@ use crate::grammar::{
     builtin_signature,
 };
 use crate::semantic::codes;
+use crate::semantic::rules::RuleSet;
 use crate::semantic::text::{LineIndex, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
@@ -22,7 +23,7 @@ use crate::semantic::types::{
     AccessDef, AccessResult, AnalyzerDef, DocumentAnalysis, EventDef, FieldDef, FunctionDef,
     FunctionLanguage, FunctionParam, GraphIndex, IndexDef, LiveMetadataSnapshot, LookupDirection,
     MergedSemanticModel, NamedRange, ParamDef, PermissionMode, PermissionRule, QueryAction,
-    QueryFact, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
+    QueryFact, SymbolOrigin, SymbolReference, TableDef, TargetResolution, WorkspaceIndex,
 };
 
 impl MergedSemanticModel {
@@ -51,7 +52,18 @@ impl MergedSemanticModel {
                         .push(reference.location.clone());
                 }
             }
+            // Cheap: a deduplicated name list per document, unioned.
+            model
+                .referenced_names
+                .extend(analysis.referenced_names.iter().cloned());
         }
+
+        // Removals are applied after every definition is absorbed, and only
+        // where the definition being removed is *earlier in the same document*.
+        // Across documents there is no defined execution order, so a `REMOVE`
+        // in one file says nothing about a `DEFINE` in another — treating it as
+        // authoritative there would delete a live table from the model.
+        model.apply_removals(workspace);
 
         model.reindex_target_usage();
 
@@ -1515,9 +1527,13 @@ impl MergedSemanticModel {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = crate::semantic::infer::type_diagnostics(analysis, self, settings);
         let active_context = settings.active_auth_context();
+        // Gated on the most permissive environment for the same reason
+        // `infer::type_diagnostics` is: this decides what work to do, and
+        // `RuleSet::apply` at the end of the pipeline decides what to keep.
+        let rules = RuleSet::resolve(settings, crate::semantic::rules::SERVER_ENVIRONMENT);
 
         for fact in analysis.query_facts.iter() {
-            if fact.target_tables.is_empty() {
+            if fact.target_tables.is_empty() && rules.is_enabled(codes::DYNAMIC_TARGET) {
                 // `$param` / expression targets are resolvable only at
                 // runtime — warning about them is pure noise.
                 if matches!(
@@ -1541,15 +1557,23 @@ impl MergedSemanticModel {
             }
 
             for table in &fact.target_tables {
-                let table_range = range_for_name(&fact.target_refs, table, fact.location.range);
+                let table_range = range_for_name(
+                    &fact.target_refs,
+                    table,
+                    fact.location.range,
+                    &analysis.text,
+                    &analysis.line_index,
+                );
                 let table_def = match self.tables.get(table) {
                     None => {
-                        let suggestion = self.find_nearest_explicit_table(table);
-                        diagnostics.push(self.unknown_table_diagnostic(
-                            table,
-                            table_range,
-                            suggestion,
-                        ));
+                        if rules.is_enabled(codes::UNKNOWN_TABLE) {
+                            let suggestion = self.find_nearest_explicit_table(table);
+                            diagnostics.push(self.unknown_table_diagnostic(
+                                table,
+                                table_range,
+                                suggestion,
+                            ));
+                        }
                         continue;
                     }
                     // The statement being checked is itself enough to
@@ -1576,7 +1600,10 @@ impl MergedSemanticModel {
                     // Everything else stays untouched — schema
                     // inference from usage is a feature, not an error.
                     Some(table_def) if !table_def.explicit => {
-                        if !self.metadata_degraded && self.target_usage_count(table) <= 1 {
+                        if rules.is_enabled(codes::UNKNOWN_TABLE)
+                            && !self.metadata_degraded
+                            && self.target_usage_count(table) <= 1
+                        {
                             if let Some(suggestion) =
                                 self.find_probable_typo_of_explicit_table(table)
                             {
@@ -1599,7 +1626,7 @@ impl MergedSemanticModel {
                 // `WHERE $auth.id = id`) that can't be evaluated
                 // without the actual record, so the diagnostics tend
                 // to be noisy false-positives in the editor.
-                if settings.analysis.enable_permission_analysis
+                if rules.any_enabled(crate::semantic::rules::CHECK_PERMISSIONS)
                     && !matches!(fact.action, QueryAction::Select | QueryAction::Relate)
                 {
                     let permission = self.evaluate_permissions(fact, table_def, active_context);
@@ -1659,7 +1686,10 @@ impl MergedSemanticModel {
                             codes::UNKNOWN_FIELD,
                             &settings.analysis.schemaless_diagnostics,
                         ));
-                if !(table_def.explicit && closed_schema) || fact.action == QueryAction::Relate {
+                if !(table_def.explicit && closed_schema)
+                    || fact.action == QueryAction::Relate
+                    || !rules.is_enabled(codes::UNKNOWN_FIELD)
+                {
                     continue;
                 }
                 for field in &fact.touched_fields {
@@ -1679,14 +1709,328 @@ impl MergedSemanticModel {
                         .and_then(|by_name| by_name.get(field.as_str()))
                         .is_some_and(|field_def| field_def.explicit);
                     if !explicitly_defined {
-                        let range = range_for_name(&fact.field_refs, field, fact.location.range);
+                        let range = range_for_name(
+                            &fact.field_refs,
+                            field,
+                            fact.location.range,
+                            &analysis.text,
+                            &analysis.line_index,
+                        );
                         diagnostics.push(self.unknown_field_diagnostic(table, field, range));
                     }
                 }
             }
         }
 
+        if rules.any_enabled(crate::semantic::rules::CHECK_INDEXES) {
+            self.check_indexes(analysis, &rules, &mut diagnostics);
+        }
+        if rules.any_enabled(crate::semantic::rules::CHECK_DUPLICATES) {
+            self.check_duplicates(analysis, &mut diagnostics);
+        }
+        if rules.any_enabled(crate::semantic::rules::CHECK_RELATIONS) {
+            self.check_relations(analysis, &mut diagnostics);
+        }
+        if rules.any_enabled(crate::semantic::rules::CHECK_UNUSED) {
+            self.check_unused(analysis, &mut diagnostics);
+        }
+
         diagnostics
+    }
+
+    /// Drop what the workspace's `REMOVE` statements remove.
+    ///
+    /// Conservative by design: only a definition in the same document and
+    /// earlier in source order. See the note at the call site.
+    fn apply_removals(&mut self, workspace: &WorkspaceIndex) {
+        for analysis in workspace.documents.values() {
+            for removal in &analysis.removals {
+                let removed_at = removal.location.range.start;
+                let earlier_here = |location: &Location| {
+                    location.uri == removal.location.uri
+                        && (location.range.start.line, location.range.start.character)
+                            < (removed_at.line, removed_at.character)
+                };
+                match removal.form.as_str() {
+                    "table" => {
+                        if self
+                            .tables
+                            .get(&removal.name)
+                            .is_some_and(|table| earlier_here(&table.location))
+                        {
+                            self.tables.remove(&removal.name);
+                            // A table's fields, events and indexes go with it.
+                            self.fields.remove(&removal.name);
+                            self.events.retain(|(table, _), _| table != &removal.name);
+                            self.indexes.retain(|(table, _), _| table != &removal.name);
+                            self.explicit_tables.retain(|name| name != &removal.name);
+                        }
+                    }
+                    "field" => {
+                        let Some(table) = &removal.table else {
+                            continue;
+                        };
+                        if self
+                            .fields
+                            .get(table)
+                            .and_then(|by_name| by_name.get(&removal.name))
+                            .is_some_and(|field| earlier_here(&field.location))
+                            && let Some(by_name) = self.fields.get_mut(table)
+                        {
+                            by_name.remove(&removal.name);
+                        }
+                    }
+                    "function" => {
+                        if self
+                            .functions
+                            .get(&removal.name)
+                            .is_some_and(|function| earlier_here(&function.location))
+                        {
+                            self.functions.remove(&removal.name);
+                        }
+                    }
+                    "param" => {
+                        if self
+                            .params
+                            .get(&removal.name)
+                            .is_some_and(|param| earlier_here(&param.location))
+                        {
+                            self.params.remove(&removal.name);
+                        }
+                    }
+                    "analyzer" => {
+                        if self
+                            .analyzers
+                            .get(&removal.name)
+                            .is_some_and(|analyzer| earlier_here(&analyzer.location))
+                        {
+                            self.analyzers.remove(&removal.name);
+                        }
+                    }
+                    "index" => {
+                        if let Some(table) = &removal.table {
+                            self.indexes.remove(&(table.clone(), removal.name.clone()));
+                        }
+                    }
+                    "event" => {
+                        if let Some(table) = &removal.table {
+                            self.events.remove(&(table.clone(), removal.name.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A `DEFINE INDEX` must name fields the table declares, and an analyzer
+    /// something defines.
+    ///
+    /// Neither was checked. An index over a field that does not exist can never
+    /// match anything on a `SCHEMAFULL` table, and an index naming a
+    /// misspelled analyzer cannot be built at all.
+    fn check_indexes(
+        &self,
+        analysis: &DocumentAnalysis,
+        rules: &RuleSet,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        for index in &analysis.indexes {
+            let Some(table) = self.tables.get(&index.table) else {
+                continue;
+            };
+            // Only where the schema is closed. On a loose table an ad-hoc field
+            // is legal, so indexing one is not a fault.
+            if rules.is_enabled(codes::UNKNOWN_INDEX_FIELD)
+                && table.explicit
+                && is_schemafull(table)
+            {
+                for field in &index.fields {
+                    // A record's own id is always there without a DEFINE.
+                    if matches!(field.as_str(), "id" | "in" | "out") {
+                        continue;
+                    }
+                    // A nested path indexes into an object field; check the root.
+                    let root = field.split('.').next().unwrap_or(field);
+                    let known = self
+                        .fields
+                        .get(&index.table)
+                        .and_then(|by_name| by_name.get(root))
+                        .is_some_and(|field_def| field_def.explicit);
+                    if !known {
+                        diagnostics.push(Diagnostic {
+                            range: index.location.range,
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            code: codes::as_code(codes::UNKNOWN_INDEX_FIELD),
+                            source: Some("surreal-language-server".to_string()),
+                            message: format!(
+                                "Index `{}` covers `{}`, which `{}` does not define.",
+                                index.name, field, index.table
+                            ),
+                            ..Diagnostic::default()
+                        });
+                    }
+                }
+            }
+
+            if rules.is_enabled(codes::UNKNOWN_ANALYZER)
+                && let Some(analyzer) = index.analyzer()
+                && !self.analyzers.contains_key(analyzer)
+            {
+                diagnostics.push(Diagnostic {
+                    range: index.location.range,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: codes::as_code(codes::UNKNOWN_ANALYZER),
+                    source: Some("surreal-language-server".to_string()),
+                    message: format!(
+                        "Index `{}` names analyzer `{analyzer}`, which nothing defines.",
+                        index.name
+                    ),
+                    ..Diagnostic::default()
+                });
+            }
+        }
+    }
+
+    /// A `RELATE` must point at tables the edge declares.
+    ///
+    /// Only for an edge marked `ENFORCED`: without it the `IN`/`OUT` lists are
+    /// documentation, and the engine accepts a row outside them. The
+    /// declaration was parsed and the flag recorded, and nothing read either.
+    fn check_relations(&self, analysis: &DocumentAnalysis, diagnostics: &mut Vec<Diagnostic>) {
+        for (observation, fact) in analysis.edge_observations.iter().zip(
+            analysis
+                .query_facts
+                .iter()
+                .filter(|fact| matches!(fact.action, crate::semantic::types::QueryAction::Relate)),
+        ) {
+            let Some(edge) = self.tables.get(&observation.edge) else {
+                continue;
+            };
+            let Some(relation) = &edge.relation else {
+                continue;
+            };
+            if !relation.enforced {
+                continue;
+            }
+            for (endpoint, declared, label) in [
+                (&observation.from, &relation.in_tables, "from"),
+                (&observation.to, &relation.out_tables, "to"),
+            ] {
+                // `None` is a `$param` or an expression: nothing to judge.
+                let Some(table) = endpoint else { continue };
+                if declared.is_empty() || declared.contains(table) {
+                    continue;
+                }
+                diagnostics.push(Diagnostic {
+                    range: fact.location.range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: codes::as_code(codes::RELATION_ENDPOINT),
+                    source: Some("surreal-language-server".to_string()),
+                    message: format!(
+                        "`{}` is enforced and cannot relate {label} `{table}`. Declared: {}.",
+                        observation.edge,
+                        declared.join(", ")
+                    ),
+                    ..Diagnostic::default()
+                });
+            }
+        }
+    }
+
+    /// Bindings and definitions nothing reads.
+    ///
+    /// A hint rather than a warning, tagged `Unnecessary` so an editor greys
+    /// the text out instead of adding a line to the problems panel — dead code
+    /// is worth showing, not worth interrupting for.
+    fn check_unused(&self, analysis: &DocumentAnalysis, diagnostics: &mut Vec<Diagnostic>) {
+        // A function called from anywhere in the workspace is used. This is why
+        // the rule needs the merged model.
+        // A reference inside the definition's own statement is the definition,
+        // not a use. Comparing ranges for equality is not enough: the reference
+        // is recorded at the name token while the definition spans the whole
+        // statement, so they never match and everything looked used.
+        for function in analysis.functions.iter().filter(|f| f.explicit) {
+            let called = self
+                .function_references
+                .get(&function.name)
+                .is_some_and(|locations| {
+                    locations
+                        .iter()
+                        .any(|location| !is_inside(&function.location, location))
+                });
+            if !called {
+                diagnostics.push(unused_diagnostic(
+                    "function",
+                    &function.name,
+                    function.selection_range,
+                ));
+            }
+        }
+        for param in &analysis.params {
+            // The name set says whether the parameter is referred to at all. It
+            // includes the `DEFINE PARAM` itself, so a bare definition would
+            // look read — the query facts and variable walk that feed the set
+            // record uses, and the definition's own `$name` token is one of
+            // them. Compare the count of *documents* mentioning it instead:
+            // a definition-only mention leaves the analysis-local list at one
+            // entry with no query fact naming it.
+            let read = self.referenced_names.contains(&param.name)
+                && workspace_mentions_beyond_definition(&param.name, &param.location, analysis);
+            if !read {
+                diagnostics.push(unused_diagnostic(
+                    "parameter",
+                    &param.name,
+                    param.location.range,
+                ));
+            }
+        }
+    }
+
+    /// The same name defined twice in one workspace.
+    ///
+    /// The merge keeps one and drops the other silently, so the losing file can
+    /// look as though it were never read. Only definitions in *this* document
+    /// are reported, and only against a definition elsewhere — otherwise every
+    /// open file would report the same pair.
+    fn check_duplicates(&self, analysis: &DocumentAnalysis, diagnostics: &mut Vec<Diagnostic>) {
+        let mut seen: Vec<(&str, Range)> = Vec::new();
+        for table in analysis.tables.iter().filter(|table| table.explicit) {
+            if seen.iter().any(|(name, _)| *name == table.name) {
+                diagnostics.push(duplicate_diagnostic(
+                    "table",
+                    &table.name,
+                    table.location.range,
+                ));
+            } else {
+                seen.push((&table.name, table.location.range));
+            }
+        }
+        let mut functions: Vec<&str> = Vec::new();
+        for function in &analysis.functions {
+            if functions.contains(&function.name.as_str()) {
+                diagnostics.push(duplicate_diagnostic(
+                    "function",
+                    &function.name,
+                    function.location.range,
+                ));
+            } else {
+                functions.push(&function.name);
+            }
+        }
+        let mut fields: Vec<(&str, &str)> = Vec::new();
+        for field in analysis.fields.iter().filter(|field| field.explicit) {
+            let key = (field.table.as_str(), field.name.as_str());
+            if fields.contains(&key) {
+                diagnostics.push(duplicate_diagnostic(
+                    "field",
+                    &format!("{}.{}", field.table, field.name),
+                    field.location.range,
+                ));
+            } else {
+                fields.push(key);
+            }
+        }
     }
 
     fn unknown_table_diagnostic(
@@ -1828,6 +2172,41 @@ impl MergedSemanticModel {
                 }));
             }
 
+            // A function name nothing answers to. The suggestion comes from the
+            // diagnostic's `data`, which the check computed against both the
+            // catalogue and the workspace — this layer has no better view.
+            if codes::has_code(diagnostic, codes::UNKNOWN_FUNCTION)
+                && let Some(data) = &diagnostic.data
+                && let Some(replacement) = data.get("suggestion").and_then(|value| value.as_str())
+            {
+                let name = data
+                    .get("function")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(replacement);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Replace `{name}` with `{replacement}`"),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    is_preferred: Some(true),
+                    edit: Some(WorkspaceEdit {
+                        document_changes: Some(DocumentChanges::Operations(vec![
+                            ls_types::DocumentChangeOperation::Edit(TextDocumentEdit {
+                                text_document: OptionalVersionedTextDocumentIdentifier {
+                                    uri: uri.clone(),
+                                    version: None,
+                                },
+                                edits: vec![OneOf::Left(TextEdit {
+                                    range: diagnostic.range,
+                                    new_text: replacement.to_string(),
+                                })],
+                            }),
+                        ])),
+                        ..WorkspaceEdit::default()
+                    }),
+                    ..CodeAction::default()
+                }));
+            }
+
             // A type SurrealQL does not have. `type_name::nearest` is a pure
             // function of the name, so the suggestion can be re-derived when a
             // client strips the `data` payload *and* the message carries none.
@@ -1939,6 +2318,194 @@ impl MergedSemanticModel {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Whether this reference is where the symbol is declared.
+    ///
+    /// Compared by location rather than by a flag on the reference, because a
+    /// definition site is recorded by the same walk as every use and the two
+    /// are otherwise indistinguishable.
+    pub fn is_declaration_of(&self, name: &str, reference: &SymbolReference) -> bool {
+        let declaration = self
+            .functions
+            .get(name)
+            .map(|function| &function.location)
+            .or_else(|| self.tables.get(name).map(|table| &table.location))
+            .or_else(|| self.params.get(name).map(|param| &param.location))
+            .or_else(|| {
+                self.fields
+                    .values()
+                    .flat_map(|table| table.values())
+                    .find(|field| field.name == name)
+                    .map(|field| &field.location)
+            });
+        match declaration {
+            Some(location) => {
+                location.uri == reference.location.uri
+                    && location.range.start.line == reference.location.range.start.line
+            }
+            None => false,
+        }
+    }
+
+    /// Every reference to `name`, computed on demand.
+    ///
+    /// Not an index. Building one on every keystroke meant 12,801 `Location`
+    /// values on a 3200-statement document, each cloning a `Uri`, for data only
+    /// a user-initiated request ever reads. This walks the query facts and the
+    /// definitions instead, which is a few thousand comparisons — invisible in
+    /// a request, and absent from the edit path entirely.
+    ///
+    /// Sorted and deduplicated, so an editor's results list does not reorder
+    /// between invocations: the underlying document map is a `HashMap`.
+    pub fn references_for_symbol(
+        &self,
+        name: &str,
+        workspace: &WorkspaceIndex,
+    ) -> Vec<SymbolReference> {
+        let mut found: Vec<SymbolReference> = Vec::new();
+        for (uri, analysis) in &workspace.documents {
+            for fact in &analysis.query_facts {
+                for target in &fact.target_refs {
+                    if target.name == name {
+                        let range = target.range(&analysis.text, &analysis.line_index);
+                        found.push(SymbolReference {
+                            name: target.name.clone(),
+                            kind: SymbolKind::STRUCT,
+                            location: Location::new(uri.clone(), range),
+                            selection_range: range,
+                        });
+                    }
+                }
+                for field in &fact.field_refs {
+                    if field.name == name {
+                        let range = field.range(&analysis.text, &analysis.line_index);
+                        found.push(SymbolReference {
+                            name: field.name.clone(),
+                            kind: SymbolKind::FIELD,
+                            location: Location::new(uri.clone(), range),
+                            selection_range: range,
+                        });
+                    }
+                }
+            }
+            for table in analysis
+                .tables
+                .iter()
+                .filter(|t| t.explicit && t.name == name)
+            {
+                found.push(SymbolReference {
+                    name: table.name.clone(),
+                    kind: SymbolKind::STRUCT,
+                    location: table.location.clone(),
+                    selection_range: table.location.range,
+                });
+            }
+            for field in analysis
+                .fields
+                .iter()
+                .filter(|f| f.explicit && f.name == name)
+            {
+                found.push(SymbolReference {
+                    name: field.name.clone(),
+                    kind: SymbolKind::FIELD,
+                    location: field.location.clone(),
+                    selection_range: field.location.range,
+                });
+            }
+            for param in analysis.params.iter().filter(|p| p.name == name) {
+                found.push(SymbolReference {
+                    name: param.name.clone(),
+                    kind: SymbolKind::VARIABLE,
+                    location: param.location.clone(),
+                    selection_range: param.location.range,
+                });
+            }
+        }
+        // Functions keep their own index: it is small, and the call-hierarchy
+        // handlers already depend on it.
+        if let Some(locations) = self.function_references.get(name) {
+            for location in locations {
+                found.push(SymbolReference {
+                    name: name.to_string(),
+                    kind: SymbolKind::FUNCTION,
+                    location: location.clone(),
+                    selection_range: location.range,
+                });
+            }
+        }
+
+        found.sort_by(|left, right| {
+            left.location
+                .uri
+                .as_str()
+                .cmp(right.location.uri.as_str())
+                .then_with(|| {
+                    (
+                        left.location.range.start.line,
+                        left.location.range.start.character,
+                    )
+                        .cmp(&(
+                            right.location.range.start.line,
+                            right.location.range.start.character,
+                        ))
+                })
+        });
+        found.dedup_by(|left, right| {
+            left.location.uri == right.location.uri && left.location.range == right.location.range
+        });
+        found
+    }
+
+    /// Whether `name` is a symbol this server can rename.
+    ///
+    /// A definition that came from the live database is refused: the server
+    /// cannot edit a database definition, and renaming only the workspace half
+    /// leaves the schema broken.
+    pub fn renameable_symbol(&self, name: &str) -> Option<SymbolKind> {
+        if let Some(function) = self.functions.get(name) {
+            return (function.origin == SymbolOrigin::Local).then_some(SymbolKind::FUNCTION);
+        }
+        if let Some(table) = self.tables.get(name) {
+            return (table.origin == SymbolOrigin::Local && table.explicit)
+                .then_some(SymbolKind::STRUCT);
+        }
+        if let Some(param) = self.params.get(name) {
+            return (param.origin == SymbolOrigin::Local).then_some(SymbolKind::VARIABLE);
+        }
+        // A field is keyed by table, so it is matched by bare name across every
+        // table that declares one.
+        let field = self
+            .fields
+            .values()
+            .flat_map(|table| table.values())
+            .find(|field| field.name == name)?;
+        (field.origin == SymbolOrigin::Local && field.explicit).then_some(SymbolKind::FIELD)
+    }
+
+    /// Rename edits for any renameable symbol, grouped by document.
+    pub fn rename_edits_for_symbol(
+        &self,
+        name: &str,
+        new_name: &str,
+        workspace: &WorkspaceIndex,
+    ) -> Option<HashMap<Uri, Vec<TextEdit>>> {
+        self.renameable_symbol(name)?;
+        let references = self.references_for_symbol(name, workspace);
+        if references.is_empty() {
+            return None;
+        }
+        let mut edits: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        for reference in references {
+            edits
+                .entry(reference.location.uri.clone())
+                .or_default()
+                .push(TextEdit {
+                    range: reference.selection_range,
+                    new_text: new_name.to_string(),
+                });
+        }
+        Some(edits)
     }
 
     pub fn rename_edits(&self, name: &str, new_name: &str) -> Option<HashMap<Uri, Vec<TextEdit>>> {
@@ -2167,10 +2734,16 @@ fn is_plural_variant(left: &str, right: &str) -> bool {
 
 /// Tight token range for `name`, falling back to the statement range
 /// for facts recorded before ranges were tracked.
-fn range_for_name(refs: &[NamedRange], name: &str, fallback: Range) -> Range {
+fn range_for_name(
+    refs: &[NamedRange],
+    name: &str,
+    fallback: Range,
+    source: &str,
+    lines: &crate::semantic::text::LineIndex,
+) -> Range {
     refs.iter()
         .find(|entry| entry.name == name)
-        .map(|entry| entry.range)
+        .map(|entry| entry.range(source, lines))
         .unwrap_or(fallback)
 }
 
@@ -3228,6 +3801,9 @@ mod tests {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
+            referenced_names: Vec::new(),
+            removals: Vec::new(),
+            suppressions: Default::default(),
         };
         let mut workspace = WorkspaceIndex::default();
         workspace
@@ -3307,6 +3883,9 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
+                referenced_names: Vec::new(),
+                removals: Vec::new(),
+                suppressions: Default::default(),
             },
             &settings,
         );
@@ -3374,6 +3953,9 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
+                referenced_names: Vec::new(),
+                removals: Vec::new(),
+                suppressions: Default::default(),
             },
             &settings,
         );
@@ -3463,6 +4045,9 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
+                referenced_names: Vec::new(),
+                removals: Vec::new(),
+                suppressions: Default::default(),
             },
             &settings,
         );
@@ -3507,6 +4092,9 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
+                referenced_names: Vec::new(),
+                removals: Vec::new(),
+                suppressions: Default::default(),
             }),
         );
         let model = MergedSemanticModel::build(&workspace, &Default::default());
@@ -3558,6 +4146,9 @@ mod tests {
                 references: Vec::new(),
                 syntax_diagnostics: Vec::new(),
                 document_symbols: Vec::new(),
+                referenced_names: Vec::new(),
+                removals: Vec::new(),
+                suppressions: Default::default(),
             }),
         );
         let model = MergedSemanticModel::build(&workspace, &Default::default());
@@ -3620,6 +4211,9 @@ mod tests {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
+            referenced_names: Vec::new(),
+            removals: Vec::new(),
+            suppressions: Default::default(),
         };
         let mut workspace = WorkspaceIndex::default();
         workspace
@@ -4228,6 +4822,9 @@ mod tests {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
+            referenced_names: Vec::new(),
+            removals: Vec::new(),
+            suppressions: Default::default(),
         };
         (model, analysis)
     }
@@ -4344,4 +4941,65 @@ mod tests {
                 if action.title == "Replace `zzz` with `person`"
         )));
     }
+}
+
+fn duplicate_diagnostic(what: &str, name: &str, range: Range) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: codes::as_code(codes::DUPLICATE_DEFINITION),
+        source: Some("surreal-language-server".to_string()),
+        message: format!("The {what} `{name}` is already defined."),
+        ..Diagnostic::default()
+    }
+}
+
+fn unused_diagnostic(what: &str, name: &str, range: Range) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::HINT),
+        code: codes::as_code(codes::UNUSED_BINDING),
+        source: Some("surreal-language-server".to_string()),
+        message: format!("The {what} `{name}` is never used."),
+        tags: Some(vec![ls_types::DiagnosticTag::UNNECESSARY]),
+        ..Diagnostic::default()
+    }
+}
+
+/// Whether `inner` falls within `outer`, in the same document.
+fn is_inside(outer: &Location, inner: &Location) -> bool {
+    outer.uri == inner.uri
+        && (inner.range.start.line, inner.range.start.character)
+            >= (outer.range.start.line, outer.range.start.character)
+        && (inner.range.end.line, inner.range.end.character)
+            <= (outer.range.end.line, outer.range.end.character)
+}
+
+/// Whether `name` is mentioned anywhere in `analysis` other than at the
+/// definition itself.
+///
+/// A `DEFINE PARAM $x VALUE 1` mentions `$x` once, at the definition. Anything
+/// beyond that is a use.
+fn workspace_mentions_beyond_definition(
+    name: &str,
+    definition: &Location,
+    analysis: &DocumentAnalysis,
+) -> bool {
+    analysis.query_facts.iter().any(|fact| {
+        !is_inside(definition, &fact.location)
+            && (fact.target_refs.iter().any(|entry| entry.name == name)
+                || fact.field_refs.iter().any(|entry| entry.name == name)
+                || fact.touched_fields.iter().any(|field| field == name))
+    }) || analysis
+        .text
+        .match_indices(name)
+        .filter(|(offset, _)| {
+            // Count occurrences outside the definition statement. The
+            // definition's own range is known, so its mention is excluded
+            // by position rather than by counting.
+            let line = analysis.text[..*offset].matches('\n').count() as u32;
+            line < definition.range.start.line || line > definition.range.end.line
+        })
+        .count()
+        > 0
 }

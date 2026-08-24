@@ -11,8 +11,10 @@
 //!   `INFO FOR TABLE` over an authenticated SurrealDB connection.
 
 pub mod backend;
+pub mod cli;
 pub mod metadata_db;
 pub mod notifier;
+pub mod project_config;
 pub mod workspace_fs;
 
 pub use backend::Backend;

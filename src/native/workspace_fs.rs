@@ -31,6 +31,32 @@ impl FilesystemWorkspaceLoader {
     pub fn new() -> Self {
         Self
     }
+
+    /// Analyze an explicit list of files, under the same size cap and the same
+    /// parallel parse as [`WorkspaceLoader::load`].
+    ///
+    /// The server only ever has folders. The command-line mode accepts file
+    /// arguments, so it needs a way in that skips the walk without
+    /// re-implementing the parse.
+    pub async fn load_paths(&self, paths: &[PathBuf]) -> WorkspaceIndex {
+        let paths = paths.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut stats = WorkspaceScanStats::default();
+            let mut candidates = Vec::with_capacity(paths.len());
+            for path in paths {
+                match fs::metadata(&path) {
+                    Ok(meta) if meta.len() > MAX_FILE_SIZE_BYTES => {
+                        stats.skipped_oversize += 1;
+                    }
+                    Ok(_) => candidates.push(path),
+                    Err(_) => stats.walk_errors += 1,
+                }
+            }
+            parse_candidates(candidates, stats)
+        })
+        .await
+        .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -51,9 +77,32 @@ impl WorkspaceLoader for FilesystemWorkspaceLoader {
             .ok()
             .flatten()
     }
+
+    async fn load_project_config(
+        &self,
+        folders: &[PathBuf],
+    ) -> (Option<serde_json::Value>, Vec<String>) {
+        let folders = folders.to_vec();
+        let found =
+            tokio::task::spawn_blocking(move || crate::native::project_config::discover(&folders))
+                .await
+                .unwrap_or_default();
+        (found.value, found.warnings)
+    }
 }
 
 fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
+    let (candidates, stats) = collect_candidates(workspace_folders);
+    parse_candidates(candidates, stats)
+}
+
+/// The `.surql` / `.surrealql` files under `workspace_folders`, in traversal
+/// order, with the scan counters that traversal produced.
+///
+/// Split from [`parse_candidates`] so the command-line mode can supply an
+/// explicit file list instead of a folder walk without duplicating the parse
+/// half — see [`FilesystemWorkspaceLoader::load_paths`].
+fn collect_candidates(workspace_folders: &[PathBuf]) -> (Vec<PathBuf>, WorkspaceScanStats) {
     let mut stats = WorkspaceScanStats::default();
 
     // First pass: gather candidate file paths sequentially (cheap,
@@ -98,6 +147,11 @@ fn load_workspace_documents(workspace_folders: &[PathBuf]) -> WorkspaceIndex {
         }
     }
 
+    (candidates, stats)
+}
+
+/// Parse each candidate in parallel and collect them into an index.
+fn parse_candidates(candidates: Vec<PathBuf>, mut stats: WorkspaceScanStats) -> WorkspaceIndex {
     // Second pass: parse files in parallel — tree-sitter parsing is
     // CPU-bound and trivially parallelisable per-file. We're already
     // inside a `spawn_blocking`, so `std::thread::scope` is the cheapest
@@ -156,5 +210,124 @@ fn should_descend(path: &Path) -> bool {
         )
     } else {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("surrealql-workspace-{tag}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create");
+        dir
+    }
+
+    fn write(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, body).expect("write");
+    }
+
+    #[test]
+    fn only_surql_extensions_are_collected() {
+        let dir = temp_dir("extensions");
+        write(&dir, "a.surql", "DEFINE TABLE a SCHEMAFULL;");
+        write(&dir, "b.surrealql", "DEFINE TABLE b SCHEMAFULL;");
+        write(&dir, "c.sql", "DEFINE TABLE c SCHEMAFULL;");
+        write(&dir, "d.txt", "not surrealql");
+
+        let (candidates, stats) = collect_candidates(std::slice::from_ref(&dir));
+        let mut names: Vec<String> = candidates
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.surql", "b.surrealql"]);
+        assert_eq!(stats.walk_errors, 0);
+    }
+
+    /// A vendored dependency tree is not the project's schema, and walking one
+    /// on a real repository dominates cold start.
+    #[test]
+    fn noisy_directories_are_skipped() {
+        let dir = temp_dir("skips");
+        write(&dir, "keep.surql", "DEFINE TABLE keep SCHEMAFULL;");
+        for noisy in ["node_modules", "target", ".git", ".idea", ".gradle"] {
+            write(
+                &dir,
+                &format!("{noisy}/skip.surql"),
+                "DEFINE TABLE s SCHEMAFULL;",
+            );
+        }
+
+        let (candidates, _) = collect_candidates(std::slice::from_ref(&dir));
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert!(candidates[0].ends_with("keep.surql"));
+    }
+
+    #[test]
+    fn an_oversize_file_is_skipped_and_counted() {
+        let dir = temp_dir("oversize");
+        write(&dir, "small.surql", "DEFINE TABLE a SCHEMAFULL;");
+        let big = "-- padding\n".repeat((MAX_FILE_SIZE_BYTES as usize / 11) + 16);
+        write(&dir, "big.surql", &big);
+
+        let (candidates, stats) = collect_candidates(std::slice::from_ref(&dir));
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].ends_with("small.surql"));
+        assert_eq!(
+            stats.skipped_oversize, 1,
+            "a skipped file must be counted, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn nested_directories_are_walked() {
+        let dir = temp_dir("nested");
+        write(&dir, "a.surql", "DEFINE TABLE a SCHEMAFULL;");
+        write(&dir, "one/b.surql", "DEFINE TABLE b SCHEMAFULL;");
+        write(&dir, "one/two/c.surql", "DEFINE TABLE c SCHEMAFULL;");
+
+        let (candidates, _) = collect_candidates(std::slice::from_ref(&dir));
+        assert_eq!(candidates.len(), 3, "{candidates:?}");
+    }
+
+    #[test]
+    fn parsing_produces_an_index_keyed_by_uri() {
+        let dir = temp_dir("parse");
+        write(&dir, "schema.surql", "DEFINE TABLE person SCHEMAFULL;");
+
+        let (candidates, stats) = collect_candidates(std::slice::from_ref(&dir));
+        let index = parse_candidates(candidates, stats);
+        assert_eq!(index.documents.len(), 1);
+        let analysis = index.documents.values().next().expect("one document");
+        assert_eq!(analysis.tables.len(), 1);
+        assert_eq!(analysis.tables[0].name, "person");
+    }
+
+    /// A file that is not valid UTF-8 is counted rather than failing the walk.
+    #[test]
+    fn an_unreadable_file_is_counted() {
+        let dir = temp_dir("unreadable");
+        write(&dir, "good.surql", "DEFINE TABLE a SCHEMAFULL;");
+        fs::write(dir.join("bad.surql"), [0xff, 0xfe, 0xfd]).expect("write");
+
+        let (candidates, stats) = collect_candidates(std::slice::from_ref(&dir));
+        assert_eq!(candidates.len(), 2, "both are candidates");
+        let index = parse_candidates(candidates, stats);
+        assert_eq!(index.documents.len(), 1, "only the readable one parses");
+        assert_eq!(index.scan_stats.skipped_unreadable, 1);
+    }
+
+    #[test]
+    fn a_missing_folder_is_not_a_failure() {
+        let (candidates, stats) =
+            collect_candidates(&[PathBuf::from("/definitely/not/a/real/path")]);
+        assert!(candidates.is_empty());
+        assert!(stats.walk_errors > 0, "the error must be counted");
     }
 }

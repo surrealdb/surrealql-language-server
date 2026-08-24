@@ -225,10 +225,63 @@ where
             Ok(params) => Outcome::from_value(core.document_symbol(params).await),
             Err(error) => error,
         },
+        // Acknowledged rather than answered with "method not found".
+        //
+        // This dispatcher is single-threaded and awaits each request to
+        // completion, so there is nothing to cancel: by the time the
+        // cancellation is read, the request it names has already finished. The
+        // honest answer is to accept the notification and say so here, rather
+        // than let it fall to the unknown-method arm.
+        "$/cancelRequest" | "$/setTrace" | "$/logTrace" => Outcome::Notification,
+        "workspace/didChangeWatchedFiles" => match decode::<DidChangeWatchedFilesParams>(params) {
+            Ok(params) => {
+                core.did_change_watched_files(params).await;
+                Outcome::Notification
+            }
+            Err(error) => error,
+        },
+        "textDocument/diagnostic" => match decode::<DocumentDiagnosticParams>(params) {
+            Ok(params) => Outcome::from_value(core.document_diagnostic(params).await),
+            Err(error) => error,
+        },
+        "workspace/diagnostic" => match decode::<WorkspaceDiagnosticParams>(params) {
+            Ok(params) => Outcome::from_value(core.workspace_diagnostic(params).await),
+            Err(error) => error,
+        },
+        "textDocument/formatting" => match decode::<DocumentFormattingParams>(params) {
+            Ok(params) => Outcome::from_value(core.formatting(params).await),
+            Err(error) => error,
+        },
+        "textDocument/rangeFormatting" => match decode::<DocumentRangeFormattingParams>(params) {
+            Ok(params) => Outcome::from_value(core.range_formatting(params).await),
+            Err(error) => error,
+        },
+        "textDocument/foldingRange" => match decode::<FoldingRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.folding_range(params).await),
+            Err(error) => error,
+        },
+        "textDocument/selectionRange" => match decode::<SelectionRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.selection_range(params).await),
+            Err(error) => error,
+        },
+        "textDocument/typeDefinition" => match decode::<GotoDefinitionParams>(params) {
+            Ok(params) => Outcome::from_value(core.goto_type_definition(params).await),
+            Err(error) => error,
+        },
+        "textDocument/documentLink" => match decode::<DocumentLinkParams>(params) {
+            Ok(params) => Outcome::from_value(core.document_link(params).await),
+            Err(error) => error,
+        },
         "textDocument/semanticTokens/full" => match decode::<SemanticTokensParams>(params) {
             Ok(params) => Outcome::from_value(core.semantic_tokens_full(params).await),
             Err(error) => error,
         },
+        "textDocument/semanticTokens/full/delta" => {
+            match decode::<SemanticTokensDeltaParams>(params) {
+                Ok(params) => Outcome::from_value(core.semantic_tokens_full_delta(params).await),
+                Err(error) => error,
+            }
+        }
         "textDocument/semanticTokens/range" => match decode::<SemanticTokensRangeParams>(params) {
             Ok(params) => Outcome::from_value(core.semantic_tokens_range(params).await),
             Err(error) => error,

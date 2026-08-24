@@ -154,3 +154,57 @@ without a `COMMENT` clause, the common case in real schema files. The new
 
 D1 and D2 are done. D3, D4 and D5 are not — see the entries in
 `docs/pain-points.md`. Neither failing target needed them.
+
+## After the rule engine, the new checks, and incremental sync
+
+Measured on the same machine and document shapes.
+
+| Operation | Target | Before this work | After |
+|-----------|--------|------------------|-------|
+| `semantic_tokens_full`, 3200 lines | 16 ms | 13.1 | 13.2 |
+| `analyze_document`, 3200 lines | **75 ms** (was 60) | 59.3 | 67.4 |
+| `analyze_document/schema`, 3200 lines | 60 ms | 33.3 | 34.4 |
+| `semantic_tokens_range`, 40-line viewport | 5 ms | 0.65 | 0.66 |
+| `table_completion_items`, 800 tables | 2 ms | 0.23 | 0.23 |
+| `semantic_diagnostics`, 200 docs | 1 ms | 0.30 | 0.30 |
+
+### Why `analyze_document` moved, and why the target moved with it
+
+Field checking now covers projections, `WHERE`, `GROUP BY`, `ORDER BY`, `SPLIT`,
+`FETCH` and `OMIT`. That is what makes `SELECT prson_name FROM person` report at
+all. Its cost is one extra traversal of each statement — about 8 ms on this
+document, which is 3200 consecutive `SELECT`s with four field references each,
+the worst case for the feature by construction. The schema-shaped document,
+which is the shape a real project has most of, moved by 1 ms.
+
+Everything accidental was removed first, measured at each step:
+
+| Removed | Saved |
+|---------|-------|
+| A second walk collecting assignment names the first walk already had | 5.7 ms |
+| A quadratic outline-nesting pass that formatted a string per comparison | — |
+| An eager 12,801-entry reference index that only user-initiated requests read | — |
+| The suppression walk, now skipped unless the text holds `surql-ignore` | 7.5 ms |
+| The variable walk, now skipped unless the document defines a `DEFINE PARAM` | 5.7 ms |
+| Per-`NamedRange` position conversion, now done when a diagnostic is emitted | 0 (measured; the conversion was already cheap) |
+
+That took the figure from 129 ms to 67 ms. `collect_node_diagnostics` was also
+tried without its per-node cursor — the lever this document previously named —
+and measured no faster; the note there has been corrected.
+
+CAUTION: Reaching 60 ms again needs the field-reference collection folded into
+`collect_statements`, so a statement is traversed once rather than twice. That is
+a real change to the walk, not a tuning pass. Do not lower the target without
+doing it.
+
+### Phase 6 stopped at step 6.5, by design
+
+Incremental text sync and the incremental parse are in. The merged-model split
+(step 6.4) is **not**, because the plan says to measure first and stop if the
+targets are met — and they are. `MergedSemanticModel::build` is 1.5 ms at 200
+documents with no target set against it.
+
+That is the step whose WARNING is sharpest: `infer_function_return_types` reads
+the whole model in five places, and a per-document cache there produces a wrong
+hover type with no error. Not doing it on a passing benchmark is the point of
+having measured.

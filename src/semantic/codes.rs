@@ -66,6 +66,25 @@ pub const FIELD_TYPE: &str = "field-type";
 /// `analysis.enable_type_checking` — see [`crate::semantic::type_name`].
 pub const UNKNOWN_TYPE: &str = "unknown-type";
 
+/// A call to a function that is neither a builtin nor defined in the workspace.
+pub const UNKNOWN_FUNCTION: &str = "unknown-function";
+/// The same table, field or function is defined more than once in the
+/// workspace. The later definition wins silently, which is rarely intended.
+pub const DUPLICATE_DEFINITION: &str = "duplicate-definition";
+/// A `DEFINE INDEX … FIELDS` names a field the table does not declare.
+pub const UNKNOWN_INDEX_FIELD: &str = "unknown-index-field";
+/// A `DEFINE INDEX … SEARCH ANALYZER` names an analyzer nothing defines.
+pub const UNKNOWN_ANALYZER: &str = "unknown-analyzer";
+
+/// A `RELATE` whose endpoints fall outside the edge table's declared
+/// `TYPE RELATION IN … OUT …`, on a table that declares `ENFORCED`.
+pub const RELATION_ENDPOINT: &str = "relation-endpoint";
+/// A `LET` binding, `DEFINE PARAM` or `DEFINE FUNCTION` that nothing reads.
+pub const UNUSED_BINDING: &str = "unused-binding";
+
+/// A `-- surql-ignore` directive that silenced nothing.
+pub const UNUSED_SUPPRESSION: &str = "unused-suppression";
+
 /// The codes whose behavior on a `SCHEMALESS` table the
 /// `analysis.schemalessDiagnostics` setting decides. Every other code is
 /// unconditional: it judges an expression, not the schema, so a loose schema

@@ -38,6 +38,24 @@ pub trait LspNotifier: Send + Sync + 'static {
     /// `surrealql` section. Returns `None` when the client either
     /// doesn't support configuration pulls or returns nothing.
     async fn request_configuration(&self) -> Option<Value>;
+
+    /// Ask the client to watch the workspace for `.surql` files, via
+    /// `client/registerCapability`.
+    ///
+    /// Defaulted to a no-op so the browser host — which has no filesystem to
+    /// watch and pushes documents itself — keeps compiling unchanged.
+    async fn register_file_watchers(&self) {}
+
+    /// Report a long operation through `$/progress`.
+    ///
+    /// The workspace walk and the `INFO FOR DB` fetch can take seconds on a
+    /// large project, and both used to report nothing at all — the editor sat
+    /// silent and the user could not tell working from hung.
+    ///
+    /// Defaulted to a no-op so the browser host, which has no progress surface,
+    /// keeps compiling unchanged.
+    async fn begin_progress(&self, _token: &str, _title: &str) {}
+    async fn end_progress(&self, _token: &str, _message: Option<String>) {}
 }
 
 /// Source of `.surql` / `.surrealql` documents that already exist on
@@ -57,6 +75,19 @@ pub trait WorkspaceLoader: Send + Sync + 'static {
     /// Re-read a single document by URI. Used after `didSave` /
     /// `didClose` to refresh the saved snapshot from disk.
     async fn read_document(&self, uri: &Uri) -> Option<String>;
+
+    /// The project configuration file for these folders, as JSON, plus
+    /// anything the user needs to know about reading it.
+    ///
+    /// Defaulted to "there isn't one" so every existing implementor — the
+    /// browser host, the test mocks — keeps compiling unchanged. Same pattern
+    /// as [`LspNotifier::show_message`], and pinned by the same kind of test.
+    async fn load_project_config(
+        &self,
+        _folders: &[PathBuf],
+    ) -> (Option<serde_json::Value>, Vec<String>) {
+        (None, Vec::new())
+    }
 }
 
 /// Source of "live" SurrealDB schema metadata (the result of running

@@ -125,6 +125,25 @@ pub struct IndexDef {
     pub location: Location,
 }
 
+impl IndexDef {
+    /// The analyzer this index names, if it names one.
+    ///
+    /// The grammar gives the analyzer no field of its own, and the option
+    /// clause arrives as one unsplit string (`"SEARCH ANALYZER simple BM25"`),
+    /// so the name is the word after `ANALYZER`.
+    pub fn analyzer(&self) -> Option<&str> {
+        self.options.iter().find_map(|option| {
+            let mut words = option.split_whitespace();
+            while let Some(word) = words.next() {
+                if word.eq_ignore_ascii_case("analyzer") {
+                    return words.next();
+                }
+            }
+            None
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FunctionLanguage {
     #[default]
@@ -205,12 +224,43 @@ pub struct EdgeObservation {
     pub to: Option<String>,
 }
 
+/// A `REMOVE` statement, so the merged model can drop what it removes.
+///
+/// Without this, `REMOVE TABLE person` left `person` in the model and every
+/// later query against it looked fine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removal {
+    /// The `DEFINE` form being removed, lowercased: `table`, `field`,
+    /// `function`, and so on.
+    pub form: String,
+    /// The name given after the form keyword.
+    pub name: String,
+    /// The table from an `ON <table>` clause, for a field, event or index.
+    pub table: Option<String>,
+    pub location: Location,
+}
+
 /// A name paired with the tight range of the token that produced it,
 /// so diagnostics can underline `prson` instead of the whole statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamedRange {
     pub name: String,
-    pub range: Range,
+    /// Byte offsets, not a [`Range`].
+    ///
+    /// A query-heavy document records four of these per statement, and
+    /// converting each to a line-and-column pair here cost 25,600 conversions
+    /// on a 3200-statement file — the same shape as the position-conversion
+    /// hotspot the `LineIndex` work removed. A diagnostic converts one, when it
+    /// is emitted; the edit path converts none.
+    pub start: usize,
+    pub end: usize,
+}
+
+impl NamedRange {
+    /// The line-and-column range, converted on demand.
+    pub fn range(&self, source: &str, lines: &crate::semantic::text::LineIndex) -> Range {
+        lines.range(source, self.start, self.end)
+    }
 }
 
 /// Why a statement's target table list is (or isn't) statically known.
@@ -287,6 +337,15 @@ pub struct DocumentAnalysis {
     pub references: Vec<SymbolReference>,
     pub syntax_diagnostics: Vec<Diagnostic>,
     pub document_symbols: Vec<DocumentSymbol>,
+    /// Every name this document refers to, deduplicated. See
+    /// `collect_referenced_names`.
+    pub referenced_names: Vec<String>,
+    /// Every `REMOVE` this document performs, in source order.
+    pub removals: Vec<Removal>,
+    /// `-- surql-ignore` directives found in this document, collected during
+    /// the same walk that produces everything else here. Applied at the very
+    /// end of [`crate::semantic::pipeline::diagnostics_for_document`].
+    pub suppressions: crate::semantic::suppress::Suppressions,
 }
 
 /// What a workspace scan had to skip. Non-zero counters are reported
@@ -395,6 +454,12 @@ pub struct MergedSemanticModel {
     pub accesses: HashMap<String, AccessDef>,
     pub analyzers: HashMap<String, AnalyzerDef>,
     pub function_references: HashMap<String, Vec<Location>>,
+    /// Every name any document refers to.
+    ///
+    /// A set rather than a position index: this is on the edit path, and only
+    /// `unused-binding` reads it, which needs a yes-or-no answer. Positions are
+    /// computed on demand by [`Self::references_for_symbol`].
+    pub referenced_names: std::collections::HashSet<String>,
     pub function_callers: HashMap<String, Vec<String>>,
     /// The return type read out of a function *body*, for the functions that
     /// declare none. Keyed by full name, `fn::` prefix included.

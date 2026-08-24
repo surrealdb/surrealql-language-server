@@ -31,6 +31,26 @@ pub fn analyze_document_with_limit(
     origin: SymbolOrigin,
     limit: usize,
 ) -> Option<DocumentAnalysis> {
+    analyze_document_reusing(uri, text, origin, limit, None)
+}
+
+/// [`analyze_document_with_limit`], reusing a previous parse tree.
+///
+/// `old_tree` must already have had every edit since it was produced applied
+/// with `Tree::edit`. tree-sitter then reuses the subtrees the edits did not
+/// touch, which is the difference between reparsing a 166 KB file and
+/// reparsing the statement someone is typing in.
+///
+/// Passing a tree that does not match the edits is undefined behaviour as far
+/// as the result is concerned, which is why the accumulator that feeds this is
+/// cleared in the same critical section that stores the tree.
+pub fn analyze_document_reusing(
+    uri: Uri,
+    text: impl Into<String>,
+    origin: SymbolOrigin,
+    limit: usize,
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Option<DocumentAnalysis> {
     // Owned once. The document text used to be copied into the analysis with
     // `to_string()` even though every caller already owns a `String` and drops
     // it — a whole-document memcpy per keystroke. It is moved in at the end
@@ -40,7 +60,7 @@ pub fn analyze_document_with_limit(
 
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
-    let tree = parser.parse(text, None)?;
+    let tree = parser.parse(text, old_tree)?;
     let root = tree.root_node();
 
     // Built once, before the walk. Every range the walk records goes through
@@ -74,6 +94,9 @@ pub fn analyze_document_with_limit(
         edge_observations: Vec::new(),
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
         document_symbols: Vec::with_capacity(statement_hint),
     };
 
@@ -106,6 +129,15 @@ pub fn analyze_document_with_limit(
         &known_names,
         syntax_diagnostic_limit(limit),
     );
+    // Collected here rather than in the pipeline so the walk happens once, on
+    // the already-off-the-reactor per-edit analysis, instead of on every
+    // publish. Most documents have none, and `Suppressions::is_empty` lets the
+    // pipeline skip the filter entirely in that case.
+    collect_referenced_names(&mut analysis, text, root);
+    analysis.document_symbols =
+        nest_document_symbols(std::mem::take(&mut analysis.document_symbols));
+    analysis.suppressions =
+        crate::semantic::suppress::Suppressions::collect(root, text, &line_index);
     analysis.line_index = line_index;
     analysis.text = owned_text;
     Some(analysis)
@@ -176,7 +208,18 @@ fn collect_statements(
             Some("param") => extract_param(node, source, lines, uri, origin, analysis),
             Some("access" | "scope") => extract_access(node, source, lines, uri, origin, analysis),
             Some("analyzer") => extract_analyzer(node, source, lines, uri, origin, analysis),
-            _ => {
+            // Every other `DEFINE`: no structured analysis yet, but the
+            // outline should still name it properly. These used to fall to the
+            // generic statement symbol, which labelled a `DEFINE USER` as an
+            // EVENT with the statement text as its name.
+            Some(form) => {
+                if let Some(symbol) = define_form_symbol(&form, node, source, lines) {
+                    analysis.document_symbols.push(symbol);
+                } else if let Some(symbol) = statement_symbol(node, source, lines, uri) {
+                    analysis.document_symbols.push(symbol);
+                }
+            }
+            None => {
                 if let Some(symbol) = statement_symbol(node, source, lines, uri) {
                     analysis.document_symbols.push(symbol);
                 }
@@ -230,6 +273,17 @@ fn collect_statements(
             if let Some(symbol) = statement_symbol(node, source, lines, uri) {
                 analysis.document_symbols.push(symbol);
             }
+        }
+        k::REMOVE_STATEMENT => {
+            if let Some(removal) = extract_removal(node, source, lines, uri) {
+                if let Some(symbol) = removal_symbol(&removal, source, lines, node) {
+                    analysis.document_symbols.push(symbol);
+                }
+                analysis.removals.push(removal);
+            } else if let Some(symbol) = statement_symbol(node, source, lines, uri) {
+                analysis.document_symbols.push(symbol);
+            }
+            return;
         }
         // Any other leaf statement (USE, INFO, KILL, …) carries nothing
         // nested that we index, so record it and stop.
@@ -314,7 +368,7 @@ fn extract_table(
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
-            .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
+            .flat_map(|child| parse_permission_rules(*child, source, lines, origin, uri))
             .collect(),
         origin,
         explicit: true,
@@ -444,7 +498,7 @@ fn extract_field(
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
-            .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
+            .flat_map(|child| parse_permission_rules(*child, source, lines, origin, uri))
             .collect(),
         origin,
         explicit: true,
@@ -582,7 +636,7 @@ fn extract_function(
     let permissions = children
         .iter()
         .filter(|child| child.kind() == k::PERMISSIONS_BASIC_CLAUSE)
-        .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
+        .flat_map(|child| parse_permission_rules(*child, source, lines, origin, uri))
         .collect::<Vec<_>>();
 
     let body_node = children
@@ -852,9 +906,14 @@ fn extract_query_fact(
     analysis: &mut DocumentAnalysis,
 ) {
     let target_nodes = target_nodes_for_statement(node, source);
-    let target_refs = target_refs_from_nodes(&target_nodes, source, lines);
+    let target_refs = target_refs_from_nodes(&target_nodes, source);
     let targets: Vec<String> = target_refs.iter().map(|entry| entry.name.clone()).collect();
-    let field_refs = collect_field_refs(node, source, lines);
+    // Both halves come out of one walk. Inference learns only from the
+    // assignments: a projection or a `WHERE` names a field but says nothing
+    // about whether it exists or what it holds, and materialising a `FieldDef`
+    // from a read would invent a column — and then hide the very
+    // `unknown-field` the read was collected to catch.
+    let (field_refs, assigned_fields) = collect_field_refs(node, source);
     let touched_fields: Vec<String> = field_refs.iter().map(|entry| entry.name.clone()).collect();
     let target_resolution = if targets.is_empty() {
         classify_unresolved_targets(&target_nodes)
@@ -917,7 +976,7 @@ fn extract_query_fact(
     }
 
     for inferred_field in
-        infer_fields_from_statement(node, source, lines, uri, action, &targets, &touched_fields)
+        infer_fields_from_statement(node, source, lines, uri, action, &targets, &assigned_fields)
     {
         analysis.fields.push(inferred_field);
     }
@@ -1112,6 +1171,46 @@ fn inferred_field(
     }
 }
 
+/// The names this document refers to, deduplicated.
+///
+/// Deliberately *not* a list of `SymbolReference` records. The first version of
+/// this recorded one per occurrence, which on a 3200-statement document meant
+/// 12,801 `Location` values — each cloning a `Uri` — built on every keystroke,
+/// and pushed `analyze_document` from 59 ms to 90 ms against a 60 ms budget.
+///
+/// Nothing on the edit path needs the positions. `unused-binding` needs to know
+/// *whether* a name is read; find-references and rename need the positions, and
+/// they are user-initiated, so those are computed on demand from the query
+/// facts and the definitions — see
+/// [`crate::semantic::types::MergedSemanticModel::references_for_symbol`].
+fn collect_referenced_names(analysis: &mut DocumentAnalysis, source: &str, root: Node<'_>) {
+    let mut names: Vec<String> = Vec::new();
+    let push = |name: String, names: &mut Vec<String>| {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    for fact in &analysis.query_facts {
+        for target in &fact.target_refs {
+            push(target.name.clone(), &mut names);
+        }
+        for field in &fact.field_refs {
+            push(field.name.clone(), &mut names);
+        }
+    }
+    // The variable walk exists for `unused-binding` on a `DEFINE PARAM`, and
+    // nothing else reads it. A document that defines none does not need it —
+    // and that is nearly every document, against 5.7 ms on a 3200-line file.
+    if !analysis.params.is_empty() {
+        for node in descendants_of_kind(root, k::VARIABLE_NAME) {
+            if let Some(name) = text_of(source, node) {
+                push(name, &mut names);
+            }
+        }
+    }
+    analysis.referenced_names = names;
+}
+
 fn collect_function_references(
     node: Node<'_>,
     source: &str,
@@ -1224,58 +1323,116 @@ fn type_expr_of(node: Node<'_>, source: &str) -> Option<TypeExpr> {
     Some(TypeExpr::from_node(node, source))
 }
 
-fn parse_permission_rule(
+/// Every rule in one `PERMISSIONS` clause.
+///
+/// A clause holds one [`k::PERMISSION_GROUP`] per `FOR`, and the actions and the
+/// mode live *inside* the group. The previous version read only the clause's
+/// direct children, so it found neither: every form — `PERMISSIONS NONE`,
+/// `PERMISSIONS FULL`, `PERMISSIONS FOR create NONE`, the role-check form —
+/// parsed to `actions: [Execute], mode: Expression(<whole clause text>)`.
+/// `Execute` matches no CRUD action, so `permission-denied` could never fire
+/// from parsed source and `PERMISSIONS FULL` never granted. Every table with a
+/// permission clause reported `permission-unknown` instead.
+///
+/// Two further details the tree makes plain:
+///
+/// * `FULL` is a `Literal` node and `NONE` is a `None` node. Neither is a
+///   keyword, so `is_kw(child, "none")` was false even at the right depth.
+/// * `PERMISSIONS FULL` with no `FOR` has no group at all, and applies to every
+///   action rather than to none.
+fn parse_permission_rules(
     node: Node<'_>,
     source: &str,
     lines: &LineIndex,
     origin: SymbolOrigin,
     uri: &Uri,
-) -> PermissionRule {
-    // `permissions_for_clause(keyword_permissions, keyword_for,
-    //   keyword_<action>+, where_clause | keyword_full | keyword_none)`
-    // `permissions_basic_clause(keyword_permissions, keyword_full |
-    //   keyword_none | where_clause)`
-    //
-    // Actions come from the dedicated `keyword_select/create/update/delete`
-    // nodes; the mode is FULL/NONE keywords or a `where_clause` expression.
-    let scope = k::named_children(node);
+) -> Vec<PermissionRule> {
+    let children = k::named_children(node);
+    let groups: Vec<Node<'_>> = children
+        .iter()
+        .copied()
+        .filter(|child| child.kind() == k::PERMISSION_GROUP)
+        .collect();
 
-    let mut actions = Vec::new();
-    for child in &scope {
-        if k::is_kw(*child, source, "select") {
-            actions.push(QueryAction::Select);
-        } else if k::is_kw(*child, source, "create") {
-            actions.push(QueryAction::Create);
-        } else if k::is_kw(*child, source, "update") {
-            actions.push(QueryAction::Update);
-        } else if k::is_kw(*child, source, "delete") {
-            actions.push(QueryAction::Delete);
-        }
-    }
-    if actions.is_empty() {
-        actions.push(QueryAction::Execute);
+    if groups.is_empty() {
+        // The bare form: `PERMISSIONS FULL`, `PERMISSIONS NONE`, or a bare
+        // `WHERE`. It governs every action, not none.
+        return vec![PermissionRule {
+            actions: ALL_QUERY_ACTIONS.to_vec(),
+            mode: permission_mode(&children, source, node),
+            raw: text_of(source, node).unwrap_or_default(),
+            origin,
+            location: Some(location(uri, source, lines, node)),
+        }];
     }
 
-    let mode = if scope.iter().any(|child| k::is_kw(*child, source, "full")) {
-        PermissionMode::Full
-    } else if scope.iter().any(|child| k::is_kw(*child, source, "none")) {
-        PermissionMode::None
-    } else {
-        let expression = scope
+    groups
+        .into_iter()
+        .map(|group| {
+            let group_children = k::named_children(group);
+            let mut actions = Vec::new();
+            for child in &group_children {
+                if k::is_kw(*child, source, "select") {
+                    actions.push(QueryAction::Select);
+                } else if k::is_kw(*child, source, "create") {
+                    actions.push(QueryAction::Create);
+                } else if k::is_kw(*child, source, "update") {
+                    actions.push(QueryAction::Update);
+                } else if k::is_kw(*child, source, "delete") {
+                    actions.push(QueryAction::Delete);
+                }
+            }
+            // `FOR` with no recognised action still governs something; treating
+            // it as nothing would silently drop the rule.
+            if actions.is_empty() {
+                actions = ALL_QUERY_ACTIONS.to_vec();
+            }
+            PermissionRule {
+                actions,
+                mode: permission_mode(&group_children, source, group),
+                raw: text_of(source, group).unwrap_or_default(),
+                origin,
+                location: Some(location(uri, source, lines, group)),
+            }
+        })
+        .collect()
+}
+
+/// The four actions a table-level permission clause can govern.
+///
+/// `Execute` is deliberately absent: it belongs to a function, and a table rule
+/// that claimed it would match a call.
+const ALL_QUERY_ACTIONS: &[QueryAction] = &[
+    QueryAction::Select,
+    QueryAction::Create,
+    QueryAction::Update,
+    QueryAction::Delete,
+];
+
+/// `FULL`, `NONE`, or the text of a `WHERE` predicate.
+fn permission_mode(children: &[Node<'_>], source: &str, fallback: Node<'_>) -> PermissionMode {
+    if children.iter().any(|child| {
+        child.kind() == k::LITERAL
+            && text_of(source, *child).is_some_and(|text| text.eq_ignore_ascii_case("full"))
+    }) || children
+        .iter()
+        .any(|child| k::is_kw(*child, source, "full"))
+    {
+        return PermissionMode::Full;
+    }
+    if children.iter().any(|child| child.kind() == k::NONE_LITERAL)
+        || children
             .iter()
-            .find(|child| child.kind() == k::WHERE_CLAUSE)
-            .and_then(|child| text_of(source, *child))
-            .unwrap_or_else(|| text_of(source, node).unwrap_or_default());
-        PermissionMode::Expression(expression)
-    };
-
-    PermissionRule {
-        actions,
-        mode,
-        raw: text_of(source, node).unwrap_or_default(),
-        origin,
-        location: Some(location(uri, source, lines, node)),
+            .any(|child| k::is_kw(*child, source, "none"))
+    {
+        return PermissionMode::None;
     }
+    let expression = children
+        .iter()
+        .find(|child| child.kind() == k::WHERE_CLAUSE)
+        .and_then(|child| text_of(source, *child))
+        .unwrap_or_else(|| text_of(source, fallback).unwrap_or_default());
+    PermissionMode::Expression(expression)
 }
 
 /// Node kinds a table *name* can be read from. Expression-shaped
@@ -1358,11 +1515,7 @@ fn target_nodes_for_statement<'tree>(node: Node<'tree>, source: &str) -> Vec<Nod
 /// each deduped table name. A `record_id`'s range is narrowed to its
 /// table prefix (the text before `:`) so a quick fix can replace just
 /// the table name.
-fn target_refs_from_nodes(
-    relevant_nodes: &[Node<'_>],
-    source: &str,
-    lines: &LineIndex,
-) -> Vec<NamedRange> {
+fn target_refs_from_nodes(relevant_nodes: &[Node<'_>], source: &str) -> Vec<NamedRange> {
     let mut refs: Vec<NamedRange> = Vec::new();
     for relevant in relevant_nodes {
         // Read the kind once. This runs for every target of every statement in
@@ -1388,7 +1541,8 @@ fn target_refs_from_nodes(
             {
                 refs.push(NamedRange {
                     name,
-                    range: lines.range(source, terminal.start_byte(), terminal.end_byte()),
+                    start: terminal.start_byte(),
+                    end: terminal.end_byte(),
                 });
             }
             // Never fall through to the sweep below: a wildcard hop names no
@@ -1416,7 +1570,8 @@ fn target_refs_from_nodes(
             };
             refs.push(NamedRange {
                 name,
-                range: lines.range(source, candidate.start_byte(), end_byte),
+                start: candidate.start_byte(),
+                end: end_byte,
             });
         }
     }
@@ -1557,19 +1712,155 @@ fn field_assignment_target<'tree>(
     k::dotted_name(source, target).map(|name| (name, target))
 }
 
-fn collect_field_refs(node: Node<'_>, source: &str, lines: &LineIndex) -> Vec<NamedRange> {
-    let mut fields: Vec<NamedRange> = Vec::new();
-    for assignment in descendants_of_kind(node, k::FIELD_ASSIGNMENT) {
-        if let Some((name, target)) = field_assignment_target(assignment, source)
-            && !fields.iter().any(|existing| existing.name == name)
+fn collect_field_refs(node: Node<'_>, source: &str) -> (Vec<NamedRange>, Vec<String>) {
+    // One traversal with one cursor, producing both outputs.
+    //
+    // The first version called `descendants_of_kind` eight times per statement
+    // and then `assigned_field_names` walked the subtree a ninth time for data
+    // this walk already has. Together they cost 19.8 ms on a 3200-statement
+    // document, against a 60 ms budget for the whole analysis.
+    let mut assignments: Vec<Node<'_>> = Vec::new();
+    let mut predicates: Vec<Node<'_>> = Vec::new();
+    let mut clauses: Vec<Node<'_>> = Vec::new();
+    collect_field_ref_sites(node, &mut assignments, &mut predicates, &mut clauses);
+
+    // Aliases first: they are row property names, not columns, so in
+    // `SELECT x AS y … WHERE y` the `y` must not be reported as a field.
+    let mut aliases: Vec<String> = Vec::new();
+    for predicate in &predicates {
+        let children = k::named_children(*predicate);
+        if let Some(position) = children
+            .iter()
+            .position(|child| k::is_kw(*child, source, "as"))
+            && let Some(alias) = children.get(position + 1)
+            && let Some(name) = text_of(source, *alias)
         {
-            fields.push(NamedRange {
-                name,
-                range: lines.range(source, target.start_byte(), target.end_byte()),
-            });
+            aliases.push(name);
         }
     }
-    fields
+
+    let mut fields: Vec<NamedRange> = Vec::new();
+    let push = |name: String, target: Node<'_>, fields: &mut Vec<NamedRange>| {
+        if !fields.iter().any(|existing| existing.name == name) {
+            fields.push(NamedRange {
+                name,
+                start: target.start_byte(),
+                end: target.end_byte(),
+            });
+        }
+    };
+
+    // Assignment targets: `SET x = …`, `CONTENT { x: … }`. This was the only
+    // source, which is why a misspelled column in a `SELECT` or a `WHERE` was
+    // silent. They are also the only evidence *inference* may learn from, so
+    // they are returned separately — a read says a field is named, not that it
+    // exists or what it holds.
+    let mut assigned: Vec<String> = Vec::new();
+    for assignment in &assignments {
+        if let Some((name, target)) = field_assignment_target(*assignment, source) {
+            if !assigned.contains(&name) {
+                assigned.push(name.clone());
+            }
+            push(name, target, &mut fields);
+        }
+    }
+
+    // Projections: the first identifier of each `Predicate`, when it is a
+    // direct child. A predicate whose value is a call or a longer expression is
+    // skipped — its operands may be fields, but reading them from here would
+    // also read every table name and literal, and silence beats a wall of
+    // wrong squiggles.
+    for predicate in &predicates {
+        let Some(first) = k::named_children(*predicate)
+            .into_iter()
+            .find(|child| child.kind() == k::IDENT)
+        else {
+            continue;
+        };
+        if let Some(name) = text_of(source, first)
+            && !aliases.contains(&name)
+        {
+            push(name, first, &mut fields);
+        }
+    }
+
+    // Clauses that name columns directly.
+    for clause in &clauses {
+        for ident in clause_field_idents(*clause) {
+            if let Some(name) = text_of(source, ident)
+                && !aliases.contains(&name)
+            {
+                push(name, ident, &mut fields);
+            }
+        }
+    }
+
+    (fields, assigned)
+}
+
+/// Gather every node the field-reference pass cares about, in one traversal.
+///
+/// Iterative with a single reused cursor. The recursive form allocated a
+/// `TreeCursor` per node, which on 48,000 nodes is most of the pass's cost.
+fn collect_field_ref_sites<'tree>(
+    root: Node<'tree>,
+    assignments: &mut Vec<Node<'tree>>,
+    predicates: &mut Vec<Node<'tree>>,
+    clauses: &mut Vec<Node<'tree>>,
+) {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_named() {
+            match node.kind() {
+                k::FIELD_ASSIGNMENT => assignments.push(node),
+                k::PREDICATE => predicates.push(node),
+                k::WHERE_CLAUSE
+                | k::GROUP_CLAUSE
+                | k::ORDER_CLAUSE
+                | k::SPLIT_CLAUSE
+                | k::FETCH_CLAUSE
+                | k::OMIT_CLAUSE => clauses.push(node),
+                _ => {}
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() || cursor.node().id() == root.id() {
+                return;
+            }
+        }
+    }
+}
+
+/// The identifiers in a clause that name a column.
+///
+/// A bare `Ident` that is a direct child, and the first `Ident` of an `Idiom`
+/// or a `BinaryExpression`. Anything deeper is an operand of an expression the
+/// analyzer has not resolved, and guessing there is how a check earns a
+/// reputation for noise.
+fn clause_field_idents<'tree>(clause: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut found = Vec::new();
+    for child in k::named_children(clause) {
+        match child.kind() {
+            k::IDENT => found.push(child),
+            k::IDIOM | k::BINARY_EXPRESSION => {
+                if let Some(first) = k::named_children(child)
+                    .into_iter()
+                    .find(|inner| inner.kind() == k::IDENT)
+                {
+                    found.push(first);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// Coarse literal typing used by *schema inference* (`SET x = …`,
@@ -1687,6 +1978,96 @@ fn leading_comment_text(node: Node<'_>, source: &str, lines: &LineIndex) -> Opti
     }
 }
 
+/// A named outline entry for a `DEFINE` form the analyzer does not model.
+fn define_form_symbol(
+    form: &str,
+    node: Node<'_>,
+    source: &str,
+    lines: &LineIndex,
+) -> Option<DocumentSymbol> {
+    let kind = match form {
+        "user" | "access" | "scope" | "token" => SymbolKind::KEY,
+        "namespace" | "database" => SymbolKind::NAMESPACE,
+        "model" | "config" | "api" | "bucket" | "sequence" => SymbolKind::OBJECT,
+        _ => return None,
+    };
+    let name = k::named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == k::IDENT)
+        .and_then(|child| text_of(source, child))?;
+    Some(definition_symbol(
+        &format!("{} {name}", form.to_ascii_uppercase()),
+        kind,
+        source,
+        lines,
+        node,
+    ))
+}
+
+/// `REMOVE <form> <name> [ON <table>]`.
+fn extract_removal(
+    node: Node<'_>,
+    source: &str,
+    lines: &LineIndex,
+    uri: &Uri,
+) -> Option<crate::semantic::types::Removal> {
+    let children = k::named_children(node);
+    let form = children
+        .iter()
+        .filter(|child| k::is_keyword(**child))
+        .nth(1)
+        .and_then(|child| text_of(source, *child))?
+        .to_ascii_lowercase();
+    // A function is named by a `FunctionName` node (`fn::f`), everything else
+    // by a plain `Ident`.
+    let name = children
+        .iter()
+        .find(|child| matches!(child.kind(), k::IDENT | k::FUNCTION_NAME))
+        .and_then(|child| text_of(source, *child))?;
+    let table = children
+        .iter()
+        .find(|child| child.kind() == k::ON_TABLE_CLAUSE)
+        .and_then(|clause| {
+            k::named_children(*clause)
+                .into_iter()
+                .find(|child| child.kind() == k::IDENT)
+        })
+        .and_then(|child| text_of(source, child));
+    Some(crate::semantic::types::Removal {
+        form,
+        name,
+        table,
+        location: location(uri, source, lines, node),
+    })
+}
+
+fn removal_symbol(
+    removal: &crate::semantic::types::Removal,
+    source: &str,
+    lines: &LineIndex,
+    node: Node<'_>,
+) -> Option<DocumentSymbol> {
+    let label = match &removal.table {
+        Some(table) => format!(
+            "REMOVE {} {table}.{}",
+            removal.form.to_ascii_uppercase(),
+            removal.name
+        ),
+        None => format!(
+            "REMOVE {} {}",
+            removal.form.to_ascii_uppercase(),
+            removal.name
+        ),
+    };
+    Some(definition_symbol(
+        &label,
+        SymbolKind::NULL,
+        source,
+        lines,
+        node,
+    ))
+}
+
 fn definition_symbol(
     name: &str,
     kind: SymbolKind,
@@ -1702,9 +2083,66 @@ fn definition_symbol(
         tags: None,
         deprecated: None,
         range: lines.range(source, node.start_byte(), node.end_byte()),
-        selection_range: lines.range(source, node.start_byte(), node.start_byte()),
+        selection_range: symbol_selection_range(source, lines, node),
         children: None,
     }
+}
+
+/// The range an editor puts the cursor on when the user picks this symbol.
+///
+/// The name node where the statement has one, and the statement's first line
+/// otherwise. It used to be a zero-width range at the statement start, which
+/// some clients render as no selection at all.
+fn symbol_selection_range(source: &str, lines: &LineIndex, node: Node<'_>) -> ls_types::Range {
+    if let Some(name) = k::named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == k::IDENT)
+    {
+        return lines.range(source, name.start_byte(), name.end_byte());
+    }
+    let first_line_end = source[node.start_byte()..node.end_byte()]
+        .find('\n')
+        .map(|offset| node.start_byte() + offset)
+        .unwrap_or(node.end_byte());
+    lines.range(source, node.start_byte(), first_line_end)
+}
+
+/// Put each field, event and index under the table it belongs to.
+///
+/// The outline was flat: every `DEFINE FIELD` sat beside its table rather than
+/// inside it, which on a real schema is a wall of entries with no structure.
+/// Nesting keys on the generated symbol names, which are produced a few lines
+/// above and are the only place the table/member relation survives into the
+/// symbol list.
+///
+/// Indexed rather than searched. The first version scanned the whole
+/// output for each symbol and formatted a string per comparison, which on a
+/// 3200-line document was quadratic and cost more than the parse.
+fn nest_document_symbols(symbols: Vec<DocumentSymbol>) -> Vec<DocumentSymbol> {
+    use std::collections::HashMap;
+
+    let mut table_slot: HashMap<String, usize> = HashMap::new();
+    let mut top: Vec<DocumentSymbol> = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        // `FIELD person.email` -> owner `person`, when a `TABLE person` entry
+        // has already been seen.
+        let owner = ["FIELD ", "EVENT ", "INDEX "]
+            .iter()
+            .find_map(|prefix| symbol.name.strip_prefix(prefix))
+            .and_then(|member| member.split('.').next())
+            .and_then(|table| table_slot.get(table).copied());
+
+        match owner {
+            Some(slot) => top[slot].children.get_or_insert_with(Vec::new).push(symbol),
+            None => {
+                if let Some(table) = symbol.name.strip_prefix("TABLE ") {
+                    table_slot.insert(table.to_string(), top.len());
+                }
+                top.push(symbol);
+            }
+        }
+    }
+    top
 }
 
 fn statement_symbol(
@@ -1862,6 +2300,9 @@ fn collect_node_diagnostics(
     // `node.walk()` allocates and frees a tree-sitter cursor, so it is not worth
     // paying for a node that has nothing to iterate. This walk covers every node
     // in the tree, anonymous ones included, and over half of them are leaves.
+    //
+    // Reaching children by index instead was measured and is not faster: the
+    // cursor is not the cost here, whatever `docs/perf-baseline.md` estimated.
     if node.child_count() == 0 {
         return;
     }
@@ -3184,11 +3625,16 @@ mod tests {
         assert_eq!(analysis.fields.len(), 1);
     }
 
+    /// Note the repeated `FOR`. The engine's `parse_permission` requires it to
+    /// start each group — `self.eat(t!("FOR"))` is the loop's continue
+    /// condition — so `FOR select FULL, create WHERE …` is not valid SurrealQL.
+    /// This test used to carry that form and pass only because the grammar
+    /// rejected the comma outright, which kept the error small.
     #[test]
     fn extracts_indexes_events_and_table_permissions() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let text = r#"
-        DEFINE TABLE person PERMISSIONS FOR select FULL, create WHERE $auth.roles CONTAINS 'admin';
+        DEFINE TABLE person PERMISSIONS FOR select FULL, FOR create WHERE $auth.roles CONTAINS 'admin';
         DEFINE EVENT audit_person ON TABLE person WHEN $before != $after THEN (CREATE event CONTENT { table: 'person' });
         DEFINE INDEX person_email ON TABLE person FIELDS email UNIQUE;
         "#;

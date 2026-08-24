@@ -2,6 +2,291 @@
 
 ## Unreleased
 
+### Rule registry and per-rule severity
+
+Every diagnostic code is now a registered rule carrying its category, its
+default severity, the analysis it needs before it may run, and whether it
+offers a fix. Nothing about the default output changed — the severity of all 17
+codes was transcribed from the emitters and is pinned against them by a test.
+
+New setting `analysis.ruleSeverity`: a map from rule id to `off`, `hint`,
+`info`, `warning` or `error`. It wins over `analysis.enableTypeChecking` and
+`analysis.enablePermissionAnalysis`, so one rule can be re-enabled inside a
+category a switch turned off. An unknown rule id or severity is dropped with a
+`window/logMessage` warning and a did-you-mean hint. Full precedence is in
+`README.md`.
+
+`analysis.enableCodeActions` now does something: `textDocument/codeAction`
+returns an empty list when it is `false`. The capability stays advertised.
+
+`analysis.enableAggressiveSchemaInference` is documented as inert. Nothing has
+ever read it. It is kept because removing it would make an existing settings
+file start producing warnings.
+
+### A grammar false positive on valid permission syntax
+
+`PERMISSIONS FOR select FULL, FOR create NONE` reported
+``Invalid SurrealQL syntax near `,`.`` — the comma between groups was an `ERROR`
+node. SurrealDB's own language tests use that form throughout.
+
+The engine's `parse_permission` makes the comma *optional* and `FOR` *required*
+on each group, so `FOR select FULL FOR create NONE` is equally valid and
+`FOR select FULL, create WHERE …` is not. The grammar's `repeat1` accepted
+neither comma.
+
+The fix is a cross-repo change: it lands in `surrealql-tree-sitter`, then the pin
+moves here. The verified patch is committed as
+`docs/permission-group-comma.patch`; it regenerates with no new conflicts, and
+`the_pinned_grammar_rejects_comma_separated_permission_groups` pins the current
+behaviour so the bump cannot pass unnoticed.
+
+Measured over SurrealDB's 1,897-file corpus: files carrying a `parse` diagnostic
+603 → 594, total `parse` diagnostics 1837 → 1823, ``near `,`` `` 25 → 11. The
+formatter, which refuses what it cannot parse, went from 588 files formatted to
+591 and 606 refused to 597.
+
+While measuring: **`tests/conformance.rs` filters `parse` out of its sweep**, so
+it is blind to grammar false positives — this one passed for its whole life. Its
+comment claimed the grammar rejects "two shapes" SurrealDB accepts; the real
+number is at least seven, and `EXPLAIN` alone accounts for 390 corpus
+occurrences. Both the comment and `docs/grammar-gaps.md` now carry the
+measurement.
+
+### Permission analysis, which had never worked
+
+Every `PERMISSIONS` clause mis-parsed. `parse_permission_rule` read only the
+direct children of `PermissionsForClause`, but the actions and the mode live
+inside a `PermissionGroup` — and `FULL` is a `Literal` node while `NONE` is a
+`None` node, neither of which is a keyword. So every form, from `PERMISSIONS
+NONE` to a role check, resolved to `actions: [Execute], mode:
+Expression(<whole clause text>)`. `Execute` matches no CRUD action, so
+`permission-denied` could never fire, `PERMISSIONS FULL` never granted, and
+every table carrying a clause reported `permission-unknown` instead.
+
+The parser now returns one rule per `FOR` group, so
+`PERMISSIONS FOR select FULL, FOR create, update NONE` becomes two rules rather
+than one mangled one. A clause with no `FOR` governs every action, which is what
+`PERMISSIONS NONE` on a table means.
+
+The existing unit test passed throughout, because it hand-built the `TableDef`
+instead of parsing SurrealQL — the same shape as the dead typo detection that
+pain-point H1 describes.
+
+### `unused-suppression`
+
+A `-- surql-ignore` directive that silenced nothing is now reported: a hint,
+tagged `Unnecessary`. It catches a comment that outlived the fault it covered
+and a rule id with a typo in it. `-- surql-ignore-file: unused-suppression`
+turns it off for a file that keeps directives deliberately.
+
+### A client sending only `rootUri` now gets a workspace
+
+`resolve_workspace_folders` read `workspaceFolders` and nothing else, so a client
+that sends only the deprecated `rootUri` — or `rootPath` — got an empty list.
+Nothing was walked and no `surrealql.toml` was ever found, which looked like both
+features being broken rather than the folder list being empty.
+
+### Incremental editing
+
+`textDocument/didChange` is now `INCREMENTAL`. An edit is applied to the
+authoritative buffer synchronously, in arrival order, and only the analysis that
+follows is spawned and debounced — under incremental sync a change carries a
+range into the previous text, so two notifications landing out of order would
+corrupt the document.
+
+tree-sitter reuses the previous parse tree. Edits since that tree was produced
+are accumulated and replayed against it, and the accumulator is cleared in the
+same critical section that stores a new tree — so an analysis dropped as
+superseded leaves the two still in step. A differential test drives seven mixed
+edits, including a multi-line insert and a line join, through the real
+`didChange` path and compares the result against a fresh parse of the same text.
+
+`textDocument/semanticTokens/full/delta`: a client re-highlighting after a
+keystroke receives the changed run rather than every token in the file. An
+unrecognised result id falls back to the full set.
+
+`positionEncoding` is stated explicitly as `utf-16` — the protocol default, and
+what every offset this server produces already was.
+
+`$/progress` for the workspace walk and the `INFO FOR DB` fetch, both of which
+can take seconds and previously reported nothing. `$/cancelRequest`,
+`$/setTrace` and `$/logTrace` are acknowledged on the browser transport instead
+of falling to the unknown-method arm.
+
+**The merged-model split is deliberately not done.** The plan's own step said to
+measure first and stop if the targets were met, and they are:
+`MergedSemanticModel::build` is 1.5 ms at 200 documents. It is also the change
+whose failure mode is a silently wrong hover type, so not doing it on a passing
+benchmark is the point of having measured.
+
+### Testing
+
+- **Marker cases** (`tests/marker/`): one file per scenario holding the
+  SurrealQL, the settings and the expected diagnostics together, borrowed from
+  gopls. Adding a test means adding a data file. The assertions are exhaustive,
+  so a case cannot quietly assert less than it appears to — the first four cases
+  caught two wrong expectations of their own on the first run.
+- **A deterministic robustness sweep** (`tests/robustness.rs`): 4,000 generated
+  documents built from real SurrealQL fragments and things the grammar cannot
+  parse, plus every prefix of a real document, through the whole pipeline and the
+  formatter. Asserts no panic, no reversed or out-of-range diagnostic, and
+  formatter idempotence. Deterministic rather than seeded from the clock — a
+  failure nobody can reproduce is not a failure anyone fixes.
+- **`workspace_fs` and `metadata_db` unit tests**: extension filtering, skipped
+  directories, the size cap, nested walks, unreadable files, a missing folder;
+  and, for the metadata harvest, `DEFINE` strings at any depth, the prefix check
+  that keeps prose out of the schema, deduplication, and deep nesting. Neither
+  module had any.
+
+There is still no `cargo-fuzz` target and no `wasm-bindgen-test` suite. CI has a
+runner for neither, and an unrun fuzzer proves nothing; the robustness sweep
+covers the parser surface a fuzzer would reach first.
+
+### New checks
+
+Six rules, all registered in the same registry as the original 17, so each can
+be re-levelled with `analysis.ruleSeverity` or silenced with `-- surql-ignore`.
+
+- **`unknown-field` now reaches beyond `SET`.** A misspelled column in a
+  `SELECT` projection, a `WHERE`, a `GROUP BY`, an `ORDER BY`, a `SPLIT`, a
+  `FETCH` or an `OMIT` was silent; it is reported now. `SELECT *` names no
+  column, an `AS` alias is a row property rather than a column, and a computed
+  projection is skipped rather than guessed at.
+- **`unknown-function`** — `fn::does_not_exist()` and `string::lenn()` were both
+  silent. Reported with a did-you-mean drawn from the catalogue and the
+  workspace, and a quick fix. A name in a namespace the catalogue does not model
+  stays silent: its absence says nothing about the engine.
+- **`duplicate-definition`** — the same table, field or function defined twice.
+  The merge kept one and dropped the other silently.
+- **`relation-endpoint`** — a `RELATE` outside an edge's declared
+  `TYPE RELATION IN … OUT …`. Only for an edge marked `ENFORCED`, which is the
+  only case the engine itself refuses.
+- **`unknown-index-field`** and **`unknown-analyzer`** — a `DEFINE INDEX` over a
+  field the table does not declare, or naming an analyzer nothing defines.
+- **`unused-binding`** — an uncalled `DEFINE FUNCTION` or an unread
+  `DEFINE PARAM`, as a hint tagged `Unnecessary` so an editor greys it out
+  rather than adding a problem.
+
+Field *inference* still learns only from assignments. A read names a field but
+says nothing about whether it exists, and inventing a definition from one would
+hide the very diagnostic the read was collected to raise.
+
+All six were swept across SurrealDB's 1,897-file corpus with no new finding.
+
+### Build pipeline
+
+`cargo clippy`, `cargo bench` and a `wasm32` build now run on every pull
+request. The `release`, `publish` and `wasm` jobs are gated on the test job —
+a red suite previously still shipped binaries. A test checks that the grammar
+revision is identical in all six places that record it.
+
+Clippy runs at warning level, not deny: the tree carries 23 pre-existing
+warnings and failing on them would block every pull request. The benchmark step
+does not gate either — `analyze_document` clears its 60 ms budget by about 1 ms
+and fails intermittently on a slower runner.
+
+### Formatter
+
+`textDocument/formatting`, `textDocument/rangeFormatting`, and
+`surrealql-language-server format [--check]`.
+
+Token-stream based: it emits every leaf of the parse tree verbatim and decides
+only the whitespace between them, so it cannot lose, reorder or invent a token.
+A document the grammar cannot parse is returned unchanged rather than rewritten.
+The result is re-parsed and re-tokenised before being returned, and any
+mismatch falls back to the original.
+
+Verified across SurrealDB's 1,897-file corpus: idempotent, no comment lost, and
+no change to the diagnostic count on any file.
+
+### Navigation reaches tables and fields
+
+Find-references, rename and document-highlight used to stop at custom
+functions. They now answer for a table, a field and a parameter as well — the
+symbols a schema author most wants to trace.
+
+- `textDocument/references` honours `includeDeclaration`, which it previously
+  ignored.
+- `textDocument/rename` returns `documentChanges` rather than the legacy
+  `changes` map, and refuses a symbol that came from the live database: the
+  server cannot edit a database definition, and renaming only the workspace
+  half leaves the schema broken.
+- `textDocument/documentHighlight` marks a definition `WRITE` and every use
+  `READ`; it used to mark everything `READ`.
+
+New methods: `textDocument/foldingRange`, `textDocument/selectionRange`,
+`textDocument/typeDefinition` (from a `record<T>` field to the table it links
+to) and `textDocument/documentLink` (from an index's analyzer name to its
+definition).
+
+`workspace/didChangeWatchedFiles` is registered at startup for `**/*.surql` and
+`**/*.surrealql`. A file created, changed or deleted outside the editor now
+reaches the model instead of staying invisible until restart. An open buffer
+always wins — the editor is the authority on text the user is editing.
+
+### Corrections to features that already existed
+
+- **Call hierarchy** `fromRanges` now point at the call sites. Both directions
+  used to send the caller's own definition range, so an editor highlighted the
+  function name instead of the call. Items also carry identity in `data`, so two
+  functions with the same name in different files no longer collide, and a
+  caller that calls twice is listed once with two sites instead of twice.
+- **Document outline** nests fields, events and indexes under their table
+  instead of listing everything flat, and `selectionRange` is the name rather
+  than a zero-width point at the statement start.
+- **Client capabilities are read.** `workspace/configuration` is only requested
+  from a client that says it answers, and `relatedInformation` is only attached
+  when the client says it understands it. Both used to be sent to everybody.
+- **Code actions** advertise their kinds (`quickfix`, `refactor.rewrite`) and
+  honour `params.range` and `context.only`. The add-PERMISSIONS refactor used to
+  appear for every table in the file regardless of the cursor.
+- **Signature help** tracks bracket depth and string literals. A nested call
+  reported the outer function with the inner call's argument index, a comma
+  inside a string moved the cursor to a parameter that does not exist, and the
+  callee name was read by splitting on whitespace, which picked up the enclosing
+  call's text.
+- **`textDocument/didSave` is registered.** The sync capability advertised a
+  bare kind with no `save` entry, so a spec-compliant client never sent the
+  notification — and `didSave` is the only path that refreshes live database
+  metadata and re-reads a file from disk.
+
+### Command-line mode
+
+`surrealql-language-server check [PATH]...` analyzes files and directories and
+prints findings, with `--format json` for machine consumption. `rules` lists
+every rule and `explain <rule>` describes one. Exit code is `0` clean, `1` on an
+error-severity finding, `2` on a usage or file error.
+
+Run with no arguments the binary still serves LSP over stdio, unchanged.
+
+The CLI runs the same pipeline as the editor, so the two cannot disagree. It has
+no database connection, so rules requiring live metadata — `unknown-table` —
+stand down instead of reporting every table as undefined.
+
+### Project configuration file
+
+A `surrealql.toml` in the workspace root now sets analysis policy for the whole
+repository. The keys are the LSP settings keys. `.surrealql.toml` is accepted as
+a fallback name, and only the first workspace folder is consulted.
+
+Precedence, lowest first: defaults, the file, the editor's LSP settings, then the
+`SURREALDB_*` environment variables. The merge is per key, so an editor setting
+for one rule leaves the rest of the file's policy in place.
+
+A file that is not valid TOML is refused whole and reported through
+`window/logMessage`.
+
+### Suppressing a rule in the source
+
+`-- surql-ignore: <rule id>` silences one rule on the next line of code, or on
+its own line when it trails one. `-- surql-ignore-file:` covers the whole
+document and is honoured above the first statement only. A comma-separated list
+covers several rules; a bare `-- surql-ignore` covers every rule on the line.
+The `--`, `//`, `#` and `/* … */` comment forms all work.
+
+Directives are read from the parse tree rather than by scanning lines, so text
+that merely looks like a directive inside a string literal is not one.
+
 ### Performance
 
 Editor-facing latency, measured on a 3200-line (166 KB) file and a 200-document

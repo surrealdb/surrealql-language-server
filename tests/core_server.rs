@@ -590,7 +590,9 @@ async fn initialized_pulls_configuration_and_logs_ready() {
         "surrealql": { "connection": { "endpoint": "ws://from-pull:8000/rpc" } }
     }));
 
-    core.initialize(InitializeParams::default()).await;
+    // The pull only goes to a client that said it answers one, so the
+    // capabilities have to be the ones a real editor sends.
+    common::initialize_modern(&core).await;
     core.initialized().await;
 
     let logs = notifier.logs();
@@ -739,6 +741,7 @@ async fn typo_in_table_name_yields_did_you_mean_diagnostic_and_quick_fix() {
     use tower_lsp_server::ls_types::{CodeActionOrCommand, DiagnosticSeverity};
 
     let (core, notifier, _) = core_with(Default::default(), Default::default());
+    common::initialize_modern(&core).await;
     let text = "DEFINE TABLE person SCHEMAFULL;\n\
                 DEFINE FIELD email ON person TYPE string;\n\
                 CREATE prson SET email = 'x';";
@@ -2562,5 +2565,788 @@ async fn hovering_the_first_character_of_a_word_resolves_it() {
     assert!(
         hover.contains("TABLE person"),
         "the first glyph of a word must resolve, got {hover}"
+    );
+}
+
+/// `analysis.enableCodeActions: false` empties the response but leaves the
+/// capability advertised. A client reads the capability once, at `initialize`;
+/// withdrawing it because of a setting would make the server change shape after
+/// the client has already decided what it can ask for.
+#[tokio::test]
+async fn disabling_code_actions_returns_an_empty_list() {
+    let text = "DEFINE TABLE person SCHEMAFULL;\n\
+                DEFINE FIELD email ON person TYPE string;\n\
+                CREATE prson SET email = 'x';";
+
+    for (enabled, expect_actions) in [(true, true), (false, false)] {
+        let (core, notifier, _) = core_with(Default::default(), Default::default());
+        core.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "surrealql": { "analysis": { "enableCodeActions": enabled } }
+            }),
+        })
+        .await;
+        open(&core, "typo.surql", text).await;
+
+        let diagnostic = notifier
+            .last_published_for(&uri("typo.surql"))
+            .expect("diagnostics published")
+            .into_iter()
+            .find(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("unknown-table".to_string()))
+            })
+            .expect("unknown-table diagnostic");
+
+        let actions = core
+            .code_action(tower_lsp_server::ls_types::CodeActionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("typo.surql"),
+                },
+                range: diagnostic.range,
+                context: tower_lsp_server::ls_types::CodeActionContext {
+                    diagnostics: vec![diagnostic],
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("a response either way");
+
+        assert_eq!(
+            !actions.is_empty(),
+            expect_actions,
+            "enableCodeActions = {enabled}"
+        );
+    }
+}
+
+/// A `surrealql.toml` in the workspace root sets policy for the whole team, so
+/// the editor and a build pipeline read the same rules.
+#[tokio::test]
+async fn a_project_config_file_silences_a_rule() {
+    let (core, notifier, _) = common::core_with_project_config(serde_json::json!({
+        "analysis": { "ruleSeverity": { "let-type": "off" } }
+    }));
+    core.initialize(Default::default()).await;
+    open(&core, "q.surql", "LET $x: int = \"abc\";").await;
+
+    let published = notifier
+        .last_published_for(&uri("q.surql"))
+        .expect("diagnostics published");
+    assert!(
+        published.is_empty(),
+        "the file turned `let-type` off: {published:?}"
+    );
+}
+
+/// The precedence rule that matters most in practice: an explicit editor
+/// setting beats the committed file, so one person can loosen a rule locally
+/// without editing the repository.
+#[tokio::test]
+async fn an_lsp_setting_wins_over_the_project_config_file() {
+    let (core, notifier, _) = common::core_with_project_config(serde_json::json!({
+        "analysis": { "ruleSeverity": { "let-type": "off" } }
+    }));
+    core.initialize(Default::default()).await;
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: serde_json::json!({
+            "surrealql": { "analysis": { "ruleSeverity": { "let-type": "warning" } } }
+        }),
+    })
+    .await;
+    open(&core, "q.surql", "LET $x: int = \"abc\";").await;
+
+    let published = notifier
+        .last_published_for(&uri("q.surql"))
+        .expect("diagnostics published");
+    assert_eq!(published.len(), 1, "{published:?}");
+    assert_eq!(
+        published[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+    );
+}
+
+/// A key the editor does not mention keeps the file's value. The merge is
+/// per-key, not whole-object — otherwise one editor setting would silently
+/// discard the rest of the committed policy.
+#[tokio::test]
+async fn the_file_still_supplies_keys_the_editor_omits() {
+    let (core, notifier, _) = common::core_with_project_config(serde_json::json!({
+        "analysis": { "ruleSeverity": { "let-type": "off", "operator-type": "off" } }
+    }));
+    core.initialize(Default::default()).await;
+    core.did_change_configuration(DidChangeConfigurationParams {
+        settings: serde_json::json!({
+            "surrealql": { "analysis": { "ruleSeverity": { "let-type": "warning" } } }
+        }),
+    })
+    .await;
+    open(
+        &core,
+        "q.surql",
+        "LET $x: int = \"abc\";\nRETURN \"a\" + 1;",
+    )
+    .await;
+
+    let codes: Vec<String> = notifier
+        .last_published_for(&uri("q.surql"))
+        .expect("diagnostics published")
+        .iter()
+        .filter_map(|d| match &d.code {
+            Some(NumberOrString::String(code)) => Some(code.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["let-type".to_string()],
+        "operator-type must stay off — the editor never mentioned it"
+    );
+}
+
+/// `fromRanges` must point at the call sites, not at the caller's own name.
+/// An editor uses them to highlight where the call happens; the old code sent
+/// the caller's `selection_range`, so it highlighted the wrong span.
+#[tokio::test]
+async fn call_hierarchy_from_ranges_point_at_the_call_sites() {
+    use tower_lsp_server::ls_types::{
+        CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCallsParams,
+        CallHierarchyPrepareParams, Position, TextDocumentPositionParams,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "DEFINE FUNCTION fn::leaf() { RETURN 1; };\n\
+                DEFINE FUNCTION fn::caller() {\n\
+                    RETURN fn::leaf() + fn::leaf();\n\
+                };";
+    open(&core, "calls.surql", text).await;
+
+    let prepared = core
+        .prepare_call_hierarchy(CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("calls.surql"),
+                },
+                // on `fn::leaf` in its definition
+                position: Position {
+                    line: 0,
+                    character: 20,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("prepared");
+    assert_eq!(prepared.len(), 1);
+    let leaf = prepared[0].clone();
+    assert!(leaf.data.is_some(), "the item must carry its identity");
+
+    let incoming = core
+        .incoming_calls(CallHierarchyIncomingCallsParams {
+            item: leaf.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    assert_eq!(incoming.len(), 1, "one caller: {incoming:?}");
+    let ranges = &incoming[0].from_ranges;
+    assert_eq!(ranges.len(), 2, "two call sites on line 2: {ranges:?}");
+    for range in ranges {
+        assert_eq!(range.start.line, 2, "call sites are on line 2");
+    }
+
+    // And the other direction: the caller's outgoing calls point at the same
+    // two sites, inside the caller's own body.
+    let caller_item = incoming[0].from.clone();
+    let outgoing = core
+        .outgoing_calls(CallHierarchyOutgoingCallsParams {
+            item: caller_item,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].from_ranges.len(), 2);
+    for range in &outgoing[0].from_ranges {
+        assert_eq!(range.start.line, 2);
+    }
+}
+
+/// The add-PERMISSIONS refactor used to be offered for every table in the
+/// file, wherever the cursor was, because `params.range` was ignored.
+#[tokio::test]
+async fn code_actions_are_limited_to_the_requested_range() {
+    use tower_lsp_server::ls_types::{
+        CodeActionContext, CodeActionOrCommand, CodeActionParams, Position, Range,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "DEFINE TABLE alpha SCHEMAFULL;\n\
+                DEFINE TABLE beta SCHEMAFULL;\n\
+                DEFINE TABLE gamma SCHEMAFULL;";
+    open(&core, "tables.surql", text).await;
+
+    let at_line = |line: u32| CodeActionParams {
+        text_document: TextDocumentIdentifier {
+            uri: uri("tables.surql"),
+        },
+        range: Range {
+            start: Position { line, character: 0 },
+            end: Position { line, character: 1 },
+        },
+        context: CodeActionContext::default(),
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+
+    let on_beta = core.code_action(at_line(1)).await.expect("a response");
+    assert_eq!(
+        on_beta.len(),
+        1,
+        "one table is under the cursor: {on_beta:?}"
+    );
+    let titles: Vec<&str> = on_beta
+        .iter()
+        .filter_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) => Some(action.title.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        titles[0].contains("beta"),
+        "the action must be for the table at the cursor: {titles:?}"
+    );
+}
+
+/// `context.only` is how a client asks for one family of actions — a
+/// "source.fixAll" binding, for instance. Ignoring it made every request
+/// return everything.
+#[tokio::test]
+async fn code_actions_honour_the_requested_kinds() {
+    use tower_lsp_server::ls_types::{
+        CodeActionContext, CodeActionKind, CodeActionParams, Position, Range,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    open(&core, "t.surql", "DEFINE TABLE alpha SCHEMAFULL;").await;
+
+    let request = |only: Option<Vec<CodeActionKind>>| CodeActionParams {
+        text_document: TextDocumentIdentifier {
+            uri: uri("t.surql"),
+        },
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 1,
+            },
+        },
+        context: CodeActionContext {
+            only,
+            ..Default::default()
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+
+    assert_eq!(core.code_action(request(None)).await.unwrap().len(), 1);
+    assert_eq!(
+        core.code_action(request(Some(vec![CodeActionKind::QUICKFIX])))
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "the permissions action is a refactor, not a quick fix"
+    );
+    assert_eq!(
+        core.code_action(request(Some(vec![CodeActionKind::REFACTOR])))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "`refactor` must include `refactor.rewrite`"
+    );
+}
+
+/// Signature help used to take the last `(` before the cursor and count every
+/// comma after it. A nested call therefore reported the outer function with
+/// the inner call's argument index, and a comma inside a string moved the
+/// cursor to a parameter that does not exist.
+#[tokio::test]
+async fn signature_help_survives_nesting_and_strings() {
+    use tower_lsp_server::ls_types::{Position, SignatureHelpParams, TextDocumentPositionParams};
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+
+    async fn active_parameter(
+        core: &common::TestCore,
+        line: &str,
+        character: u32,
+    ) -> Option<(String, u32)> {
+        open(core, "sig.surql", line).await;
+        let help = core
+            .signature_help(SignatureHelpParams {
+                context: None,
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: uri("sig.surql"),
+                    },
+                    position: Position { line: 0, character },
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await?;
+        let signature = help.signatures.first()?;
+        Some((
+            signature.label.clone(),
+            help.active_parameter.or(signature.active_parameter)?,
+        ))
+    }
+
+    // Cursor inside the *inner* call's first argument.
+    // `RETURN string::concat(string::len(` — 34 characters before the cursor.
+    let inner = active_parameter(&core, "RETURN string::concat(string::len(x), 'b');", 34).await;
+    let (label, index) = inner.expect("signature help inside the nested call");
+    assert!(
+        label.contains("string::len"),
+        "the inner call owns the cursor: {label}"
+    );
+    assert_eq!(index, 0, "first argument of the inner call");
+
+    // Cursor after the inner call closes, in the outer call's second argument.
+    let outer = active_parameter(&core, "RETURN string::concat(string::len(x), 'b');", 38).await;
+    let (label, index) = outer.expect("signature help in the outer call");
+    assert!(
+        label.contains("string::concat"),
+        "the outer call owns the cursor: {label}"
+    );
+    assert_eq!(index, 1, "second argument of the outer call");
+
+    // A comma and a paren inside a string must not move the parameter.
+    let quoted = active_parameter(&core, "RETURN string::concat('a,(b', x);", 30).await;
+    let (label, index) = quoted.expect("signature help past a string literal");
+    assert!(label.contains("string::concat"), "{label}");
+    assert_eq!(
+        index, 1,
+        "the comma inside the string is not an argument separator"
+    );
+}
+
+/// Find-references, rename and highlight used to stop at custom functions. For
+/// a schema language, a table is the symbol a user most wants to trace.
+#[tokio::test]
+async fn navigation_reaches_tables_and_fields() {
+    use tower_lsp_server::ls_types::{
+        DocumentHighlightKind, DocumentHighlightParams, Position, ReferenceContext,
+        ReferenceParams, RenameParams, TextDocumentPositionParams,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "DEFINE TABLE person SCHEMAFULL;\n\
+                DEFINE FIELD email ON person TYPE string;\n\
+                SELECT * FROM person;\n\
+                CREATE person SET email = 'a';";
+    open(&core, "schema.surql", text).await;
+
+    let on_table = Position {
+        line: 2,
+        character: 15,
+    };
+
+    // References, without the declaration.
+    let uses = core
+        .references(ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("schema.surql"),
+                },
+                position: on_table,
+            },
+            context: ReferenceContext {
+                include_declaration: false,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    assert!(!uses.is_empty(), "a table must have references");
+    assert!(
+        uses.iter().all(|location| location.range.start.line != 0),
+        "the DEFINE on line 0 is the declaration and was excluded: {uses:?}"
+    );
+
+    // And with it.
+    let all = core
+        .references(ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("schema.surql"),
+                },
+                position: on_table,
+            },
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    assert!(
+        all.len() > uses.len(),
+        "including the declaration must add one: {all:?}"
+    );
+
+    // Highlight marks the declaration as a write.
+    let highlights = core
+        .document_highlight(DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("schema.surql"),
+                },
+                position: on_table,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    assert!(
+        highlights
+            .iter()
+            .any(|highlight| highlight.kind == Some(DocumentHighlightKind::WRITE)),
+        "the DEFINE is a write: {highlights:?}"
+    );
+    assert!(
+        highlights
+            .iter()
+            .any(|highlight| highlight.kind == Some(DocumentHighlightKind::READ)),
+        "the uses are reads: {highlights:?}"
+    );
+
+    // Rename rewrites every occurrence, and returns documentChanges.
+    let edit = core
+        .rename(RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("schema.surql"),
+                },
+                position: on_table,
+            },
+            new_name: "human".to_string(),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("a table is renameable");
+    assert!(
+        edit.document_changes.is_some(),
+        "rename must return documentChanges, not the legacy map"
+    );
+}
+
+/// Only open buffers were ever diagnosed, so a schema error in a file nobody
+/// had opened was invisible. `workspace/diagnostic` is the answer.
+#[tokio::test]
+async fn workspace_diagnostics_reach_unopened_files() {
+    use surrealql_language_server::semantic::analyzer::analyze_document;
+    use surrealql_language_server::semantic::types::{SymbolOrigin, WorkspaceIndex};
+    use tower_lsp_server::ls_types::{
+        DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+        WorkspaceDiagnosticParams, WorkspaceDiagnosticReportResult,
+        WorkspaceDocumentDiagnosticReport,
+    };
+
+    // A closed file with a fault, present in the workspace index only.
+    let mut index = WorkspaceIndex::default();
+    let closed = uri("closed.surql");
+    let analysis = analyze_document(
+        closed.clone(),
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM persn;",
+        SymbolOrigin::Local,
+    )
+    .expect("analysis");
+    index
+        .documents
+        .insert(closed.clone(), std::sync::Arc::new(analysis));
+
+    let (core, _, _) = core_with(index, Default::default());
+    common::initialize_modern(&core).await;
+    core.initialized().await;
+
+    let report = core
+        .workspace_diagnostic(WorkspaceDiagnosticParams {
+            identifier: None,
+            previous_result_ids: Vec::new(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    let WorkspaceDiagnosticReportResult::Report(report) = report else {
+        panic!("expected a full report");
+    };
+    let found = report
+        .items
+        .iter()
+        .find_map(|item| match item {
+            WorkspaceDocumentDiagnosticReport::Full(full) if full.uri == closed => {
+                Some(&full.full_document_diagnostic_report.items)
+            }
+            _ => None,
+        })
+        .expect("the closed file must be reported");
+    assert!(
+        found
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("unknown-table".to_string()))),
+        "the closed file's fault must be reported: {found:?}"
+    );
+
+    // And a pull for one document agrees with the push channel.
+    open(&core, "open.surql", "LET $x: int = \"abc\";").await;
+    let pulled = core
+        .document_diagnostic(DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("open.surql"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = pulled
+    else {
+        panic!("expected a full report");
+    };
+    let pulled_codes: Vec<String> = full
+        .full_document_diagnostic_report
+        .items
+        .iter()
+        .filter_map(|d| match &d.code {
+            Some(NumberOrString::String(code)) => Some(code.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pulled_codes, vec!["let-type".to_string()]);
+}
+
+/// Incremental sync: a change carries a range into the previous text, so the
+/// buffer has to be reconstructed edit by edit. Full sync sent the whole
+/// document every keystroke and this path did not exist.
+#[tokio::test]
+async fn incremental_edits_rebuild_the_buffer() {
+    use tower_lsp_server::ls_types::{
+        DidChangeTextDocumentParams, Position, Range, TextDocumentContentChangeEvent,
+        VersionedTextDocumentIdentifier,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "edit.surql", "DEFINE TABLE aaa SCHEMAFULL;").await;
+
+    let edit = |version: i32, range: Range, text: &str| DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri("edit.surql"),
+            version,
+        },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: Some(range),
+            range_length: None,
+            text: text.to_string(),
+        }],
+    };
+    let at = |from: u32, to: u32| Range {
+        start: Position {
+            line: 0,
+            character: from,
+        },
+        end: Position {
+            line: 0,
+            character: to,
+        },
+    };
+
+    // `aaa` -> `bbb`, one character at a time, as an editor would send it.
+    core.did_change(edit(2, at(13, 14), "b")).await;
+    core.did_change(edit(3, at(14, 15), "b")).await;
+    core.did_change(edit(4, at(15, 16), "b")).await;
+
+    assert_eq!(
+        defined_table(&core, "edit.surql").await.as_deref(),
+        Some("TABLE bbb"),
+        "three range edits must compose into the new text"
+    );
+}
+
+/// A change with no range is still the whole document, so a client that
+/// negotiates full sync anyway keeps working.
+#[tokio::test]
+async fn a_full_text_change_still_replaces_the_buffer() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "full.surql", "DEFINE TABLE aaa SCHEMAFULL;").await;
+    core.did_change(change("full.surql", 2, "DEFINE TABLE zzz SCHEMAFULL;"))
+        .await;
+    assert_eq!(
+        defined_table(&core, "full.surql").await.as_deref(),
+        Some("TABLE zzz")
+    );
+}
+
+/// The differential test that makes the incremental parse safe to trust.
+///
+/// A reused tree is only correct if the `InputEdit`s handed to tree-sitter
+/// describe the text change exactly. Nothing about a wrong edit is loud — the
+/// tree is simply subtly wrong — so this drives a long sequence of edits
+/// through the real `didChange` path and compares the resulting analysis
+/// against a from-scratch parse of the same final text.
+#[tokio::test]
+async fn an_incrementally_parsed_document_matches_a_fresh_parse() {
+    use surrealql_language_server::semantic::analyzer::analyze_document;
+    use surrealql_language_server::semantic::types::SymbolOrigin;
+    use tower_lsp_server::ls_types::{
+        DidChangeTextDocumentParams, Position, Range, TextDocumentContentChangeEvent,
+        VersionedTextDocumentIdentifier,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let start = "DEFINE TABLE person SCHEMAFULL;\n\
+                 DEFINE FIELD name ON person TYPE string;\n\
+                 SELECT name FROM person;\n";
+    open(&core, "diff.surql", start).await;
+
+    // A mix of inserts, deletes and replacements, on several lines, including a
+    // multi-line insert and one that spans a line boundary.
+    let steps: &[(u32, u32, u32, u32, &str)] = &[
+        (2, 7, 2, 11, "email"),                           // replace within a line
+        (1, 12, 1, 16, "email"),                          // replace on another line
+        (3, 0, 3, 0, "CREATE person SET email = 'a';\n"), // insert a whole line
+        (0, 30, 0, 30, " PERMISSIONS FOR select FULL"),   // append to line 0
+        (1, 0, 1, 6, ""),                                 // delete a run
+        (1, 0, 1, 0, "DEFINE"),                           // put it back
+        (2, 23, 3, 0, ""),                                // join two lines
+    ];
+
+    let mut version = 2;
+    for (sl, sc, el, ec, text) in steps {
+        core.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri("diff.surql"),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: *sl,
+                        character: *sc,
+                    },
+                    end: Position {
+                        line: *el,
+                        character: *ec,
+                    },
+                }),
+                range_length: None,
+                text: text.to_string(),
+            }],
+        })
+        .await;
+        version += 1;
+    }
+
+    let incremental = core
+        .open_document_analysis(&uri("diff.surql"))
+        .await
+        .expect("an analysis");
+    let fresh = analyze_document(uri("diff.surql"), &incremental.text, SymbolOrigin::Local)
+        .expect("a fresh parse");
+
+    assert_eq!(
+        incremental.tree.root_node().to_sexp(),
+        fresh.tree.root_node().to_sexp(),
+        "the reused tree differs from a fresh parse of the same text:\n{}",
+        incremental.text
+    );
+    assert_eq!(
+        incremental.syntax_diagnostics.len(),
+        fresh.syntax_diagnostics.len(),
+        "diagnostic counts differ"
+    );
+}
+
+/// A keystroke changes a few tokens in a long file. Returning the whole set on
+/// every edit was the difference between a small message and a large one.
+#[tokio::test]
+async fn semantic_tokens_can_be_requested_as_a_delta() {
+    use tower_lsp_server::ls_types::{
+        SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+        SemanticTokensResult,
+    };
+
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    let text = "DEFINE TABLE person SCHEMAFULL;\n\
+                DEFINE FIELD name ON person TYPE string;\n\
+                SELECT name FROM person;";
+    open(&core, "tok.surql", text).await;
+
+    let full = core
+        .semantic_tokens_full(SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("tok.surql"),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("tokens");
+    let SemanticTokensResult::Tokens(full) = full else {
+        panic!("expected a full set");
+    };
+    let first_id = full.result_id.clone().expect("a result id");
+    assert!(!full.data.is_empty());
+
+    // Nothing changed: the delta must be empty rather than the whole set.
+    let unchanged = core
+        .semantic_tokens_full_delta(SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("tok.surql"),
+            },
+            previous_result_id: first_id.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("a delta");
+    match unchanged {
+        SemanticTokensFullDeltaResult::TokensDelta(delta) => {
+            assert!(
+                delta.edits.is_empty(),
+                "an unchanged document needs no edits: {:?}",
+                delta.edits
+            );
+        }
+        other => panic!("expected a delta, got {other:?}"),
+    }
+
+    // An unknown id cannot be diffed against, so the full set comes back. That
+    // is what the protocol allows and it is always correct.
+    let stale = core
+        .semantic_tokens_full_delta(SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("tok.surql"),
+            },
+            previous_result_id: "not-an-id".to_string(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("a response");
+    assert!(
+        matches!(stale, SemanticTokensFullDeltaResult::Tokens(_)),
+        "an unrecognised id must fall back to the full set"
     );
 }

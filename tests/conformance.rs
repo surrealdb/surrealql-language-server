@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use surrealql_language_server::config::ServerSettings;
 use surrealql_language_server::semantic::analyzer::analyze_document;
+use surrealql_language_server::semantic::pipeline::diagnostics_for_document;
 use surrealql_language_server::semantic::types::{
     MergedSemanticModel, SymbolOrigin, WorkspaceIndex,
 };
@@ -45,10 +46,17 @@ fn uri(path: &str) -> Uri {
 /// The semantic diagnostics, plus the one syntax diagnostic this crate reasons
 /// about rather than merely relays: `unknown-type`. The other syntax codes are
 /// left out on purpose — `parse` reports whatever the tree-sitter grammar cannot
-/// read, including two shapes it rejects although SurrealDB accepts them
-/// (a union in a `ParamDefinition`, and `array<float, 10>`). Those are grammar
-/// defects tracked separately, and pulling them in would bury a real regression
-/// in known noise.
+/// read, and it cannot read a fair amount of valid SurrealQL: 603 of the 1,897
+/// corpus files carry a `parse` diagnostic, across at least seven systematic
+/// shapes (`EXPLAIN` alone accounts for 390 occurrences). Those are grammar
+/// defects tracked in `docs/grammar-gaps.md`, and pulling them in would bury a
+/// real regression in known noise.
+///
+/// CAUTION: the corollary is that this sweep is blind to grammar false
+/// positives. It cannot tell you that valid SurrealQL stopped parsing, only that
+/// a semantic rule changed its mind. The permission-group comma was a false
+/// `parse` error on a form SurrealDB's own tests use throughout, and this test
+/// passed for its whole life. Measure the syntax pass directly for that.
 fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
     let Some(analysis) = analyze_document(uri("q.surql"), source, SymbolOrigin::Local) else {
         return Vec::new();
@@ -58,16 +66,12 @@ fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
         .documents
         .insert(uri("q.surql"), std::sync::Arc::new(analysis.clone()));
     let model = MergedSemanticModel::build(&workspace, &Default::default());
-    let mut diagnostics = model.semantic_diagnostics(&analysis, &ServerSettings::default());
-    diagnostics.extend(
-        analysis
-            .syntax_diagnostics
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic.code == Some(NumberOrString::String("unknown-type".to_string()))
-            })
-            .cloned(),
-    );
+    let mut diagnostics = diagnostics_for_document(&analysis, &model, &ServerSettings::default());
+    // `parse` is dropped *after* the pipeline rather than never collected, so
+    // this sweep judges exactly what the server emits, minus the one code it
+    // deliberately does not reason about.
+    diagnostics
+        .retain(|diagnostic| diagnostic.code != Some(NumberOrString::String("parse".to_string())));
     diagnostics
 }
 
@@ -380,4 +384,123 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
         missing.is_empty(),
         "these known-bad calls are no longer reported: {missing:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Formatter
+// ---------------------------------------------------------------------------
+
+use surrealql_language_server::format;
+
+/// Whether the document holds a `parse` diagnostic — i.e. the formatter would
+/// refuse it.
+fn diagnostics_for_with_parse(source: &str) -> bool {
+    let Some(analysis) = analyze_document(uri("q.surql"), source, SymbolOrigin::Local) else {
+        return true;
+    };
+    analysis.tree.root_node().has_error()
+}
+
+/// Count the comment characters, as a proxy for "no comment was lost".
+fn comment_bytes(source: &str) -> usize {
+    source
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            ["--", "//", "#"]
+                .iter()
+                .find_map(|opener| trimmed.strip_prefix(opener))
+        })
+        .map(|body| body.trim().len())
+        .sum()
+}
+
+/// Format each committed fixture and check the three properties that make a
+/// formatter safe to run on save: it does not change meaning, it does not lose
+/// a comment, and running it twice changes nothing.
+#[test]
+fn the_formatter_is_safe_on_the_committed_fixtures() {
+    for name in [
+        "builtin_calls_valid.surql",
+        "method_syntax.surql",
+        "adversarial.surql",
+    ] {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(&path).expect("fixture");
+        let formatted = format::format(&source);
+
+        // `adversarial.surql` deliberately contains constructs the pinned
+        // grammar cannot parse, and the formatter refuses those whole. That is
+        // the designed behaviour, so an unchanged result is a pass.
+        if formatted == source {
+            continue;
+        }
+
+        assert_eq!(
+            format::format(&formatted),
+            formatted,
+            "{name}: formatting is not idempotent"
+        );
+        assert!(
+            comment_bytes(&formatted) >= comment_bytes(&source),
+            "{name}: comment text was lost"
+        );
+
+        let before = diagnostics_for(&source).len();
+        let after = diagnostics_for(&formatted).len();
+        assert_eq!(
+            after, before,
+            "{name}: formatting changed the diagnostic count"
+        );
+    }
+}
+
+/// The same three properties across SurrealDB's whole corpus. Ignored for the
+/// same reason the diagnostic sweep is: it needs a SurrealDB checkout and takes
+/// a few seconds.
+#[test]
+#[ignore = "sweeps the whole SurrealDB corpus"]
+fn the_formatter_is_safe_on_the_surrealdb_corpus() {
+    let Some(root) = corpus_dir() else {
+        eprintln!("no SurrealDB checkout; skipping");
+        return;
+    };
+    let mut files = Vec::new();
+    surql_files(&root, &mut files);
+    let mut checked = 0usize;
+    let mut refused = 0usize;
+    let mut already = 0usize;
+    for path in files {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let formatted = format::format(&source);
+        if formatted == source {
+            // Either the file is already in canonical form, or the formatter
+            // refused it because it does not parse. The two are worth telling
+            // apart: a high refusal count means the grammar, not the formatter,
+            // is the limit.
+            if diagnostics_for_with_parse(&source) {
+                refused += 1;
+            } else {
+                already += 1;
+            }
+            continue;
+        }
+        checked += 1;
+        assert_eq!(
+            format::format(&formatted),
+            formatted,
+            "{}: not idempotent",
+            path.display()
+        );
+        assert_eq!(
+            diagnostics_for(&formatted).len(),
+            diagnostics_for(&source).len(),
+            "{}: formatting changed the diagnostic count",
+            path.display()
+        );
+    }
+    println!("formatted {checked}; already canonical {already}; refused (unparseable) {refused}");
+    assert!(checked > 100, "the sweep must actually reach files");
 }

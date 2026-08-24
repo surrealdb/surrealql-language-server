@@ -10,6 +10,7 @@ use surrealql_language_server::semantic::infer::{TypeCtx, infer_expr_type, resol
 use surrealql_language_server::semantic::model::{
     function_signature, is_record_type_context, param_label,
 };
+use surrealql_language_server::semantic::pipeline::diagnostics_for_document;
 use surrealql_language_server::semantic::text::LineIndex;
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
@@ -800,6 +801,9 @@ fn hover_for_js_function_shows_javascript_badge() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     ws.documents.insert(u, Arc::new(analysis));
     let model = MergedSemanticModel::build(&ws, &Default::default());
@@ -859,6 +863,9 @@ fn hover_for_surql_function_with_return_type_shows_arrow() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     ws.documents.insert(u, Arc::new(analysis));
     let model = MergedSemanticModel::build(&ws, &Default::default());
@@ -916,6 +923,9 @@ fn hover_for_table_shows_schema_and_permissions() {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
+            referenced_names: Vec::new(),
+            removals: Vec::new(),
+            suppressions: Default::default(),
         }),
     );
     let model = MergedSemanticModel::build(&ws, &Default::default());
@@ -993,6 +1003,9 @@ fn completion_includes_user_js_function() {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
+            referenced_names: Vec::new(),
+            removals: Vec::new(),
+            suppressions: Default::default(),
         }),
     );
     let model = MergedSemanticModel::build(&ws, &Default::default());
@@ -1114,6 +1127,9 @@ fn no_diagnostics_for_allowed_permission() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let diagnostics = model.semantic_diagnostics(&analysis, &ServerSettings::default());
     assert!(diagnostics.is_empty());
@@ -1170,6 +1186,9 @@ fn error_diagnostic_for_denied_permission() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let diagnostics = model.semantic_diagnostics(&analysis, &ServerSettings::default());
     assert_eq!(diagnostics.len(), 1);
@@ -1214,6 +1233,9 @@ fn warning_for_unknown_table_in_query() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let diagnostics = model.semantic_diagnostics(&analysis, &ServerSettings::default());
     assert!(!diagnostics.is_empty());
@@ -1305,6 +1327,9 @@ fn role_based_permission_allowed_for_matching_context() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let diagnostics = model.semantic_diagnostics(&analysis, &settings);
     assert!(
@@ -1476,6 +1501,9 @@ fn local_function_overrides_remote() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let local = DocumentAnalysis {
         edge_observations: Vec::new(),
@@ -1509,6 +1537,9 @@ fn local_function_overrides_remote() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let mut ws = WorkspaceIndex::default();
     ws.documents.insert(remote.uri.clone(), Arc::new(remote));
@@ -1597,6 +1628,9 @@ fn workspace_symbols_search_covers_tables_fields_functions() {
             references: Vec::new(),
             syntax_diagnostics: Vec::new(),
             document_symbols: Vec::new(),
+            referenced_names: Vec::new(),
+            removals: Vec::new(),
+            suppressions: Default::default(),
         }),
     );
     let model = MergedSemanticModel::build(&ws, &Default::default());
@@ -1645,6 +1679,9 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+        referenced_names: Vec::new(),
+        removals: Vec::new(),
+        suppressions: Default::default(),
     };
     let model = MergedSemanticModel::default();
     let actions = model.code_actions(&u, &analysis, &[]);
@@ -2256,9 +2293,11 @@ fn diagnostics_for(source: &str) -> Vec<tower_lsp_server::ls_types::Diagnostic> 
 }
 
 /// Like [`diagnostics_for`], but under caller-chosen settings, and covering the
-/// syntax pass as well so `unknown-type` is visible. Mirrors what
-/// `diagnostics_for_document` assembles in `src/core/server.rs`, which is the
-/// only place the schemaless filter runs in the real server.
+/// syntax pass as well so `unknown-type` is visible.
+///
+/// Calls the real pipeline rather than re-assembling it. This function used to
+/// hold its own copy of that assembly, which meant a change to the server could
+/// leave this suite green while the editor behaved differently.
 fn diagnostics_for_with(
     source: &str,
     settings: &ServerSettings,
@@ -2267,10 +2306,7 @@ fn diagnostics_for_with(
         analyze_document(uri("check.surql"), source, SymbolOrigin::Local).expect("analysis");
     let workspace = workspace_from(vec![analysis.clone()]);
     let model = MergedSemanticModel::build(&workspace, &Default::default());
-    let mut diagnostics = analysis.syntax_diagnostics.clone();
-    diagnostics.extend(model.semantic_diagnostics(&analysis, settings));
-    model.apply_schemaless_policy(&mut diagnostics, settings);
-    diagnostics
+    diagnostics_for_document(&analysis, &model, settings)
 }
 
 fn settings_with_schemaless(mode: &str) -> ServerSettings {
@@ -6294,5 +6330,1002 @@ fn a_record_valued_column_does_not_capture_the_row() {
         ty,
         TypeExpr::Array(Box::new(TypeExpr::Scalar("string".to_string()))),
         "`name` is `book`'s `string`, not `person`'s `int` reached through `author`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-rule severity
+// ---------------------------------------------------------------------------
+
+/// `LET $x: int = "abc";` reports `let-type` at ERROR by default.
+const LET_TYPE_FAULT: &str = "LET $x: int = \"abc\";";
+
+fn settings_with_rule(id: &str, severity: &str) -> ServerSettings {
+    let mut settings = ServerSettings::default();
+    settings
+        .analysis
+        .rule_severity
+        .insert(id.to_string(), severity.to_string());
+    settings
+}
+
+#[test]
+fn a_rule_reports_at_its_default_severity() {
+    let diagnostics = diagnostics_for_with(LET_TYPE_FAULT, &ServerSettings::default());
+    assert_eq!(codes_of(&diagnostics), vec!["let-type".to_string()]);
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn a_rule_set_to_off_is_not_reported() {
+    let settings = settings_with_rule("let-type", "off");
+    assert!(codes_of(&diagnostics_for_with(LET_TYPE_FAULT, &settings)).is_empty());
+}
+
+#[test]
+fn a_rule_can_be_lowered_to_a_hint() {
+    let settings = settings_with_rule("let-type", "hint");
+    let diagnostics = diagnostics_for_with(LET_TYPE_FAULT, &settings);
+    assert_eq!(codes_of(&diagnostics), vec!["let-type".to_string()]);
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::HINT)
+    );
+}
+
+#[test]
+fn a_rule_can_be_raised_to_an_error() {
+    // `renamed-function` is a WARNING by default: the engine still accepts the
+    // old name. A team that wants it gone can make it fail.
+    let settings = settings_with_rule("renamed-function", "error");
+    let diagnostics = diagnostics_for_with("RETURN duration::from::days(1);", &settings);
+    assert_eq!(codes_of(&diagnostics), vec!["renamed-function".to_string()]);
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+/// The precedence rule, stated as a test because any order is defensible and
+/// an undocumented one is not: the per-rule map wins over the coarse switch,
+/// in both directions.
+#[test]
+fn rule_severity_wins_over_the_type_checking_switch() {
+    let mut off = ServerSettings::default();
+    off.analysis.enable_type_checking = false;
+    assert!(
+        codes_of(&diagnostics_for_with(LET_TYPE_FAULT, &off)).is_empty(),
+        "the switch alone still silences the category"
+    );
+
+    let mut back_on = off.clone();
+    back_on
+        .analysis
+        .rule_severity
+        .insert("let-type".to_string(), "warning".to_string());
+    let diagnostics = diagnostics_for_with(LET_TYPE_FAULT, &back_on);
+    assert_eq!(
+        codes_of(&diagnostics),
+        vec!["let-type".to_string()],
+        "an explicit severity re-enables one rule inside a disabled category"
+    );
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+    );
+}
+
+#[test]
+fn turning_one_rule_off_leaves_the_others_alone() {
+    let source = "LET $x: int = \"abc\";\nRETURN \"a\" + 1;";
+    let settings = settings_with_rule("let-type", "off");
+    assert_eq!(
+        codes_of(&diagnostics_for_with(source, &settings)),
+        vec!["operator-type".to_string()]
+    );
+}
+
+/// A run without a live database withdraws `Requires::LIVE_METADATA`, so
+/// `unknown-table` stands down rather than accusing every table in the file.
+/// This is what keeps an offline command-line run useful.
+#[test]
+fn an_environment_without_live_metadata_stands_unknown_table_down() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM persn;";
+    let analysis =
+        analyze_document(uri("check.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let workspace = workspace_from(vec![analysis.clone()]);
+    let model = MergedSemanticModel::build(&workspace, &Default::default());
+    let settings = ServerSettings::default();
+
+    let online = surrealql_language_server::semantic::pipeline::diagnostics_in(
+        &analysis,
+        &model,
+        &settings,
+        surrealql_language_server::semantic::pipeline::SERVER_ENVIRONMENT,
+    );
+    assert_eq!(codes_of(&online), vec!["unknown-table".to_string()]);
+
+    let offline = surrealql_language_server::semantic::pipeline::diagnostics_in(
+        &analysis,
+        &model,
+        &settings,
+        surrealql_language_server::semantic::rules::Requires::MODEL,
+    );
+    assert!(
+        codes_of(&offline).is_empty(),
+        "unknown-table must not fire without live metadata"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Comment suppression
+// ---------------------------------------------------------------------------
+
+fn suppression_codes(source: &str) -> Vec<String> {
+    codes_of(&diagnostics_for_with(source, &ServerSettings::default()))
+}
+
+#[test]
+fn a_leading_directive_suppresses_the_next_code_line() {
+    assert_eq!(
+        suppression_codes("LET $x: int = \"abc\";"),
+        vec!["let-type".to_string()],
+        "control: the fault is reported without a directive"
+    );
+    assert!(suppression_codes("-- surql-ignore: let-type\nLET $x: int = \"abc\";").is_empty());
+}
+
+#[test]
+fn a_trailing_directive_suppresses_its_own_line() {
+    assert!(suppression_codes("LET $x: int = \"abc\"; -- surql-ignore: let-type").is_empty());
+}
+
+#[test]
+fn a_directive_only_covers_the_rule_it_names() {
+    // `let-type` still reports, and the directive itself is now flagged: it
+    // named `unknown-table`, which did not report here.
+    let codes = suppression_codes("-- surql-ignore: unknown-table\nLET $x: int = \"abc\";");
+    assert!(codes.contains(&"let-type".to_string()), "{codes:?}");
+    assert!(
+        codes.contains(&"unused-suppression".to_string()),
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn a_bare_directive_covers_every_rule_on_the_line() {
+    assert!(suppression_codes("-- surql-ignore\nLET $x: int = \"abc\";").is_empty());
+}
+
+#[test]
+fn a_directive_accepts_a_comma_separated_list() {
+    let source = "-- surql-ignore: unknown-table, let-type\nLET $x: int = \"abc\";";
+    assert!(suppression_codes(source).is_empty());
+}
+
+#[test]
+fn a_file_directive_covers_every_line() {
+    let source = "-- surql-ignore-file: let-type\n\
+                  LET $a: int = \"abc\";\n\
+                  LET $b: int = \"def\";";
+    assert!(suppression_codes(source).is_empty());
+}
+
+/// A file directive below the first statement is not honoured. A reader who
+/// has to scroll past code to discover the whole file is muted has been
+/// misled, so the directive is simply inert there.
+#[test]
+fn a_file_directive_below_the_first_statement_is_inert() {
+    let source = "LET $a: int = \"abc\";\n\
+                  -- surql-ignore-file: let-type\n\
+                  LET $b: int = \"def\";";
+    assert_eq!(
+        suppression_codes(source),
+        vec!["let-type".to_string(), "let-type".to_string()]
+    );
+}
+
+/// The reason directives are read from the parse tree and not by scanning
+/// lines. This text *looks* like a directive to any line scan.
+#[test]
+fn a_directive_inside_a_string_is_not_a_directive() {
+    let source = "LET $x: int = \"abc -- surql-ignore: let-type\";";
+    assert_eq!(suppression_codes(source), vec!["let-type".to_string()]);
+}
+
+#[test]
+fn every_comment_opener_works() {
+    for opener in ["--", "//", "#"] {
+        let source = format!("{opener} surql-ignore: let-type\nLET $x: int = \"abc\";");
+        assert!(
+            suppression_codes(&source).is_empty(),
+            "`{opener}` should open a directive"
+        );
+    }
+    assert!(
+        suppression_codes("/* surql-ignore: let-type */\nLET $x: int = \"abc\";").is_empty(),
+        "the block form should open a directive"
+    );
+}
+
+/// A directive can sit above a run of other comments and still reach the
+/// statement — the shape a header block takes when a note and a directive are
+/// written together.
+#[test]
+fn a_directive_reaches_past_intervening_comments() {
+    let source = "-- surql-ignore: let-type\n\
+                  -- the value is a placeholder until the importer lands\n\
+                  \n\
+                  LET $x: int = \"abc\";";
+    assert!(suppression_codes(source).is_empty());
+}
+
+#[test]
+fn a_word_that_merely_starts_with_the_directive_is_not_one() {
+    let source = "-- surql-ignorethis\nLET $x: int = \"abc\";";
+    assert_eq!(suppression_codes(source), vec!["let-type".to_string()]);
+}
+
+#[test]
+fn an_unknown_rule_id_in_a_directive_suppresses_nothing() {
+    let source = "-- surql-ignore: not-a-rule\nLET $x: int = \"abc\";";
+    let codes = suppression_codes(source);
+    assert!(codes.contains(&"let-type".to_string()), "{codes:?}");
+    // And the directive is reported, which is how a typo in a rule id becomes
+    // visible rather than silently covering nothing.
+    assert!(
+        codes.contains(&"unused-suppression".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// A directive next to a syntax error still has to work: that is exactly when
+/// someone reaches for one. Tree-sitter lexes comments as extras, so the
+/// directive survives error recovery.
+#[test]
+fn a_directive_survives_a_broken_document() {
+    let source = "-- surql-ignore: parse\nDEFINE TABLE @@@invalid@@@;";
+    assert!(
+        !suppression_codes("DEFINE TABLE @@@invalid@@@;").is_empty(),
+        "control: the broken document does report"
+    );
+    assert!(suppression_codes(source).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Document outline
+// ---------------------------------------------------------------------------
+
+/// A field, event or index belongs under its table. The outline used to be
+/// flat, which on a real schema is a wall of entries with no structure.
+#[test]
+fn the_outline_nests_members_under_their_table() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;\n\
+                  DEFINE FIELD name ON person TYPE string;\n\
+                  DEFINE INDEX by_email ON person FIELDS email;\n\
+                  DEFINE TABLE company SCHEMAFULL;\n\
+                  DEFINE FIELD title ON company TYPE string;";
+    let analysis =
+        analyze_document(uri("outline.surql"), source, SymbolOrigin::Local).expect("analysis");
+
+    let names: Vec<&str> = analysis
+        .document_symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["TABLE person", "TABLE company"]);
+
+    let person = &analysis.document_symbols[0];
+    let children: Vec<&str> = person
+        .children
+        .as_ref()
+        .expect("person has children")
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    assert_eq!(
+        children,
+        vec![
+            "FIELD person.email",
+            "FIELD person.name",
+            "INDEX person.by_email"
+        ]
+    );
+
+    let company = &analysis.document_symbols[1];
+    assert_eq!(
+        company
+            .children
+            .as_ref()
+            .expect("company has children")
+            .len(),
+        1
+    );
+}
+
+/// A member written above its table stays visible at the top level rather than
+/// being dropped. Ordering in a file is the author's business.
+#[test]
+fn a_member_above_its_table_stays_visible() {
+    let source = "DEFINE FIELD email ON person TYPE string;\n\
+                  DEFINE TABLE person SCHEMAFULL;";
+    let analysis =
+        analyze_document(uri("outline.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let names: Vec<&str> = analysis
+        .document_symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["FIELD person.email", "TABLE person"]);
+}
+
+/// `selectionRange` is where an editor puts the cursor. A zero-width range at
+/// the statement start is rendered as no selection by some clients.
+#[test]
+fn a_symbol_selection_range_is_not_empty() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;";
+    let analysis =
+        analyze_document(uri("outline.surql"), source, SymbolOrigin::Local).expect("analysis");
+
+    fn check(symbol: &tower_lsp_server::ls_types::DocumentSymbol) {
+        assert_ne!(
+            (
+                symbol.selection_range.start.line,
+                symbol.selection_range.start.character
+            ),
+            (
+                symbol.selection_range.end.line,
+                symbol.selection_range.end.character
+            ),
+            "`{}` has a zero-width selection range",
+            symbol.name
+        );
+        for child in symbol.children.iter().flatten() {
+            check(child);
+        }
+    }
+    for symbol in &analysis.document_symbols {
+        check(symbol);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema consistency rules
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_duplicate_table_is_reported_once() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\nDEFINE TABLE person SCHEMAFULL;";
+    assert_eq!(
+        suppression_codes(source),
+        vec!["duplicate-definition".to_string()],
+        "the second definition is the one reported, not both"
+    );
+}
+
+#[test]
+fn a_duplicate_field_and_function_are_reported() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;\n\
+                  DEFINE FIELD email ON person TYPE string;\n\
+                  DEFINE FUNCTION fn::f() { RETURN 1; };\n\
+                  DEFINE FUNCTION fn::f() { RETURN 2; };";
+    let codes = suppression_codes(source);
+    assert_eq!(
+        codes,
+        vec![
+            "duplicate-definition".to_string(),
+            "duplicate-definition".to_string()
+        ],
+        "one per redefinition: {codes:?}"
+    );
+}
+
+#[test]
+fn defining_a_table_once_reports_nothing() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;";
+    assert!(suppression_codes(source).is_empty());
+}
+
+#[test]
+fn an_index_over_an_undeclared_field_is_reported() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;\n\
+                  DEFINE INDEX by_name ON person FIELDS name;";
+    assert_eq!(
+        suppression_codes(source),
+        vec!["unknown-index-field".to_string()]
+    );
+}
+
+#[test]
+fn an_index_over_a_declared_field_is_silent() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;\n\
+                  DEFINE INDEX by_email ON person FIELDS email;";
+    assert!(suppression_codes(source).is_empty());
+}
+
+/// A loose table legitimately accepts ad-hoc fields, so indexing one is not a
+/// fault there.
+#[test]
+fn an_index_on_a_schemaless_table_is_silent() {
+    let source = "DEFINE TABLE person SCHEMALESS;\n\
+                  DEFINE INDEX by_name ON person FIELDS name;";
+    assert!(suppression_codes(source).is_empty());
+}
+
+#[test]
+fn a_search_index_naming_an_unknown_analyzer_is_reported() {
+    let source = "DEFINE ANALYZER simple TOKENIZERS blank;\n\
+                  DEFINE TABLE article SCHEMAFULL;\n\
+                  DEFINE FIELD body ON article TYPE string;\n\
+                  DEFINE INDEX ft ON article FIELDS body SEARCH ANALYZER simpl BM25;";
+    let codes = suppression_codes(source);
+    assert!(
+        codes.contains(&"unknown-analyzer".to_string()),
+        "expected unknown-analyzer, got {codes:?}"
+    );
+}
+
+#[test]
+fn a_search_index_naming_a_defined_analyzer_is_silent() {
+    let source = "DEFINE ANALYZER simple TOKENIZERS blank;\n\
+                  DEFINE TABLE article SCHEMAFULL;\n\
+                  DEFINE FIELD body ON article TYPE string;\n\
+                  DEFINE INDEX ft ON article FIELDS body SEARCH ANALYZER simple BM25;";
+    assert!(
+        suppression_codes(source).is_empty(),
+        "{:?}",
+        suppression_codes(source)
+    );
+}
+
+#[test]
+fn an_unknown_user_function_is_reported() {
+    let codes = suppression_codes("RETURN fn::does_not_exist();");
+    assert_eq!(codes, vec!["unknown-function".to_string()]);
+}
+
+#[test]
+fn a_defined_user_function_is_silent() {
+    let source = "DEFINE FUNCTION fn::greet() { RETURN 'hi'; };\nRETURN fn::greet();";
+    assert!(suppression_codes(source).is_empty());
+}
+
+#[test]
+fn a_misspelled_builtin_is_reported_with_a_suggestion() {
+    let diagnostics = diagnostics_for_with("RETURN string::lenn('a');", &ServerSettings::default());
+    assert_eq!(codes_of(&diagnostics), vec!["unknown-function".to_string()]);
+    assert!(
+        diagnostics[0].message.contains("string::len"),
+        "expected a did-you-mean: {}",
+        diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_real_builtin_is_silent() {
+    assert!(suppression_codes("RETURN string::len('a');").is_empty());
+}
+
+/// A namespace the catalogue does not model at all says nothing about whether
+/// the engine has the function, so the rule stands down rather than guessing.
+#[test]
+fn a_name_in_an_unmodelled_namespace_is_silent() {
+    assert!(suppression_codes("RETURN nosuchns::whatever(1);").is_empty());
+}
+
+/// A `fn::` name is always judgeable: the workspace is the only source and the
+/// merged model has all of it.
+#[test]
+fn a_misspelled_user_function_suggests_the_real_one() {
+    let source = "DEFINE FUNCTION fn::greet() { RETURN 'hi'; };\nRETURN fn::greeet();";
+    let diagnostics = diagnostics_for_with(source, &ServerSettings::default());
+    let unknown: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                == Some(tower_lsp_server::ls_types::NumberOrString::String(
+                    "unknown-function".to_string(),
+                ))
+        })
+        .collect();
+    assert_eq!(unknown.len(), 1, "{diagnostics:?}");
+    assert!(
+        unknown[0].message.contains("fn::greet"),
+        "expected a did-you-mean: {}",
+        unknown[0].message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Field references beyond SET
+// ---------------------------------------------------------------------------
+
+const CLOSED_PERSON: &str = "DEFINE TABLE person SCHEMAFULL;\n\
+                             DEFINE FIELD name ON person TYPE string;\n";
+
+#[test]
+fn a_misspelled_column_in_a_projection_is_reported() {
+    let source = format!("{CLOSED_PERSON}SELECT prson_name FROM person;");
+    assert_eq!(
+        suppression_codes(&source),
+        vec!["unknown-field".to_string()]
+    );
+}
+
+#[test]
+fn a_misspelled_column_in_a_where_clause_is_reported() {
+    let source = format!("{CLOSED_PERSON}SELECT name FROM person WHERE nme = 'x';");
+    assert_eq!(
+        suppression_codes(&source),
+        vec!["unknown-field".to_string()]
+    );
+}
+
+#[test]
+fn a_misspelled_column_in_a_group_clause_is_reported() {
+    let source = format!("{CLOSED_PERSON}SELECT name FROM person GROUP BY nme;");
+    assert_eq!(
+        suppression_codes(&source),
+        vec!["unknown-field".to_string()]
+    );
+}
+
+#[test]
+fn a_declared_column_is_silent_everywhere() {
+    let source = format!(
+        "{CLOSED_PERSON}SELECT name FROM person WHERE name = 'x' GROUP BY name ORDER BY name;"
+    );
+    assert!(suppression_codes(&source).is_empty());
+}
+
+/// `SELECT *` names no column, so it can report none.
+#[test]
+fn select_star_is_silent() {
+    let source = format!("{CLOSED_PERSON}SELECT * FROM person;");
+    assert!(suppression_codes(&source).is_empty());
+}
+
+/// An alias is a row property, not a column. Reporting it would be a false
+/// positive on correct SurrealQL.
+#[test]
+fn an_alias_is_not_a_column() {
+    let source = format!("{CLOSED_PERSON}SELECT name AS who FROM person WHERE who = 'x';");
+    assert!(
+        suppression_codes(&source).is_empty(),
+        "{:?}",
+        suppression_codes(&source)
+    );
+}
+
+/// A projection that is a call is skipped rather than guessed at. Its operands
+/// may be columns, but reading them from here would also read every literal.
+#[test]
+fn a_computed_projection_is_not_treated_as_a_column() {
+    let source = format!("{CLOSED_PERSON}SELECT string::len(name) FROM person;");
+    assert!(suppression_codes(&source).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Enforced relations and unused code
+// ---------------------------------------------------------------------------
+
+const ENFORCED_EDGE: &str = "DEFINE TABLE person SCHEMALESS;\n\
+                             DEFINE TABLE project SCHEMALESS;\n\
+                             DEFINE TABLE company SCHEMALESS;\n\
+                             DEFINE TABLE works_on TYPE RELATION IN person OUT project ENFORCED;\n";
+
+#[test]
+fn a_relate_outside_an_enforced_relation_is_reported() {
+    let source = format!("{ENFORCED_EDGE}RELATE person:1->works_on->company:2;");
+    let codes = suppression_codes(&source);
+    assert!(
+        codes.contains(&"relation-endpoint".to_string()),
+        "expected relation-endpoint, got {codes:?}"
+    );
+}
+
+#[test]
+fn a_relate_inside_an_enforced_relation_is_silent() {
+    let source = format!("{ENFORCED_EDGE}RELATE person:1->works_on->project:2;");
+    let codes = suppression_codes(&source);
+    assert!(
+        !codes.contains(&"relation-endpoint".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// Without `ENFORCED` the declaration is documentation, not a constraint — the
+/// engine itself accepts the row.
+#[test]
+fn an_unenforced_relation_is_not_a_constraint() {
+    let source = "DEFINE TABLE person SCHEMALESS;\n\
+                  DEFINE TABLE company SCHEMALESS;\n\
+                  DEFINE TABLE works_on TYPE RELATION IN person OUT project;\n\
+                  RELATE person:1->works_on->company:2;";
+    let codes = suppression_codes(source);
+    assert!(
+        !codes.contains(&"relation-endpoint".to_string()),
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn an_uncalled_function_is_a_hint() {
+    let diagnostics = diagnostics_for_with(
+        "DEFINE FUNCTION fn::never_used() { RETURN 1; };",
+        &ServerSettings::default(),
+    );
+    assert_eq!(codes_of(&diagnostics), vec!["unused-binding".to_string()]);
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::HINT)
+    );
+    assert_eq!(
+        diagnostics[0].tags,
+        Some(vec![tower_lsp_server::ls_types::DiagnosticTag::UNNECESSARY]),
+        "an editor greys out dead code rather than listing it as a problem"
+    );
+}
+
+#[test]
+fn a_called_function_is_silent() {
+    let source = "DEFINE FUNCTION fn::used() { RETURN 1; };\nRETURN fn::used();";
+    assert!(suppression_codes(source).is_empty());
+}
+
+#[test]
+fn an_unread_param_is_a_hint() {
+    let codes = suppression_codes("DEFINE PARAM $unused VALUE 1;");
+    assert_eq!(codes, vec!["unused-binding".to_string()]);
+}
+
+#[test]
+fn a_read_param_is_silent() {
+    let source = "DEFINE PARAM $limit VALUE 10;\nSELECT * FROM person LIMIT $limit;";
+    let codes = suppression_codes(source);
+    assert!(!codes.contains(&"unused-binding".to_string()), "{codes:?}");
+}
+
+// ---------------------------------------------------------------------------
+// REMOVE and the unmodelled DEFINE forms
+// ---------------------------------------------------------------------------
+
+#[test]
+fn removing_a_table_takes_it_out_of_the_model() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  REMOVE TABLE person;\n\
+                  SELECT * FROM person;";
+    let codes = suppression_codes(source);
+    assert!(
+        codes.contains(&"unknown-table".to_string()),
+        "the table was removed before the query: {codes:?}"
+    );
+}
+
+#[test]
+fn a_table_that_is_not_removed_stays() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;";
+    assert!(suppression_codes(source).is_empty());
+}
+
+/// A `REMOVE` before the `DEFINE` removes nothing: the definition that follows
+/// is the one in force.
+#[test]
+fn a_removal_above_its_definition_is_inert() {
+    let source = "REMOVE TABLE person;\n\
+                  DEFINE TABLE person SCHEMAFULL;\n\
+                  SELECT * FROM person;";
+    let codes = suppression_codes(source);
+    assert!(
+        !codes.contains(&"unknown-table".to_string()),
+        "the definition comes after the removal: {codes:?}"
+    );
+}
+
+#[test]
+fn removing_a_field_takes_it_out_of_the_model() {
+    let source = "DEFINE TABLE person SCHEMAFULL;\n\
+                  DEFINE FIELD email ON person TYPE string;\n\
+                  REMOVE FIELD email ON person;\n\
+                  CREATE person SET email = 'x';";
+    let codes = suppression_codes(source);
+    assert!(
+        codes.contains(&"unknown-field".to_string()),
+        "the field was removed: {codes:?}"
+    );
+}
+
+#[test]
+fn removing_a_function_takes_it_out_of_the_model() {
+    let source = "DEFINE FUNCTION fn::f() { RETURN 1; };\n\
+                  REMOVE FUNCTION fn::f;\n\
+                  RETURN fn::f();";
+    let codes = suppression_codes(source);
+    assert!(
+        codes.contains(&"unknown-function".to_string()),
+        "the function was removed: {codes:?}"
+    );
+}
+
+/// The outline used to label every unmodelled `DEFINE` as an EVENT named after
+/// the whole statement text.
+#[test]
+fn unmodelled_define_forms_get_a_named_outline_entry() {
+    let source = "DEFINE USER alice ON ROOT PASSWORD 'x' ROLES OWNER;\n\
+                  DEFINE NAMESPACE app;\n\
+                  REMOVE TABLE person;";
+    let analysis =
+        analyze_document(uri("misc.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let names: Vec<&str> = analysis
+        .document_symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["USER alice", "NAMESPACE app", "REMOVE TABLE person"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Permission clauses
+// ---------------------------------------------------------------------------
+
+/// Every `PERMISSIONS` form used to parse to `actions: [Execute]` and
+/// `mode: Expression(<whole clause text>)`, because the parser read only the
+/// clause's direct children while the actions and the mode live one level
+/// deeper. `permission-denied` could therefore never fire, `PERMISSIONS FULL`
+/// never granted, and every table with a clause reported `permission-unknown`.
+#[test]
+fn every_permission_form_parses_its_actions_and_mode() {
+    use surrealql_language_server::semantic::types::{PermissionMode, QueryAction};
+
+    let cases: &[(&str, usize, &[QueryAction], PermissionMode)] = &[
+        (
+            "PERMISSIONS NONE",
+            1,
+            &[
+                QueryAction::Select,
+                QueryAction::Create,
+                QueryAction::Update,
+                QueryAction::Delete,
+            ],
+            PermissionMode::None,
+        ),
+        (
+            "PERMISSIONS FULL",
+            1,
+            &[
+                QueryAction::Select,
+                QueryAction::Create,
+                QueryAction::Update,
+                QueryAction::Delete,
+            ],
+            PermissionMode::Full,
+        ),
+        (
+            "PERMISSIONS FOR create NONE",
+            1,
+            &[QueryAction::Create],
+            PermissionMode::None,
+        ),
+        (
+            "PERMISSIONS FOR create, update NONE",
+            1,
+            &[QueryAction::Create, QueryAction::Update],
+            PermissionMode::None,
+        ),
+    ];
+
+    for (clause, rule_count, actions, mode) in cases {
+        let source = format!("DEFINE TABLE t SCHEMAFULL {clause};");
+        let analysis =
+            analyze_document(uri("p.surql"), &source, SymbolOrigin::Local).expect("analysis");
+        let rules = &analysis.tables[0].permissions;
+        assert_eq!(rules.len(), *rule_count, "`{clause}`: {rules:?}");
+        assert_eq!(rules[0].actions, actions.to_vec(), "`{clause}`");
+        assert_eq!(&rules[0].mode, mode, "`{clause}`");
+    }
+}
+
+/// Several `FOR` groups in one clause become several rules, each governing its
+/// own actions. One rule per clause could only ever describe one of them.
+#[test]
+fn several_permission_groups_become_several_rules() {
+    use surrealql_language_server::semantic::types::{PermissionMode, QueryAction};
+
+    let source = "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR select FULL, FOR create, update NONE;";
+    let analysis = analyze_document(uri("p.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let rules = &analysis.tables[0].permissions;
+    assert_eq!(rules.len(), 2, "{rules:?}");
+    assert_eq!(rules[0].actions, vec![QueryAction::Select]);
+    assert_eq!(rules[0].mode, PermissionMode::Full);
+    assert_eq!(
+        rules[1].actions,
+        vec![QueryAction::Create, QueryAction::Update]
+    );
+    assert_eq!(rules[1].mode, PermissionMode::None);
+}
+
+#[test]
+fn a_role_check_keeps_only_the_predicate() {
+    use surrealql_language_server::semantic::types::PermissionMode;
+
+    let source =
+        "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR create WHERE $auth.roles CONTAINS 'admin';";
+    let analysis = analyze_document(uri("p.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let PermissionMode::Expression(expression) = &analysis.tables[0].permissions[0].mode else {
+        panic!(
+            "expected an expression: {:?}",
+            analysis.tables[0].permissions
+        );
+    };
+    assert!(
+        expression.starts_with("WHERE") && expression.contains("$auth.roles"),
+        "the predicate, not the whole clause: {expression:?}"
+    );
+}
+
+/// The end-to-end payoff: a blanket deny now reports.
+#[test]
+fn a_denied_write_is_reported() {
+    let source = "DEFINE TABLE locked SCHEMAFULL PERMISSIONS FOR create NONE;\n\
+                  DEFINE FIELD a ON locked TYPE string;\n\
+                  CREATE locked SET a = 'x';";
+    let codes = suppression_codes(source);
+    assert!(
+        codes.contains(&"permission-denied".to_string()),
+        "expected permission-denied, got {codes:?}"
+    );
+}
+
+/// And a grant is no longer reported as undecidable.
+#[test]
+fn a_granted_write_is_silent() {
+    let source = "DEFINE TABLE open SCHEMAFULL PERMISSIONS FULL;\n\
+                  DEFINE FIELD a ON open TYPE string;\n\
+                  CREATE open SET a = 'x';";
+    let codes = suppression_codes(source);
+    assert!(
+        !codes.contains(&"permission-denied".to_string())
+            && !codes.contains(&"permission-unknown".to_string()),
+        "PERMISSIONS FULL grants: {codes:?}"
+    );
+}
+
+/// A role the active auth context does have.
+#[test]
+fn a_role_the_context_holds_is_granted() {
+    let mut settings = ServerSettings::default();
+    settings.auth_contexts[0].roles = vec!["admin".to_string()];
+    let source = "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR create WHERE $auth.roles CONTAINS 'admin';\n\
+                  DEFINE FIELD a ON t TYPE string;\n\
+                  CREATE t SET a = 'x';";
+    let codes = codes_of(&diagnostics_for_with(source, &settings));
+    assert!(
+        !codes.contains(&"permission-denied".to_string()),
+        "the context holds `admin`: {codes:?}"
+    );
+}
+
+/// And one it does not.
+#[test]
+fn a_role_the_context_lacks_is_denied() {
+    let source = "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR create WHERE $auth.roles CONTAINS 'admin';\n\
+                  DEFINE FIELD a ON t TYPE string;\n\
+                  CREATE t SET a = 'x';";
+    let codes = suppression_codes(source);
+    assert!(
+        codes.contains(&"permission-denied".to_string()),
+        "the default context is `viewer`: {codes:?}"
+    );
+}
+
+/// A directive that does its job is not reported.
+#[test]
+fn a_working_directive_is_not_flagged() {
+    let codes = suppression_codes("-- surql-ignore: let-type\nLET $x: int = \"abc\";");
+    assert!(codes.is_empty(), "{codes:?}");
+}
+
+/// A stale directive is a hint, tagged so an editor greys it out rather than
+/// adding a line to the problems panel.
+#[test]
+fn a_stale_directive_is_a_hint() {
+    let diagnostics = diagnostics_for_with(
+        "-- surql-ignore: let-type\nDEFINE TABLE person SCHEMAFULL;",
+        &ServerSettings::default(),
+    );
+    assert_eq!(
+        codes_of(&diagnostics),
+        vec!["unused-suppression".to_string()]
+    );
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::HINT)
+    );
+    assert_eq!(
+        diagnostics[0].tags,
+        Some(vec![tower_lsp_server::ls_types::DiagnosticTag::UNNECESSARY])
+    );
+}
+
+/// The rule can be turned off like any other, for a codebase that keeps
+/// directives deliberately.
+#[test]
+fn the_unused_suppression_rule_can_be_silenced() {
+    let mut settings = ServerSettings::default();
+    settings
+        .analysis
+        .rule_severity
+        .insert("unused-suppression".to_string(), "off".to_string());
+    let diagnostics = diagnostics_for_with(
+        "-- surql-ignore: let-type\nDEFINE TABLE person SCHEMAFULL;",
+        &settings,
+    );
+    assert!(codes_of(&diagnostics).is_empty());
+}
+
+/// A file that keeps directives deliberately can silence the rule about
+/// directives. The file form, not the line form: a line directive's scope is
+/// the next line of *code*, so it cannot reach another directive.
+#[test]
+fn a_file_directive_can_silence_the_rule_about_directives() {
+    let source = "-- surql-ignore-file: unused-suppression\n\
+                  -- surql-ignore: let-type\n\
+                  DEFINE TABLE person SCHEMAFULL;";
+    let codes = suppression_codes(source);
+    assert!(
+        !codes.contains(&"unused-suppression".to_string()),
+        "{codes:?}"
+    );
+}
+
+/// Comma-separated permission groups are valid SurrealQL and used throughout
+/// SurrealDB's own language tests, but the pinned grammar leaves the comma as an
+/// `ERROR` sibling — see `docs/grammar-gaps.md` and
+/// `docs/permission-group-comma.patch`.
+///
+/// This test states what the *pinned* grammar does. Building against a grammar
+/// that carries the fix makes it fail — deliberately. That is the only signal
+/// that tells whoever bumps the pin which defect the bump closed, and which
+/// documentation to correct; CI builds against the pin, so CI stays green until
+/// someone moves it on purpose.
+#[test]
+fn the_pinned_grammar_rejects_comma_separated_permission_groups() {
+    let one_group = "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR select FULL;";
+    assert!(
+        suppression_codes(one_group)
+            .iter()
+            .all(|code| code != "parse"),
+        "a single group parses"
+    );
+
+    let two_groups = "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR select FULL, FOR create NONE;";
+    let codes = suppression_codes(two_groups);
+    assert!(
+        codes.iter().any(|code| code == "parse"),
+        "the pinned grammar rejects the comma; if this now passes, the pin has \
+         moved and `docs/grammar-gaps.md` needs updating: {codes:?}"
+    );
+
+    // The engine also accepts the groups with no separator at all. The pinned
+    // grammar's `repeat1` handles that form, which is why only the comma is a
+    // false positive.
+    let no_separator = "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR select FULL FOR create NONE;";
+    assert!(
+        suppression_codes(no_separator)
+            .iter()
+            .all(|code| code != "parse"),
+        "groups with no separator already parse"
     );
 }
