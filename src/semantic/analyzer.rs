@@ -682,8 +682,9 @@ fn extract_index(
         child.kind() == k::UNIQUE_CLAUSE || k::has_descendant(*child, k::UNIQUE_CLAUSE)
     });
 
-    // Any remaining index-variant clause (HNSW/MTREE/search analyzer/…) is
-    // captured verbatim as an option string.
+    // Any remaining index-variant clause (FULLTEXT/COUNT/HNSW/DISKANN/…) is
+    // captured verbatim as an option string. `OVERWRITE` and `IF NOT EXISTS`
+    // end in `Clause` too but modify the definition, not the index.
     let options = children
         .iter()
         .filter(|child| {
@@ -695,6 +696,8 @@ fn extract_index(
                         | k::FIELDS_COLUMNS_CLAUSE
                         | k::UNIQUE_CLAUSE
                         | k::COMMENT_CLAUSE
+                        | k::OVERWRITE_CLAUSE
+                        | k::IF_NOT_EXISTS_CLAUSE
                 )
                 && !(unique && k::has_descendant(**child, k::UNIQUE_CLAUSE))
         })
@@ -3252,6 +3255,134 @@ mod tests {
         assert_eq!(analysis.indexes[0].table, "documents");
         assert_eq!(analysis.indexes[0].name, "documents_vec_index");
         assert_eq!(analysis.indexes[0].fields, vec!["embedding".to_string()]);
+    }
+
+    #[test]
+    fn accepts_fulltext_index_variants() {
+        // Reported ``Invalid SurrealQL syntax near `FULLTEXT ANALYZER english
+        // BM25`.`` at the `df12d94` grammar pin, whose `IndexClause` knew only
+        // the pre-3.0 `SEARCH ANALYZER` spelling. The engine reads `ANALYZER`,
+        // `BM25 [(k1, b)]` and `HIGHLIGHTS` in any order and requires none.
+        let uri = Uri::from_str("file:///workspace/search.surql").expect("valid uri");
+        let text = r#"
+        DEFINE ANALYZER english TOKENIZERS class FILTERS snowball(english);
+        DEFINE INDEX OVERWRITE article_body_search  ON article FIELDS body FULLTEXT ANALYZER english BM25;
+        DEFINE INDEX blog_title ON blog FIELDS title FULLTEXT ANALYZER english BM25(1.2,0.75) HIGHLIGHTS;
+        DEFINE INDEX i ON b FIELDS t FULLTEXT HIGHLIGHTS BM25 ANALYZER english;
+        DEFINE INDEX j ON b FIELDS t FULLTEXT BM25 HIGHLIGHTS;
+        "#;
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+        assert_eq!(analysis.analyzers.len(), 1);
+        assert_eq!(analysis.indexes.len(), 4);
+        assert_eq!(analysis.indexes[0].name, "article_body_search");
+        assert_eq!(analysis.indexes[0].table, "article");
+        assert_eq!(analysis.indexes[0].fields, vec!["body".to_string()]);
+        assert!(!analysis.indexes[0].unique);
+        let options: Vec<Vec<String>> = analysis
+            .indexes
+            .iter()
+            .map(|index| index.options.clone())
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                vec!["FULLTEXT ANALYZER english BM25".to_string()],
+                vec!["FULLTEXT ANALYZER english BM25(1.2,0.75) HIGHLIGHTS".to_string()],
+                vec!["FULLTEXT HIGHLIGHTS BM25 ANALYZER english".to_string()],
+                vec!["FULLTEXT BM25 HIGHLIGHTS".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_count_index_variants() {
+        // `COUNT [WHERE <condition>]` takes no field list — the engine rejects
+        // one. `CONCURRENTLY` is a clause of its own and is captured as an
+        // option, as it is for every other index kind.
+        let uri = Uri::from_str("file:///workspace/count.surql").expect("valid uri");
+        let text = r#"
+        DEFINE INDEX idx_count ON t COUNT;
+        DEFINE INDEX item_active_count ON item COUNT WHERE status = "active" CONCURRENTLY;
+        DEFINE INDEX idx ON users COUNT COMMENT "Users expected to grow" CONCURRENTLY;
+        "#;
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+        assert_eq!(analysis.indexes.len(), 3);
+        assert!(
+            analysis
+                .indexes
+                .iter()
+                .all(|index| index.fields.is_empty() && !index.unique)
+        );
+        let options: Vec<Vec<String>> = analysis
+            .indexes
+            .iter()
+            .map(|index| index.options.clone())
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                vec!["COUNT".to_string()],
+                vec![
+                    "COUNT WHERE status = \"active\"".to_string(),
+                    "CONCURRENTLY".to_string()
+                ],
+                vec!["COUNT".to_string(), "CONCURRENTLY".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_diskann_and_hashed_vector_index_variants() {
+        // `DISKANN` was a declared completion the grammar could not parse;
+        // `HASHED_VECTOR` and the `DISTANCE` spelling of `DIST` were missing
+        // from `HNSW` too. The first option string is longer than the preview
+        // cap, so it is checked by prefix.
+        let uri = Uri::from_str("file:///workspace/vector.surql").expect("valid uri");
+        let text = r#"
+        DEFINE INDEX diskann_pts ON pts FIELDS point DISKANN DIMENSION 4 DIST EUCLIDEAN TYPE F32 DEGREE 8 L_BUILD 20 ALPHA 1.4 HASHED_VECTOR;
+        DEFINE INDEX emb ON embeddings FIELDS vec DISKANN DIMENSION 8 DISTANCE INNER_PRODUCT TYPE F16;
+        DEFINE INDEX idx_embedding ON TABLE test FIELDS embedding HNSW DIMENSION 3 DISTANCE COSINE HASHED_VECTOR;
+        "#;
+
+        let analysis = analyze_document(uri, text, SymbolOrigin::Local).expect("analysis");
+
+        assert!(
+            analysis.syntax_diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.syntax_diagnostics
+        );
+        assert_eq!(analysis.indexes.len(), 3);
+        assert_eq!(analysis.indexes[0].fields, vec!["point".to_string()]);
+        assert_eq!(analysis.indexes[0].options.len(), 1);
+        assert!(
+            analysis.indexes[0].options[0].starts_with(
+                "DISKANN DIMENSION 4 DIST EUCLIDEAN TYPE F32 DEGREE 8 L_BUILD 20 ALPHA 1.4"
+            ),
+            "got {:?}",
+            analysis.indexes[0].options
+        );
+        assert_eq!(
+            analysis.indexes[1].options,
+            vec!["DISKANN DIMENSION 8 DISTANCE INNER_PRODUCT TYPE F16".to_string()]
+        );
+        assert_eq!(
+            analysis.indexes[2].options,
+            vec!["HNSW DIMENSION 3 DISTANCE COSINE HASHED_VECTOR".to_string()]
+        );
     }
 
     #[test]

@@ -1,12 +1,53 @@
 # Grammar Gaps
 
 The language server compiles against the tree-sitter SurrealQL grammar
-pinned to commit `df12d94720f3e22822026df41194feb3f47c20b2`
+pinned to commit `cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b`
 (`GRAMMAR_REF` in [`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh)
 and the checkout steps in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
 The analysis layer in [`src/semantic/node_kind.rs`](../src/semantic/node_kind.rs)
 is coupled to that revision's node kinds — bump the pin and the
 constants together.
+
+## Fixed by the `cb2e6b5` pin
+
+The pin moved from `df12d94` to `cb2e6b5` for the `DEFINE INDEX` kinds
+SurrealDB 3 reads. At `df12d94`, `IndexClause` was
+`choice(UniqueClause, SearchAnalyzerClause, MtreeClause, HnswClause)` — the
+full-text form keyed on the pre-3.0 `SEARCH` keyword — so
+`DEFINE INDEX … FULLTEXT ANALYZER english BM25` reported ``Invalid SurrealQL
+syntax near `FULLTEXT ANALYZER english BM25`.`` on valid SurrealQL, and every
+`COUNT` and `DISKANN` index failed the same way. The new revision mirrors the
+engine's `parse_define_index` (`syn/parser/stmt/define.rs`):
+
+- **`FullTextClause`** — `FULLTEXT [ANALYZER <name>] [BM25 [(k1, b)]]
+  [HIGHLIGHTS]`, the options in any order and none required. The statement
+  above is `IndexClause(FullTextClause(Keyword, Keyword, Ident,
+  Bm25Clause(Keyword)))`; the analyzer name is the `Ident` child, as in
+  `SearchAnalyzerClause`.
+- **`CountClause`** — `COUNT [WHERE <condition>]`; the condition is an
+  ordinary `WhereClause` child.
+- **`DiskAnnClause`** — `DISKANN DIMENSION <n>` followed, in any order, by
+  `DiskAnnDistClause`, `IndexTypeClause`, `IndexDegreeClause`,
+  `IndexLBuildClause`, `IndexAlphaClause` and `IndexHashedVectorClause`.
+- **`HnswClause`** gains `IndexHashedVectorClause`, and both vector `DIST`
+  clauses accept the `DISTANCE` spelling the engine lexes as the same
+  keyword.
+- **`IndexTypeClause`** covers the engine's `VectorTypeKind` set (`F16`,
+  `I8`, `U8` were missing) and **`Distance`** its `DistanceKind` set
+  (`COSINE_NORMALIZED`, `INNER_PRODUCT` were missing).
+
+`SearchAnalyzerClause` and `MtreeClause` are unchanged, so 2.x schemas still
+parse, and no existing node is renamed or reshaped — `node_kind.rs` needed no
+change, and `extract_index` in
+[`src/semantic/analyzer.rs`](../src/semantic/analyzer.rs) captures the new
+clauses verbatim as index options, as it did for `HNSW`. Guard tests:
+`tests/lsp.rs` (the *Grammar pin `cb2e6b5`* section) and the
+`accepts_*_index_variants` tests in `src/semantic/analyzer.rs`. `DISKANN`
+leaves `OFFERS_THE_GRAMMAR_CANNOT_PARSE` in
+[`src/core/statement_shape.rs`](../src/core/statement_shape.rs).
+
+Across SurrealDB's own `language-tests/` corpus the move fixed the parse of
+42 files and regressed none.
 
 ## Fixed by the `df12d94` pin
 

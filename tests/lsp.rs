@@ -6625,3 +6625,70 @@ fn arithmetic_under_a_short_circuits_right_side_is_not_provable() {
         vec!["Cannot perform addition with `string` and `int`."]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Grammar pin `cb2e6b5` — DEFINE INDEX
+// ---------------------------------------------------------------------------
+//
+// `DEFINE INDEX OVERWRITE article_body_search ON article FIELDS body FULLTEXT
+// ANALYZER english BM25;` reported ``Invalid SurrealQL syntax near `FULLTEXT
+// ANALYZER english BM25`.`` at `df12d94`, whose `IndexClause` knew only the
+// pre-3.0 `SEARCH ANALYZER` spelling of a full-text index; every `COUNT` and
+// `DISKANN` index failed the same way. The pin moved for the index kinds
+// SurrealDB 3 reads. These pin every form on the `DEFINE INDEX` docs page,
+// every option order the engine's `parse_define_index` accepts, and the two
+// pre-3.0 spellings the grammar keeps.
+
+#[test]
+fn a_fulltext_index_parses() {
+    let source = "DEFINE ANALYZER english TOKENIZERS class FILTERS snowball(english);\n\
+                  DEFINE TABLE article;\n\
+                  DEFINE INDEX OVERWRITE article_body_search  ON article FIELDS body FULLTEXT ANALYZER english BM25;\n\
+                  DEFINE INDEX OVERWRITE article_title_search ON article FIELDS title FULLTEXT ANALYZER english BM25;";
+    let diagnostics = diagnostics_for(source);
+    assert!(
+        diagnostics.is_empty(),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn every_documented_index_form_parses() {
+    // https://surrealdb.com/docs/reference/query-language/statements/define/indexes
+    for statement in [
+        "DEFINE INDEX userAgeIndex ON TABLE user COLUMNS age;",
+        "DEFINE INDEX userEmailIndex ON TABLE user COLUMNS email UNIQUE;",
+        "DEFINE INDEX test ON user FIELDS account, email UNIQUE;",
+        "DEFINE INDEX tag_age ON user FIELDS tags.*, age;",
+        "DEFINE INDEX idx ON user COUNT;",
+        "DEFINE INDEX item_active_count ON user COUNT WHERE status = \"active\";",
+        "DEFINE INDEX userNameIndex ON TABLE user COLUMNS name FULLTEXT ANALYZER example_ascii BM25 HIGHLIGHTS;",
+        "DEFINE INDEX title_index ON user FIELDS title FULLTEXT ANALYZER example_ascii BM25(1.2,0.75) HIGHLIGHTS;",
+        "DEFINE INDEX i ON user FIELDS title FULLTEXT BM25 HIGHLIGHTS;",
+        "DEFINE INDEX i ON user FIELDS title FULLTEXT HIGHLIGHTS BM25 ANALYZER example_ascii;",
+        "DEFINE INDEX mt_pts ON user FIELDS point HNSW DIMENSION 4 DIST EUCLIDEAN EFC 150 M 12;",
+        "DEFINE INDEX idx_hnsw_embedding ON user FIELDS items.embedding HNSW DIMENSION 4 TYPE I64;",
+        "DEFINE INDEX idx_embedding ON user FIELDS embedding HNSW DIMENSION 3 DISTANCE COSINE HASHED_VECTOR;",
+        "DEFINE INDEX diskann_pts ON user FIELDS point DISKANN DIMENSION 4 DIST EUCLIDEAN TYPE F32;",
+        "DEFINE INDEX diskann_pts ON user FIELDS point DISKANN DIMENSION 4 DIST EUCLIDEAN TYPE F32 DEGREE 8 L_BUILD 20 ALPHA 1.4 HASHED_VECTOR;",
+        "DEFINE INDEX emb ON user FIELDS vec DISKANN DIMENSION 8 DISTANCE INNER_PRODUCT TYPE F16;",
+        "DEFINE INDEX IF NOT EXISTS example ON user FIELDS example;",
+        "DEFINE INDEX OVERWRITE example ON user FIELDS example;",
+        "DEFINE INDEX test ON user FIELDS email CONCURRENTLY;",
+        "DEFINE INDEX idx ON user COUNT COMMENT \"Users expected to grow\" CONCURRENTLY;",
+        "DEFINE INDEX active_users ON user COUNT WHERE status = \"active\" CONCURRENTLY;",
+        "DEFINE INDEX idx_search ON TABLE user FIELDS name SEARCH ANALYZER example_ascii BM25 HIGHLIGHTS;",
+        "DEFINE INDEX idx_vec ON TABLE user FIELDS embedding MTREE DIMENSION 3 DIST COSINE;",
+    ] {
+        let source = format!(
+            "DEFINE ANALYZER example_ascii TOKENIZERS class FILTERS ascii;\nDEFINE TABLE user;\n{statement}"
+        );
+        let diagnostics = diagnostics_for(&source);
+        assert!(
+            diagnostics.is_empty(),
+            "`{statement}` got {:?}",
+            messages_of(&diagnostics)
+        );
+    }
+}
