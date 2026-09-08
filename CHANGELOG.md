@@ -95,6 +95,29 @@ Also:
 
 ### Added
 
+- **Closures are typed, and calls through them are checked.**
+  `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`
+  instead of `unknown`. The parameters come from the closure as written; the
+  result is the declared `-> T` when there is one, otherwise what the body was
+  read to produce — a `Block` body through its `RETURN`s and trailing
+  expression, a bare-expression body through the expression itself. Hover,
+  completion detail and signature help (`$double(`) all show it, and
+  `LET $y = $double(20)` binds `$y` to `int`.
+
+  A call through the variable is checked as the engine checks it
+  (`exec/physical_expr/function/closure.rs`): `$double("asdasd")` reports
+  ``Argument 1 of `$double` expects `int`, found `string`.`` (`argument-type`),
+  and `$double()` reports ``expects 1 argument, found 0`` (`argument-count`).
+  Two engine facts shape the count check: an unannotated parameter is `any`,
+  which may be omitted, and extra arguments are dropped rather than rejected,
+  so only the lower bound is ever reported. A closure declared `-> T` has its
+  result checked against `T` (`return-type`), as a `DEFINE FUNCTION` does.
+
+  The new type fits a parameter declared with the bare kind `function` — the
+  engine's own spelling for every closure, and what every closure-taking
+  builtin declares — and nothing else. A variable typed only as `function` is
+  never judged: its parameters are not visible.
+
 - **`analysis.diagnosticDebounceMs`** (default `200`) waits for typing to settle
   before analysing an edited buffer. Every keystroke used to trigger a full
   reparse, a workspace-model rebuild and a diagnostic publish; at ten characters
@@ -132,6 +155,28 @@ Also:
   Writing `SCHEMALESS` is the signal; omitting the clause is not.
 
 ### Changed
+
+- **Grammar pin moved to `df12d94`** (upstream `master` of
+  `surrealql-tree-sitter`), from `826d0c2`. Four shapes the earlier revision
+  rejected or mis-nested on valid SurrealQL no longer produce a false `parse`
+  diagnostic: a closure with a bare-expression body (`|$x: int| $x * 2`),
+  `UNSET` with a field list (`UPDATE person:tobie UNSET name, email, age`),
+  `SHOW CHANGES FOR TABLE person SINCE 1` with a versionstamp, and mock
+  syntax (`|test:1..4|`). Binary operators now nest by the engine's
+  precedence. Across SurrealDB's own `language-tests/` corpus the move fixes
+  the parse of 91 files and regresses none. `docs/grammar-gaps.md` records
+  what the new revision still rejects.
+
+- **Arithmetic chains are flattened on both sides.** With operators nested
+  by precedence, `1 + "a" * 3` carries `"a" * 3` as the *right* operand of
+  `+`, and a chain nested there used to be typed with its diagnostics
+  discarded. `semantic::infer` now flattens a chain on either side before
+  regrouping it with the engine's binding powers, so every nested chain is
+  judged exactly once — and the regrouping now distinguishes every rank of the
+  engine's `BindingPower`, not only the arithmetic three. That matters for
+  what is *provable*: `$a AND $b = "x" + 1` groups as
+  `$a AND ($b = ("x" + 1))`, whose right side may never run, and is no longer
+  reported.
 
 - **A nested `SET` target is read whole.** `field_assignment_target` in
   `src/semantic/analyzer.rs` now accepts either grammar shape for the

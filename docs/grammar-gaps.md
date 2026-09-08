@@ -1,12 +1,43 @@
 # Grammar Gaps
 
 The language server compiles against the tree-sitter SurrealQL grammar
-pinned to commit `826d0c2ca6733a1c201ea7015dd91f439f67b573`
+pinned to commit `df12d94720f3e22822026df41194feb3f47c20b2`
 (`GRAMMAR_REF` in [`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh)
 and the checkout steps in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
 The analysis layer in [`src/semantic/node_kind.rs`](../src/semantic/node_kind.rs)
 is coupled to that revision's node kinds — bump the pin and the
 constants together.
+
+## Fixed by the `df12d94` pin
+
+The pin moved from `826d0c2` to `df12d94` (upstream `master`) for four
+shapes the earlier revision rejected or mis-nested on valid SurrealQL.
+Each produced a false `parse` diagnostic, or a wrong tree, and each has a
+guard test in `tests/lsp.rs` (the *Grammar pin* section):
+
+- **A closure may have a bare-expression body.** `|$x: int| $x * 2` parses
+  as `Closure(Pipe, ParamDefinition, Pipe, BinaryExpression)`; before, only
+  a `Block` body was accepted and the expression form was an `ERROR`. This
+  is what lets `semantic::infer` type a `LET`-bound closure at all.
+- **`UNSET` takes a field list.** `UPDATE person:tobie UNSET name, email`
+  is `UnsetClause(Keyword, Predicate(Ident)…)`, the same shape as `OMIT`.
+  Before, `UNSET` was read as a list of `FieldAssignment`s, so the first
+  bare field name broke the statement.
+- **`SHOW CHANGES … SINCE` accepts a versionstamp.** `SINCE 1` is a
+  `Number` child; before, only a `String` was accepted.
+- **Binary operators carry the engine's precedence.** `BinaryExpression`
+  is split into tiers mirroring `BindingPower`, so `1 + 1 * 3` nests as
+  `1 + (1 * 3)`. The re-grouping in `semantic::infer` is kept regardless:
+  it flattens a chain on *both* sides and regroups it with the engine's
+  binding powers, which reproduces this grammar's tree and would correct a
+  future one, and it is what judges a nested chain exactly once.
+- **Mock syntax parses.** `|test:1..4|` is a `RangeRecordId`. The
+  `has_broken_sibling` guard in `semantic::infer` that this shape motivated
+  is kept, because the failure mode is tree-sitter's recovery rather than
+  one rule.
+
+Across SurrealDB's own `language-tests/` corpus the move fixed the parse
+of 91 files and regressed none.
 
 ## Known parse/shape gaps at the pinned revision
 
@@ -31,15 +62,6 @@ constants together.
   statements produce no query facts (see
   [`docs/pain-points.md`](pain-points.md)).
 
-- **All binary operators share one precedence level.** `BinaryExpression`
-  is `prec.left('binary', seq($._value, $.Operator, $._value))` and
-  `binary` is a single entry in `precedences`, so the tree carries no
-  operator precedence at all: `1 + 1 * 3` parses as `(1 + 1) * 3`, while
-  SurrealDB evaluates `1 + (1 * 3)` and answers `4` (its own
-  `language/expression/operators/precedence.surql` asserts that).
-  `semantic::infer` works around this for the arithmetic type check by
-  flattening the left spine and re-grouping it with the engine's binding
-  powers; semantic tokens and completion read the tree as parsed.
 - **No `%` operator.** Nothing in `grammar.js` holds `'%'`, so `8 % 3`
   does not parse. The engine supports it at `MulDiv` precedence and
   rejects `"8" % "3"`, which the arithmetic check therefore cannot reach.
@@ -47,13 +69,23 @@ constants together.
   (`optional(choice('-', '+'))`) and `PrefixExpression` accepts `!`
   alone, so `-[1,2,3]` does not parse. The engine rejects it with
   `Cannot negate the value 'array'`.
-- **Mock syntax does not parse.** `|test:1..4|` yields `ERROR` nodes
-  *around* a `BinaryExpression` rather than inside one, so a guard that
-  only inspects a subtree sees a well-formed fragment. `has_broken_sibling`
-  in `semantic::infer` exists for exactly this shape.
+- **A union in a `ParamDefinition` does not parse.** `_safeType` is
+  `choice($._singleType, seq('<', $._type, '>'))` and omits `UnionType`,
+  so `LET $a: int | float = 2` and a closure or function parameter typed
+  the same way leave an `ERROR` node; the bracketed `<int | float>` form
+  parses. `DEFINE FIELD … TYPE int | float` is unaffected, because
+  `TypeClause` uses `_type`. `semantic::infer` refuses to type a closure
+  whose parameter list holds an `ERROR`, rather than invent an arity.
+- **A sized collection does not parse.** `array<float, 10>` and
+  `set<int, 3>` produce `ParameterizedType(TypeName, TypeName,
+  ERROR(Int))` — `ParameterizedType` has no comma list. Both are valid
+  engine kinds.
+- **A signed decimal suffix does not parse.** `math::ceil(-102023.1dec)`
+  leaves an `ERROR` in the argument list, which is why the call checks
+  refuse to count arguments in a list that holds one.
 
 - **A `SET` target cannot be a nested field.** `FieldAssignment` is
-  `seq($.Ident, alias($._assignmentOp, $.Operator), $._value)`, so the
+  `seq($.Ident, alias($._assignmentOp, $.Operator), choice($.IfElseStatement, $._value))`, so the
   assigned-to side is a *single* identifier. `CREATE person SET
   name.first = 'John'` therefore reports ``Invalid SurrealQL syntax near
   `.first`.`` on valid SurrealQL — the `.first` becomes an `ERROR` sibling

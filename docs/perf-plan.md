@@ -46,7 +46,7 @@ The plan is complete when all of these statements are true:
 
 1. Make sure that the branch is `perf/lsp-latency-fixes`.
 2. Make sure that `git status` reports a clean tree.
-3. Clone the grammar at the pinned reference `826d0c2ca6733a1c201ea7015dd91f439f67b573`.
+3. Clone the grammar at the pinned reference `df12d94720f3e22822026df41194feb3f47c20b2`.
 4. Set `TREE_SITTER_SURREALQL_DIR` to the grammar directory for every `cargo` command.
 5. Make sure that a SurrealDB checkout is at `../surrealdb`, or set `SURREALDB_DIR`.
    - NOTE: Without this checkout the corpus sweep prints `skipping` and proves nothing.

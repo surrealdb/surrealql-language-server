@@ -3104,31 +3104,26 @@ fn a_variadic_types_every_argument_it_absorbs() {
 
 #[test]
 fn a_call_with_an_unparseable_argument_is_never_flagged() {
-    // The pinned grammar cannot parse a closure or a signed decimal suffix, so
-    // the argument list holds an `ERROR` node. That node might stand for one
-    // argument or five, which makes the count meaningless — and both forms are
-    // valid SurrealQL, so counting it reported a wrong arity on working code.
-    for source in [
-        "RETURN math::ceil(-102023.1dec);",
-        "RETURN type::of(|| 'test');",
-        "RETURN array::map([1], || 1);",
-    ] {
-        let codes = codes_of(&diagnostics_for(source));
-        assert!(
-            !codes.iter().any(|code| code.starts_with("argument-")),
-            "{source} has an unparseable argument, got {codes:?}"
-        );
-    }
+    // The pinned grammar cannot parse a signed decimal suffix, so the argument
+    // list holds an `ERROR` node. That node might stand for one argument or
+    // five, which makes the count meaningless — and the form is valid
+    // SurrealQL, so counting it reported a wrong arity on working code.
+    let source = "RETURN math::ceil(-102023.1dec);";
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes.iter().any(|code| code.starts_with("argument-")),
+        "{source} has an unparseable argument, got {codes:?}"
+    );
 
     // Contrast, using a construct whose parse does not depend on the grammar
     // revision: the guard suppresses a call it *cannot read*, not every call.
     //
-    // A closure would be the natural contrast here, and an earlier version of
-    // this test used one — but whether `|$a, $b| $a + $b` parses depends on the
-    // grammar revision. The pinned `826d0c2` accepts only a block body, while
-    // later revisions add an expression body, so the assertion passed locally
-    // and failed in continuous integration. Never assert a diagnostic on a
-    // construct whose parse tree differs between grammar revisions.
+    // Closures used to sit in the list above, because the grammar pinned before
+    // `df12d94` accepted only a block body and left `|| 1` as an `ERROR`. That
+    // made this test pass or fail with the grammar revision, so it no longer
+    // mentions them; the closure section below asserts what a closure argument
+    // does now that it parses. Never assert a diagnostic on a construct whose
+    // parse tree differs between grammar revisions.
     assert!(
         codes_of(&diagnostics_for("RETURN array::at([1, 2], 0, 3);"))
             .contains(&"argument-count".to_string()),
@@ -6294,5 +6289,339 @@ fn a_record_valued_column_does_not_capture_the_row() {
         ty,
         TypeExpr::Array(Box::new(TypeExpr::Scalar("string".to_string()))),
         "`name` is `book`'s `string`, not `person`'s `int` reached through `author`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Closures
+// ---------------------------------------------------------------------------
+//
+// `LET $double = |$x: int| $x * 2;` used to bind `$double` to `unknown`, and
+// `$double("asdasd")` passed without a word. The engine coerces each argument to
+// the parameter's declared kind and fails otherwise
+// (`exec/physical_expr/function/closure.rs`), so the binding now carries the
+// closure's own type — its parameters and what it returns — and a call through
+// the variable is checked against it.
+
+/// The type of the binding named `name`, read at its declaration.
+fn closure_binding_type(source: &str, name: &str) -> TypeExpr {
+    let analysis =
+        analyze_document(uri("closure.surql"), source, SymbolOrigin::Local).expect("analysis");
+    let model =
+        MergedSemanticModel::build(&workspace_from(vec![analysis.clone()]), &Default::default());
+    let bindings = resolve_bindings(&analysis, &model);
+    let declaration = source
+        .find(name)
+        .expect("the binding is declared in the source");
+    bindings
+        .at(name, declaration)
+        .unwrap_or_else(|| panic!("no binding for {name}"))
+        .ty
+        .clone()
+}
+
+/// The messages carrying `code` that `source` produces.
+fn messages_with_code(source: &str, code: &str) -> Vec<String> {
+    diagnostics_for(source)
+        .into_iter()
+        .filter(|diagnostic| {
+            matches!(
+                &diagnostic.code,
+                Some(tower_lsp_server::ls_types::NumberOrString::String(actual))
+                    if actual == code
+            )
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn a_closure_binding_carries_its_parameters_and_result() {
+    // The reported case. `int * int` is `int` by the engine's own operand tables,
+    // and the type is written the way the closure is.
+    assert_eq!(
+        closure_binding_type("LET $double = |$x: int| $x * 2;", "$double").to_string(),
+        "|$x: int| -> int"
+    );
+}
+
+#[test]
+fn a_declared_return_type_wins_over_the_body() {
+    // The engine coerces the result to the declared type, so that is what a
+    // call yields — not the narrower `int` the body would suggest.
+    assert_eq!(
+        closure_binding_type("LET $f = |$x: int| -> number { RETURN $x * 2 };", "$f").to_string(),
+        "|$x: int| -> number"
+    );
+}
+
+#[test]
+fn a_block_bodied_closure_is_typed_from_its_returns() {
+    assert_eq!(
+        closure_binding_type("LET $f = |$x: int| { RETURN $x * 2 };", "$f").to_string(),
+        "|$x: int| -> int"
+    );
+    // Two parameters, the second unannotated, and a trailing expression.
+    assert_eq!(
+        closure_binding_type("LET $f = |$a: string, $b| { $a + 'x' };", "$f").to_string(),
+        "|$a: string, $b| -> string"
+    );
+}
+
+#[test]
+fn what_cannot_be_read_is_left_out_rather_than_guessed() {
+    // `$x * 2` with `$x` untyped is untyped, and no arrow is then written.
+    assert_eq!(
+        closure_binding_type("LET $f = |$x| $x * 2;", "$f").to_string(),
+        "|$x|"
+    );
+    // An `ERROR` inside the parameter list could stand for any number of
+    // parameters — a union in a `ParamDefinition` is a known grammar gap — so
+    // the whole closure is unknown rather than a wrong arity.
+    assert_eq!(
+        closure_binding_type("LET $f = |$x: int | float| $x;", "$f"),
+        TypeExpr::Unknown
+    );
+}
+
+#[test]
+fn a_call_with_the_wrong_argument_type_is_reported() {
+    // The reported case: `$double` accepts an `int`, not a string.
+    assert_eq!(
+        messages_with_code(
+            "LET $double = |$x: int| $x * 2;\n$double(\"asdasd\");",
+            "argument-type"
+        ),
+        vec!["Argument 1 of `$double` expects `int`, found `string`."]
+    );
+}
+
+#[test]
+fn a_call_the_engine_accepts_is_silent() {
+    for source in [
+        // The reported case.
+        "LET $double = |$x: int| $x * 2;\n$double(20);",
+        // Extra arguments are dropped, not rejected (`arg_spec.iter().zip(args)`).
+        "LET $double = |$x: int| $x * 2;\n$double(20, 30);",
+        // An unannotated parameter is `any`.
+        "LET $f = |$x| $x;\n$f('anything');",
+        // `any` can hold NONE, so an unannotated trailing parameter may be
+        // omitted; so may an explicit `option<…>`.
+        "LET $f = |$a: int, $b| $a;\n$f(1);",
+        "LET $f = |$a: int, $b: option<int>| $a;\n$f(1);",
+        // Numeric widening is silent, as for every other call.
+        "LET $f = |$x: number| $x;\n$f(1);",
+    ] {
+        let codes = codes_of(&diagnostics_for(source));
+        assert!(
+            !codes.iter().any(|code| code.starts_with("argument-")),
+            "`{source}` is accepted by the engine, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_required_argument_is_reported() {
+    assert_eq!(
+        messages_with_code(
+            "LET $double = |$x: int| $x * 2;\n$double();",
+            "argument-count"
+        ),
+        vec!["`$double` expects 1 argument, found 0."]
+    );
+    // The required run reaches the last parameter that cannot hold NONE, even
+    // past an `any` before it.
+    assert_eq!(
+        messages_with_code("LET $f = |$a, $b: int| $a;\n$f(1);", "argument-count"),
+        vec!["`$f` expects 2 arguments, found 1."]
+    );
+    // With omittable parameters after the required ones, only the lower bound
+    // is stated: there is no upper one.
+    assert_eq!(
+        messages_with_code(
+            "LET $f = |$a: int, $b: int, $c| $a;\n$f();",
+            "argument-count"
+        ),
+        vec!["`$f` expects at least 2 arguments, found 0."]
+    );
+}
+
+#[test]
+fn a_call_through_a_closure_has_the_closures_result_type() {
+    assert_eq!(
+        closure_binding_type(
+            "LET $double = |$x: int| $x * 2;\nLET $y = $double(20);",
+            "$y"
+        )
+        .to_string(),
+        "int"
+    );
+    // …which flows on into every other check.
+    assert_eq!(
+        messages_with_code(
+            "LET $double = |$x: int| $x * 2;\nLET $y: string = $double(20);",
+            "let-type"
+        ),
+        vec!["`$y` is declared `string` but the value is `int`."]
+    );
+}
+
+#[test]
+fn a_closure_result_is_checked_against_its_declared_type() {
+    // `validate_return("ANONYMOUS", …)` coerces a closure's result exactly as a
+    // function's. A block body, named by the variable it initialises.
+    assert_eq!(
+        messages_with_code(
+            "LET $f = |$x: int| -> string { RETURN $x * 2 };",
+            "return-type"
+        ),
+        vec!["`$f` returns `string`, but this value is `int`."]
+    );
+    // An anonymous closure. A declared return type requires a block body —
+    // the engine's `parse_closure_after_args` demands `{` after the kind — so
+    // the trailing expression is the value here.
+    assert_eq!(
+        messages_with_code(
+            "RETURN array::map([1], |$v: int| -> string { $v });",
+            "return-type"
+        ),
+        vec!["this closure returns `string`, but this value is `int`."]
+    );
+    // A `RETURN` inside a closure belongs to the closure, not to the function
+    // around it: this body returns a closure, and its declared type says so.
+    assert!(
+        messages_with_code(
+            "DEFINE FUNCTION fn::make() -> function { RETURN |$x: int| -> int { RETURN $x }; };",
+            "return-type"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_closure_fits_the_bare_kind_function_and_nothing_else() {
+    // Builtins declare their closure parameters as `function`, so the commonest
+    // closure there is must pass.
+    assert!(
+        diagnostics_for("RETURN array::map([1, 2], |$v| $v * 2);").is_empty(),
+        "a closure argument to a builtin is silent"
+    );
+    assert!(messages_with_code("LET $f: function = |$x| $x;", "let-type").is_empty());
+    // `Value::Closure` coerces to no other kind.
+    assert_eq!(
+        messages_with_code("LET $f: int = |$x| $x;", "let-type"),
+        vec!["`$f` is declared `int` but the value is `|$x|`."]
+    );
+}
+
+#[test]
+fn a_variable_typed_only_as_function_is_not_judged() {
+    // A parameter declared with the bare kind has parameters this cannot see,
+    // so neither the count nor the types are checked.
+    let codes = codes_of(&diagnostics_for(
+        "DEFINE FUNCTION fn::apply($f: function) { RETURN $f(1, 2, 3); };",
+    ));
+    assert!(
+        !codes.iter().any(|code| code.starts_with("argument-")),
+        "got {codes:?}"
+    );
+}
+
+#[test]
+fn a_closure_takes_part_in_no_arithmetic() {
+    assert_eq!(
+        operator_messages("LET $f = |$x| $x;\nRETURN $f + 1;"),
+        vec!["Cannot perform addition with `|$x|` and `int`."]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Grammar pin `df12d94`
+// ---------------------------------------------------------------------------
+//
+// Three of the four reported faults were the grammar's, not the analyzer's: the
+// revision pinned before this one read `UNSET` as a list of assignments, `SHOW
+// CHANGES … SINCE` as taking only a string, and a closure as taking only a block
+// body. Each left an `ERROR` node, and so a false `parse` diagnostic, on valid
+// SurrealQL. These pin the shapes the current revision produces.
+
+#[test]
+fn unset_takes_a_field_list() {
+    // Reported ``Invalid SurrealQL syntax near `UNSET name`. Expected a
+    // operator, `=`, `+=`, or `-=`.``
+    let source = "DEFINE TABLE person;\n\
+                  DEFINE FIELD name ON person;\n\
+                  DEFINE FIELD email ON person;\n\
+                  DEFINE FIELD age ON person;\n\
+                  UPDATE person:tobie UNSET name, email, age;";
+    // The `UPDATE` still draws the permission advisory every write on a table
+    // without rules does; what must be gone is the syntax fault, and no field
+    // may be mistaken for an unknown one.
+    let codes = codes_of(&diagnostics_for(source));
+    assert!(
+        !codes
+            .iter()
+            .any(|code| code == "parse" || code == "unknown-field"),
+        "got {codes:?}"
+    );
+}
+
+#[test]
+fn show_changes_since_accepts_a_versionstamp() {
+    // Reported ``Invalid SurrealQL syntax near `SINCE 1`.`` — `SINCE` takes a
+    // datetime *or* a versionstamp number.
+    for source in [
+        "DEFINE TABLE person;\nSHOW CHANGES FOR TABLE person SINCE 1 LIMIT 10;",
+        "DEFINE TABLE person;\nSHOW CHANGES FOR TABLE person SINCE d'2023-09-07T01:23:52Z' LIMIT 10;",
+    ] {
+        let diagnostics = diagnostics_for(source);
+        assert!(
+            diagnostics.is_empty(),
+            "`{source}` got {:?}",
+            messages_of(&diagnostics)
+        );
+    }
+}
+
+#[test]
+fn an_expression_bodied_closure_parses() {
+    let diagnostics = diagnostics_for("LET $double = |$x: int| $x * 2;\nRETURN $double(20);");
+    assert!(
+        diagnostics.is_empty(),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn a_chain_nested_on_the_right_is_judged_once() {
+    // This grammar nests by the engine's precedence, so `"a" * 3` is the *right*
+    // operand of `+`. A right-nested chain used to be typed with its diagnostics
+    // discarded; flattening both sides puts it in the root's chain, where it is
+    // reported — and exactly once.
+    assert_eq!(
+        operator_messages("RETURN 1 + \"a\" * 3;"),
+        vec!["Cannot perform multiplication with `string` and `int`."]
+    );
+    assert_eq!(
+        closure_binding_type("LET $v = 1 + 2 * 3;", "$v").to_string(),
+        "int"
+    );
+}
+
+#[test]
+fn arithmetic_under_a_short_circuits_right_side_is_not_provable() {
+    // `$a AND $b = "x" + 1` is `$a AND ($b = ("x" + 1))`: `AND` binds looser
+    // than `=`, which binds looser than `+`. The right side of an `AND` may never
+    // run, so the failing pair is not provable. Collapsing every non-arithmetic
+    // operator to one rank grouped this as `($a AND $b) = ("x" + 1)` instead and
+    // reported it.
+    assert!(
+        operator_messages("LET $a = true;\nLET $b = 1;\nRETURN $a AND $b = \"x\" + 1;").is_empty()
+    );
+    // The same pair on the *left* of the `AND` always runs.
+    assert_eq!(
+        operator_messages("LET $a = true;\nRETURN \"x\" + 1 AND $a;"),
+        vec!["Cannot perform addition with `string` and `int`."]
     );
 }

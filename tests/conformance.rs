@@ -190,6 +190,9 @@ fn surql_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// positive fails here instead of blending into a total. Every file *not* listed
 /// is code SurrealDB accepts and the checks must stay silent on.
 const EXPECTED: &[(&str, &str)] = &[
+    // `$argtype(123)` where `$argtype = |$arg: string| $arg`; the file expects
+    // `Expected a value of type 'string' for argument $arg`.
+    ("language/closure/basic.surql", "argument-type"),
     ("language/coerce/regex.surql", "argument-type"),
     ("language/functions/array/add.surql", "argument-count"),
     ("language/functions/array/add.surql", "argument-type"),

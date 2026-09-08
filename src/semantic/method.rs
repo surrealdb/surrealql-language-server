@@ -33,6 +33,9 @@ pub fn receiver_kind(ty: &TypeExpr) -> Option<&'static str> {
         TypeExpr::Set(_) => Some("Set"),
         TypeExpr::Object(_) => Some("Object"),
         TypeExpr::Record(_) => Some("RecordId"),
+        // A closure is served by the catch-all arm, exactly as the bare kind
+        // name `function` is below.
+        TypeExpr::Function { .. } => Some(""),
 
         TypeExpr::Scalar(name) => match name.to_ascii_lowercase().as_str() {
             // One table serves all three numeric kinds, because the engine
