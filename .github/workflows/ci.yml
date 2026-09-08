@@ -20,7 +20,7 @@ jobs:
             - name: Check out tree-sitter grammar
               run: |
                   git clone https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
-                  git -C ../surrealql-tree-sitter checkout df12d94720f3e22822026df41194feb3f47c20b2
+                  git -C ../surrealql-tree-sitter checkout cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b
             # The revision `src/grammar_generated.rs` was generated from, in full
             # so a shallow fetch can ask for it by name. Its 9-character
             # abbreviation `9d9a5b069` is what the catalogue header records.
@@ -84,7 +84,7 @@ jobs:
             - name: Check out tree-sitter grammar
               run: |
                   git clone https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
-                  git -C ../surrealql-tree-sitter checkout df12d94720f3e22822026df41194feb3f47c20b2
+                  git -C ../surrealql-tree-sitter checkout cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
                   toolchain: 1.94.0
@@ -110,7 +110,7 @@ jobs:
             - name: Check out tree-sitter grammar
               run: |
                   git clone https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
-                  git -C ../surrealql-tree-sitter checkout df12d94720f3e22822026df41194feb3f47c20b2
+                  git -C ../surrealql-tree-sitter checkout cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
                   toolchain: 1.94.0
@@ -133,7 +133,7 @@ jobs:
             - name: Check out tree-sitter grammar
               run: |
                   git clone https://github.com/surrealdb/surrealql-tree-sitter ../surrealql-tree-sitter
-                  git -C ../surrealql-tree-sitter checkout df12d94720f3e22822026df41194feb3f47c20b2
+                  git -C ../surrealql-tree-sitter checkout cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
                   toolchain: 1.94.0

@@ -204,7 +204,6 @@ pub const OFFERS_THE_GRAMMAR_CANNOT_PARSE: &[&str] = &[
     "GRAPHQL_ALIAS",
     "GRAPHQL_DEPRECATED",
     "SYSTEM",
-    "DISKANN",
     "RETRY",
     "MAXDEPTH",
 ];

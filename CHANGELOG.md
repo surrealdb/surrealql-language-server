@@ -156,6 +156,25 @@ Also:
 
 ### Changed
 
+- **`DEFINE INDEX … FULLTEXT`, `COUNT` and `DISKANN` no longer report a false
+  syntax error.** `DEFINE INDEX OVERWRITE article_body_search ON article FIELDS
+  body FULLTEXT ANALYZER english BM25;` reported ``Invalid SurrealQL syntax
+  near `FULLTEXT ANALYZER english BM25`.`` — the grammar's `IndexClause` knew
+  only the pre-3.0 `SEARCH ANALYZER` spelling. The grammar pin moves to
+  `cb2e6b5`, which parses every index kind SurrealDB 3 reads
+  (`syn/parser/stmt/define.rs`, `parse_define_index`): `FULLTEXT` with
+  `ANALYZER`, `BM25 [(k1, b)]` and `HIGHLIGHTS` in any order and none
+  required; `COUNT [WHERE …]`; `DISKANN` with `DIST`, `TYPE`, `DEGREE`,
+  `L_BUILD`, `ALPHA` and `HASHED_VECTOR`; `HASHED_VECTOR` on `HNSW`; the
+  `DISTANCE` spelling of `DIST`; the `F16`, `I8` and `U8` vector types; and
+  the `COSINE_NORMALIZED` and `INNER_PRODUCT` distances. The clauses appear
+  verbatim among the index's options in hover, as `HNSW` already did — and
+  `OVERWRITE` / `IF NOT EXISTS` no longer do, which they wrongly had. The
+  pre-3.0 `SEARCH ANALYZER` and `MTREE` forms still parse. Across SurrealDB's
+  own `language-tests/` corpus the move fixes the parse of 42 files and
+  regresses none; `DISKANN` leaves the list of completions the grammar cannot
+  parse. Recorded in `docs/grammar-gaps.md`.
+
 - **Grammar pin moved to `df12d94`** (upstream `master` of
   `surrealql-tree-sitter`), from `826d0c2`. Four shapes the earlier revision
   rejected or mis-nested on valid SurrealQL no longer produce a false `parse`
