@@ -255,3 +255,156 @@ fn default_settings_are_stable() {
     assert_eq!(settings.auth_contexts[0].roles, vec!["viewer".to_string()]);
     assert!(settings.connection.endpoint.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// The `check` subcommand surface (machine-readable output, exit codes, flags)
+// ---------------------------------------------------------------------------
+
+/// Exact-equality golden for the `--format json` report shape. The
+/// diagnostics inside are LSP wire objects verbatim (0-based lines, UTF-16
+/// columns, camelCase keys, integer severity, string code) — agents key
+/// repairs on these fields, so changes must be additive and deliberate.
+#[test]
+fn check_json_report_shape_golden() {
+    use surrealql_language_server::native::check::{
+        CheckReport, FileReport, ScanReport, Summary, render_json,
+    };
+    use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+    let report = CheckReport {
+        version: "test".to_string(),
+        files: vec![FileReport {
+            path: "queries/feed.surql".to_string(),
+            diagnostics: vec![Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 1,
+                        character: 14,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 19,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(NumberOrString::String("unknown-table".to_string())),
+                source: Some("surreal-language-server".to_string()),
+                message: "Unknown table `persn`. Did you mean `person`?".to_string(),
+                data: Some(json!({ "suggestion": "person", "table": "persn" })),
+                ..Diagnostic::default()
+            }],
+        }],
+        summary: Summary {
+            files_checked: 1,
+            errors: 0,
+            warnings: 1,
+            information: 0,
+            hints: 0,
+        },
+        scan: ScanReport::default(),
+        config_warnings: vec![],
+        exit_code: 0,
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&render_json(&report)).expect("render_json emits one JSON object");
+    let expected = json!({
+        "version": "test",
+        "files": [{
+            "path": "queries/feed.surql",
+            "diagnostics": [{
+                "range": {
+                    "start": { "line": 1, "character": 14 },
+                    "end": { "line": 1, "character": 19 },
+                },
+                "severity": 2,
+                "code": "unknown-table",
+                "source": "surreal-language-server",
+                "message": "Unknown table `persn`. Did you mean `person`?",
+                "data": { "suggestion": "person", "table": "persn" },
+            }],
+        }],
+        "summary": {
+            "filesChecked": 1,
+            "errors": 0,
+            "warnings": 1,
+            "information": 0,
+            "hints": 0,
+        },
+        "scan": {
+            "walkErrors": 0,
+            "skippedOversize": 0,
+            "skippedUnreadable": 0,
+            "fileCapHit": false,
+        },
+        "configWarnings": [],
+        "exitCode": 0,
+    });
+    assert_eq!(
+        value, expected,
+        "the check JSON report changed shape — update this golden only for a deliberate, reviewed addition"
+    );
+}
+
+/// The exit-code contract agents and CI key on: 0 clean, 1 diagnostics at
+/// or above `--fail-on`, 2 when check could not do what was asked. Also
+/// pins that `unknown-table` stays a warning (the default threshold lets
+/// it pass) and that every documented flag keeps parsing.
+#[test]
+fn check_exit_codes_and_flags_are_stable() {
+    use std::process::Command;
+
+    let binary = env!("CARGO_BIN_EXE_surrealql-language-server");
+    let dir = std::env::temp_dir().join(format!("surql-compat-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("schema")).expect("scratch dir");
+    std::fs::write(dir.join("clean.surql"), "DEFINE TABLE person SCHEMALESS;\n").expect("fixture");
+    std::fs::write(dir.join("broken.surql"), "SELEC * FRM person\n").expect("fixture");
+    std::fs::write(
+        dir.join("typo.surql"),
+        "DEFINE TABLE person SCHEMALESS;\nSELECT * FROM persn;\n",
+    )
+    .expect("fixture");
+    std::fs::write(dir.join("config.json"), "{}").expect("fixture");
+
+    let run = |args: &[&str]| {
+        Command::new(binary)
+            .arg("check")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn check")
+            .status
+            .code()
+            .expect("exit code")
+    };
+
+    assert_eq!(run(&["clean.surql"]), 0, "clean file");
+    assert_eq!(run(&["broken.surql"]), 1, "parse error is an error");
+    assert_eq!(run(&["typo.surql"]), 0, "unknown-table stays a warning");
+    assert_eq!(
+        run(&["typo.surql", "--fail-on", "warning"]),
+        1,
+        "--fail-on raises it"
+    );
+    assert_eq!(run(&["absent.surql"]), 2, "missing file");
+    assert_eq!(run(&["clean.surql", "--frobnicate"]), 2, "unknown flag");
+
+    // Every documented flag parses; renaming one breaks callers.
+    assert_eq!(
+        run(&[
+            "clean.surql",
+            "--workspace",
+            "schema",
+            "--format",
+            "json",
+            "--config",
+            "config.json",
+            "--param",
+            "id",
+            "--fail-on",
+            "error",
+        ]),
+        0,
+        "the documented flag surface"
+    );
+}

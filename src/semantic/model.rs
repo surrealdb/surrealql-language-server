@@ -1508,6 +1508,23 @@ impl MergedSemanticModel {
         });
     }
 
+    /// The complete diagnostic set for one document: the syntax pass, then the
+    /// semantic and type passes, then the schema-mode filter over both.
+    ///
+    /// The filter has to run last because `unknown-type` comes from the syntax
+    /// pass, which reads a single document and cannot see the merged model —
+    /// see [`Self::apply_schemaless_policy`].
+    pub fn document_diagnostics(
+        &self,
+        analysis: &DocumentAnalysis,
+        settings: &ServerSettings,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = analysis.syntax_diagnostics.clone();
+        diagnostics.extend(self.semantic_diagnostics(analysis, settings));
+        self.apply_schemaless_policy(&mut diagnostics, settings);
+        diagnostics
+    }
+
     pub fn semantic_diagnostics(
         &self,
         analysis: &DocumentAnalysis,

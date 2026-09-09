@@ -368,7 +368,7 @@ where
                 .or_else(|| saved_for_diag.documents.get(&uri).cloned());
             if let Some(analysis) = analysis {
                 let diagnostics =
-                    diagnostics_for_document(&analysis, &model_for_diag, &settings_for_diag);
+                    model_for_diag.document_diagnostics(&analysis, &settings_for_diag);
                 self.notifier.publish_diagnostics(uri, diagnostics).await;
             }
         }
@@ -1387,7 +1387,7 @@ where
         };
 
         if let Some(analysis) = analysis {
-            let diagnostics = diagnostics_for_document(&analysis, &model, &settings);
+            let diagnostics = model.document_diagnostics(&analysis, &settings);
             self.notifier
                 .publish_diagnostics(uri.clone(), diagnostics)
                 .await;
@@ -1637,27 +1637,6 @@ async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<Doc
 #[cfg(target_arch = "wasm32")]
 async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
     analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
-}
-
-/// The complete diagnostic set for one document: the syntax pass, then the
-/// semantic and type passes, then the schema-mode filter over both.
-///
-/// The filter has to run last because `unknown-type` comes from the syntax
-/// pass, which reads a single document and cannot see the merged model — see
-/// [`MergedSemanticModel::apply_schemaless_policy`].
-///
-/// `model` and `settings` are parameters rather than state reads so callers
-/// already holding a snapshot do not re-acquire the lock per document, and
-/// cannot race a concurrent `recompute_model`.
-fn diagnostics_for_document(
-    analysis: &DocumentAnalysis,
-    model: &MergedSemanticModel,
-    settings: &ServerSettings,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = analysis.syntax_diagnostics.clone();
-    diagnostics.extend(model.semantic_diagnostics(analysis, settings));
-    model.apply_schemaless_policy(&mut diagnostics, settings);
-    diagnostics
 }
 
 /// Extension methods used by [`LanguageServerCore::reload_from_client_configuration`]
