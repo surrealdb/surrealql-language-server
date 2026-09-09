@@ -11,6 +11,12 @@ publish = false
 [dependencies]
 proc-macro2 = '1.0'
 quote = '1.0'
+# `builtins.json` is a published artifact consumed by third parties, so its
+# rendering is serde-derived structs (correct by construction) rather than the
+# hand-built strings `emit.rs` uses for the Rust source. Nothing here enters
+# the library's dependency graph: `xtask` is a separate package.
+serde = { version = '1.0', features = ['derive'] }
+serde_json = '1.0'
 syn = { version = '2.0', features = ['full', 'parsing', 'printing', 'extra-traits'] }
 
 # `verify-returns` only. The engine never runs its own return-type table, so the

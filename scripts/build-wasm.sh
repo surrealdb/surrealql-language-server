@@ -71,5 +71,8 @@ wasm-opt -O \
     -o "pkg/${OUT_NAME}_bg.wasm"
 
 cp LICENSE pkg/LICENSE
+# The catalogue-as-data artifact rides in the npm package too; it is
+# committed at the repo root and freshness-checked in CI (`make builtins-check`).
+cp builtins.json pkg/builtins.json
 
 echo "WASM package ready in pkg/"

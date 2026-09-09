@@ -53,11 +53,11 @@ wasm-setup: ## Install the WASM toolchain prerequisites (target, CLIs, clang)
 	fi
 
 .PHONY: builtins
-builtins: ## Regenerate src/grammar_generated.rs from a SurrealDB checkout
+builtins: ## Regenerate grammar_generated.rs + builtins.json from SurrealDB
 	$(CARGO) xtask generate-builtins --surrealdb $(SURREALDB)
 
 .PHONY: builtins-check
-builtins-check: ## Fail if the committed catalogue is stale (CI parity)
+builtins-check: ## Fail if either committed catalogue file is stale (CI parity)
 	$(CARGO) xtask generate-builtins --surrealdb $(SURREALDB) --check
 
 # Compiles surrealdb-core, so the first run takes a few minutes. Worth it after
@@ -84,4 +84,5 @@ fmt-check: ## Check formatting without modifying files (CI parity)
 clean: ## Remove cargo artifacts and generated pkg/ output
 	$(CARGO) clean
 	rm -f pkg/$(OUT_NAME).js pkg/$(OUT_NAME).d.ts \
-		pkg/$(OUT_NAME)_bg.wasm pkg/$(OUT_NAME)_bg.wasm.d.ts pkg/LICENSE
+		pkg/$(OUT_NAME)_bg.wasm pkg/$(OUT_NAME)_bg.wasm.d.ts pkg/LICENSE \
+		pkg/builtins.json

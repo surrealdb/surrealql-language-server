@@ -91,6 +91,55 @@ fn parse_diagnostic_identity_covers_error_and_missing_nodes() {
     }
 }
 
+/// `builtins.json` is a release artifact consumed outside this repository,
+/// so its shape is wire compat: additions are fine, renames and re-encodings
+/// are not. One function entry pinned exactly, plus the document's key set.
+#[test]
+fn builtins_json_entry_shape_golden() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins.json");
+    let text = std::fs::read_to_string(path).expect("builtins.json is committed");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("one JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "constants",
+            "functions",
+            "meta",
+            "namespaces",
+            "receivers",
+            "renames"
+        ],
+        "top-level keys changed — additions must be deliberate, removals are breaking"
+    );
+    assert_eq!(value["meta"]["schemaVersion"], 1);
+
+    let entry = value["functions"]
+        .as_array()
+        .expect("functions is an array")
+        .iter()
+        .find(|function| function["name"] == "array::len")
+        .expect("array::len is a stable builtin");
+    assert_eq!(
+        entry,
+        &json!({
+            "name": "array::len",
+            "params": [{ "name": "array", "type": "array", "form": "required" }],
+            "isAsync": false,
+            "notCallable": false,
+            "returns": "int",
+        }),
+        "a function entry changed shape — update this golden only for a deliberate, reviewed change"
+    );
+}
+
 /// Every historical settings shape keeps parsing: nested vs flat
 /// roots, camelCase vs snake_case aliases.
 #[test]
