@@ -1,0 +1,23 @@
+# SurrealQL Language Server
+
+> Language Server Protocol implementation for SurrealQL, the query language
+> of SurrealDB. Ships editor intelligence (diagnostics, completions, hover,
+> type checking), a headless `check` subcommand for CI and AI agents, and
+> `builtins.json` — a machine-readable catalogue of every SurrealDB builtin
+> function, generated from the engine's own source.
+
+## Docs
+
+- [README](https://github.com/surrealdb/surrealql-language-server/blob/master/README.md): features, build, editor setup, settings, releases
+- [Agent guide](https://github.com/surrealdb/surrealql-language-server/blob/master/AGENTS.md): the check loop, exit codes, diagnostic codes, known false positives
+- [Grammar gaps](https://github.com/surrealdb/surrealql-language-server/blob/master/docs/grammar-gaps.md): valid SurrealQL shapes the pinned grammar rejects — do not "fix" queries that hit them
+- [AI plan](https://github.com/surrealdb/surrealql-language-server/blob/master/docs/ai-plan.md): the roadmap for agent-facing features
+
+## Data
+
+- [builtins.json (latest release)](https://github.com/surrealdb/surrealql-language-server/releases/latest/download/builtins.json): 434 builtin functions with signatures, return types, arity, renames and method receivers; `params: null` means the signature is unknown, not zero-arity
+- [npm package](https://www.npmjs.com/package/@surrealdb/surrealql-language-server): browser WASM build; `builtins.json` resolves as `@surrealdb/surrealql-language-server/builtins.json`
+
+## Binaries
+
+- [Latest release](https://github.com/surrealdb/surrealql-language-server/releases/latest): native binaries for Linux, macOS and Windows; `surrealql-language-server check <paths>` exits 0 (clean), 1 (diagnostics), 2 (could not check)
