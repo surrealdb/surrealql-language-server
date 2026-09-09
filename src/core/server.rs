@@ -918,6 +918,48 @@ where
             }
         }
 
+        // A call through a variable: `$double(`. The binding's type carries the
+        // closure's parameters and result, so it answers as a `DEFINE FUNCTION`
+        // does. The binding is the one in scope at the `(`, which is where the
+        // call sits.
+        if function_name.starts_with('$') {
+            let bindings = crate::semantic::infer::resolve_bindings(&analysis, &model);
+            if let Some(binding) = bindings.resolve(function_name, open_paren)
+                && let crate::semantic::type_expr::TypeExpr::Function { params, returns } =
+                    &binding.ty
+            {
+                let labels: Vec<String> = params
+                    .iter()
+                    .map(|(name, ty)| match ty {
+                        Some(ty) => format!("{name}: {ty}"),
+                        None => name.clone(),
+                    })
+                    .collect();
+                let mut label = format!("{function_name}({})", labels.join(", "));
+                if **returns != crate::semantic::type_expr::TypeExpr::Unknown {
+                    label.push_str(&format!(" -> {returns}"));
+                }
+                return Some(SignatureHelp {
+                    signatures: vec![SignatureInformation {
+                        label,
+                        documentation: None,
+                        parameters: Some(
+                            labels
+                                .into_iter()
+                                .map(|label| ParameterInformation {
+                                    label: ParameterLabel::Simple(label),
+                                    documentation: None,
+                                })
+                                .collect(),
+                        ),
+                        active_parameter: Some(active_parameter),
+                    }],
+                    active_signature: Some(0),
+                    active_parameter: Some(active_parameter),
+                });
+            }
+        }
+
         if let Some(function) = model.functions.get(function_name) {
             return Some(SignatureHelp {
                 signatures: vec![SignatureInformation {

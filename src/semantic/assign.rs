@@ -334,6 +334,25 @@ pub fn assignable(actual: &TypeExpr, expected: &TypeExpr) -> Verdict {
         (Scalar(_), Object(_)) | (Object(_), Scalar(_)) => Verdict::Incompatible,
         (Scalar(_), Record(_)) | (Record(_), Scalar(_)) => Verdict::Incompatible,
 
+        // 10. Closures. The engine's kind grammar names every closure
+        // `function`, so a declared `function` accepts any closure whatever its
+        // parameters. The reverse says nothing: a value typed by that bare word
+        // has parameters this cannot see, so a call through it is not judged.
+        (Function { .. }, Scalar(name)) if name.eq_ignore_ascii_case("function") => {
+            Verdict::Compatible
+        }
+        (Scalar(name), Function { .. }) if name.eq_ignore_ascii_case("function") => {
+            Verdict::Unknown
+        }
+        // Two closure types that are not identical (identity was settled above).
+        // Whether one may stand in for the other is a question about parameter
+        // variance that nothing here models, so it is not answered.
+        (Function { .. }, Function { .. }) => Verdict::Unknown,
+        // `Value::Closure` coerces to no other kind, and no other value coerces
+        // to a closure, so a closure against any remaining concrete shape is a
+        // provable mismatch in both directions.
+        (Function { .. }, _) | (_, Function { .. }) => Verdict::Incompatible,
+
         _ => Verdict::Unknown,
     }
 }

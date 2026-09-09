@@ -33,6 +33,23 @@ pub enum TypeExpr {
     /// A type expression we recognised syntactically but cannot model.
     /// Treated exactly like [`Self::Unknown`] by the checker.
     Other(String),
+    /// A closure's type, written the way a closure is: `|$x: int, $y| -> int`.
+    ///
+    /// Parameters keep their declaration order and their `$` sigil. A
+    /// parameter's type is `None` when the author wrote none; the engine reads
+    /// that as `any`, which accepts anything and may be omitted at the call.
+    /// `returns` is the declared `-> T` when written, otherwise what the body
+    /// was read to produce, otherwise [`Self::Unknown`].
+    ///
+    /// SurrealDB's kind grammar spells every closure as the bare word
+    /// `function` (`sql/kind.rs`, `Kind::Function(_, _) => "function"`), so a
+    /// declared `function` accepts one of these. This carries more than that
+    /// word does — the parameters drive the argument check at every `$f(…)`
+    /// call site, and the result type is what such a call evaluates to.
+    Function {
+        params: Vec<(String, Option<TypeExpr>)>,
+        returns: Box<TypeExpr>,
+    },
 }
 
 impl TypeExpr {
@@ -254,6 +271,12 @@ impl TypeExpr {
                 .iter()
                 .flat_map(|(_, value)| value.record_tables())
                 .collect(),
+            Self::Function { params, returns } => params
+                .iter()
+                .filter_map(|(_, ty)| ty.as_ref())
+                .chain(std::iter::once(returns.as_ref()))
+                .flat_map(Self::record_tables)
+                .collect(),
             Self::Unknown | Self::Scalar(_) | Self::Literal(_) | Self::Other(_) => Vec::new(),
         }
     }
@@ -295,6 +318,23 @@ impl fmt::Display for TypeExpr {
                 write!(f, "{joined}")
             }
             Self::Other(value) => write!(f, "{value}"),
+            Self::Function { params, returns } => {
+                let params = params
+                    .iter()
+                    .map(|(name, ty)| match ty {
+                        Some(ty) => format!("{name}: {ty}"),
+                        None => name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "|{params}|")?;
+                // `-> unknown` would claim to know something; the arrow is
+                // only worth writing when there is a type behind it.
+                if !matches!(**returns, Self::Unknown) {
+                    write!(f, " -> {returns}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
