@@ -36,7 +36,7 @@ use crate::semantic::node_kind as k;
 use crate::semantic::text::LineIndex;
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::types::{
-    DocumentAnalysis, FunctionLanguage, LookupDirection, MergedSemanticModel,
+    DocumentAnalysis, FunctionLanguage, FunctionParam, LookupDirection, MergedSemanticModel,
 };
 
 const SOURCE: &str = "surreal-language-server";
@@ -240,11 +240,107 @@ pub fn infer_expr_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
         // carries a real shape instead of `unknown`.
         k::SELECT_STATEMENT => select_type(node, ctx),
 
+        // `|$x: int| $x * 2` — the parameters as written, the result from the
+        // declared `-> T` or from the body. See [`closure_type`].
+        k::CLOSURE => closure_type(node, ctx),
+
         // Deliberately unhandled, needing field resolution the server does not
-        // have: Idiom, Subscript, IdiomFunction on its own, Closure, Range,
-        // Block, IfElseStatement, and every other statement kind.
+        // have: Idiom, Subscript, IdiomFunction on its own, Range, Block,
+        // IfElseStatement, and every other statement kind.
         _ => TypeExpr::Unknown,
     }
+}
+
+/// The type of a closure literal.
+///
+/// The parameters come straight from the `ParamDefinition`s. The result is the
+/// declared `-> T` when there is one — the engine coerces the value to it, so it
+/// is the truth about what a call yields — and otherwise what the body was read
+/// to produce: a `Block` body through [`body_return_type`], a bare-expression
+/// body through [`infer_expr_type`]. Either may come back `Unknown`, and the type
+/// is still worth having then, because the parameter list alone drives the
+/// argument check at every `$f(…)` call site.
+///
+/// The body is typed against the closure's own parameters because
+/// [`collect_bindings`] has already bound them over the closure's span. For a
+/// closure that initialises a `LET`, that rests on [`bind_let`] descending into
+/// the value *before* it types it.
+///
+/// A closure the parser could not read fully yields `Unknown`. An `ERROR` in
+/// the parameter list could stand for any number of parameters, and an arity
+/// built on it would be invented; a `parse` diagnostic already covers the spot.
+fn closure_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    if contains_parse_error(node) {
+        return TypeExpr::Unknown;
+    }
+    let params = k::named_children(node)
+        .into_iter()
+        .filter(|child| child.kind() == k::PARAM_DEFINITION)
+        .filter_map(|definition| param_definition_parts(definition, ctx.source))
+        .map(|(name, declared, _)| (name, declared))
+        .collect();
+    let returns = closure_declared_return(node, ctx.source)
+        .or_else(|| {
+            let body = closure_body(node)?;
+            if body.kind() == k::BLOCK {
+                body_return_type(body, ctx)
+            } else {
+                Some(infer_expr_type(body, ctx))
+            }
+        })
+        .unwrap_or(TypeExpr::Unknown);
+    TypeExpr::Function {
+        params,
+        returns: Box::new(returns),
+    }
+}
+
+/// The `-> T` of a closure, when written.
+///
+/// Grammar: `Closure(Pipe, ParamDefinition*, Pipe, [LookupRight, type], body)`.
+/// A parameter's type sits *inside* its `ParamDefinition`, so a type node that is
+/// a direct child can only be the return type.
+fn closure_declared_return(node: Node<'_>, source: &str) -> Option<TypeExpr> {
+    k::find_child_any(node, k::TYPE_KINDS).map(|ty| TypeExpr::from_node(ty, source))
+}
+
+/// The body of a closure: a `Block`, or the bare expression after the closing
+/// `|`.
+///
+/// Everything before the body is a pipe, a parameter, the return arrow or its
+/// type, so the body is the last named child that is none of those. Reading it
+/// as "the last" rather than "the first other" keeps a leading comment out.
+fn closure_body<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    k::named_children(node).into_iter().rev().find(|child| {
+        !matches!(
+            child.kind(),
+            k::PIPE | k::PARAM_DEFINITION | k::LOOKUP_RIGHT
+        ) && !k::TYPE_KINDS.contains(&child.kind())
+            && !is_trivia(*child)
+    })
+}
+
+/// The `VariableName` a call goes through, for the `$f(…)` form.
+///
+/// `FunctionCall` is `seq(VariableName, ArgumentList)` there, so the callee is a
+/// direct child. The arguments live inside the `ArgumentList`, so a `$y` passed
+/// *to* a named function is never mistaken for this.
+fn variable_callee<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    k::named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == k::VARIABLE_NAME)
+}
+
+/// The closure type a call through `variable` reaches, when the binding in scope
+/// at that point holds one.
+///
+/// `None` for anything else — an unbound name, a value this could not type, or a
+/// parameter declared with the bare kind `function`, whose parameters are not
+/// visible. Every caller is silent on `None`.
+fn closure_signature<'a>(variable: Node<'_>, ctx: &'a TypeCtx<'_>) -> Option<&'a TypeExpr> {
+    let name = k::text_of(ctx.source, variable)?;
+    let binding = ctx.bindings.resolve(name, variable.start_byte())?;
+    matches!(binding.ty, TypeExpr::Function { .. }).then_some(&binding.ty)
 }
 
 /// The type a `SELECT` evaluates to.
@@ -548,8 +644,19 @@ fn bind_let(
         })
         .copied();
 
-    // Type the initializer against the bindings that already exist. The
-    // borrow of `table` must end before we push, hence the block.
+    // Descend first: a nested statement in the initializer may itself bind
+    // things, and they belong before this entry in source order. The order is
+    // also what types a closure initializer. `LET $double = |$x: int| $x * 2`
+    // reads its body against `$x`, and `$x` is bound over the closure's span by
+    // this descent; typing before it would read `$x` as nothing at all.
+    if let Some(value) = value {
+        collect_bindings(value, scope_end, source, lines, model, table);
+    }
+
+    // Type the initializer against the bindings that exist so far. Nothing the
+    // descent bound leaks in here: every such binding is scoped to its own
+    // block or closure. The borrow of `table` must end before we push, hence
+    // the block.
     let inferred = {
         let ctx = TypeCtx {
             model,
@@ -561,12 +668,6 @@ fn bind_let(
             .map(|value| infer_expr_type(value, &ctx))
             .unwrap_or(TypeExpr::Unknown)
     };
-
-    // Descend first: a nested statement in the initializer may itself
-    // bind things, and they belong before this entry in source order.
-    if let Some(value) = value {
-        collect_bindings(value, scope_end, source, lines, model, table);
-    }
 
     table.entries.push(Binding {
         name,
@@ -778,6 +879,14 @@ fn object_literal_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
 
 /// The declared return type of a call, if we know the callee.
 fn call_return_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    // `$f(…)` yields whatever the closure bound to `$f` returns. A stored type
+    // is read, never a body — see the note on [`body_return_type`].
+    if let Some(variable) = variable_callee(node) {
+        return match closure_signature(variable, ctx) {
+            Some(TypeExpr::Function { returns, .. }) => (**returns).clone(),
+            _ => TypeExpr::Unknown,
+        };
+    }
     let Some(name) = callee_name(node, ctx.source) else {
         return TypeExpr::Unknown;
     };
@@ -859,8 +968,9 @@ fn string_literal_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
 /// The callee of a `FunctionCall`, when it is a plain name.
 ///
 /// `FunctionCall`'s declared children include `RecordId` and
-/// `VariableName` — `person:tobie()` and `$fn()` parse as calls too. Those
-/// are dynamic dispatch and get skipped.
+/// `VariableName` — `person:tobie()` and `$fn()` parse as calls too. A record
+/// id is dynamic dispatch and gets skipped; a variable is answered separately,
+/// through the closure type its binding carries ([`closure_signature`]).
 fn callee_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     let mut cursor = node.walk();
     let name = node
@@ -1397,21 +1507,21 @@ fn anchor_type(path: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
 // ---------------------------------------------------------------------------
 //
 // The operand rules themselves live in [`crate::semantic::operate`], read from
-// the engine. What lives here is the tree work, and it exists because the
-// grammar and the engine disagree about shape.
+// the engine. What lives here is the tree work, and it exists so that the
+// pairs judged are the pairs the *engine* forms, whatever the grammar did.
 //
-// The pinned grammar puts *every* binary operator on one left-associative
-// precedence level (`grammar.js`, `precedences` and the `BinaryExpression`
-// rule). So it parses `1 + 1 * 3` as `(1 + 1) * 3`, while SurrealDB evaluates
-// `1 + (1 * 3)` and answers `4` — its own
-// `language/expression/operators/precedence.surql` asserts exactly that. Reading
-// the tree as parsed would therefore describe operand pairs the engine never
-// formed, which is the wrong-but-plausible diagnostic this module exists to
-// avoid.
-//
-// The fix is three steps: flatten the left spine back into the written operand
-// and operator sequence, re-group it with the engine's binding powers, then fold
-// the result. Same-operator chains are unaffected; mixed ones become correct.
+// The tree's grouping is not trusted. Three steps instead: flatten the whole
+// chain back into the written operand and operator sequence, re-group it with
+// the engine's binding powers, then fold the result. On a grammar that already
+// nests by the engine's precedence — the pinned one does, mirroring
+// `BindingPower` tier for tier — the re-grouping reproduces the tree, and the
+// flattening still earns its place: it puts every nested `BinaryExpression`,
+// on either side, into one chain that is judged exactly once. On the earlier
+// grammar, which put every operator on one left-associative level and so
+// parsed `1 + 1 * 3` as `(1 + 1) * 3` while the engine answers `4`, the same
+// steps corrected the grouping. Either way the fold never describes an operand
+// pair the engine never formed, which is the wrong-but-plausible diagnostic
+// this module exists to avoid.
 
 /// One operator occurrence in a flattened chain.
 struct ChainOp {
@@ -1420,7 +1530,7 @@ struct ChainOp {
     power: u8,
 }
 
-/// A left-nested run of binary operators, flattened back to source order.
+/// A run of binary operators, flattened back to source order.
 ///
 /// `operands[i]` is followed by `operators[i]`, so there is always exactly one
 /// more operand than operator.
@@ -1467,7 +1577,7 @@ fn fold_from(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) -> Op
     fold_chain(&grouped, &chain, ctx, out)
 }
 
-/// Collect the operands and operators of a left-nested chain, in source order.
+/// Collect the operands and operators of a chain, in source order.
 fn flatten_chain<'tree>(node: Node<'tree>, source: &str) -> Option<Chain<'tree>> {
     let mut chain = Chain {
         operands: Vec::new(),
@@ -1493,9 +1603,11 @@ fn push_chain<'tree>(node: Node<'tree>, source: &str, chain: &mut Chain<'tree>) 
         return None;
     }
 
-    // Descend the left spine only. `prec.left` means the right operand is never
-    // itself a bare chain — a parenthesised group is a `SubQuery`, which ends
-    // the spine on its own and is typed by recursion instead.
+    // Descend into a nested chain on *either* side. The grammar nests a tighter
+    // operator under a looser one, so `1 + 2 * 3` carries `2 * 3` as the right
+    // operand; an in-order walk recovers the written sequence whichever way the
+    // tree leans. A parenthesised group is a `SubQuery`, not a
+    // `BinaryExpression`, so it ends the chain and is typed by recursion.
     if left.kind() == k::BINARY_EXPRESSION {
         push_chain(*left, source, chain)?;
     } else {
@@ -1507,7 +1619,12 @@ fn push_chain<'tree>(node: Node<'tree>, source: &str, chain: &mut Chain<'tree>) 
         power: crate::semantic::operate::binding_power(&spelling),
         spelling,
     });
-    chain.operands.push(*right);
+
+    if right.kind() == k::BINARY_EXPRESSION {
+        push_chain(*right, source, chain)?;
+    } else {
+        chain.operands.push(*right);
+    }
     Some(())
 }
 
@@ -1618,6 +1735,9 @@ fn fold_chain(
 /// `contains_parse_error` only looks inside a subtree. A construct the grammar
 /// cannot parse at all can leave a well-formed-looking fragment flanked by
 /// `ERROR` nodes, and that fragment's operands are an artefact of the failure.
+/// The case that motivated it — mock syntax, `|test:1..4|` — now parses, but
+/// the failure mode is a property of tree-sitter's recovery, not of one rule,
+/// so the guard stays.
 fn has_broken_sibling(node: Node<'_>) -> bool {
     [node.prev_named_sibling(), node.next_named_sibling()]
         .into_iter()
@@ -1627,9 +1747,10 @@ fn has_broken_sibling(node: Node<'_>) -> bool {
 
 /// Report every arithmetic operand pair SurrealDB rejects.
 fn check_binary_expressions(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
-    // Act at the root of a chain only. Every node on the left spine is itself a
-    // `BinaryExpression` whose parent is one, and folding from each of them
-    // would report the same pair once per level.
+    // Act at the root of a chain only. Every nested `BinaryExpression`, on
+    // either side, is flattened into its root's chain by `push_chain`, and
+    // folding from each of them as well would report the same pair once per
+    // level of nesting.
     if node.kind() == k::BINARY_EXPRESSION
         && node
             .parent()
@@ -1637,10 +1758,10 @@ fn check_binary_expressions(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Dia
         // A chain the parser could not read says nothing reliable about its
         // operands, and a syntax diagnostic already covers the position.
         && !contains_parse_error(node)
-        // The same, one step out. The pinned grammar cannot parse mock syntax
-        // (`|test:1..4|`), and it fails by leaving `ERROR` nodes *beside* a
-        // `BinaryExpression` rather than inside it — so `test:..=-9` becomes a
-        // record id minus an int, which is neither operand the author wrote.
+        // The same, one step out. A construct the grammar cannot parse can fail
+        // by leaving `ERROR` nodes *beside* a `BinaryExpression` rather than
+        // inside it — `|test:..=-9|` once became a record id minus an int, which
+        // is neither operand the author wrote.
         && !has_broken_sibling(node)
     {
         fold_from(node, ctx, out);
@@ -1717,6 +1838,9 @@ fn check_function_returns(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagn
     {
         check_one_function_body(node, ctx, out);
     }
+    if node.kind() == k::CLOSURE {
+        check_one_closure_body(node, ctx, out);
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         check_function_returns(child, ctx, out);
@@ -1740,17 +1864,58 @@ fn check_one_function_body(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diag
     if contains_parse_error(body) {
         return;
     }
-    let name = k::find_child(node, k::FUNCTION_NAME)
+    let subject = k::find_child(node, k::FUNCTION_NAME)
         .and_then(|node| k::text_of(ctx.source, node))
-        .unwrap_or("this function");
+        .map(|name| format!("`{name}`"))
+        .unwrap_or_else(|| "this function".to_string());
 
     for result in body_results(body) {
         // `RETURN` with no value yields NONE, which every optional type
         // accepts and `assignable` already judges.
         if let BodyResult::Value(value) = result {
-            report_return_mismatch(value, &declared, name, ctx, out);
+            report_return_mismatch(value, &declared, &subject, ctx, out);
         }
     }
+}
+
+/// `|$x| -> T { … }` — every value the closure yields must satisfy `T`.
+///
+/// The engine coerces a closure's result to its declared type exactly as it does
+/// a function's (`validate_return("ANONYMOUS", …)` in
+/// `exec/physical_expr/function/closure.rs`), so this is
+/// [`check_one_function_body`] for a closure. A `Block` body contributes the
+/// same [`body_results`]; a bare-expression body *is* the result.
+fn check_one_closure_body(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    let Some(declared) = closure_declared_return(node, ctx.source) else {
+        return;
+    };
+    let Some(body) = closure_body(node) else {
+        return;
+    };
+    if contains_parse_error(body) {
+        return;
+    }
+    let subject = closure_subject(node, ctx.source);
+    if body.kind() == k::BLOCK {
+        for result in body_results(body) {
+            if let BodyResult::Value(value) = result {
+                report_return_mismatch(value, &declared, &subject, ctx, out);
+            }
+        }
+    } else {
+        report_return_mismatch(body, &declared, &subject, ctx, out);
+    }
+}
+
+/// How a diagnostic names a closure: by the variable it initialises
+/// (`LET $double = |…|`), or as "this closure" when it has no name.
+fn closure_subject(node: Node<'_>, source: &str) -> String {
+    node.parent()
+        .filter(|parent| parent.kind() == k::LET_STATEMENT)
+        .and_then(|parent| k::find_child(parent, k::PARAM_DEFINITION))
+        .and_then(|definition| param_definition_parts(definition, source))
+        .map(|(name, _, _)| format!("`{name}`"))
+        .unwrap_or_else(|| "this closure".to_string())
 }
 
 /// One thing a function body can hand back.
@@ -1848,12 +2013,19 @@ fn body_tail<'tree>(body: Node<'tree>) -> Option<Node<'tree>> {
 /// still telling hover something true. `union` also folds a `none` member into
 /// an `option<…>`, which is inert on the value side for the same reason.
 ///
-/// WARNING: this must never become reachable from [`infer_expr_type`]. The
-/// no-cycle argument for the whole feature is that
+/// WARNING: a *named* function's body must never be reached from
+/// [`infer_expr_type`]. The no-cycle argument for the whole feature is that
 /// [`infer_function_return_types`] reads already-computed types out of a map, so
 /// nothing here can re-enter a function body. Wire this into
 /// [`call_return_type`] as a fallback and `fn::fib` without an annotation
 /// overflows the stack.
+///
+/// A *closure's* body is different, and [`closure_type`] does reach here from
+/// [`infer_expr_type`]. It cannot cycle: a closure has no name to call itself
+/// by — a `LET` binding is visible only *after* its statement — and a call
+/// through some other variable reads that binding's stored type, never a body.
+/// The only recursion left is into a closure nested inside this one, which the
+/// tree bounds.
 fn body_return_type(body: Node<'_>, ctx: &TypeCtx<'_>) -> Option<TypeExpr> {
     let results = body_results(body);
     // A body with no result at all — `{}` — says nothing.
@@ -1934,10 +2106,13 @@ fn returned_expression<'tree>(statement: Node<'tree>) -> Option<Node<'tree>> {
         .find(|child| !k::is_keyword(*child) && !is_trivia(*child))
 }
 
+/// `subject` names the function or closure as it should read in the message —
+/// already in backticks when it is a name (``"`fn::f`"``), bare when it is a
+/// description (`"this closure"`).
 fn report_return_mismatch(
     value: Node<'_>,
     declared: &TypeExpr,
-    name: &str,
+    subject: &str,
     ctx: &TypeCtx<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -1953,10 +2128,10 @@ fn report_return_mismatch(
             out,
             &|fault, label| match fault {
                 ElementFault::Element { actual, .. } => {
-                    format!("`{name}` returns `{declared}`, but {label} is `{actual}`.")
+                    format!("{subject} returns `{declared}`, but {label} is `{actual}`.")
                 }
                 ElementFault::Arity { expected, actual } => format!(
-                    "`{name}` returns `{declared}`, which has {expected} elements, but this \
+                    "{subject} returns `{declared}`, which has {expected} elements, but this \
                      value has {actual}."
                 ),
             },
@@ -1966,7 +2141,7 @@ fn report_return_mismatch(
     out.push(diagnostic(
         node_range(ctx, value),
         codes::RETURN_TYPE,
-        format!("`{name}` returns `{declared}`, but this value is `{actual}`."),
+        format!("{subject} returns `{declared}`, but this value is `{actual}`."),
     ));
 }
 
@@ -2313,6 +2488,10 @@ fn check_calls(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
 }
 
 fn check_one_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) {
+    if let Some(variable) = variable_callee(node) {
+        check_closure_call(variable, node, ctx, out);
+        return;
+    }
     let Some(name) = callee_name(node, ctx.source) else {
         return;
     };
@@ -2345,10 +2524,10 @@ fn check_one_call(node: Node<'_>, ctx: &TypeCtx<'_>, out: &mut Vec<Diagnostic>) 
     };
     // An argument the parser could not read makes the count meaningless: the
     // `ERROR` node might stand for one argument or five. The pinned grammar
-    // cannot parse a closure (`|| 'x'`) or a signed decimal suffix
-    // (`-1.5dec`), and both are valid SurrealQL — so counting the error node
-    // reported a wrong arity on code the engine accepts. A syntax diagnostic
-    // already covers the position; do not pile an invented one on top.
+    // cannot parse a signed decimal suffix (`-1.5dec`), which is valid
+    // SurrealQL — so counting the error node reported a wrong arity on code
+    // the engine accepts. A syntax diagnostic already covers the position; do
+    // not pile an invented one on top.
     if contains_parse_error(arg_list) {
         return;
     }
@@ -2670,9 +2849,92 @@ fn check_user_call(
         // Positional comparison is meaningless once the count is wrong.
         return;
     }
+    check_argument_types(name, &function.params, args, ctx, out);
+}
 
+/// `$f(…)` — a call through a variable bound to a closure.
+///
+/// What the engine does with one (`exec/physical_expr/function/closure.rs`,
+/// `val/closure.rs`), and so what is checked:
+///
+/// * Each argument is coerced to its parameter's declared kind; a failure is
+///   `Expected a value of type 'T' for argument $x`. That is the relation
+///   [`assignable`] models for a `DEFINE FUNCTION` argument, so the same walk
+///   judges it.
+/// * A missing argument fails only when its parameter cannot hold `NONE`. An
+///   unannotated parameter is `any`, which can — so `|$a, $b: int| …` needs two
+///   arguments and `|$a: int, $b| …` needs one. That is [`required_arity`] with
+///   `any` standing in for every missing annotation.
+/// * Extra arguments are dropped (`arg_spec.iter().zip(args)`), so too *many* is
+///   never a fault and only the lower bound is reported.
+///
+/// Only a binding whose type is a closure is checked. A parameter declared with
+/// the bare kind `function`, or a variable this could not type, has parameters
+/// this cannot see and stays silent.
+fn check_closure_call(
+    variable: Node<'_>,
+    node: Node<'_>,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(name) = k::text_of(ctx.source, variable) else {
+        return;
+    };
+    let Some(TypeExpr::Function { params, .. }) = closure_signature(variable, ctx) else {
+        return;
+    };
+    let Some(arg_list) = k::find_child(node, k::ARGUMENT_LIST) else {
+        return;
+    };
+    if contains_parse_error(arg_list) {
+        return;
+    }
+    let args = argument_nodes(arg_list);
+
+    let params: Vec<FunctionParam> = params
+        .iter()
+        .map(|(param, declared)| FunctionParam {
+            name: param.clone(),
+            type_expr: Some(
+                declared
+                    .clone()
+                    .unwrap_or_else(|| TypeExpr::Scalar("any".to_string())),
+            ),
+        })
+        .collect();
+    let required = required_arity(&params);
+    if args.len() < required {
+        let plural = if required == 1 { "" } else { "s" };
+        let expected = if required == params.len() {
+            format!("{required} argument{plural}")
+        } else {
+            format!("at least {required} argument{plural}")
+        };
+        out.push(diagnostic(
+            node_range(ctx, arg_list),
+            codes::ARGUMENT_COUNT,
+            format!("`{name}` expects {expected}, found {}.", args.len()),
+        ));
+        return;
+    }
+    check_argument_types(name, &params, &args, ctx, out);
+}
+
+/// Judge each argument against the parameter in the same position.
+///
+/// Shared by every call form that has named, typed parameters — a `DEFINE
+/// FUNCTION` and a closure — so the two cannot drift in what they report. The
+/// caller has already settled the count; a position with no parameter is not
+/// reached, and a parameter with no declared type checks nothing.
+fn check_argument_types(
+    name: &str,
+    params: &[FunctionParam],
+    args: &[Node<'_>],
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
     for (index, argument) in args.iter().enumerate() {
-        let Some(param) = function.params.get(index) else {
+        let Some(param) = params.get(index) else {
             break;
         };
         let Some(expected) = param.type_expr.as_ref() else {

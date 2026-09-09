@@ -230,8 +230,10 @@ pub fn value_kind(ty: &TypeExpr) -> Option<ValueKind> {
         TypeExpr::Set(_) => Some(ValueKind::Set),
         TypeExpr::Object(_) => Some(ValueKind::Object),
 
-        // A record id takes part in no arithmetic arm.
-        TypeExpr::Record(_) => Some(ValueKind::Other),
+        // A record id takes part in no arithmetic arm, and neither does a
+        // closure: `Value::Closure` falls to the catch-all `Err` of every
+        // operator, so `$f + 1` is as provable a failure as `true + 1`.
+        TypeExpr::Record(_) | TypeExpr::Function { .. } => Some(ValueKind::Other),
 
         // `'x'` behaves as its family does. Reuse the one widening step the
         // assignability relation already defines, so the two cannot disagree.
@@ -288,21 +290,42 @@ fn scalar_kind(name: &str) -> Option<ValueKind> {
 /// from spellings at `syn/parser/expression.rs:78-140`. Every one is
 /// left-associative (`syn/parser/expression.rs:77`).
 ///
-/// Only the three arithmetic ranks are distinguished. Everything else collapses
-/// to zero, and that is sufficient rather than lazy: a non-arithmetic operator
-/// is never *checked*, so its rank matters only in that it must bind looser than
-/// `+`. Collapsing also makes the unrecognisable spellings safe — a KNN
-/// operator (`<|2|>`), a `@1@` match, and a `+=` assignment all land at zero,
-/// which lets the arithmetic parts of their chain still group correctly.
+/// Every rank is distinguished, not only the arithmetic three, because the
+/// non-arithmetic ranks decide which arithmetic *runs*. `a AND b = "x" + 1`
+/// groups as `a AND (b = ("x" + 1))`, and the right side of an `AND` may never
+/// be evaluated ([`short_circuits`]), so the failing pair is not provable. With
+/// the comparison and the `AND` collapsed to one rank it would group as
+/// `(a AND b) = ("x" + 1)` instead, putting the pair under an `=` that always
+/// runs, and the checker would report code that may well succeed.
+///
+/// A spelling this does not recognise ranks loosest of all. That is the safe
+/// side: a `+=` in an odd position, or an operator a future engine adds, still
+/// lets the arithmetic parts of its chain group correctly.
 ///
 /// NOTE: The published documentation puts `??`/`?:` *above* `**`. That is wrong.
 /// The engine's own `language/expression/operators/precedence.surql` asserts
 /// `2 + 1 ?: true + 1` is `3`, which holds only when `?:` binds loosest.
 pub fn binding_power(spelling: &str) -> u8 {
-    match spelling {
-        "**" => 3,
-        "*" | "×" | "/" | "÷" => 2,
-        "+" | "-" => 1,
+    // A KNN operator carries its own arguments (`<|2, COSINE|>`) and a fuzzy
+    // match carries a distance (`@1@`), so neither has one fixed spelling.
+    if spelling.starts_with("<|") {
+        return 5;
+    }
+    if spelling.len() > 1 && spelling.starts_with('@') && spelling.ends_with('@') {
+        return 4;
+    }
+    match spelling.to_ascii_uppercase().as_str() {
+        "??" | "?:" => 1,
+        "OR" | "||" => 2,
+        "AND" | "&&" => 3,
+        "=" | "==" | "!=" | "?=" | "*=" | "~" | "!~" | "*~" | "IS" | "IS NOT" => 4,
+        "<" | "<=" | ">" | ">=" | "IN" | "NOT IN" | "CONTAINS" | "CONTAINSNOT" | "CONTAINSALL"
+        | "CONTAINSANY" | "CONTAINSNONE" | "INSIDE" | "NOTINSIDE" | "ALLINSIDE" | "ANYINSIDE"
+        | "NONEINSIDE" | "OUTSIDE" | "INTERSECTS" | "∋" | "∌" | "⊇" | "⊃" | "⊅" | "∈" | "∉"
+        | "⊆" | "⊂" | "⊄" => 5,
+        "+" | "-" => 6,
+        "*" | "×" | "/" | "÷" | "%" => 7,
+        "**" => 8,
         _ => 0,
     }
 }

@@ -104,6 +104,11 @@ pub const DEFAULT_ALWAYS: &str = "DefaultAlways";
 
 pub const FIELDS_COLUMNS_CLAUSE: &str = "FieldsColumnsClause";
 pub const UNIQUE_CLAUSE: &str = "UniqueClause";
+/// `OVERWRITE` / `IF NOT EXISTS` on any `DEFINE`. Named so the index
+/// extractor can tell a definition modifier from an index option — both end
+/// in `Clause`.
+pub const OVERWRITE_CLAUSE: &str = "OverwriteClause";
+pub const IF_NOT_EXISTS_CLAUSE: &str = "IfNotExistsClause";
 /// `TYPE NORMAL` / `TYPE ANY` / `TYPE RELATION IN a|b OUT c|d` on a
 /// `DEFINE TABLE`. Holds only `Keyword`, [`IDENT`] and [`ENFORCED_CLAUSE`]
 /// children — the grammar names no fields, so `RELATION`, `IN`, `OUT`, `FROM`

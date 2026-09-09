@@ -114,6 +114,22 @@ async fn signature_help_covers_a_namespace_the_curated_table_never_had() {
 }
 
 #[tokio::test]
+async fn signature_help_reads_a_closure_through_its_variable() {
+    // `$double(` has no `DEFINE FUNCTION` and no catalogue entry; the parameters
+    // and result come from the type the `LET` binding carries.
+    let (core, _, _) = core_with(Default::default(), Default::default());
+    let text = "LET $double = |$x: int| $x * 2;\nRETURN $double(";
+    open(&core, "a.surql", text).await;
+
+    let help = signature_help_at(&core, "a.surql", 1, "RETURN $double(".len() as u32).await;
+
+    let signature = &help.signatures[0];
+    assert_eq!(signature.label, "$double($x: int) -> int");
+    let rendered = format!("{:?}", signature.parameters);
+    assert!(rendered.contains("$x: int"), "{rendered}");
+}
+
+#[tokio::test]
 async fn signature_help_marks_optional_and_variadic_parameters() {
     let (core, _, _) = core_with(Default::default(), Default::default());
     let text = "RETURN array::insert(";
