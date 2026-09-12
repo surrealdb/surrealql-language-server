@@ -20,7 +20,12 @@ fn server_capabilities_golden() {
     let capabilities =
         serde_json::to_value(common::TestCore::server_capabilities()).expect("serializable");
     let expected = json!({
-        "textDocumentSync": 1,
+        // Changed from 1 (Full) to 2 (Incremental) in 0.7. The win is not the
+        // parse: it is that a 166 KB document no longer crosses the wire and
+        // gets JSON-decoded on every keystroke. Safe because the edit is applied
+        // synchronously on the ordered path; a client that keeps sending whole
+        // documents is still handled.
+        "textDocumentSync": 2,
         "hoverProvider": true,
         "completionProvider": {
             "resolveProvider": true,

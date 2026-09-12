@@ -45,6 +45,26 @@ The README documented 5 of about 20 settings. It now covers the whole
 heading of their own) the two keys that are accepted and not yet implemented,
 rather than leaving them to look as though they work.
 
+### Changed
+
+**Incremental document sync** (`textDocumentSync: 2`). The server used to
+receive the whole document on every keystroke: a 166 KB file crossed the wire
+and was JSON-decoded into a fresh `String` *on the reactor thread* ten times a
+second, which is 1.6 MB/s of decoding before the debounce even saw the message,
+and in the browser a full JS-to-wasm string copy each time. No benchmark here
+measured it, because it is paid before any code in this repository runs.
+
+A client that ignores the advertised kind and keeps sending whole documents is
+still handled: that is the `range: None` path, and it is tested.
+
+The risk this carries is worth naming: under full sync a conversion bug
+self-corrects, because the next keystroke resends everything; under incremental
+sync a single off-by-one in a UTF-16 column compounds and never recovers. So an
+out-of-bounds range marks the buffer desynced, logs it, and refuses further
+ranged edits until the editor sends a whole document: visible and self-healing
+rather than silently wrong. `LineIndex::offset` *clamps* rather than failing, so
+the requested position is bounds-checked before its conversion is trusted.
+
 ### Added
 
 **`analysis.maxDocumentBytes`** (default 2 MB, `0` to disable). The workspace

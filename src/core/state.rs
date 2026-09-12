@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ls_types::Uri;
+use ls_types::{Range, Uri};
 
 use crate::config::ServerSettings;
 use crate::semantic::text::LineIndex;
@@ -112,6 +112,41 @@ impl OpenBuffer {
         self.text = Arc::new(text);
         self.version = version;
         self.desynced = false;
+    }
+
+    /// Splice `replacement` into the region `range` covers.
+    ///
+    /// Returns `false` when the range describes a document this buffer is not:
+    /// the caller marks the buffer desynced and refuses further ranged changes
+    /// until a whole document arrives.
+    ///
+    /// The bounds check is not belt and braces. [`LineIndex::offset`] *clamps*:
+    /// a line past the end of the document answers `source.len()` rather than
+    /// failing, so a wrong range silently converts to a plausible offset and the
+    /// splice lands somewhere real. Under full-document sync that self-corrects
+    /// on the next keystroke; under incremental sync it compounds forever. The
+    /// requested position has to be checked before the conversion is trusted.
+    pub fn splice(&mut self, range: Range, replacement: &str, version: i32) -> bool {
+        let line_count = self.line_index.line_count() as u32;
+        if range.start.line >= line_count || range.end.line >= line_count {
+            return false;
+        }
+
+        let start = self.line_index.offset(&self.text, range.start);
+        let end = self.line_index.offset(&self.text, range.end);
+        if start > end || end > self.text.len() {
+            return false;
+        }
+
+        let mut text = String::with_capacity(self.text.len() - (end - start) + replacement.len());
+        text.push_str(&self.text[..start]);
+        text.push_str(replacement);
+        text.push_str(&self.text[end..]);
+
+        // Rebuilt per change, not once per batch: the next change in the same
+        // notification is expressed against the text this one produced.
+        self.replace(text, version);
+        true
     }
 }
 

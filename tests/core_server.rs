@@ -3246,3 +3246,234 @@ async fn a_change_without_an_open_is_still_applied() {
         Some("TABLE ghost"),
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Incremental sync
+// ──────────────────────────────────────────────────────────────────────
+
+/// One ranged edit: `(start line, start character)`, `(end …)`, replacement.
+/// Characters are UTF-16 code units, as the protocol counts them.
+type RangedEdit<'a> = ((u32, u32), (u32, u32), &'a str);
+
+fn ranged(path: &str, version: i32, edits: &[RangedEdit<'_>]) -> DidChangeTextDocumentParams {
+    DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri(path),
+            version,
+        },
+        content_changes: edits
+            .iter()
+            .map(|(start, end, text)| TextDocumentContentChangeEvent {
+                range: Some(tower_lsp_server::ls_types::Range {
+                    start: Position::new(start.0, start.1),
+                    end: Position::new(end.0, end.1),
+                }),
+                range_length: None,
+                text: (*text).to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// Read back exactly what the server believes the buffer contains.
+async fn buffer_text(core: &common::TestCore, path: &str) -> Option<String> {
+    core.buffer_snapshot(&uri(path))
+}
+
+/// Three partial changes must produce the same text as the one full replacement
+/// they add up to. This is the property incremental sync lives or dies on.
+#[tokio::test]
+async fn partial_changes_equal_the_full_replacement() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "inc.surql", "SELECT a FROM t;\n").await;
+
+    // "SELECT a FROM t;" -> "SELECT name FROM person;"
+    core.did_change(ranged(
+        "inc.surql",
+        2,
+        &[
+            ((0, 7), (0, 8), "name"),     // a -> name
+            ((0, 17), (0, 18), "person"), // t -> person
+        ],
+    ))
+    .await;
+
+    assert_eq!(
+        buffer_text(&core, "inc.surql").await.as_deref(),
+        Some("SELECT name FROM person;\n"),
+        "the second edit must be applied against the text the first produced"
+    );
+}
+
+/// The second change in a batch is expressed against the text the first
+/// produced, so the line index has to be rebuilt per change rather than per
+/// notification. An insertion that adds a line proves it.
+#[tokio::test]
+async fn a_later_change_sees_the_earlier_one() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "lines.surql", "one\nthree\n").await;
+
+    core.did_change(ranged(
+        "lines.surql",
+        2,
+        &[
+            ((0, 3), (0, 3), "\ntwo"), // insert a line
+            ((2, 0), (2, 5), "THREE"), // line 2 only exists after the first edit
+        ],
+    ))
+    .await;
+
+    assert_eq!(
+        buffer_text(&core, "lines.surql").await.as_deref(),
+        Some("one\ntwo\nTHREE\n"),
+    );
+}
+
+/// A range crossing a character outside the BMP. `LineIndex` counts UTF-16 code
+/// units, so an emoji is two of them and one `char`: the arithmetic that a full
+/// sync never exercised, and the one where an off-by-one compounds forever.
+#[tokio::test]
+async fn a_range_across_a_surrogate_pair_converts_correctly() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    // 🦀 is one char, two UTF-16 units, four bytes.
+    open(&core, "utf.surql", "RETURN '🦀 crab';\n").await;
+
+    // Replace `crab`, which starts at UTF-16 offset 8+2+1 = 11.
+    core.did_change(ranged("utf.surql", 2, &[((0, 11), (0, 15), "lobster")]))
+        .await;
+
+    assert_eq!(
+        buffer_text(&core, "utf.surql").await.as_deref(),
+        Some("RETURN '🦀 lobster';\n"),
+        "a surrogate pair must count as two UTF-16 units, not one"
+    );
+}
+
+/// A multi-byte character inside the BMP: ₹ is three bytes and one UTF-16 unit.
+#[tokio::test]
+async fn a_range_across_a_multi_byte_character_converts_correctly() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "rupee.surql", "RETURN '₹ 5';\n").await;
+
+    // R E T U R N ␣ ' ₹ ␣ 5 ' ;  `₹` is three bytes but one UTF-16 unit, so
+    // `5` sits at unit 10, which is the whole point of the case.
+    core.did_change(ranged("rupee.surql", 2, &[((0, 10), (0, 11), "10")]))
+        .await;
+
+    assert_eq!(
+        buffer_text(&core, "rupee.surql").await.as_deref(),
+        Some("RETURN '₹ 10';\n"),
+    );
+}
+
+/// Insertion at the very end, and deletion to the end.
+#[tokio::test]
+async fn edits_at_the_document_boundary_apply() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "edge.surql", "RETURN 1;\n").await;
+
+    core.did_change(ranged("edge.surql", 2, &[((1, 0), (1, 0), "RETURN 2;\n")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "edge.surql").await.as_deref(),
+        Some("RETURN 1;\nRETURN 2;\n"),
+    );
+
+    core.did_change(ranged("edge.surql", 3, &[((0, 9), (2, 0), "")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "edge.surql").await.as_deref(),
+        Some("RETURN 1;"),
+    );
+}
+
+/// `\r\n` line endings: the terminator is two bytes but the position of the
+/// next line is unaffected.
+#[tokio::test]
+async fn crlf_line_endings_are_handled() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "crlf.surql", "RETURN 1;\r\nRETURN 2;\r\n").await;
+
+    core.did_change(ranged("crlf.surql", 2, &[((1, 7), (1, 8), "9")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "crlf.surql").await.as_deref(),
+        Some("RETURN 1;\r\nRETURN 9;\r\n"),
+    );
+}
+
+/// An out-of-bounds range desynchronises the buffer rather than splicing
+/// somewhere plausible: `LineIndex::offset` clamps, so the wrong answer would
+/// otherwise look like a right one and compound with every later edit. A whole
+/// document clears it.
+#[tokio::test]
+async fn an_out_of_bounds_range_desyncs_until_a_full_document_arrives() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "desync.surql", "RETURN 1;\n").await;
+
+    // Line 99 does not exist.
+    core.did_change(ranged("desync.surql", 2, &[((99, 0), (99, 4), "nope")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 1;\n"),
+        "an impossible range must change nothing"
+    );
+
+    // Further ranged edits are refused while desynced.
+    core.did_change(ranged("desync.surql", 3, &[((0, 7), (0, 8), "2")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 1;\n"),
+        "ranged edits stay refused until the client resends the document"
+    );
+
+    // A full replacement re-establishes the baseline.
+    core.did_change(change("desync.surql", 4, "RETURN 7;\n"))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 7;\n"),
+    );
+
+    // And ranged edits work again.
+    core.did_change(ranged("desync.surql", 5, &[((0, 7), (0, 8), "8")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 8;\n"),
+        "the desync must clear, not persist for the life of the document"
+    );
+
+    assert!(
+        notifier
+            .logs()
+            .iter()
+            .any(|(_, message)| message.contains("Ranged edits are ignored")),
+        "a desync has to be visible, not silent"
+    );
+}
+
+/// A client that ignores the advertised kind and keeps sending whole documents
+/// is still handled: that is the `range: None` branch.
+#[tokio::test]
+async fn a_client_sending_full_documents_still_works() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "full.surql", "DEFINE TABLE a SCHEMAFULL;").await;
+
+    core.did_change(change("full.surql", 2, "DEFINE TABLE b SCHEMAFULL;"))
+        .await;
+    assert_eq!(
+        defined_table(&core, "full.surql").await.as_deref(),
+        Some("TABLE b"),
+    );
+}

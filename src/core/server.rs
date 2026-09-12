@@ -114,7 +114,21 @@ where
     /// LSP capability advertisement, identical for both targets.
     pub fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+            // Incremental since 0.7. A 166 KB document used to cross the wire,
+            // and get JSON-unescaped into a fresh `String` on the reactor: on
+            // *every keystroke*: at ten characters a second that is 1.6 MB/s of
+            // decoding before the debounce even sees the message, and in the
+            // browser a full JS-to-wasm string copy each time. No benchmark here
+            // measures that, because it is paid before any code this repository
+            // owns runs.
+            //
+            // Safe only because the edit is applied on the ordered path: see
+            // `apply_document_change`. A client that ignores this and keeps
+            // sending whole documents still works: that is the `range: None`
+            // branch.
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                TextDocumentSyncKind::INCREMENTAL,
+            )),
             completion_provider: Some(CompletionOptions {
                 // Table items ship without documentation and get it from
                 // `completion_resolve`, so the dropdown does not pay to render
@@ -423,22 +437,29 @@ where
     /// only the analysis. See [`Self::apply_document_change`] for why that
     /// matters.
     pub fn apply_did_change(&self, params: &DidChangeTextDocumentParams) -> Option<Edit> {
-        let change = params.content_changes.last()?;
+        if params.content_changes.is_empty() {
+            return None;
+        }
         let edit = Edit::Changed(params.text_document.version);
-        self.apply_document_change(&params.text_document.uri, change.text.clone(), edit)
+        self.apply_document_change(&params.text_document.uri, &params.content_changes, edit)
             .map(|_| edit)
     }
 
+    /// Apply and analyse, for callers with no reason to separate them.
+    ///
+    /// The native adapter does separate them (see
+    /// [`Self::apply_did_change`]), so that the apply stays on the ordered
+    /// path. This is the wasm dispatcher's entry point, where ordering comes
+    /// free from `handleMessage` processing one message at a time.
+    ///
+    /// Note it no longer takes only the *last* change. Under incremental sync a
+    /// notification carries a batch, and every one of them has to be applied, in
+    /// order, against the text the previous one produced.
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Some(change) = params.content_changes.into_iter().last() else {
+        let Some(edit) = self.apply_did_change(&params) else {
             return;
         };
-        self.upsert_open_document(
-            params.text_document.uri,
-            change.text,
-            Edit::Changed(params.text_document.version),
-        )
-        .await;
+        self.analyze_buffer(params.text_document.uri, edit).await;
     }
 
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -1299,43 +1320,90 @@ where
     /// `Server::new(…).concurrency_level(1)` in `main.rs` makes the ordering
     /// unconditional, at the cost of serialising requests behind each other and
     /// disabling `$/cancelRequest`.
-    pub fn apply_document_change(&self, uri: &Uri, text: String, edit: Edit) -> Option<i32> {
+    pub fn apply_document_change(
+        &self,
+        uri: &Uri,
+        changes: &[TextDocumentContentChangeEvent],
+        edit: Edit,
+    ) -> Option<i32> {
         let mut buffers = self
             .buffers
             .lock()
             .expect("panic = 'abort' makes poisoning unreachable");
 
-        match edit {
-            // An open declares where this buffer's versioning now starts, so it
-            // replaces rather than compares.
-            Edit::Opened(version) => {
-                buffers
-                    .entry(uri.clone())
-                    .and_modify(|buffer| buffer.replace(text.clone(), version))
-                    .or_insert_with(|| OpenBuffer::new(text, version));
-                Some(version)
-            }
+        let version = match edit {
+            Edit::Opened(version) => version,
             Edit::Changed(version) => {
-                match buffers.get_mut(uri) {
-                    Some(buffer) => {
-                        // LSP does not require contiguous versions, so a gap is
-                        // not evidence of reordering: only a version at or
-                        // below the one already applied is stale.
-                        if version < buffer.version {
-                            return None;
-                        }
-                        buffer.replace(text, version);
-                    }
+                // LSP does not require contiguous versions, so a gap is not
+                // evidence of reordering: only a version below the one already
+                // applied is stale.
+                if buffers
+                    .get(uri)
+                    .is_some_and(|buffer| version < buffer.version)
+                {
+                    return None;
+                }
+                version
+            }
+        };
+
+        let mut desynced = None;
+        for change in changes {
+            match change.range {
+                // A whole-document replacement. Always accepted, and it clears a
+                // desync: this is the client telling us what the buffer is.
+                None => match buffers.get_mut(uri) {
+                    Some(buffer) => buffer.replace(change.text.clone(), version),
                     None => {
-                        // A change for a document that was never opened. Take it
-                        // as the whole content rather than dropping it: the
-                        // client believes this buffer exists.
-                        buffers.insert(uri.clone(), OpenBuffer::new(text, version));
+                        buffers.insert(uri.clone(), OpenBuffer::new(change.text.clone(), version));
+                    }
+                },
+                Some(range) => {
+                    let Some(buffer) = buffers.get_mut(uri) else {
+                        // A ranged change against a document we have no text
+                        // for. There is nothing to splice into.
+                        desynced = Some("a ranged change arrived for a document with no buffer");
+                        continue;
+                    };
+                    if buffer.desynced {
+                        continue;
+                    }
+                    if !buffer.splice(range, &change.text, version) {
+                        buffer.desynced = true;
+                        desynced = Some("a ranged change described text this buffer does not have");
                     }
                 }
-                Some(version)
             }
         }
+
+        if let Some(reason) = desynced {
+            // Visible and self-healing rather than silently wrong. There is no
+            // LSP request for "please resend the document", so refusing further
+            // ranged changes until a whole one arrives is the recovery
+            // available, and the next full replacement clears it.
+            self.log_desync(uri, version, reason);
+        }
+
+        buffers.get(uri).map(|buffer| buffer.version)
+    }
+
+    /// Report a buffer that has fallen out of step with its client.
+    ///
+    /// Deliberately not `async`: [`Self::apply_document_change`] must not gain
+    /// an await. The message is queued through the notifier's own spawn rather
+    /// than awaited here.
+    fn log_desync(&self, uri: &Uri, version: i32, reason: &str) {
+        let notifier = Arc::clone(&self.notifier);
+        let message = format!(
+            "SurrealQL: {} ({} at version {}). Ranged edits are ignored until the \
+             editor sends the whole document again.",
+            reason,
+            uri.as_str(),
+            version,
+        );
+        runtime::spawn(async move {
+            notifier.log_message(MessageType::WARNING, message).await;
+        });
     }
 
     /// Analyse the buffer at `uri` and publish what it says.
@@ -1411,9 +1479,23 @@ where
     /// them: the wasm dispatcher, which processes one message at a time, and
     /// the tests.
     async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
-        if self.apply_document_change(&uri, text, edit).is_some() {
+        let changes = [TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text,
+        }];
+        if self.apply_document_change(&uri, &changes, edit).is_some() {
             self.analyze_buffer(uri, edit).await;
         }
+    }
+
+    /// The authoritative text for `uri`, as a `String`.
+    ///
+    /// Exists for tests: asserting on what the server believes a buffer contains
+    /// is the only way to test incremental sync directly, and going through the
+    /// analysis would only show what survived it.
+    pub fn buffer_snapshot(&self, uri: &Uri) -> Option<String> {
+        self.buffer_text(uri).map(|text| text.to_string())
     }
 
     /// The authoritative text for `uri`, if the client has it open.
