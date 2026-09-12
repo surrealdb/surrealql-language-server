@@ -125,6 +125,17 @@ pub struct AnalysisSettings {
         alias = "max_syntax_diagnostics"
     )]
     pub max_syntax_diagnostics: usize,
+    /// Largest document to analyse, in bytes. `0` removes the limit.
+    ///
+    /// Unlike [`Self::max_syntax_diagnostics`], this one *is* about length. The
+    /// workspace walk has always skipped files over 2 MB; a buffer the editor
+    /// pushes was unbounded, which is the wider door of the two.
+    ///
+    /// An oversize buffer is still **tracked**: only its analysis is skipped.
+    /// Dropping the text would be worse than useless: the server would lose its
+    /// record of a document the client still has open.
+    #[serde(default = "default_max_document_bytes", alias = "max_document_bytes")]
+    pub max_document_bytes: usize,
     /// How long to wait for typing to settle before analysing an edited buffer,
     /// in milliseconds. `0` disables the wait.
     ///
@@ -199,6 +210,7 @@ impl Default for AnalysisSettings {
             enable_type_checking: true,
             schemaless_diagnostics: default_schemaless_diagnostics(),
             max_syntax_diagnostics: default_max_syntax_diagnostics(),
+            max_document_bytes: default_max_document_bytes(),
             diagnostic_debounce_ms: default_diagnostic_debounce_ms(),
             external_params: Vec::new(),
         }
@@ -472,6 +484,15 @@ impl PresentKeys {
     }
 }
 
+/// Largest document the analyzer will look at, in bytes.
+///
+/// The filesystem walk has skipped oversize files since 0.3, but that limit
+/// never applied to what an editor *pushes*: `didOpen` and `didChange` went
+/// straight into the analyzer with no bound at all, so the widest input door was
+/// the one nothing guarded. Kept equal to the walk's limit so a file is treated
+/// the same whether it is opened or indexed.
+pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+
 /// Lower-case a dotted path and drop the `_` separators, so `analysis.max_syntax_diagnostics`
 /// and `analysis.maxSyntaxDiagnostics` compare equal.
 fn normalize_path(path: &str) -> String {
@@ -611,6 +632,8 @@ const ANALYSIS_KEYS: &[&str] = &[
     "schemaless_diagnostics",
     "maxSyntaxDiagnostics",
     "max_syntax_diagnostics",
+    "maxDocumentBytes",
+    "max_document_bytes",
     "diagnosticDebounceMs",
     "diagnostic_debounce_ms",
     "externalParams",
@@ -719,6 +742,10 @@ fn default_diagnostic_debounce_ms() -> u64 {
 
 fn default_max_syntax_diagnostics() -> usize {
     crate::semantic::analyzer::DEFAULT_MAX_SYNTAX_DIAGNOSTICS
+}
+
+fn default_max_document_bytes() -> usize {
+    DEFAULT_MAX_DOCUMENT_BYTES
 }
 
 #[cfg(test)]

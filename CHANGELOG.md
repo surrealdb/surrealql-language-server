@@ -47,6 +47,13 @@ rather than leaving them to look as though they work.
 
 ### Added
 
+**`analysis.maxDocumentBytes`** (default 2 MB, `0` to disable). The workspace
+walk has skipped oversize files since 0.3, but a buffer the *editor* pushes went
+straight into the analyzer with no bound at all: the wider of the two doors, and
+the unguarded one. An oversize document is still tracked; only its analysis is
+skipped, and it publishes one informational diagnostic explaining the silence
+rather than looking clean.
+
 **`cargo install surrealql-language-server` works.** It never has: `build.rs`
 looked for a sibling `../surrealql-tree-sitter` checkout, which exists in this
 repository's layout and nowhere a crates.io consumer unpacks to, so the build

@@ -30,7 +30,9 @@ use crate::core::state::{ServerState, merged_workspace, workspace_signature};
 use crate::core::statement_shape::SlotYield;
 use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
-use crate::semantic::analyzer::{analyze_document, analyze_document_with_limit};
+use crate::semantic::analyzer::{
+    analyze_document, analyze_document_bounded, analyze_document_with_limit,
+};
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
@@ -1252,10 +1254,11 @@ where
     // ──────────────────────────────────────────────────────────────────
 
     async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
-        let (limit, debounce_ms) = {
+        let (limit, max_bytes, debounce_ms) = {
             let state = self.state.read().await;
             (
                 state.settings.analysis.max_syntax_diagnostics,
+                state.settings.analysis.max_document_bytes,
                 state.settings.analysis.diagnostic_debounce_ms,
             )
         };
@@ -1296,7 +1299,7 @@ where
         // Parsing and extraction are CPU-bound and now the most frequent work
         // the server does, so they must not run on a thread that is also
         // serving requests.
-        let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit).await else {
+        let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit, max_bytes).await else {
             // The previous analysis stays in `open_documents`, so the editor
             // keeps showing diagnostics for text the user has already changed.
             // That is the worst kind of wrong (stale and silent), so say it
@@ -1916,8 +1919,13 @@ where
     Some(work())
 }
 
-async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
-    off_reactor(move || analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit))
+async fn analyze_off_reactor(
+    uri: Uri,
+    text: String,
+    limit: usize,
+    max_bytes: usize,
+) -> Option<DocumentAnalysis> {
+    off_reactor(move || analyze_document_bounded(uri, text, SymbolOrigin::Local, limit, max_bytes))
         .await
         .flatten()
 }

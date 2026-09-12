@@ -237,9 +237,10 @@ This counts **diagnostics, not lines** — no setting limits how long a document
 may be. Semantic and type diagnostics are uncapped; they are derived from the
 definitions and query facts in the file, so the code itself bounds them.
 
-Two unrelated limits do apply to the *workspace scan*, and neither is
-configurable: files over 2 MB are skipped, and at most 5,000 `.surql` files are
-indexed. Both are reported through `window/logMessage` when they bite. They
+`analysis.maxDocumentBytes` is the companion that *does* bound length, and it
+applies to buffers the editor pushes. Two further limits apply to the *workspace
+scan*, and neither is configurable: files over 2 MB are skipped, and at most
+5,000 `.surql` files are indexed. Both are reported through `window/logMessage` when they bite. They
 affect which files contribute schema, not the diagnostics on the file you have
 open.
 
@@ -252,6 +253,7 @@ open.
 | `analysis.enableCodeActions` | `true` | Stops offering quick fixes and refactors entirely. |
 | `analysis.externalParams` | `[]` | Not a toggle: names the variables your caller binds at runtime (`db.query(sql).bind(("id", id))`, or Surrealist's variables panel) so `undefined-variable` does not flag them. |
 | `analysis.diagnosticDebounceMs` | `200` | Not a toggle: how long a burst of keystrokes must settle before the document is re-analysed. `0` analyses every change. |
+| `analysis.maxDocumentBytes` | `2097152` | Not a toggle: the largest document to analyse, in bytes. An oversize buffer is still tracked, and publishes one informational diagnostic explaining the silence rather than looking clean. `0` removes the limit. |
 
 #### Connecting to a database
 

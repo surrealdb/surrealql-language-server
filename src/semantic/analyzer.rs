@@ -32,6 +32,29 @@ pub fn analyze_document_with_limit(
     origin: SymbolOrigin,
     limit: usize,
 ) -> Option<DocumentAnalysis> {
+    analyze_document_bounded(
+        uri,
+        text,
+        origin,
+        limit,
+        crate::config::DEFAULT_MAX_DOCUMENT_BYTES,
+    )
+}
+
+/// [`analyze_document_with_limit`], with the document size cap supplied by the
+/// caller so `analysis.maxDocumentBytes` can drive it. `0` removes the cap.
+///
+/// A document over the cap is **still returned** (with its text, its line
+/// index, and one informational diagnostic explaining the silence), because the
+/// server's record of an open buffer is not optional. Only the analysis is
+/// skipped.
+pub fn analyze_document_bounded(
+    uri: Uri,
+    text: impl Into<String>,
+    origin: SymbolOrigin,
+    limit: usize,
+    max_bytes: usize,
+) -> Option<DocumentAnalysis> {
     // Owned once. The document text used to be copied into the analysis with
     // `to_string()` even though every caller already owns a `String` and drops
     // it — a whole-document memcpy per keystroke. It is moved in at the end
@@ -47,6 +70,20 @@ pub fn analyze_document_with_limit(
     // such a document be refused without ever building the tree.
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
+
+    // Too large to be worth analysing. The workspace walk has skipped oversize
+    // files since 0.3, but what an editor *pushes* was never bounded, so the
+    // widest input door was the one nothing guarded.
+    if max_bytes > 0 && text.len() > max_bytes {
+        let tree = parser.parse("", None)?;
+        let line_index = LineIndex::new(text);
+        let mut analysis = blank_analysis(uri, tree);
+        analysis.syntax_diagnostics =
+            vec![too_large_diagnostic(&line_index, text.len(), max_bytes)];
+        analysis.line_index = line_index;
+        analysis.text = owned_text;
+        return Some(analysis);
+    }
 
     if limits::too_deep(limits::max_bracket_depth(text)) {
         // Parse an empty document instead of this one. The analysis still needs
@@ -1978,6 +2015,28 @@ fn blank_analysis(uri: Uri, tree: tree_sitter::Tree) -> DocumentAnalysis {
         references: Vec::new(),
         syntax_diagnostics: Vec::new(),
         document_symbols: Vec::new(),
+    }
+}
+
+/// Reported once when a document exceeds `analysis.maxDocumentBytes`.
+///
+/// INFORMATION rather than ERROR: nothing is wrong with the file, the server has
+/// simply declined to read it. Saying nothing at all would be worse: the user
+/// would see a document with no diagnostics and reasonably conclude it is clean.
+fn too_large_diagnostic(lines: &LineIndex, size: usize, max_bytes: usize) -> Diagnostic {
+    Diagnostic {
+        range: lines.range("", 0, 0),
+        severity: Some(DiagnosticSeverity::INFORMATION),
+        code: codes::as_code(codes::PARSE),
+        source: Some("surreal-language-server".to_string()),
+        message: format!(
+            "Document is {} KB, over the {} KB analysis limit, so it was not \
+             analysed. Raise `analysis.maxDocumentBytes` (or set it to 0) to \
+             include it.",
+            size / 1024,
+            max_bytes / 1024,
+        ),
+        ..Diagnostic::default()
     }
 }
 

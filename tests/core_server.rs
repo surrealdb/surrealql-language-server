@@ -3084,3 +3084,86 @@ async fn selection_range_widens_at_every_step() {
         );
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Oversize documents are declined, not dropped
+// ──────────────────────────────────────────────────────────────────────
+
+/// The filesystem walk has skipped files over 2 MB since 0.3, but a buffer the
+/// *editor* pushes went straight into the analyzer with no bound: the wider of
+/// the two doors, and the unguarded one.
+///
+/// The document must still be tracked. Dropping its text would lose the
+/// server's record of a buffer the client still has open, and under incremental
+/// sync it would desynchronise permanently.
+#[tokio::test]
+async fn an_oversize_document_is_tracked_but_not_analysed() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 1024;
+    core.apply_settings(settings).await;
+
+    // Well over the cap, and otherwise perfectly valid.
+    let text = "DEFINE TABLE person SCHEMAFULL;\n".repeat(200);
+    open(&core, "big.surql", &text).await;
+
+    let published = notifier
+        .published()
+        .into_iter()
+        .rev()
+        .find(|(published_uri, _)| *published_uri == uri("big.surql"))
+        .map(|(_, diagnostics)| diagnostics)
+        .expect("an oversize document still publishes");
+    assert_eq!(published.len(), 1, "one explanation, not a flood");
+    assert!(
+        published[0].message.contains("analysis limit"),
+        "the user must be told why it is silent: {:?}",
+        published[0].message
+    );
+    assert_eq!(
+        published[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::INFORMATION),
+        "nothing is wrong with the file; the server declined to read it"
+    );
+
+    // Tracked: the document answers requests rather than being unknown.
+    assert_eq!(
+        defined_table(&core, "big.surql").await,
+        None,
+        "no symbols, because it was not analysed"
+    );
+}
+
+/// Under the cap, nothing changes.
+#[tokio::test]
+async fn a_document_under_the_cap_is_analysed_normally() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 1024;
+    core.apply_settings(settings).await;
+
+    open(&core, "small.surql", "DEFINE TABLE person SCHEMAFULL;\n").await;
+    assert_eq!(
+        defined_table(&core, "small.surql").await.as_deref(),
+        Some("TABLE person"),
+    );
+}
+
+/// `0` means no cap, for anyone who really does open a generated dump.
+#[tokio::test]
+async fn a_zero_cap_removes_the_limit() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 0;
+    core.apply_settings(settings).await;
+
+    let text = "DEFINE TABLE person SCHEMAFULL;\n".repeat(200);
+    open(&core, "uncapped.surql", &text).await;
+    assert_eq!(
+        defined_table(&core, "uncapped.surql").await.as_deref(),
+        Some("TABLE person"),
+    );
+}
