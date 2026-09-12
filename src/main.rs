@@ -88,17 +88,26 @@ async fn main() -> std::process::ExitCode {
                 println!("{}", check::USAGE);
                 ExitCode::SUCCESS
             }
-            Ok(check::Parsed::Explain(code)) => match check::explain(&code) {
-                Some(prose) => {
-                    println!("{prose}");
-                    ExitCode::SUCCESS
+            Ok(check::Parsed::Explain(code, format)) => {
+                let known = check::explain(&code).is_some();
+                match check::render_explanation(&code, format) {
+                    // Under `--format json` an unknown code is still one JSON
+                    // object on stdout, carrying the error and an exit code of
+                    // 2, exactly as a failed run is.
+                    Ok(rendered) => {
+                        println!("{rendered}");
+                        if known {
+                            ExitCode::SUCCESS
+                        } else {
+                            ExitCode::from(2)
+                        }
+                    }
+                    Err(message) => {
+                        eprintln!("{message}");
+                        ExitCode::from(2)
+                    }
                 }
-                None => {
-                    eprintln!("error: `{code}` is not a diagnostic code this server emits");
-                    eprintln!("known codes: {}", check::known_codes().join(", "));
-                    ExitCode::from(2)
-                }
-            },
+            }
             Err(message) => {
                 eprintln!("error: {message}");
                 eprintln!("{}", check::USAGE);

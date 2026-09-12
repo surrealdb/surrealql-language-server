@@ -70,6 +70,9 @@ Options:
 Subcommands:
   explain <code>             Print what one diagnostic code means, and how to
                              fix it: the same prose every diagnostic links to.
+                             Honours --format json, which wraps the markdown in
+                             one object, and answers an unknown code with an
+                             error object and exit 2.
 
 Exit codes:
   0  ran to completion, nothing at or above --fail-on
@@ -120,8 +123,9 @@ pub struct CheckOptions {
 pub enum Parsed {
     Run(CheckOptions),
     Help,
-    /// `check explain <code>`: print what one diagnostic code means.
-    Explain(String),
+    /// `check explain <code>`: print what one diagnostic code means, in the
+    /// format the run was asked for.
+    Explain(String, OutputFormat),
 }
 
 /// The prose for every diagnostic code, compiled in.
@@ -131,6 +135,37 @@ pub enum Parsed {
 /// two cannot drift. Native-only: the browser build has no `explain` and no
 /// reason to carry the markdown.
 const DIAGNOSTICS_DOC: &str = include_str!("../../docs/diagnostics.md");
+
+/// Replace `path`'s contents, or leave them exactly as they were.
+///
+/// `--fix` rewrites a file in a user's working tree, and a plain `fs::write`
+/// truncates before it writes: an interrupt, a full disk or a crash between the
+/// two leaves a truncated `.surql` and no copy of what it held. Writing beside
+/// it and renaming over it makes the replacement a single atomic step, since a
+/// rename within one directory is on one filesystem.
+fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "target".to_string());
+    let temporary = directory
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.{}.surql-fix", std::process::id()));
+
+    fs::write(&temporary, contents)?;
+    // A file an editor could open before must stay one it can open after.
+    if let Ok(metadata) = fs::metadata(path) {
+        let _ = fs::set_permissions(&temporary, metadata.permissions());
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
 
 /// The on-disk path for a target, when there is one.
 ///
@@ -204,6 +239,49 @@ pub fn explain(code: &str) -> Option<String> {
     Some(body[..end].trim_end().to_string())
 }
 
+fn parse_format(value: &str) -> Result<OutputFormat, String> {
+    match value {
+        "text" => Ok(OutputFormat::Text),
+        "json" => Ok(OutputFormat::Json),
+        other => Err(format!("unknown format `{other}` (text or json)")),
+    }
+}
+
+/// The answer to `check explain <code>`, in whichever form was asked for.
+///
+/// Same invariant as a run: under `--format json` this is exactly one JSON
+/// object on stdout, whatever the exit code, so a consumer never has to
+/// special-case an empty stdout.
+pub fn render_explanation(code: &str, format: OutputFormat) -> Result<String, String> {
+    match (explain(code), format) {
+        (Some(prose), OutputFormat::Text) => Ok(prose),
+        (Some(prose), OutputFormat::Json) => Ok(render_json_value(&serde_json::json!({
+            "version": build_version(),
+            "code": code,
+            "markdown": prose,
+            "exitCode": 0,
+        }))),
+        (None, OutputFormat::Text) => Err(format!(
+            "error: `{code}` is not a diagnostic code this server emits\nknown codes: {}",
+            known_codes().join(", ")
+        )),
+        (None, OutputFormat::Json) => Ok(render_json_value(&serde_json::json!({
+            "version": build_version(),
+            "code": code,
+            "error": {
+                "kind": "unknown-code",
+                "message": format!("`{code}` is not a diagnostic code this server emits"),
+            },
+            "knownCodes": known_codes(),
+            "exitCode": 2,
+        }))),
+    }
+}
+
+fn render_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Hand-rolled argument parser, following the `xtask` precedent — no
 /// dependency enters the graph for a fixed flag set this small.
 pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
@@ -232,10 +310,18 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
             // does not check anything: it takes no paths and produces no report.
             "explain" if options.paths.is_empty() && !options.stdin => {
                 let code = value_for(&arg, &mut args)?;
-                if let Some(extra) = args.next() {
+                // `--format` is the one flag that still means something here,
+                // and it has to work on either side of the code: an agent
+                // writing `check explain unknown-table --format json` is asking
+                // the same question as one writing the flag first.
+                while let Some(extra) = args.next() {
+                    if extra == "--format" {
+                        options.format = parse_format(&value_for("--format", &mut args)?)?;
+                        continue;
+                    }
                     return Err(format!("`explain` takes one code, not `{extra}` as well"));
                 }
-                return Ok(Parsed::Explain(code));
+                return Ok(Parsed::Explain(code, options.format));
             }
             "--stdin" => options.stdin = true,
             "--stdin-filename" => {
@@ -246,13 +332,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
                     .workspace_dirs
                     .push(PathBuf::from(value_for(&arg, &mut args)?));
             }
-            "--format" => {
-                options.format = match value_for(&arg, &mut args)?.as_str() {
-                    "text" => OutputFormat::Text,
-                    "json" => OutputFormat::Json,
-                    other => return Err(format!("unknown format `{other}` (text or json)")),
-                };
-            }
+            "--format" => options.format = parse_format(&value_for(&arg, &mut args)?)?,
             "--config" => {
                 options.config = Some(PathBuf::from(value_for(&arg, &mut args)?));
             }
@@ -610,9 +690,56 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     }
 
     // No database, ever: an empty snapshot instead of a metadata provider.
-    let model = MergedSemanticModel::build(&index, &LiveMetadataSnapshot::default());
+    let mut model = MergedSemanticModel::build(&index, &LiveMetadataSnapshot::default());
 
     analyses.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Repairs happen in their own pass, before anything is reported.
+    //
+    // Rewriting a file changes what the workspace says, so the model every
+    // file is then judged against has to be the one built from the repaired
+    // text. Doing this inside the reporting loop meant each file was measured
+    // against a model describing the files as they were before the run, which
+    // is the state nothing is in by the time the report is printed.
+    let mut fixed_count = 0usize;
+    if !options.fix.is_empty() {
+        let mut repaired_any = false;
+        for (display, analysis) in analyses.iter_mut() {
+            let Some(path) = fixable_path(display) else {
+                continue;
+            };
+            // Repair before filtering, so `--ignore` cannot hide something that
+            // was then silently rewritten.
+            let diagnostics = model.document_diagnostics(analysis, &settings);
+            let (fixed, applied) =
+                apply_renames(&analysis.text, &analysis.line_index, &diagnostics);
+            if applied == 0 {
+                continue;
+            }
+            if let Err(error) = write_atomically(&path, &fixed) {
+                eprintln!("warning: could not write `{}`: {error}", path.display());
+                continue;
+            }
+            fixed_count += applied;
+            if let Some(reanalyzed) = analyze_document_with_limit(
+                analysis.uri.clone(),
+                fixed,
+                SymbolOrigin::Local,
+                settings.analysis.max_syntax_diagnostics,
+            ) {
+                let reanalyzed = Arc::new(reanalyzed);
+                index
+                    .documents
+                    .insert(reanalyzed.uri.clone(), Arc::clone(&reanalyzed));
+                *analysis = reanalyzed;
+                repaired_any = true;
+            }
+        }
+        if repaired_any {
+            model = MergedSemanticModel::build(&index, &LiveMetadataSnapshot::default());
+        }
+    }
+
     let mut summary = Summary {
         files_checked: analyses.len(),
         ..Summary::default()
@@ -620,40 +747,10 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     let mut files = Vec::with_capacity(analyses.len());
     let mut worst_rank: u8 = u8::MAX;
     let mut suppressed = 0usize;
-    let mut fixed_count = 0usize;
     for (display, analysis) in analyses {
+        // The repaired text, where there was one, against a model built from
+        // every repair this run made.
         let mut diagnostics = model.document_diagnostics(&analysis, &settings);
-
-        // Repair before filtering, so `--ignore` cannot hide something that was
-        // then silently rewritten. Writing the file is the only side effect
-        // `check` has, so it happens only for codes explicitly named.
-        if !options.fix.is_empty()
-            && let Some(path) = fixable_path(&display)
-        {
-            let (fixed, applied) =
-                apply_renames(&analysis.text, &analysis.line_index, &diagnostics);
-            if applied > 0 {
-                match fs::write(&path, &fixed) {
-                    Ok(()) => {
-                        fixed_count += applied;
-                        // Re-analyse so the report describes the file as it now
-                        // is, not as it was. Reporting the errors we just fixed
-                        // would be actively misleading.
-                        if let Some(reanalyzed) = analyze_document_with_limit(
-                            analysis.uri.clone(),
-                            fixed,
-                            SymbolOrigin::Local,
-                            settings.analysis.max_syntax_diagnostics,
-                        ) {
-                            diagnostics = model.document_diagnostics(&reanalyzed, &settings);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("warning: could not write `{}`: {error}", path.display());
-                    }
-                }
-            }
-        }
 
         // Filter *reporting*, not analysis. An ignored check still runs; it
         // simply does not reach the output or the exit code, and the report
