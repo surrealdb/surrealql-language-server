@@ -60,6 +60,17 @@ async fn main() -> std::process::ExitCode {
                 println!("{}", check::USAGE);
                 ExitCode::SUCCESS
             }
+            Ok(check::Parsed::Explain(code)) => match check::explain(&code) {
+                Some(prose) => {
+                    println!("{prose}");
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("error: `{code}` is not a diagnostic code this server emits");
+                    eprintln!("known codes: {}", check::known_codes().join(", "));
+                    ExitCode::from(2)
+                }
+            },
             Err(message) => {
                 eprintln!("error: {message}");
                 eprintln!("{}", check::USAGE);

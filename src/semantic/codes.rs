@@ -66,6 +66,52 @@ pub const FIELD_TYPE: &str = "field-type";
 /// `analysis.enable_type_checking` — see [`crate::semantic::type_name`].
 pub const UNKNOWN_TYPE: &str = "unknown-type";
 
+/// Every code this server emits, in the order `docs/diagnostics.md` documents
+/// them.
+///
+/// Exists so three things cannot drift apart: the codes, the prose that explains
+/// them, and the `codeDescription` link every diagnostic carries. A code with no
+/// section, or a section with no code, fails
+/// `every_code_is_documented` in `tests/compat.rs`.
+pub const ALL: &[&str] = &[
+    PARSE,
+    UNKNOWN_TYPE,
+    UNKNOWN_TABLE,
+    UNKNOWN_FIELD,
+    PERMISSION_DENIED,
+    PERMISSION_UNKNOWN,
+    DYNAMIC_TARGET,
+    ARGUMENT_TYPE,
+    ARGUMENT_COUNT,
+    LET_TYPE,
+    RETURN_TYPE,
+    FIELD_TYPE,
+    OPERATOR_TYPE,
+    UNKNOWN_METHOD,
+    UNDEFINED_VARIABLE,
+    RENAMED_FUNCTION,
+    NOT_CALLABLE,
+];
+
+/// Where the prose for `code` lives, for `Diagnostic.codeDescription`.
+///
+/// Points into this repository rather than at a documentation site, so the link
+/// is true the day it ships and keeps working for anyone reading a tagged
+/// release. A `codeDescription` pointing at a 404 renders as a dead hyperlink in
+/// VS Code, which is worse than none: `every_code_is_documented` is what keeps
+/// it honest.
+pub fn description(code: &str) -> Option<ls_types::CodeDescription> {
+    if !ALL.contains(&code) {
+        return None;
+    }
+    let href: ls_types::Uri = format!(
+        "https://github.com/surrealdb/surrealql-language-server/blob/master/docs/diagnostics.md#{code}"
+    )
+    .parse()
+    .ok()?;
+    Some(ls_types::CodeDescription { href })
+}
+
 /// The codes whose behavior on a `SCHEMALESS` table the
 /// `analysis.schemalessDiagnostics` setting decides. Every other code is
 /// unconditional: it judges an expression, not the schema, so a loose schema

@@ -385,3 +385,168 @@ fn a_successful_report_carries_no_error_field() {
         "a clean report gained an `error` key: {report}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// explain, filters, and the one safe fix
+// ──────────────────────────────────────────────────────────────────────
+
+/// `explain` prints the same prose the `codeDescription` link points at, so an
+/// agent offline or behind a proxy reads exactly what a human would.
+#[test]
+fn explain_prints_a_codes_documentation() {
+    let dir = scratch("explain");
+    let output = run_check(&dir, &["explain", "renamed-function"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("## renamed-function"));
+    assert!(
+        stdout.contains("rename table"),
+        "the explanation must say where the replacement comes from: {stdout}"
+    );
+    assert!(
+        !stdout.contains("## not-callable"),
+        "the slice must stop at the next section: {stdout}"
+    );
+}
+
+/// An unknown code is a usage error that names the alternatives, not a silent
+/// empty answer.
+#[test]
+fn explain_rejects_a_code_that_does_not_exist() {
+    let dir = scratch("explain-bad");
+    let output = run_check(&dir, &["explain", "not-a-code"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a diagnostic code"));
+    assert!(
+        stderr.contains("unknown-table"),
+        "it must list the real ones"
+    );
+}
+
+/// `--only` reports one code; `--ignore` reports everything else. Both record
+/// what they hid, because a filtered clean run is not a clean run.
+#[test]
+fn only_and_ignore_filter_reporting_and_say_so() {
+    let dir = scratch("filters");
+    let file = write(
+        &dir,
+        "mixed.surql",
+        "RETURN type::thing('person', '1');\nRETURN \"a\" + 1;\n",
+    );
+    let path = file.to_str().expect("utf8");
+
+    let all = run_check(&dir, &[path, "--format", "json"]);
+    let all: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&all.stdout)).expect("json");
+    let total = all["files"][0]["diagnostics"]
+        .as_array()
+        .expect("array")
+        .len();
+    assert!(total >= 2, "fixture must produce more than one code");
+    assert!(
+        all.get("filters").is_none(),
+        "an unfiltered run must not claim filters"
+    );
+
+    let only = run_check(
+        &dir,
+        &[path, "--format", "json", "--only", "renamed-function"],
+    );
+    let only: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&only.stdout)).expect("json");
+    let kept = only["files"][0]["diagnostics"].as_array().expect("array");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0]["code"], "renamed-function");
+    assert_eq!(only["filters"]["only"][0], "renamed-function");
+    assert_eq!(
+        only["filters"]["suppressed"].as_u64(),
+        Some((total - 1) as u64),
+        "the report must say how many it did not show"
+    );
+
+    let ignored = run_check(
+        &dir,
+        &[path, "--format", "json", "--ignore", "renamed-function"],
+    );
+    let ignored: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&ignored.stdout)).expect("json");
+    assert!(
+        ignored["files"][0]["diagnostics"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|d| d["code"] != "renamed-function"),
+    );
+}
+
+/// A typo'd code is a usage error. Silently filtering nothing is the failure a
+/// CI filter can least afford.
+#[test]
+fn an_unknown_code_in_a_filter_is_rejected() {
+    let dir = scratch("filter-typo");
+    let file = write(&dir, "q.surql", "RETURN 1;\n");
+    let output = run_check(
+        &dir,
+        &[file.to_str().expect("utf8"), "--ignore", "parse-error"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a diagnostic code"),);
+}
+
+/// `--fix renamed-function` rewrites the file, re-analyses it, and says what it
+/// did. The replacement comes from SurrealDB's own rename table.
+#[test]
+fn fix_rewrites_a_renamed_builtin() {
+    let dir = scratch("fix");
+    let file = write(&dir, "old.surql", "RETURN type::thing('person', '1');\n");
+    let path = file.to_str().expect("utf8");
+
+    let output = run_check(
+        &dir,
+        &[path, "--fix", "renamed-function", "--format", "json"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
+    assert_eq!(report["fixed"].as_u64(), Some(1));
+    assert!(
+        report["files"][0]["diagnostics"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "the report must describe the file as it now is, not as it was"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&file).expect("read"),
+        "RETURN type::record('person', '1');\n",
+    );
+}
+
+/// Every other code is a suggestion, and applying one unattended can change what
+/// a query means: `unknown-table`'s fix is a string-distance guess that could
+/// repoint a query at a different real table.
+#[test]
+fn fix_refuses_any_code_but_the_mechanical_one() {
+    let dir = scratch("fix-refuse");
+    let file = write(&dir, "q.surql", "SELECT * FROM persn;\n");
+    let output = run_check(
+        &dir,
+        &[file.to_str().expect("utf8"), "--fix", "unknown-table"],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not supported"),
+        "the refusal must explain itself: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).expect("read"),
+        "SELECT * FROM persn;\n",
+        "a refused fix must not touch the file"
+    );
+}

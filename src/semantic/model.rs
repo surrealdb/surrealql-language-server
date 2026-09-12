@@ -1544,6 +1544,18 @@ impl MergedSemanticModel {
         let mut diagnostics = analysis.syntax_diagnostics.clone();
         diagnostics.extend(self.semantic_diagnostics(analysis, settings));
         self.apply_schemaless_policy(&mut diagnostics, settings);
+
+        // Attached here rather than at each of the thirteen places a diagnostic
+        // is built. This is the one funnel both surfaces go through (the LSP
+        // publish path and `check`), so a code that gains prose gains the link
+        // everywhere at once, and a code that never gets prose gets no link
+        // rather than a dead one.
+        for diagnostic in &mut diagnostics {
+            if let Some(ls_types::NumberOrString::String(code)) = &diagnostic.code {
+                diagnostic.code_description = codes::description(code);
+            }
+        }
+
         diagnostics
     }
 

@@ -382,6 +382,8 @@ fn check_json_report_shape_golden() {
         config_warnings: vec![],
         exit_code: 0,
         error: None,
+        filters: None,
+        fixed: None,
     };
     let value: serde_json::Value =
         serde_json::from_str(&render_json(&report)).expect("render_json emits one JSON object");
@@ -636,4 +638,61 @@ fn a_pulling_client_is_offered_exactly_one_more_capability() {
             "workspaceDiagnostics": false,
         }),
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Every code has prose, and every prose section has a code
+// ──────────────────────────────────────────────────────────────────────
+
+/// A `codeDescription` pointing at a section that does not exist renders as a
+/// dead hyperlink in VS Code, which is worse than no link at all. This is what
+/// keeps the registry, the prose and the link from drifting apart.
+#[test]
+fn every_code_is_documented() {
+    use surrealql_language_server::semantic::codes;
+
+    let doc = include_str!("../docs/diagnostics.md");
+    let headings: std::collections::BTreeSet<&str> = doc
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .map(str::trim)
+        .collect();
+
+    for code in codes::ALL {
+        assert!(
+            headings.contains(code),
+            "`{code}` has no `## {code}` section in docs/diagnostics.md, so its \
+             codeDescription link would 404"
+        );
+        assert!(
+            codes::description(code).is_some(),
+            "`{code}` is in ALL but builds no codeDescription"
+        );
+    }
+
+    for heading in &headings {
+        assert!(
+            codes::ALL.contains(heading),
+            "docs/diagnostics.md documents `{heading}`, which is not a code this \
+             server emits: rename it or remove the section"
+        );
+    }
+
+    assert!(
+        codes::description("not-a-real-code").is_none(),
+        "an unknown code must not be given a link"
+    );
+}
+
+/// The `data` hints AGENTS.md tells agents to prefer are part of the contract.
+#[test]
+fn documented_codes_match_the_agent_guide() {
+    let agents = include_str!("../AGENTS.md");
+    for code in surrealql_language_server::semantic::codes::ALL {
+        assert!(
+            agents.contains(&format!("`{code}`")),
+            "`{code}` is not in the AGENTS.md code table, so an agent keying on \
+             the table would not know it exists"
+        );
+    }
 }

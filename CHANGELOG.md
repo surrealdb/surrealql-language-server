@@ -47,6 +47,27 @@ rather than leaving them to look as though they work.
 
 ### Added
 
+**Every diagnostic links to its explanation.** `codeDescription.href` points at a
+new [`docs/diagnostics.md`](docs/diagnostics.md), one section per code: what it
+means, why SurrealDB refuses the query, and what fixing it looks like. Attached
+at the single funnel both the LSP and `check` go through, so a code that gains
+prose gains the link everywhere, and a code that has none gets no link rather
+than a dead one, which is what `every_code_is_documented` enforces.
+
+**`check explain <code>`** prints the same prose, compiled in, so an agent
+offline or behind a proxy reads exactly what a human clicking the link would.
+
+**`check --only` / `--ignore`** filter reporting by code. The JSON report gains
+a `filters` object recording what was hidden, because a filtered clean run is
+not a clean run. An unknown code is a usage error, not a filter that silently
+matches nothing.
+
+**`check --fix renamed-function`** repairs in place, and takes only that code.
+Its replacement comes from SurrealDB's own rename table; every other fix here is
+inferred, and `unknown-table`'s is a string-distance guess that could repoint a
+query at a *different real table*. A run that rewrote files reports `fixed` and
+re-analyses, so it never reports the errors it just repaired.
+
 **The server reads what the client can do.** `initialize` discarded
 `params.capabilities` entirely, which is why every optional protocol feature was
 either unavailable or unconditional. A small `ClientProfile` is now read once and

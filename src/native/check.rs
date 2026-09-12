@@ -35,6 +35,7 @@ use crate::native::workspace_fs::{
     FilesystemWorkspaceLoader, MAX_FILE_SIZE_BYTES, MAX_WORKSPACE_FILES, should_descend,
 };
 use crate::semantic::analyzer::analyze_document_with_limit;
+use crate::semantic::text::LineIndex;
 use crate::semantic::types::{
     DocumentAnalysis, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
 };
@@ -66,6 +67,10 @@ Options:
                              warning, info, or hint (default: error).
   -h, --help                 Print this help.
 
+Subcommands:
+  explain <code>             Print what one diagnostic code means, and how to
+                             fix it: the same prose every diagnostic links to.
+
 Exit codes:
   0  ran to completion, nothing at or above --fail-on
   1  ran to completion, diagnostics at or above --fail-on
@@ -88,16 +93,115 @@ pub struct CheckOptions {
     pub format: OutputFormat,
     pub config: Option<PathBuf>,
     pub params: Vec<String>,
+    /// Report only these codes. Empty means every code.
+    pub only: Vec<String>,
+    /// Never report these codes.
+    ///
+    /// Suppresses *reporting*, not analysis: an ignored code still runs, it
+    /// just does not reach the output or the exit code. The report says which
+    /// filters were in force, so a clean run cannot be mistaken for full
+    /// coverage.
+    pub ignore: Vec<String>,
+    /// Codes to repair in place.
+    ///
+    /// Deliberately an allowlist rather than a switch. Most quick fixes here are
+    /// string-distance guesses ("did you mean `person`?"), and applying one
+    /// unattended can silently repoint a query at a *different real table*. Only
+    /// `renamed-function` is mechanical enough: its replacement comes from
+    /// SurrealDB's own rename table.
+    pub fix: Vec<String>,
     /// Severity rank (1 = error … 4 = hint) at or above which the run
     /// exits 1. Stored as the rank so the comparison is a single `<=`.
     pub fail_on: u8,
 }
 
-/// Outcome of [`parse_args`]: a run, or an explicit help request.
+/// Outcome of [`parse_args`]: a run, a help request, or an `explain`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed {
     Run(CheckOptions),
     Help,
+    /// `check explain <code>`: print what one diagnostic code means.
+    Explain(String),
+}
+
+/// The prose for every diagnostic code, compiled in.
+///
+/// The same file `Diagnostic.codeDescription` links to, so an agent offline or
+/// behind a proxy reads exactly what a human clicking the link would, and the
+/// two cannot drift. Native-only: the browser build has no `explain` and no
+/// reason to carry the markdown.
+const DIAGNOSTICS_DOC: &str = include_str!("../../docs/diagnostics.md");
+
+/// The on-disk path for a target, when there is one.
+///
+/// `--stdin` has no file to rewrite, so a fix there is reported and not applied.
+fn fixable_path(display: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(display);
+    path.is_file().then_some(path)
+}
+
+/// Rewrite the renamed builtins in `text`, returning the new text and how many
+/// were replaced.
+///
+/// Applied right-to-left so an earlier edit cannot shift the offsets of a later
+/// one. Only `renamed-function` reaches here: see `CheckOptions::fix` for why
+/// the allowlist is not a switch.
+fn apply_renames(text: &str, lines: &LineIndex, diagnostics: &[Diagnostic]) -> (String, usize) {
+    let mut edits: Vec<(usize, usize, &'static str)> = diagnostics
+        .iter()
+        .filter(|diagnostic| code_of(diagnostic) == crate::semantic::codes::RENAMED_FUNCTION)
+        .filter_map(|diagnostic| {
+            let start = lines.offset(text, diagnostic.range.start);
+            let end = lines.offset(text, diagnostic.range.end);
+            // The replacement comes from SurrealDB's own rename table, keyed on
+            // the text in the diagnostic's own range, not from the message, and
+            // not from a guess.
+            let current = crate::grammar::renamed_builtin(text.get(start..end)?.trim())?;
+            Some((start, end, current))
+        })
+        .collect();
+
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    edits.dedup_by_key(|(start, _, _)| *start);
+
+    let mut fixed = text.to_string();
+    let applied = edits.len();
+    for (start, end, replacement) in edits {
+        fixed.replace_range(start..end, replacement);
+    }
+    (fixed, applied)
+}
+
+/// Accept a code only if this server can emit it.
+///
+/// A typo'd `--ignore parse-error` would otherwise filter nothing and look like
+/// it worked, which is the failure mode a CI filter can least afford.
+fn known_code(value: &str) -> Result<String, String> {
+    if crate::semantic::codes::ALL.contains(&value) {
+        return Ok(value.to_string());
+    }
+    Err(format!(
+        "`{value}` is not a diagnostic code. Known codes: {}",
+        known_codes().join(", ")
+    ))
+}
+
+/// Every code `explain` will answer for.
+pub fn known_codes() -> Vec<&'static str> {
+    crate::semantic::codes::ALL.to_vec()
+}
+
+/// The section of [`DIAGNOSTICS_DOC`] describing `code`.
+pub fn explain(code: &str) -> Option<String> {
+    let heading = format!("## {code}\n");
+    let start = DIAGNOSTICS_DOC.find(&heading)?;
+    let body = &DIAGNOSTICS_DOC[start..];
+    // Up to the next section, or the end of the file.
+    let end = body[heading.len()..]
+        .find("\n## ")
+        .map(|offset| heading.len() + offset)
+        .unwrap_or(body.len());
+    Some(body[..end].trim_end().to_string())
 }
 
 /// Hand-rolled argument parser, following the `xtask` precedent — no
@@ -112,6 +216,9 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
         config: None,
         params: Vec::new(),
         fail_on: 1,
+        only: Vec::new(),
+        ignore: Vec::new(),
+        fix: Vec::new(),
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -121,6 +228,15 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
         };
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            // `check explain <code>`. A subcommand rather than a flag because it
+            // does not check anything: it takes no paths and produces no report.
+            "explain" if options.paths.is_empty() && !options.stdin => {
+                let code = value_for(&arg, &mut args)?;
+                if let Some(extra) = args.next() {
+                    return Err(format!("`explain` takes one code, not `{extra}` as well"));
+                }
+                return Ok(Parsed::Explain(code));
+            }
             "--stdin" => options.stdin = true,
             "--stdin-filename" => {
                 options.stdin_filename = Some(PathBuf::from(value_for(&arg, &mut args)?));
@@ -141,6 +257,22 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
                 options.config = Some(PathBuf::from(value_for(&arg, &mut args)?));
             }
             "--param" => options.params.push(value_for(&arg, &mut args)?),
+            "--only" => options.only.push(known_code(&value_for(&arg, &mut args)?)?),
+            "--ignore" => options
+                .ignore
+                .push(known_code(&value_for(&arg, &mut args)?)?),
+            "--fix" => {
+                let code = known_code(&value_for(&arg, &mut args)?)?;
+                if code != crate::semantic::codes::RENAMED_FUNCTION {
+                    return Err(format!(
+                        "`--fix {code}` is not supported. Only `renamed-function` can be \
+                         applied unattended; every other fix is a suggestion whose \
+                         replacement is inferred, and applying one blindly can change what \
+                         a query means"
+                    ));
+                }
+                options.fix.push(code);
+            }
             "--fail-on" => {
                 options.fail_on = match value_for(&arg, &mut args)?.as_str() {
                     "error" => 1,
@@ -233,6 +365,28 @@ pub struct CheckReport {
     /// clean report serialises exactly as it always has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<CheckError>,
+    /// Set only when `--only` or `--ignore` was used.
+    ///
+    /// Coverage has to be honest: without this, filtering every code that would
+    /// have failed produces a report indistinguishable from a clean one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Filters>,
+    /// How many diagnostics `--fix` repaired in place. Absent when none were.
+    ///
+    /// Rewriting a file is the only side effect `check` has; a run that did it
+    /// has to say so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<usize>,
+}
+
+/// Which codes a run reported on, when it did not report on all of them.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Filters {
+    pub only: Vec<String>,
+    pub ignore: Vec<String>,
+    /// How many diagnostics were produced and then not reported.
+    pub suppressed: usize,
 }
 
 impl CheckReport {
@@ -252,6 +406,8 @@ impl CheckReport {
             config_warnings: Vec::new(),
             exit_code: 2,
             error: Some(CheckError { kind, message }),
+            filters: None,
+            fixed: None,
         }
     }
 }
@@ -299,6 +455,23 @@ pub fn render_text(report: &CheckReport) -> String {
         tallies.join(", "),
         plural(report.summary.files_checked, "file")
     ));
+
+    // Both of these exist so a clean-looking run cannot be mistaken for a
+    // complete one, or for one that changed nothing.
+    if let Some(fixed) = report.fixed {
+        out.push_str(&format!(
+            "{} repaired in place\n",
+            plural(fixed, "diagnostic")
+        ));
+    }
+    if let Some(filters) = &report.filters
+        && filters.suppressed > 0
+    {
+        out.push_str(&format!(
+            "{} not reported because of --only/--ignore\n",
+            plural(filters.suppressed, "diagnostic"),
+        ));
+    }
     out
 }
 
@@ -446,8 +619,55 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     };
     let mut files = Vec::with_capacity(analyses.len());
     let mut worst_rank: u8 = u8::MAX;
+    let mut suppressed = 0usize;
+    let mut fixed_count = 0usize;
     for (display, analysis) in analyses {
         let mut diagnostics = model.document_diagnostics(&analysis, &settings);
+
+        // Repair before filtering, so `--ignore` cannot hide something that was
+        // then silently rewritten. Writing the file is the only side effect
+        // `check` has, so it happens only for codes explicitly named.
+        if !options.fix.is_empty()
+            && let Some(path) = fixable_path(&display)
+        {
+            let (fixed, applied) =
+                apply_renames(&analysis.text, &analysis.line_index, &diagnostics);
+            if applied > 0 {
+                match fs::write(&path, &fixed) {
+                    Ok(()) => {
+                        fixed_count += applied;
+                        // Re-analyse so the report describes the file as it now
+                        // is, not as it was. Reporting the errors we just fixed
+                        // would be actively misleading.
+                        if let Some(reanalyzed) = analyze_document_with_limit(
+                            analysis.uri.clone(),
+                            fixed,
+                            SymbolOrigin::Local,
+                            settings.analysis.max_syntax_diagnostics,
+                        ) {
+                            diagnostics = model.document_diagnostics(&reanalyzed, &settings);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("warning: could not write `{}`: {error}", path.display());
+                    }
+                }
+            }
+        }
+
+        // Filter *reporting*, not analysis. An ignored check still runs; it
+        // simply does not reach the output or the exit code, and the report
+        // records that it happened, so a clean run cannot be read as full
+        // coverage.
+        let before = diagnostics.len();
+        diagnostics.retain(|diagnostic| {
+            let code = code_of(diagnostic);
+            let wanted = options.only.is_empty() || options.only.contains(&code);
+            let barred = options.ignore.contains(&code);
+            wanted && !barred
+        });
+        suppressed += before - diagnostics.len();
+
         diagnostics.sort_by(|a, b| {
             let key = |d: &Diagnostic| {
                 (
@@ -496,6 +716,12 @@ pub async fn run(options: CheckOptions) -> ExitCode {
         config_warnings,
         exit_code,
         error: None,
+        fixed: (fixed_count > 0).then_some(fixed_count),
+        filters: (!options.only.is_empty() || !options.ignore.is_empty()).then(|| Filters {
+            only: options.only.clone(),
+            ignore: options.ignore.clone(),
+            suppressed,
+        }),
     };
 
     for warning in &report.config_warnings {
@@ -696,7 +922,7 @@ mod tests {
     fn parsed_options(args: &[&str]) -> CheckOptions {
         match parse(args).expect("parse") {
             Parsed::Run(options) => options,
-            Parsed::Help => panic!("expected a run"),
+            other => panic!("expected a run, got {other:?}"),
         }
     }
 
@@ -810,6 +1036,8 @@ mod tests {
             config_warnings: vec![],
             exit_code: 1,
             error: None,
+            filters: None,
+            fixed: None,
         }
     }
 

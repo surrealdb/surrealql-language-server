@@ -119,6 +119,33 @@ Several diagnostics carry structured hints in `data` — for example
 `unknown-table` includes `{"table": …, "suggestion": …}`. Prefer the hint
 over re-deriving the fix.
 
+Every diagnostic also carries `codeDescription.href`, pointing at the section of
+[`docs/diagnostics.md`](docs/diagnostics.md) that explains it. Offline, the same
+prose is one command away:
+
+```bash
+surrealql-language-server check explain unknown-table
+```
+
+### Narrowing and repairing
+
+```bash
+check q.surql --only argument-type --only argument-count   # report these codes
+check q.surql --ignore dynamic-target                      # report all but these
+check q.surql --fix renamed-function                       # repair in place
+```
+
+- `--only` / `--ignore` filter **reporting**, not analysis, and the JSON report
+  carries a `filters` object saying what was hidden: a filtered clean run is
+  not a clean run, and the report must not let it look like one. An unknown code
+  is a usage error rather than a filter that silently matches nothing.
+- `--fix` takes an explicit code and **only `renamed-function` is accepted**.
+  That is not a temporary limitation: its replacement comes from SurrealDB's own
+  rename table, while every other fix here is inferred: `unknown-table`'s is a
+  string-distance guess, and applying it unattended can repoint a query at a
+  *different real table*. A run that rewrote files reports `fixed` and
+  re-analyses, so it never reports the errors it just repaired.
+
 ## Known false positives
 
 **There are currently none.** Every `parse` error the server reports is a real
