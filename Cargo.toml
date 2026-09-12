@@ -25,7 +25,15 @@ documentation = 'https://docs.rs/surrealql-language-server'
 # below is repository furniture that a consumer never compiles.
 exclude = [
     '.github/**',
-    'docs/**',
+    # `docs/diagnostics.md` is deliberately absent: `check.rs` compiles it in
+    # with `include_str!`, so excluding it makes the published crate fail to
+    # build. The CI step that packages the crate and builds it in isolation is
+    # what caught that, and is why it exists.
+    'docs/ai-plan.md',
+    'docs/grammar-gaps.md',
+    'docs/pain-points.md',
+    'docs/perf-baseline.md',
+    'docs/perf-plan.md',
     'scripts/**',
     'tests/**',
     'xtask/**',
