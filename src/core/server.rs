@@ -1345,18 +1345,41 @@ where
     /// disk: an open buffer may be dirty, and its `DocumentAnalysis.text` is
     /// the exact content the client last sent.
     async fn reanalyze_open_documents(&self, limit: usize) {
-        let open_documents = self.state.read().await.open_documents.clone();
-        let reanalyzed: Vec<(Uri, Arc<DocumentAnalysis>)> = open_documents
-            .iter()
-            .filter_map(|(uri, analysis)| {
-                analyze_document_with_limit(uri.clone(), &analysis.text, SymbolOrigin::Local, limit)
-                    .map(|fresh| (uri.clone(), Arc::new(fresh)))
-            })
-            .collect();
+        // The text is copied out under the guard so the analysis (which is the
+        // expensive part, and there is one per open buffer) runs off the
+        // reactor. At 45 ms for a 3,200-line file, twenty open buffers was a
+        // near-second stall on the thread serving hover and completion.
+        let sources: Vec<(Uri, String)> = {
+            let state = self.state.read().await;
+            state
+                .open_documents
+                .iter()
+                .map(|(uri, analysis)| (uri.clone(), analysis.text.clone()))
+                .collect()
+        };
+
+        let Some(reanalyzed) = off_reactor(move || {
+            sources
+                .into_iter()
+                .filter_map(|(uri, text)| {
+                    analyze_document_with_limit(uri.clone(), text, SymbolOrigin::Local, limit)
+                        .map(|fresh| (uri, Arc::new(fresh)))
+                })
+                .collect::<Vec<(Uri, Arc<DocumentAnalysis>)>>()
+        })
+        .await
+        else {
+            return;
+        };
 
         let mut state = self.state.write().await;
         for (uri, analysis) in reanalyzed {
-            state.open_documents.insert(uri, analysis);
+            // Only if the document is still open: an edit or a close may have
+            // landed while this ran, and neither should be undone by a
+            // re-analysis of the text as it was.
+            if state.open_documents.contains_key(&uri) {
+                state.open_documents.insert(uri, analysis);
+            }
         }
     }
 
@@ -1364,7 +1387,12 @@ where
         let Some(text) = self.workspace_loader.read_document(uri).await else {
             return;
         };
-        let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) else {
+        // Runs on every `didSave` *and* every `didClose`, so it is the most
+        // frequent of the analyses that used to sit on the reactor.
+        let owned = uri.clone();
+        let Some(Some(analysis)) =
+            off_reactor(move || analyze_document(owned, &text, SymbolOrigin::Local)).await
+        else {
             return;
         };
         let mut state = self.state.write().await;
@@ -1382,7 +1410,17 @@ where
             )
         };
 
-        let model = Arc::new(MergedSemanticModel::build(&workspace, &live_metadata));
+        // Rebuilt on every keystroke, over the whole workspace. Cheap today
+        // (1.3 ms at 200 documents), but it scales with workspace size rather
+        // than edit size, and `infer_function_return_types` is 89% of it on a
+        // function-heavy corpus (`docs/pain-points.md` H14). Moving it costs a
+        // thread hand-off and removes a stall that grows with the repository.
+        let Some(model) =
+            off_reactor(move || Arc::new(MergedSemanticModel::build(&workspace, &live_metadata)))
+                .await
+        else {
+            return;
+        };
         let mut state = self.state.write().await;
         state.model = model;
     }
@@ -1508,13 +1546,41 @@ where
     /// Republish diagnostics for every open editor buffer after the
     /// merged model changes without a document edit (e.g. live
     /// metadata arriving from the host).
+    /// Recompute and publish diagnostics for every open buffer.
+    ///
+    /// One hop off the reactor for all of them rather than one per document:
+    /// the per-document cost is small, so at twenty open buffers the thread
+    /// hand-offs would be a meaningful fraction of the work.
     async fn republish_open_diagnostics(&self) {
-        let uris = {
+        let (documents, model, settings) = {
             let state = self.state.read().await;
-            state.open_documents.keys().cloned().collect::<Vec<_>>()
+            (
+                state
+                    .open_documents
+                    .iter()
+                    .map(|(uri, analysis)| (uri.clone(), Arc::clone(analysis)))
+                    .collect::<Vec<_>>(),
+                Arc::clone(&state.model),
+                Arc::clone(&state.settings),
+            )
         };
-        for uri in uris {
-            self.publish_diagnostics_for_uri(&uri).await;
+
+        let Some(published) = off_reactor(move || {
+            documents
+                .into_iter()
+                .map(|(uri, analysis)| {
+                    let diagnostics = model.document_diagnostics(&analysis, &settings);
+                    (uri, diagnostics)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        else {
+            return;
+        };
+
+        for (uri, diagnostics) in published {
+            self.notifier.publish_diagnostics(uri, diagnostics).await;
         }
     }
 
@@ -1533,12 +1599,24 @@ where
             )
         };
 
-        if let Some(analysis) = analysis {
-            let diagnostics = model.document_diagnostics(&analysis, &settings);
-            self.notifier
-                .publish_diagnostics(uri.clone(), diagnostics)
-                .await;
-        }
+        let Some(analysis) = analysis else {
+            return;
+        };
+
+        // `document_diagnostics` runs `type_diagnostics`, which is six full-tree
+        // walks, plus the query-fact loop. Under a millisecond on a typical
+        // document: this is moved for uniformity with the paths above rather
+        // than for a measured win, and the thread hand-off is a real fraction of
+        // it, but it is also where the stack overflow landed before the depth
+        // guard, which is reason enough not to run it on a request thread.
+        let Some(diagnostics) =
+            off_reactor(move || model.document_diagnostics(&analysis, &settings)).await
+        else {
+            return;
+        };
+        self.notifier
+            .publish_diagnostics(uri.clone(), diagnostics)
+            .await;
     }
 
     async fn snapshot_for_uri(
@@ -1802,31 +1880,44 @@ enum Edit {
     Changed(i32),
 }
 
-/// Run [`analyze_document_with_limit`] without occupying a thread that serves
-/// requests.
+/// Run CPU-bound work without occupying a thread that serves requests.
 ///
-/// On native this hands the work to tokio's blocking pool, so a hover or
-/// completion arriving mid-keystroke is not queued behind a reparse. The
-/// workspace walk already did this (see
+/// On native this hands the closure to tokio's blocking pool, so a hover or
+/// completion arriving mid-keystroke is not queued behind it. The workspace walk
+/// already did this (see
 /// [`crate::native::workspace_fs::FilesystemWorkspaceLoader::load`]); the
 /// per-edit path did not, and it is the far more frequent one.
+///
+/// **The guard cannot cross this call.** `RwLockReadGuard` is not `Send`, so
+/// every caller has to snapshot what it needs under the guard, drop it, compute
+/// here, and re-acquire to store. That shape is not incidental: it is what
+/// keeps a request handler from waiting on a model rebuild.
 ///
 /// On `wasm32` it runs inline. `tokio_with_wasm` would move it to a web worker,
 /// which means shipping the module to that worker and a serialisation hop for
 /// every edit — a change to how the browser build works that nothing here can
 /// test, since CI does not exercise the wasm JS surface. Inline keeps the
-/// browser behaviour exactly as it was.
+/// browser behaviour exactly as it was, on a runtime that has one thread anyway.
 #[cfg(not(target_arch = "wasm32"))]
-async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
-    runtime::task::spawn_blocking(move || {
-        analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
-    })
-    .await
-    .ok()
-    .flatten()
+async fn off_reactor<T, F>(work: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    runtime::task::spawn_blocking(work).await.ok()
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn off_reactor<T, F>(work: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Some(work())
+}
+
 async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
-    analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
+    off_reactor(move || analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit))
+        .await
+        .flatten()
 }
