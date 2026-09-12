@@ -15,7 +15,7 @@ use crate::grammar::{
     builtin_signature,
 };
 use crate::semantic::codes;
-use crate::semantic::text::{LineIndex, compact_preview};
+use crate::semantic::text::{LineIndex, compact_preview, ranges_overlap};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
@@ -1778,13 +1778,30 @@ impl MergedSemanticModel {
         }
     }
 
+    /// Code actions offered for `range`, optionally narrowed to `only`.
+    ///
+    /// Both arguments used to be discarded. The consequence was visible: putting
+    /// the cursor anywhere in a file with three permission-less tables offered
+    /// "Add PERMISSIONS clause" three times, for tables nowhere near the cursor,
+    /// and a client asking for `source.fixAll` got the whole list back.
     pub fn code_actions(
         &self,
         uri: &Uri,
         analysis: &DocumentAnalysis,
         diagnostics: &[Diagnostic],
+        range: Range,
+        only: Option<&[CodeActionKind]>,
     ) -> Vec<CodeActionOrCommand> {
         let mut actions = Vec::new();
+
+        // The client passes the diagnostics under the cursor in `context`, but
+        // is not required to filter them to `range`: VS Code sends the ones it
+        // considers relevant, other clients send more. Filtering here makes the
+        // answer the same everywhere.
+        let diagnostics: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| ranges_overlap(diagnostic.range, range))
+            .collect();
 
         for diagnostic in diagnostics {
             if let Some((table, suggestion)) = unknown_table_payload(diagnostic) {
@@ -1879,11 +1896,11 @@ impl MergedSemanticModel {
             }
         }
 
-        for table in analysis
-            .tables
-            .iter()
-            .filter(|table| table.permissions.is_empty() && table.explicit)
-        {
+        for table in analysis.tables.iter().filter(|table| {
+            table.permissions.is_empty()
+                && table.explicit
+                && ranges_overlap(table.location.range, range)
+        }) {
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title: format!("Add PERMISSIONS clause to table `{}`", table.name),
                 kind: Some(CodeActionKind::REFACTOR_REWRITE),
@@ -1907,6 +1924,26 @@ impl MergedSemanticModel {
                 }),
                 ..CodeAction::default()
             }));
+        }
+
+        if let Some(only) = only {
+            // A requested kind matches an action whose kind is that kind or a
+            // more specific one: `quickfix` requests `quickfix.foo` too. That is
+            // the prefix rule the specification states.
+            actions.retain(|action| {
+                let CodeActionOrCommand::CodeAction(action) = action else {
+                    return true;
+                };
+                let Some(kind) = action.kind.as_ref() else {
+                    return true;
+                };
+                only.iter().any(|wanted| {
+                    let (kind, wanted) = (kind.as_str(), wanted.as_str());
+                    kind == wanted
+                        || (kind.starts_with(wanted)
+                            && kind.as_bytes().get(wanted.len()) == Some(&b'.'))
+                })
+            });
         }
 
         actions
@@ -3187,6 +3224,14 @@ mod tests {
 
     use crate::config::{AuthContext, ServerSettings};
     use crate::semantic::text::LineIndex;
+
+    /// A range covering any document, for cases that are not about the cursor.
+    fn whole_document_range() -> ls_types::Range {
+        ls_types::Range {
+            start: ls_types::Position::new(0, 0),
+            end: ls_types::Position::new(u32::MAX, u32::MAX),
+        }
+    }
     use crate::semantic::types::{
         DocumentAnalysis, EventDef, FunctionDef, IndexDef, PermissionMode, PermissionRule,
         QueryAction, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
@@ -4264,7 +4309,15 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         let quick_fix = actions
             .iter()
             .find_map(|action| match action {
@@ -4290,7 +4343,15 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(
             actions.iter().any(|action| matches!(
                 action,
@@ -4314,7 +4375,15 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
             ls_types::CodeActionOrCommand::CodeAction(action)
@@ -4335,7 +4404,15 @@ mod tests {
 
         // `zzz` has no near-miss, so only the parsed suggestion can
         // produce this action.
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
             ls_types::CodeActionOrCommand::CodeAction(action)
@@ -4356,7 +4433,15 @@ mod tests {
 
         // `zzz` is nowhere near `person` by string distance, so only
         // the precomputed suggestion can produce this action.
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
             ls_types::CodeActionOrCommand::CodeAction(action)

@@ -129,7 +129,20 @@ where
                 retrigger_characters: Some(vec![",".into()]),
                 work_done_progress_options: Default::default(),
             }),
-            code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+            // Declaring the kinds is what lets a client ask for a subset:
+            // VS Code's Quick Fix menu requests `quickfix`, and a
+            // "fix all on save" request asks for `source.fixAll`. Advertising a
+            // bare `true` meant every request got every action back, including
+            // refactors in a quick-fix menu. The handler honours
+            // `context.only`; this tells the client it is worth sending.
+            code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                code_action_kinds: Some(vec![
+                    CodeActionKind::QUICKFIX,
+                    CodeActionKind::REFACTOR_REWRITE,
+                ]),
+                work_done_progress_options: Default::default(),
+                resolve_provider: None,
+            })),
             document_highlight_provider: Some(OneOf::Left(true)),
             inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
                 InlayHintOptions {
@@ -1011,8 +1024,22 @@ where
 
     pub async fn code_action(&self, params: CodeActionParams) -> Option<CodeActionResponse> {
         let uri = params.text_document.uri;
-        let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        Some(model.code_actions(&uri, &analysis, &params.context.diagnostics))
+        let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
+
+        // `analysis.enableCodeActions` parsed, validated and did nothing for
+        // three releases. A settings surface that lies is worse than a smaller
+        // one, so it is read here.
+        if !settings.analysis.enable_code_actions {
+            return Some(Vec::new());
+        }
+
+        Some(model.code_actions(
+            &uri,
+            &analysis,
+            &params.context.diagnostics,
+            params.range,
+            params.context.only.as_deref(),
+        ))
     }
 
     pub async fn document_highlight(

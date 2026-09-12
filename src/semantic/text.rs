@@ -943,3 +943,52 @@ mod tests {
         assert!(preview.is_char_boundary(preview.len()));
     }
 }
+
+/// True when two LSP ranges share at least one position, or touch.
+///
+/// Touching counts: a zero-width request range at the exact start of a
+/// diagnostic is a cursor sitting on it, and an editor asking "what can I do
+/// here" means that diagnostic. Comparing `(line, character)` tuples is the
+/// spec's own ordering: ranges are ordered by line first, then character.
+pub fn ranges_overlap(a: Range, b: Range) -> bool {
+    let start = |range: Range| (range.start.line, range.start.character);
+    let end = |range: Range| (range.end.line, range.end.character);
+    start(a) <= end(b) && start(b) <= end(a)
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use ls_types::Position;
+
+    fn range(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Range {
+        Range {
+            start: Position::new(start_line, start_char),
+            end: Position::new(end_line, end_char),
+        }
+    }
+
+    #[test]
+    fn disjoint_ranges_do_not_overlap() {
+        assert!(!ranges_overlap(range(0, 0, 0, 5), range(1, 0, 1, 5)));
+        assert!(!ranges_overlap(range(1, 0, 1, 5), range(0, 0, 0, 5)));
+    }
+
+    #[test]
+    fn a_cursor_on_the_edge_counts() {
+        // A zero-width range at the start of a diagnostic: the cursor is on it.
+        assert!(ranges_overlap(range(0, 5, 0, 5), range(0, 5, 0, 9)));
+        assert!(ranges_overlap(range(0, 9, 0, 9), range(0, 5, 0, 9)));
+    }
+
+    #[test]
+    fn containment_counts_either_way() {
+        assert!(ranges_overlap(range(0, 0, 9, 0), range(3, 2, 3, 4)));
+        assert!(ranges_overlap(range(3, 2, 3, 4), range(0, 0, 9, 0)));
+    }
+
+    #[test]
+    fn a_multi_line_range_meets_a_line_inside_it() {
+        assert!(ranges_overlap(range(1, 8, 4, 2), range(2, 0, 2, 30)));
+    }
+}

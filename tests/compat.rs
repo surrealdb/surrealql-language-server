@@ -37,7 +37,14 @@ fn server_capabilities_golden() {
         "documentHighlightProvider": true,
         "documentSymbolProvider": true,
         "workspaceSymbolProvider": true,
-        "codeActionProvider": true,
+        // Changed from `true` in 0.7: declaring the kinds is what lets a
+        // client request a subset, which is how VS Code's Quick Fix menu and
+        // "fix all on save" ask for `quickfix` and `source.fixAll`. A bare
+        // `true` meant every request got every action, refactors included. The
+        // handler honours `context.only` as of the same change.
+        "codeActionProvider": {
+            "codeActionKinds": ["quickfix", "refactor.rewrite"],
+        },
         "renameProvider": { "prepareProvider": true },
         "workspace": {
             "workspaceFolders": {

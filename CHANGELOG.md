@@ -31,6 +31,18 @@ stale, and the buffer showed whatever it looked like when it was opened. The
 mark is now removed on close and replaced on open, which the LSP says is
 authoritative.
 
+**Code actions respect where you asked and what you asked for.** The handler
+discarded both `params.range` and `context.only`, so a cursor anywhere in a file
+with three permission-less tables offered "Add PERMISSIONS clause" three times
+(for tables nowhere near the cursor), and a client asking for quick fixes got
+refactors back. The advertised capability now also declares its kinds
+(`quickfix`, `refactor.rewrite`), which is what lets a client request a subset at
+all; that is a **shape change** from `codeActionProvider: true` to an object, and
+the compat golden moved deliberately with it.
+
+**`analysis.enableCodeActions` does something.** It parsed, validated,
+serialized and was read by nothing.
+
 **`check --format json` now prints exactly one JSON object for every exit
 code.** Four failure paths (an unreadable or malformed `--config`, an
 unreadable target, a document that could not be analyzed) wrote a sentence to

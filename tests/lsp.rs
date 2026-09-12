@@ -1647,7 +1647,17 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
         document_symbols: Vec::new(),
     };
     let model = MergedSemanticModel::default();
-    let actions = model.code_actions(&u, &analysis, &[]);
+    let actions = model.code_actions(
+        &u,
+        &analysis,
+        &[],
+        // Whole document: this case is about the action itself, not the cursor.
+        Range {
+            start: Position::new(0, 0),
+            end: Position::new(u32::MAX, u32::MAX),
+        },
+        None,
+    );
     assert!(
         actions.iter().any(|a| {
             if let tower_lsp_server::ls_types::CodeActionOrCommand::CodeAction(ca) = a {

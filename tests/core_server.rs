@@ -2622,3 +2622,149 @@ async fn hovering_the_first_character_of_a_word_resolves_it() {
         "the first glyph of a word must resolve, got {hover}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Code actions honour the requested range and kinds
+// ──────────────────────────────────────────────────────────────────────
+
+/// Request code actions over `range`, optionally narrowed to `only`.
+async fn actions_at(
+    core: &common::TestCore,
+    path: &str,
+    range: tower_lsp_server::ls_types::Range,
+    only: Option<Vec<tower_lsp_server::ls_types::CodeActionKind>>,
+) -> Vec<String> {
+    core.code_action(tower_lsp_server::ls_types::CodeActionParams {
+        text_document: TextDocumentIdentifier { uri: uri(path) },
+        range,
+        context: tower_lsp_server::ls_types::CodeActionContext {
+            diagnostics: Vec::new(),
+            only,
+            ..Default::default()
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    })
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|action| match action {
+        tower_lsp_server::ls_types::CodeActionOrCommand::CodeAction(action) => Some(action.title),
+        _ => None,
+    })
+    .collect()
+}
+
+fn line_range(line: u32) -> tower_lsp_server::ls_types::Range {
+    tower_lsp_server::ls_types::Range {
+        start: tower_lsp_server::ls_types::Position::new(line, 0),
+        end: tower_lsp_server::ls_types::Position::new(line, 0),
+    }
+}
+
+/// `params.range` was ignored, so a cursor anywhere in a file offered an
+/// "Add PERMISSIONS clause" action for *every* permission-less table in it:
+/// three lightbulb entries for tables nowhere near the cursor.
+#[tokio::test]
+async fn code_actions_are_limited_to_the_requested_range() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "perms.surql",
+        "DEFINE TABLE alpha SCHEMAFULL;\nDEFINE TABLE beta SCHEMAFULL;\nDEFINE TABLE gamma SCHEMAFULL;\n",
+    )
+    .await;
+
+    let on_beta = actions_at(&core, "perms.surql", line_range(1), None).await;
+    assert_eq!(
+        on_beta,
+        vec!["Add PERMISSIONS clause to table `beta`".to_string()],
+        "the cursor is on line 2; the other two tables are not offered"
+    );
+
+    let whole_file = actions_at(
+        &core,
+        "perms.surql",
+        tower_lsp_server::ls_types::Range {
+            start: tower_lsp_server::ls_types::Position::new(0, 0),
+            end: tower_lsp_server::ls_types::Position::new(2, 30),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(
+        whole_file.len(),
+        3,
+        "selecting the whole file still offers all three: {whole_file:?}"
+    );
+}
+
+/// `context.only` was ignored too, so a client asking for quick fixes got
+/// refactors back, which is how a refactor ends up in VS Code's Quick Fix menu.
+#[tokio::test]
+async fn code_actions_honour_the_requested_kinds() {
+    use tower_lsp_server::ls_types::CodeActionKind;
+
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "only.surql", "DEFINE TABLE alpha SCHEMAFULL;\n").await;
+
+    let refactors = actions_at(
+        &core,
+        "only.surql",
+        line_range(0),
+        Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+    )
+    .await;
+    assert_eq!(refactors.len(), 1, "the PERMISSIONS action is a refactor");
+
+    let quick_fixes = actions_at(
+        &core,
+        "only.surql",
+        line_range(0),
+        Some(vec![CodeActionKind::QUICKFIX]),
+    )
+    .await;
+    assert!(
+        quick_fixes.is_empty(),
+        "a quick-fix request must not return a refactor: {quick_fixes:?}"
+    );
+
+    // `refactor` matches `refactor.rewrite`: a requested kind covers the more
+    // specific kinds beneath it.
+    let umbrella = actions_at(
+        &core,
+        "only.surql",
+        line_range(0),
+        Some(vec![CodeActionKind::REFACTOR]),
+    )
+    .await;
+    assert_eq!(
+        umbrella.len(),
+        1,
+        "`refactor` must match `refactor.rewrite`"
+    );
+}
+
+/// `analysis.enableCodeActions` parsed, validated, serialized and did nothing.
+#[tokio::test]
+async fn disabling_code_actions_silences_them() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "off.surql", "DEFINE TABLE alpha SCHEMAFULL;\n").await;
+    assert_eq!(
+        actions_at(&core, "off.surql", line_range(0), None)
+            .await
+            .len(),
+        1
+    );
+
+    let mut settings = ServerSettings::default();
+    settings.analysis.enable_code_actions = false;
+    core.apply_settings(settings).await;
+
+    assert!(
+        actions_at(&core, "off.surql", line_range(0), None)
+            .await
+            .is_empty(),
+        "the setting is advertised; it must do something"
+    );
+}
