@@ -154,3 +154,59 @@ without a `COMMENT` clause, the common case in real schema files. The new
 
 D1 and D2 are done. D3, D4 and D5 are not — see the entries in
 `docs/pain-points.md`. Neither failing target needed them.
+
+
+---
+
+# Incremental sync and parse (0.7)
+
+Measured on the same machine and harness, after the Phase 2 work.
+
+## The release profile was the largest single win
+
+`[profile.release]` carried `opt-level = 'z'`, which the benchmark inherited,
+so every number this document recorded described a binary optimised for size,
+which is not what the native binary wants. Same harness, same machine, the only
+change being the optimisation level:
+
+| Operation | `opt-level = 'z'` | `opt-level = 3` | Gain |
+|-----------|-------------------|-----------------|------|
+| `analyze_document`, 3200 lines | 46.39 ms | **28.68 ms** | 1.62x |
+| `analyze_document/schema` | 26.21 ms | **15.73 ms** | 1.67x |
+| `semantic_tokens_full` | 10.26 ms | **6.63 ms** | 1.55x |
+| `semantic_diagnostics`, 200 docs | 0.228 ms | **0.144 ms** | 1.58x |
+
+Larger than anything left in `docs/perf-plan.md`, for a one-line change. The
+default now optimises for speed; `scripts/build-wasm.sh` sets
+`CARGO_PROFILE_RELEASE_OPT_LEVEL=z` for the browser module, where a download is
+a real cost. The native binary grows to about 9.3 MB.
+
+## Incremental parse
+
+A reparse against the previous tree, against a fresh parse of the same text:
+
+| Document | Fresh parse | Incremental | Saved |
+|----------|-------------|-------------|-------|
+| 200 lines (9 KB) | 1.054 ms | **0.263 ms** | 0.79 ms (75%) |
+| 800 lines (38 KB) | 4.024 ms | **0.408 ms** | 3.62 ms (90%) |
+| 3200 lines (156 KB) | 16.449 ms | **0.765 ms** | 15.68 ms (95%) |
+
+The parse is the part of `analyze_document` that incremental sync can remove;
+the extraction and syntax walks are full-document and gain nothing.
+
+NOTE: The plan gated this on a differential test, and was right to. Tree-sitter's
+incremental reparse is not *guaranteed* to reproduce a fresh parse when the
+previous tree held ERROR nodes, and ERROR/MISSING nodes are the `parse`
+diagnostics, this server's primary output. Measured over SurrealDB's 1,894
+parseable corpus files with ten random single-character edits each, including
+inserted quotes and parens: **zero mismatches**. Pinned as
+`incremental_reparse_matches_a_fresh_parse` in `tests/conformance.rs`; re-run it
+after a grammar bump.
+
+## What incremental sync actually saves
+
+Not measured here, because no harness in this repository can: a 166 KB document
+used to cross the wire and be JSON-unescaped into a fresh `String` on the reactor
+thread for every keystroke. At ten characters a second that is 1.6 MB/s of
+decoding before the debounce sees the message, and in the browser a full
+JS-to-wasm string copy each time. It is paid before any code here runs.

@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tree_sitter::Tree;
+
 use ls_types::*;
 
 use crate::config::{AuthContext, ServerSettings, merge_absent};
@@ -32,7 +34,7 @@ use crate::core::statement_shape::SlotYield;
 use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
 use crate::semantic::analyzer::{
-    analyze_document, analyze_document_bounded, analyze_document_with_limit,
+    analyze_document, analyze_document_incremental, analyze_document_with_limit,
 };
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
@@ -1432,7 +1434,9 @@ where
             }
         }
 
-        let Some(text) = self.buffer_text(&uri) else {
+        // Text and pending tree are taken together, under one lock, so the tree
+        // always describes the text it is paired with.
+        let Some((text, pending_tree)) = self.buffer_for_analysis(&uri) else {
             // Closed while the debounce ran.
             return;
         };
@@ -1440,8 +1444,14 @@ where
         // Parsing and extraction are CPU-bound and the most frequent work the
         // server does, so they must not run on a thread that is also serving
         // requests.
-        let Some(analysis) =
-            analyze_off_reactor(uri.clone(), text.to_string(), limit, max_bytes).await
+        let Some(analysis) = analyze_off_reactor(
+            uri.clone(),
+            text.to_string(),
+            limit,
+            max_bytes,
+            pending_tree,
+        )
+        .await
         else {
             // The previous analysis stays in `open_documents`, so the editor
             // keeps showing diagnostics for text the user has already changed.
@@ -1467,12 +1477,56 @@ where
             return;
         }
 
+        // Record the tree for the next parse to build on, in the same critical
+        // section as the desync check so the two cannot disagree. A superseded
+        // analysis leaves it alone: the buffer's tree has already absorbed the
+        // newer edits and is still the right thing to reparse from.
+        {
+            let mut buffers = self
+                .buffers
+                .lock()
+                .expect("panic = 'abort' makes poisoning unreachable");
+            if let Some(buffer) = buffers.get_mut(&uri)
+                && !buffer.desynced
+                // A refused document (past the size or nesting cap) carries an
+                // *empty* tree, since parsing it is what was declined. Keeping
+                // that as the base for the next parse would apply the
+                // intervening edits, which are byte offsets into a large
+                // document, to a tree describing nothing.
+                && analysis.parsed_whole_document()
+                && buffer.text.len() == analysis.text.len()
+            {
+                buffer.set_pending_tree(analysis.tree.clone());
+            } else if let Some(buffer) = buffers.get_mut(&uri) {
+                buffer.pending_tree = None;
+            }
+        }
+
         {
             let mut state = self.state.write().await;
             state.open_documents.insert(uri.clone(), Arc::new(analysis));
         }
         self.recompute_model().await;
         self.publish_diagnostics_for_uri(&uri).await;
+    }
+
+    /// Whether a reusable tree is held for `uri`. For tests: a stale pending
+    /// tree is worse than none, so the paths that clear it need pinning.
+    pub fn has_pending_tree(&self, uri: &Uri) -> bool {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .is_some_and(|buffer| buffer.pending_tree.is_some())
+    }
+
+    /// The text and pending tree for `uri`, taken together so they agree.
+    fn buffer_for_analysis(&self, uri: &Uri) -> Option<(Arc<String>, Option<Tree>)> {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .map(|buffer| (Arc::clone(&buffer.text), buffer.pending_tree.clone()))
     }
 
     /// Apply and analyse in one call, for callers with no reason to separate
@@ -1487,6 +1541,16 @@ where
         if self.apply_document_change(&uri, &changes, edit).is_some() {
             self.analyze_buffer(uri, edit).await;
         }
+    }
+
+    /// The s-expression of the analysed tree for `uri`. For tests comparing a
+    /// document reached by editing against the same text opened whole.
+    pub async fn tree_sexp(&self, uri: &Uri) -> Option<String> {
+        let state = self.state.read().await;
+        state
+            .open_documents
+            .get(uri)
+            .map(|analysis| analysis.tree.root_node().to_sexp())
     }
 
     /// The authoritative text for `uri`, as a `String`.
@@ -2108,8 +2172,18 @@ async fn analyze_off_reactor(
     text: String,
     limit: usize,
     max_bytes: usize,
+    old_tree: Option<Tree>,
 ) -> Option<DocumentAnalysis> {
-    off_reactor(move || analyze_document_bounded(uri, text, SymbolOrigin::Local, limit, max_bytes))
-        .await
-        .flatten()
+    off_reactor(move || {
+        analyze_document_incremental(
+            uri,
+            text,
+            SymbolOrigin::Local,
+            limit,
+            max_bytes,
+            old_tree.as_ref(),
+        )
+    })
+    .await
+    .flatten()
 }

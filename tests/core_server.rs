@@ -3477,3 +3477,130 @@ async fn a_client_sending_full_documents_still_works() {
         Some("TABLE b"),
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Incremental parsing
+// ──────────────────────────────────────────────────────────────────────
+
+/// The pending tree must exist after an analysis and vanish when it can no
+/// longer describe the buffer.
+///
+/// Not an implementation detail: a *stale* pending tree is worse than none,
+/// because the next parse would build on a description of text that no longer
+/// exists. Every path that cannot maintain it has to clear it, and this is what
+/// says so.
+#[tokio::test]
+async fn the_pending_tree_is_kept_and_dropped_at_the_right_moments() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    open(&core, "tree.surql", "SELECT a FROM t;\n").await;
+    assert!(
+        core.has_pending_tree(&uri("tree.surql")),
+        "an analysis must leave a tree for the next parse to build on"
+    );
+
+    // A ranged edit keeps it: that is the whole point.
+    core.did_change(ranged("tree.surql", 2, &[((0, 7), (0, 8), "b")]))
+        .await;
+    assert!(
+        core.has_pending_tree(&uri("tree.surql")),
+        "a ranged edit must leave a reusable tree"
+    );
+
+    // A whole-document replacement drops the old tree (there is no edit that
+    // describes a wholesale replacement), and the analysis that follows leaves a
+    // tree of the *new* text, which is what the next parse should build on.
+    core.did_change(change("tree.surql", 3, "SELECT c FROM u;\n"))
+        .await;
+    assert!(core.has_pending_tree(&uri("tree.surql")));
+    assert_eq!(
+        core.buffer_snapshot(&uri("tree.surql")).as_deref(),
+        Some("SELECT c FROM u;\n"),
+    );
+}
+
+/// A document the analyzer *declined* must leave no tree behind.
+///
+/// The refusal paths carry an empty tree, because parsing is what they declined.
+/// Keeping that as the base for the next parse would apply the intervening
+/// edits (byte offsets into a large document) to a tree describing nothing.
+#[tokio::test]
+async fn a_refused_document_leaves_no_tree_to_build_on() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 512;
+    core.apply_settings(settings).await;
+
+    open(&core, "refused.surql", &"SELECT * FROM t;\n".repeat(100)).await;
+    assert!(
+        !core.has_pending_tree(&uri("refused.surql")),
+        "an empty tree must not become the base for the next incremental parse"
+    );
+}
+
+/// A document reached through ranged edits must analyse to exactly what the same
+/// final text analyses to when opened directly.
+///
+/// The corpus-wide version of this lives in `tests/conformance.rs`
+/// (`incremental_reparse_matches_a_fresh_parse`); this one drives the real
+/// server path, so it also covers the bookkeeping around the parse rather than
+/// the parse alone.
+#[tokio::test]
+async fn edits_reach_the_same_analysis_as_opening_the_final_text() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    // Type it the way a person would: broken in the middle, then fixed.
+    open(&core, "typed.surql", "DEFINE TABLE p SCHEMAFULL;\n").await;
+    core.did_change(ranged("typed.surql", 2, &[((0, 13), (0, 14), "person")]))
+        .await;
+    core.did_change(ranged(
+        "typed.surql",
+        3,
+        &[((1, 0), (1, 0), "SELECT * FROM ")],
+    ))
+    .await;
+    core.did_change(ranged("typed.surql", 4, &[((1, 14), (1, 14), "person;")]))
+        .await;
+
+    let typed_tree = core.tree_sexp(&uri("typed.surql")).await.expect("analysed");
+    let typed_symbols = document_symbol_names(&core, "typed.surql").await;
+
+    // The same text, opened in one go.
+    open(
+        &core,
+        "opened.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;",
+    )
+    .await;
+    let opened_tree = core
+        .tree_sexp(&uri("opened.surql"))
+        .await
+        .expect("analysed");
+
+    assert_eq!(
+        typed_tree, opened_tree,
+        "a document reached by editing must parse to the same tree as one opened whole"
+    );
+    assert_eq!(
+        typed_symbols,
+        document_symbol_names(&core, "opened.surql").await,
+        "and to the same extracted symbols"
+    );
+}
+
+async fn document_symbol_names(core: &common::TestCore, path: &str) -> Vec<String> {
+    let Some(DocumentSymbolResponse::Nested(symbols)) = core
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    symbols.into_iter().map(|symbol| symbol.name).collect()
+}

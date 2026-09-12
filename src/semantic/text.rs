@@ -135,6 +135,20 @@ impl LineIndex {
         line_end
     }
 
+    /// The tree-sitter position of a byte offset.
+    ///
+    /// Note the unit: `tree_sitter::Point.column` counts **bytes**, where
+    /// `lsp::Position.character` counts UTF-16 code units. Mixing them is the
+    /// classic way to corrupt an incremental reparse, so the conversion lives
+    /// here rather than being written out at each call site.
+    pub fn point(&self, source: &str, offset: usize) -> tree_sitter::Point {
+        let (line, line_start) = self.line_at(offset.min(source.len()));
+        tree_sitter::Point {
+            row: line,
+            column: offset.min(source.len()).saturating_sub(line_start),
+        }
+    }
+
     /// The text of one line, without its terminator.
     ///
     /// `None` past the end of the document. Exists so a caller that needs a few

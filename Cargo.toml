@@ -101,4 +101,18 @@ strip = true
 # visibility comes from the stderr panic hook in main.rs (native) and
 # console_error_panic_hook (wasm); editors auto-restart crashed servers.
 panic = 'abort'
-opt-level = 'z'
+# Speed, not size.
+#
+# This used to be `'z'`, which costs roughly 1.6x across the board: measured on
+# the same benchmark harness and machine: `analyze_document` on a 3,200-line file
+# 46.4 ms at 'z' against 28.7 ms at 3, `semantic_tokens_full` 10.3 against 6.6,
+# `semantic_diagnostics` 0.228 against 0.144. A larger win than anything left in
+# `docs/perf-plan.md`, for a one-line change.
+#
+# The default belongs to the common case, which is the native binary: `cargo
+# build --release`, `cargo install`, and every platform artifact CI uploads. The
+# one consumer that *does* want size is the browser module, and
+# `scripts/build-wasm.sh` opts into it with
+# `CARGO_PROFILE_RELEASE_OPT_LEVEL=z`: a wasm artifact is downloaded, so there
+# every kilobyte is a real cost.
+opt-level = 3

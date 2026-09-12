@@ -289,6 +289,20 @@ pub struct DocumentAnalysis {
     pub document_symbols: Vec<DocumentSymbol>,
 }
 
+impl DocumentAnalysis {
+    /// True when [`Self::tree`] is a parse of the whole of [`Self::text`].
+    ///
+    /// False for the refusal paths: a document past the size or nesting cap
+    /// gets an *empty* tree, because parsing it is exactly what was declined.
+    /// Anything that reuses the tree has to ask: feeding an empty tree to the
+    /// next incremental parse as though it described a 2 MB buffer produces
+    /// nonsense, and the edits applied to it in the meantime would be byte
+    /// offsets into text it has never seen.
+    pub fn parsed_whole_document(&self) -> bool {
+        self.tree.root_node().end_byte() == self.text.len()
+    }
+}
+
 /// What a workspace scan had to skip. Non-zero counters are reported
 /// to the client so silent truncation doesn't look like coverage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

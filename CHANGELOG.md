@@ -45,6 +45,32 @@ The README documented 5 of about 20 settings. It now covers the whole
 heading of their own) the two keys that are accepted and not yet implemented,
 rather than leaving them to look as though they work.
 
+### Performance
+
+**The release profile now optimises for speed.** It carried `opt-level = 'z'`,
+which costs roughly 1.6x across the board: `analyze_document` on a 3,200-line
+file measures 46.4 ms at `'z'` against 28.7 ms at `3`. That is a larger win than
+anything left in `docs/perf-plan.md`. The default belongs to the common case,
+which is the native binary; `scripts/build-wasm.sh` opts the browser module back
+into size, where a download is a real cost. The native binary grows to about
+9.3 MB.
+
+The benchmark inherited `'z'` too, so every number in `docs/perf-baseline.md`
+described a binary no user of the `surrealql-language-server` executable ever
+ran.
+
+**Incremental parsing.** An edited document is reparsed against its previous
+tree rather than from scratch: 0.77 ms against 16.4 ms on a 3,200-line file, 95%
+of the parse. Gated on a differential test rather than assumed, because
+tree-sitter's incremental reparse is not guaranteed to reproduce a fresh parse
+when the previous tree held ERROR nodes, and ERROR nodes are the `parse`
+diagnostics. Zero mismatches over SurrealDB's 1,894 corpus files with ten random
+edits each.
+
+**The analysis pipeline no longer runs on the reactor thread.** Five paths still
+did, including one at ~45 ms per open buffer on every settings change and one on
+every save and close.
+
 ### Changed
 
 **Incremental document sync** (`textDocumentSync: 2`). The server used to

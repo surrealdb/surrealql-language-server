@@ -51,7 +51,12 @@ if [ -z "${CC_wasm32_unknown_unknown:-}" ]; then
     echo "         manually if the build fails." >&2
 fi
 
-echo "Building the WASM module"
+# Size over speed, and only here. `[profile.release]` optimises for speed
+# because that is what the native binary wants; a browser downloads this one, so
+# every kilobyte is a real cost paid by every page load.
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
+
+echo "Building the WASM module (opt-level=z)"
 cargo build --release --target wasm32-unknown-unknown --no-default-features
 
 echo "Generating wasm-bindgen bindings"

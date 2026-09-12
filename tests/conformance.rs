@@ -380,6 +380,156 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
 ];
 
+/// The gate for incremental parsing: a tree reparsed against its predecessor
+/// must equal a tree parsed from scratch.
+///
+/// This is the risk that made incremental parsing worth gating rather than
+/// assuming. Tree-sitter's incremental reparse is not *guaranteed* to reproduce
+/// a fresh parse when the previous tree contained ERROR nodes, and ERROR and
+/// MISSING nodes are the `parse` diagnostics, which are this server's primary
+/// output. A divergence would show up as a syntax error that appears or vanishes
+/// depending on how the user got to the text, which is the worst kind of bug to
+/// chase.
+///
+/// Measured over SurrealDB's corpus with ten random single-character edits per
+/// file (the shape of typing), including deletions, inserted quotes and
+/// inserted parens, which are exactly the characters that make a document
+/// transiently unparseable. Zero mismatches when this was written.
+///
+/// ```text
+/// cargo test --test conformance -- --ignored incremental_reparse --nocapture
+/// ```
+#[test]
+#[ignore = "sweeps the whole SurrealDB corpus; run it after a grammar bump"]
+fn incremental_reparse_matches_a_fresh_parse() {
+    /// Deterministic, so a failure is reproducible. No dependency: the shared
+    /// `[dependencies]` list is also the wasm graph.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next() as usize) % n
+            }
+        }
+    }
+
+    fn point_of(text: &str, offset: usize) -> tree_sitter::Point {
+        let before = &text[..offset];
+        tree_sitter::Point {
+            row: before.matches('\n').count(),
+            column: offset - before.rfind('\n').map(|index| index + 1).unwrap_or(0),
+        }
+    }
+
+    let Some(corpus) = corpus_dir() else {
+        eprintln!("skipping: no SurrealDB checkout. Set SURREALDB_DIR to run this.");
+        return;
+    };
+    let mut files = Vec::new();
+    surql_files(&corpus, &mut files);
+    files.sort();
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&surrealql_language_server::grammar::language())
+        .expect("grammar");
+
+    let mut checked = 0usize;
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for (index, file) in files.iter().enumerate() {
+        let Ok(original) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        // Big files cost time without adding coverage; the shapes repeat.
+        if original.is_empty() || original.len() > 20_000 {
+            continue;
+        }
+
+        let mut rng = Rng(0x5EED ^ index as u64);
+        let mut text = original;
+        let Some(mut tree) = parser.parse(&text, None) else {
+            continue;
+        };
+
+        for _ in 0..10 {
+            if text.is_empty() {
+                break;
+            }
+            let mut start = rng.below(text.len());
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+
+            let (old_end, inserted): (usize, &str) = if rng.next().is_multiple_of(2) {
+                let mut end = (start + 1).min(text.len());
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                (end, "")
+            } else {
+                // `(`, `'` and `;` are the characters that make a document
+                // transiently unparseable, which is the interesting case.
+                (start, ["x", " ", "(", ";", "'", "\n"][rng.below(6)])
+            };
+
+            let start_position = point_of(&text, start);
+            let old_end_position = point_of(&text, old_end);
+
+            let mut next = String::with_capacity(text.len());
+            next.push_str(&text[..start]);
+            next.push_str(inserted);
+            next.push_str(&text[old_end..]);
+            let new_end = start + inserted.len();
+            let new_end_position = point_of(&next, new_end);
+
+            tree.edit(&tree_sitter::InputEdit {
+                start_byte: start,
+                old_end_byte: old_end,
+                new_end_byte: new_end,
+                start_position,
+                old_end_position,
+                new_end_position,
+            });
+            text = next;
+            let Some(reparsed) = parser.parse(&text, Some(&tree)) else {
+                break;
+            };
+            tree = reparsed;
+        }
+
+        let Some(fresh) = parser.parse(&text, None) else {
+            continue;
+        };
+        checked += 1;
+        if tree.root_node().to_sexp() != fresh.root_node().to_sexp() {
+            mismatches.push(file.display().to_string());
+        }
+    }
+
+    println!("checked {checked} files, {} mismatched", mismatches.len());
+    assert!(
+        checked > 1_000,
+        "expected the corpus, only reached {checked} files"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "an incremental reparse diverged from a fresh parse in {} file(s); the \
+         first few: {:?}",
+        mismatches.len(),
+        &mismatches[..mismatches.len().min(5)]
+    );
+}
+
 /// Reports the deepest tree the corpus produces, which is how
 /// `semantic::limits::MAX_NODE_DEPTH` was sized.
 ///
