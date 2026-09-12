@@ -372,6 +372,17 @@ plus a `summary`, the `scan` losses, and the `exitCode`:
 }
 ```
 
+For a harness that speaks MCP rather than shell:
+
+```bash
+surrealql-language-server mcp --workspace schema/
+```
+
+Five tools (`validate_surrealql`, `get_schema`, `lookup_function`,
+`search_functions`, `explain_diagnostic`) over stdio, each backed by the same
+analysis the editor runs. No database connection, and no extra dependency: MCP
+is JSON-RPC 2.0 with a small method set, so it is implemented directly.
+
 Hand a model the schema before it writes anything, rather than letting it guess
 and correcting afterwards:
 

@@ -47,6 +47,22 @@ rather than leaving them to look as though they work.
 
 ### Added
 
+**`surrealql-language-server mcp`** serves the Model Context Protocol over
+stdio, so an agent calls the analysis directly instead of shelling out and
+parsing output. Five tools, each a thin adapter over machinery that already
+exists and is already tested: `validate_surrealql`, `get_schema`,
+`lookup_function`, `search_functions`, `explain_diagnostic`.
+
+No dependency was added. MCP is JSON-RPC 2.0 with a small method set carried as
+newline-delimited JSON, which is the same size of problem as the argument
+parsers and the LSP dispatcher already hand-rolled here, and `[dependencies]` is
+also the wasm dependency graph, where an MCP crate has no business.
+
+A tool that cannot answer returns a *result* carrying `isError` rather than a
+JSON-RPC error, because the call was well-formed and the connection is fine; the
+model needs to read why. Tool names and input schemas are a permanent surface and
+are pinned by `tests/mcp.rs` from the first release.
+
 **`validateQuery(text, params?)` on the browser build.** A one-shot check for a
 host that wants an answer without speaking LSP: a playground, the docs site,
 Surrealist validating an editor's contents. It returns the same `Diagnostic`

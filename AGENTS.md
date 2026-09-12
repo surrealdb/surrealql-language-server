@@ -92,6 +92,31 @@ Facts a machine consumer must know:
 - **`check` never connects to a database.** `SURREALDB_ENDPOINT` has no
   effect on it.
 
+## As an MCP server
+
+For a harness that calls tools rather than shelling out:
+
+```bash
+surrealql-language-server mcp --workspace schema/
+```
+
+Five tools over stdio, each a thin adapter over the same analysis everything
+else here uses: `validate_surrealql`, `get_schema`, `lookup_function`,
+`search_functions`, `explain_diagnostic`. `tools/list` describes them.
+
+Two conventions worth knowing:
+
+- A tool that cannot answer returns a **result** carrying `isError`, not a
+  JSON-RPC error, and the text says why. A JSON-RPC error means the protocol
+  broke, not that the question had no answer.
+- `validate_surrealql` checks against the schema in `--workspace`, so it catches
+  a misspelled table as well as a syntax error. Without `--workspace` it still
+  checks syntax and types; `get_schema` says so rather than returning an empty
+  schema that reads as "this database has no tables".
+
+Tool names and their input schemas are a permanent surface, pinned by
+[`tests/mcp.rs`](tests/mcp.rs).
+
 ## Reading the schema
 
 ```bash
