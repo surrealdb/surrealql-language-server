@@ -29,7 +29,9 @@ use crate::core::completion_context::{
     completion_table_qualifier, graph_anchors, graph_edge_context, head_slot_at,
     is_table_name_context, statement_target_in_text,
 };
-use crate::core::state::{OpenBuffer, ServerState, merged_workspace, workspace_signature};
+use crate::core::state::{
+    ClientProfile, OpenBuffer, ServerState, merged_workspace, workspace_signature,
+};
 use crate::core::statement_shape::SlotYield;
 use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
@@ -114,8 +116,20 @@ where
     }
 
     /// LSP capability advertisement, identical for both targets.
-    pub fn server_capabilities() -> ServerCapabilities {
+    /// What this server offers, given what the client said it can handle.
+    ///
+    /// Almost everything here is unconditional: the capability is the same
+    /// whoever asks. The exception is `diagnosticProvider`, which is only worth
+    /// advertising to a client that pulls, because advertising it *and* pushing
+    /// gives a client that does both every diagnostic twice.
+    pub fn server_capabilities(client: ClientProfile) -> ServerCapabilities {
         ServerCapabilities {
+            // Echoed, not negotiated. Every conformant client supports UTF-16
+            // (it is the specification's default), and threading a second
+            // encoding through `LineIndex` would touch every range-producing
+            // call site in the server for the benefit of no known client. Saying
+            // so explicitly is still better than leaving it to be assumed.
+            position_encoding: Some(PositionEncodingKind::UTF16),
             // Incremental since 0.7. A 166 KB document used to cross the wire,
             // and get JSON-unescaped into a fresh `String` on the reactor: on
             // *every keystroke*: at ten characters a second that is 1.6 MB/s of
@@ -178,6 +192,24 @@ where
             })),
             document_highlight_provider: Some(OneOf::Left(true)),
             folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+            // Only offered to a client that asked for it. A client that both
+            // pulls and accepts pushes would otherwise render every diagnostic
+            // twice, so the advertisement and the push suppression have to be
+            // decided by the same answer, and they are.
+            //
+            // `interFileDependencies` is factually true: the merged model spans
+            // the workspace, so a `DEFINE TABLE` in one file changes the
+            // diagnostics of another. `workspaceDiagnostics` is not offered:
+            // a full report over 5,000 files on every poll is a latency hazard,
+            // and it needs a model generation counter to answer "unchanged".
+            diagnostic_provider: client.pull_diagnostics.then(|| {
+                DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                    identifier: Some("surrealql".to_string()),
+                    inter_file_dependencies: true,
+                    workspace_diagnostics: false,
+                    work_done_progress_options: Default::default(),
+                })
+            }),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
                 InlayHintOptions {
@@ -221,11 +253,25 @@ where
             None,
         );
         let workspace_folders = resolve_workspace_folders(&params);
+        let client = ClientProfile::from_capabilities(&params.capabilities);
+
+        // Which client, and which version. Free, and it turns an
+        // editor-specific bug report into something reproducible.
+        if let Some(info) = &params.client_info {
+            let version = info.version.as_deref().unwrap_or("unknown version");
+            self.notifier
+                .log_message(
+                    MessageType::INFO,
+                    format!("SurrealQL: connected to {} ({version})", info.name),
+                )
+                .await;
+        }
 
         {
             let mut state = self.state.write().await;
             state.settings = Arc::new(settings);
             state.workspace_folders = workspace_folders;
+            state.client = client;
             // The client can't receive `window/logMessage` until the
             // initialize handshake completes; `initialized` drains these.
             state.pending_settings_warnings = warnings;
@@ -236,8 +282,77 @@ where
                 name: "surreal-language-server".to_string(),
                 version: Some(build_version()),
             }),
-            capabilities: Self::server_capabilities(),
+            capabilities: Self::server_capabilities(client),
             ..Default::default()
+        }
+    }
+
+    /// Ask the client to tell us when `.surql` files change outside the editor.
+    ///
+    /// Without this the workspace schema goes stale on a `git checkout`, a
+    /// generated file, or a `rm`, and the symptom is `unknown-table` firing on
+    /// a table that exists, which reads as a language-server bug rather than a
+    /// missed notification. Nothing picked those changes up short of a restart.
+    ///
+    /// Only asked of a client that said it supports dynamic registration; the
+    /// browser host has no filesystem to watch, and its notifier's default
+    /// implementation does nothing.
+    async fn register_file_watcher(&self) {
+        if !self.state.read().await.client.watched_file_registration {
+            return;
+        }
+
+        let watchers = ["**/*.surql", "**/*.surrealql"]
+            .into_iter()
+            .map(|pattern| FileSystemWatcher {
+                glob_pattern: GlobPattern::String(pattern.to_string()),
+                // Created, changed and deleted: the default when omitted.
+                kind: None,
+            })
+            .collect();
+
+        self.notifier
+            .register_capability(vec![Registration {
+                id: "surrealql-watched-files".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers,
+                })
+                .ok(),
+            }])
+            .await;
+    }
+
+    /// A `.surql` file changed outside the editor.
+    ///
+    /// The saved-workspace copy is refreshed (or dropped, for a deletion), the
+    /// model is rebuilt, and every open buffer is republished: a definition in
+    /// the changed file may be exactly what an open document's diagnostics
+    /// depend on.
+    pub async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut touched = false;
+        for event in params.changes {
+            if event.typ == FileChangeType::DELETED {
+                let mut state = self.state.write().await;
+                let mut workspace = (*state.saved_workspace).clone();
+                if workspace.documents.remove(&event.uri).is_some() {
+                    state.saved_workspace = Arc::new(workspace);
+                    touched = true;
+                }
+            } else {
+                // An open buffer is the authority for its own text; a change on
+                // disk under it must not overwrite what the user is editing.
+                if self.buffer_text(&event.uri).is_some() {
+                    continue;
+                }
+                self.sync_saved_document_from_disk(&event.uri).await;
+                touched = true;
+            }
+        }
+
+        if touched {
+            self.recompute_model().await;
+            self.republish_open_diagnostics().await;
         }
     }
 
@@ -249,6 +364,7 @@ where
             std::mem::take(&mut state.pending_settings_warnings)
         };
         self.report_settings_warnings(&pending_warnings).await;
+        self.register_file_watcher().await;
         self.reload_from_client_configuration().await;
         self.notifier
             .log_message(
@@ -1134,6 +1250,42 @@ where
         )
     }
 
+    /// Answer a diagnostic *pull*.
+    ///
+    /// The same set `publish_diagnostics_for_uri` would have pushed: there is
+    /// deliberately no second analysis path, so a pulling client and a pushed
+    /// one cannot disagree.
+    pub async fn document_diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> DocumentDiagnosticReportResult {
+        let empty = || {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                RelatedFullDocumentDiagnosticReport::default(),
+            ))
+        };
+
+        let uri = params.text_document.uri;
+        let Some((analysis, model, settings)) = self.snapshot_for_uri(&uri).await else {
+            return empty();
+        };
+        let Some(diagnostics) =
+            off_reactor(move || model.document_diagnostics(&analysis, &settings)).await
+        else {
+            return empty();
+        };
+
+        DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+            RelatedFullDocumentDiagnosticReport {
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    items: diagnostics,
+                    ..FullDocumentDiagnosticReport::default()
+                },
+                ..RelatedFullDocumentDiagnosticReport::default()
+            },
+        ))
+    }
+
     pub async fn document_highlight(
         &self,
         params: DocumentHighlightParams,
@@ -1853,6 +2005,13 @@ where
         let Some(analysis) = analysis else {
             return;
         };
+
+        // A client that pulls is not told. Doing both is how a diagnostic ends
+        // up rendered twice, and the client's own declaration is the only sound
+        // way to decide which it is.
+        if self.state.read().await.client.pull_diagnostics {
+            return;
+        }
 
         // `document_diagnostics` runs `type_diagnostics`, which is six full-tree
         // walks, plus the query-fact loop. Under a millisecond on a typical

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tower_lsp_server::ls_types;
 use tower_lsp_server::ls_types::{Diagnostic, MessageType, Uri};
 
 use surrealql_language_server::config::ServerSettings;
@@ -24,6 +25,7 @@ pub struct Recorded {
     pub published: Vec<(Uri, Vec<Diagnostic>)>,
     pub logs: Vec<(MessageType, String)>,
     pub shows: Vec<(MessageType, String)>,
+    pub registrations: Vec<String>,
 }
 
 /// [`LspNotifier`] that records every outbound call and answers
@@ -45,6 +47,10 @@ impl RecordingNotifier {
 
     pub fn logs(&self) -> Vec<(MessageType, String)> {
         self.recorded.lock().unwrap().logs.clone()
+    }
+
+    pub fn registrations(&self) -> Vec<String> {
+        self.recorded.lock().unwrap().registrations.clone()
     }
 
     pub fn shows(&self) -> Vec<(MessageType, String)> {
@@ -79,6 +85,14 @@ impl LspNotifier for RecordingNotifier {
 
     async fn show_message(&self, level: MessageType, message: String) {
         self.recorded.lock().unwrap().shows.push((level, message));
+    }
+
+    async fn register_capability(&self, registrations: Vec<ls_types::Registration>) {
+        self.recorded
+            .lock()
+            .unwrap()
+            .registrations
+            .extend(registrations.into_iter().map(|item| item.method));
     }
 
     async fn request_configuration(&self) -> Option<serde_json::Value> {

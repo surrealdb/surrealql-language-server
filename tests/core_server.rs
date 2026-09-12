@@ -3604,3 +3604,241 @@ async fn document_symbol_names(core: &common::TestCore, path: &str) -> Vec<Strin
     };
     symbols.into_iter().map(|symbol| symbol.name).collect()
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Pull diagnostics, and the switch that stops the pushing
+// ──────────────────────────────────────────────────────────────────────
+
+/// An `initialize` payload from a client that pulls diagnostics.
+fn pulling_client() -> InitializeParams {
+    InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            text_document: Some(tower_lsp_server::ls_types::TextDocumentClientCapabilities {
+                diagnostic: Some(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    }
+}
+
+async fn pulled_diagnostics(core: &common::TestCore, path: &str) -> Vec<Diagnostic> {
+    let result = core
+        .document_diagnostic(tower_lsp_server::ls_types::DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    match result {
+        tower_lsp_server::ls_types::DocumentDiagnosticReportResult::Report(
+            tower_lsp_server::ls_types::DocumentDiagnosticReport::Full(report),
+        ) => report.full_document_diagnostic_report.items,
+        _ => Vec::new(),
+    }
+}
+
+/// A client that pulls must not also be pushed to: doing both is how every
+/// diagnostic ends up rendered twice.
+#[tokio::test]
+async fn a_pulling_client_is_not_pushed_to() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(pulling_client()).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let before = notifier.published().len();
+    open(&core, "pull.surql", "SELECT * FROM;").await;
+    core.did_change(change("pull.surql", 2, "SELECT * FROM ;;"))
+        .await;
+
+    assert_eq!(
+        notifier.published().len(),
+        before,
+        "a pulling client was pushed to anyway"
+    );
+
+    // But the diagnostics are there when asked for.
+    let pulled = pulled_diagnostics(&core, "pull.surql").await;
+    assert!(
+        !pulled.is_empty(),
+        "a pull must return what the push would have carried"
+    );
+}
+
+/// The regression guard that matters: a client which declares nothing (the
+/// browser host sends exactly that today) must keep receiving pushes.
+#[tokio::test]
+async fn a_client_that_declares_nothing_still_receives_pushes() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(InitializeParams::default()).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let before = notifier.published().len();
+    open(&core, "push.surql", "SELECT * FROM;").await;
+
+    assert!(
+        notifier.published().len() > before,
+        "an absent capability must never turn a working behaviour off"
+    );
+}
+
+/// The advertisement follows the same answer as the suppression, so the two
+/// cannot drift apart.
+#[tokio::test]
+async fn the_diagnostic_provider_is_only_advertised_to_a_pulling_client() {
+    let quiet = common::TestCore::server_capabilities(Default::default());
+    assert!(
+        quiet.diagnostic_provider.is_none(),
+        "a client that did not ask must not be offered pulls"
+    );
+
+    let profile = surrealql_language_server::core::state::ClientProfile::from_capabilities(
+        &pulling_client().capabilities,
+    );
+    assert!(profile.pull_diagnostics);
+    assert!(
+        common::TestCore::server_capabilities(profile)
+            .diagnostic_provider
+            .is_some(),
+        "a client that asked must be offered pulls"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Files changed outside the editor
+// ──────────────────────────────────────────────────────────────────────
+
+/// A client that supports dynamic registration.
+fn watching_client() -> InitializeParams {
+    InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                did_change_watched_files: Some(
+                    tower_lsp_server::ls_types::DidChangeWatchedFilesClientCapabilities {
+                        dynamic_registration: Some(true),
+                        relative_pattern_support: None,
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    }
+}
+
+/// The watcher is registered only for a client that can take it.
+#[tokio::test]
+async fn a_file_watcher_is_registered_when_the_client_supports_it() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(watching_client()).await;
+    core.initialized().await;
+    assert!(
+        notifier
+            .registrations()
+            .contains(&"workspace/didChangeWatchedFiles".to_string()),
+        "a capable client must be asked to watch .surql files"
+    );
+
+    let (quiet, quiet_notifier, _) = common::core_with(Default::default(), Default::default());
+    quiet.initialize(InitializeParams::default()).await;
+    quiet.initialized().await;
+    assert!(
+        quiet_notifier.registrations().is_empty(),
+        "a client that cannot register must not be asked"
+    );
+}
+
+/// A schema file deleted outside the editor must stop contributing.
+///
+/// This is the `git checkout` case. Nothing picked such a change up short of a
+/// restart, and the symptom was a diagnostic that disagreed with the files on
+/// disk, which reads as a language-server bug rather than a missed
+/// notification.
+///
+/// The probe is a typo: `persn` is only reportable *while* `person` is defined
+/// somewhere to be a typo of. Delete the definition and the report must go.
+#[tokio::test]
+async fn deleting_a_schema_file_updates_the_open_buffer() {
+    let mut workspace = surrealql_language_server::semantic::types::WorkspaceIndex::default();
+    let schema_uri = uri("schema.surql");
+    let analysis = surrealql_language_server::semantic::analyzer::analyze_document(
+        schema_uri.clone(),
+        "DEFINE TABLE person SCHEMAFULL;",
+        surrealql_language_server::semantic::types::SymbolOrigin::Local,
+    )
+    .expect("analysed");
+    workspace
+        .documents
+        .insert(schema_uri.clone(), std::sync::Arc::new(analysis));
+
+    let (core, notifier, _) = common::core_with(workspace, Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "query.surql", "SELECT * FROM persn;").await;
+
+    let latest = |notifier: &common::RecordingNotifier| {
+        notifier
+            .published()
+            .into_iter()
+            .rev()
+            .find(|(published, _)| *published == uri("query.surql"))
+            .map(|(_, diagnostics)| diagnostics)
+            .unwrap_or_default()
+    };
+
+    assert!(
+        latest(&notifier)
+            .iter()
+            .any(|d| has_code(d, "unknown-table")),
+        "`persn` is a typo of a defined table, so it must be reported"
+    );
+
+    core.did_change_watched_files(tower_lsp_server::ls_types::DidChangeWatchedFilesParams {
+        changes: vec![tower_lsp_server::ls_types::FileEvent {
+            uri: schema_uri,
+            typ: tower_lsp_server::ls_types::FileChangeType::DELETED,
+        }],
+    })
+    .await;
+
+    assert!(
+        !latest(&notifier)
+            .iter()
+            .any(|d| has_code(d, "unknown-table")),
+        "with the definition gone there is nothing for `persn` to be a typo of, \
+         and the open buffer must be told"
+    );
+}
+
+/// A file changed on disk *under an open buffer* must not overwrite what the
+/// user is editing: the buffer is the authority for its own text.
+#[tokio::test]
+async fn a_disk_change_does_not_clobber_an_open_buffer() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "live.surql", "DEFINE TABLE edited SCHEMAFULL;").await;
+
+    core.did_change_watched_files(tower_lsp_server::ls_types::DidChangeWatchedFilesParams {
+        changes: vec![tower_lsp_server::ls_types::FileEvent {
+            uri: uri("live.surql"),
+            typ: tower_lsp_server::ls_types::FileChangeType::CHANGED,
+        }],
+    })
+    .await;
+
+    assert_eq!(
+        core.buffer_snapshot(&uri("live.surql")).as_deref(),
+        Some("DEFINE TABLE edited SCHEMAFULL;"),
+        "the editor's unsaved text must survive a change notification"
+    );
+}
+
+fn has_code(diagnostic: &Diagnostic, code: &str) -> bool {
+    matches!(
+        &diagnostic.code,
+        Some(tower_lsp_server::ls_types::NumberOrString::String(value)) if value == code
+    )
+}

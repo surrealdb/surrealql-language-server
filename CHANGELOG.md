@@ -45,6 +45,32 @@ The README documented 5 of about 20 settings. It now covers the whole
 heading of their own) the two keys that are accepted and not yet implemented,
 rather than leaving them to look as though they work.
 
+### Added
+
+**The server reads what the client can do.** `initialize` discarded
+`params.capabilities` entirely, which is why every optional protocol feature was
+either unavailable or unconditional. A small `ClientProfile` is now read once and
+cached. Every field defaults to false, which is what a client declaring nothing
+gets: an absent capability must never turn a working behaviour off. The client's
+name and version are logged, which makes an editor-specific bug report
+reproducible.
+
+**Pull diagnostics** (`textDocument/diagnostic`), offered only to a client that
+asked for them, and that client is no longer pushed to. Advertising both is how
+a diagnostic ends up rendered twice, so the advertisement and the push
+suppression are decided by the same answer.
+
+**`workspace/didChangeWatchedFiles`.** A `.surql` file created, changed or
+deleted outside the editor was invisible until restart, so the schema went stale
+on a `git checkout` and `unknown-table` started firing on tables that exist. The
+server now registers a watcher for `**/*.surql` and `**/*.surrealql` when the
+client supports dynamic registration, refreshes the workspace copy, and
+republishes every open buffer: a definition in the changed file may be exactly
+what their diagnostics depend on. A change on disk *under an open buffer* is
+ignored: the editor is the authority for text the user is editing.
+
+**`positionEncoding: utf-16`** is now stated rather than left to be assumed.
+
 ### Performance
 
 **The release profile now optimises for speed.** It carried `opt-level = 'z'`,

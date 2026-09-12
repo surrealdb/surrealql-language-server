@@ -3,7 +3,7 @@
 //! single trait object so the core itself never sees the tower types.
 
 use async_trait::async_trait;
-use ls_types::{ConfigurationItem, Diagnostic, MessageType, Uri};
+use ls_types::{ConfigurationItem, Diagnostic, MessageType, Registration, Uri};
 use serde_json::Value;
 use tower_lsp_server::Client;
 
@@ -33,6 +33,20 @@ impl LspNotifier for TowerNotifier {
 
     async fn show_message(&self, level: MessageType, message: String) {
         self.client.show_message(level, message).await;
+    }
+
+    async fn register_capability(&self, registrations: Vec<Registration>) {
+        if let Err(error) = self.client.register_capability(registrations).await {
+            // Not fatal: the server keeps working, it just will not hear about
+            // files changed outside the editor. Say so rather than leaving the
+            // staleness to be discovered as a wrong diagnostic.
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("SurrealQL: could not register a file watcher: {error}"),
+                )
+                .await;
+        }
     }
 
     async fn request_configuration(&self) -> Option<Value> {

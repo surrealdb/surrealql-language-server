@@ -25,6 +25,9 @@ use crate::semantic::types::{
 #[derive(Debug, Default)]
 pub struct ServerState {
     pub settings: Arc<ServerSettings>,
+    /// What the client declared at `initialize`. All-false until then, which is
+    /// also what a client that declares nothing gets.
+    pub client: ClientProfile,
     pub workspace_folders: Vec<PathBuf>,
     pub saved_workspace: Arc<WorkspaceIndex>,
     pub open_documents: HashMap<Uri, Arc<DocumentAnalysis>>,
@@ -48,6 +51,58 @@ pub struct ServerState {
     /// so a persistently bad configuration doesn't re-log on every
     /// pull. Same pattern as [`Self::last_metadata_errors`].
     pub last_settings_warnings: Option<Vec<String>>,
+}
+
+/// What the client told us it can do, reduced to the handful of answers this
+/// server actually branches on.
+///
+/// `initialize` used to discard `params.capabilities` entirely, which is why
+/// every optional protocol feature was either unavailable or unconditional.
+/// Walking the nested `Option` soup per request would be both slow and easy to
+/// get subtly wrong in one place and not another, so it is read once and the
+/// answers are cached here.
+///
+/// Every field defaults to `false`, which is also what a capabilities-free
+/// client gets: the wasm host sends one today. That is deliberate: an absent
+/// capability must never turn a working behaviour off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientProfile {
+    /// The client will ask for diagnostics rather than be told
+    /// (`textDocument/diagnostic`). When true the server must **stop pushing**,
+    /// or a client that does both shows every diagnostic twice.
+    pub pull_diagnostics: bool,
+    /// `textDocument/definition` may answer with `LocationLink`, which carries
+    /// the origin range so the editor underlines the right extent.
+    pub location_links: bool,
+    /// `workspace/didChangeWatchedFiles` can be registered at run time. Without
+    /// it there is no point asking.
+    pub watched_file_registration: bool,
+    /// `textDocument/documentSymbol` understands the nested form.
+    pub hierarchical_symbols: bool,
+}
+
+impl ClientProfile {
+    /// Read the handful of answers that matter out of an `initialize` payload.
+    pub fn from_capabilities(capabilities: &ls_types::ClientCapabilities) -> Self {
+        let text_document = capabilities.text_document.as_ref();
+        Self {
+            pull_diagnostics: text_document.is_some_and(|caps| caps.diagnostic.is_some()),
+            location_links: text_document
+                .and_then(|caps| caps.definition.as_ref())
+                .and_then(|definition| definition.link_support)
+                .unwrap_or(false),
+            watched_file_registration: capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+                .and_then(|watched| watched.dynamic_registration)
+                .unwrap_or(false),
+            hierarchical_symbols: text_document
+                .and_then(|caps| caps.document_symbol.as_ref())
+                .and_then(|symbol| symbol.hierarchical_document_symbol_support)
+                .unwrap_or(false),
+        }
+    }
 }
 
 /// What the client last sent for one open document, before any analysis.

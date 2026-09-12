@@ -105,6 +105,13 @@ impl LanguageServer for Backend {
         });
     }
 
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            core.did_change_watched_files(params).await;
+        });
+    }
+
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
         let core = Arc::clone(&self.core);
         tokio::spawn(async move {
@@ -173,6 +180,13 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         Ok(self.core.code_action(params).await)
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        Ok(self.core.document_diagnostic(params).await)
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {

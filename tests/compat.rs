@@ -18,7 +18,8 @@ use tower_lsp_server::ls_types::NumberOrString;
 #[test]
 fn server_capabilities_golden() {
     let capabilities =
-        serde_json::to_value(common::TestCore::server_capabilities()).expect("serializable");
+        serde_json::to_value(common::TestCore::server_capabilities(Default::default()))
+            .expect("serializable");
     let expected = json!({
         // Changed from 1 (Full) to 2 (Incremental) in 0.7. The win is not the
         // parse: it is that a 166 KB document no longer crosses the wire and
@@ -39,6 +40,12 @@ fn server_capabilities_golden() {
         },
         "definitionProvider": true,
         "referencesProvider": true,
+        // Added in 0.7. Echoed rather than negotiated: UTF-16 is the
+        // specification's default and every conformant client supports it, so
+        // threading a second encoding through LineIndex would touch every
+        // range-producing call site for no known client. Saying so is still
+        // better than leaving it to be assumed.
+        "positionEncoding": "utf-16",
         "documentHighlightProvider": true,
         // Added in 0.7. Both read the cached parse tree, so they cost a walk and
         // no re-parse; folding is what collapses a function body, and selection
@@ -573,5 +580,56 @@ fn snake_case_keys_count_as_present() {
     assert_eq!(
         merged.analysis.max_syntax_diagnostics, 5,
         "a snake_case key was treated as absent and overwritten"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Capability-dependent advertising
+// ──────────────────────────────────────────────────────────────────────
+
+/// `server_capabilities` now depends on what the client said, so the golden
+/// above pins only half the answer. This pins the other half.
+///
+/// The difference must be *exactly* `diagnosticProvider`: a capability that
+/// appears or vanishes for any other reason is a client-visible change that
+/// nobody decided.
+#[test]
+fn a_pulling_client_is_offered_exactly_one_more_capability() {
+    use surrealql_language_server::core::state::ClientProfile;
+
+    let quiet = serde_json::to_value(common::TestCore::server_capabilities(
+        ClientProfile::default(),
+    ))
+    .expect("serializable");
+    let pulling = serde_json::to_value(common::TestCore::server_capabilities(ClientProfile {
+        pull_diagnostics: true,
+        ..ClientProfile::default()
+    }))
+    .expect("serializable");
+
+    let quiet_keys: std::collections::BTreeSet<&String> =
+        quiet.as_object().expect("object").keys().collect();
+    let pulling_keys: std::collections::BTreeSet<&String> =
+        pulling.as_object().expect("object").keys().collect();
+
+    let added: Vec<&&String> = pulling_keys.difference(&quiet_keys).collect();
+    assert_eq!(
+        added.len(),
+        1,
+        "expected exactly one added capability, got {added:?}"
+    );
+    assert_eq!(added[0].as_str(), "diagnosticProvider");
+    assert!(
+        quiet_keys.difference(&pulling_keys).next().is_none(),
+        "declaring a capability must never take one away"
+    );
+
+    assert_eq!(
+        pulling["diagnosticProvider"],
+        serde_json::json!({
+            "identifier": "surrealql",
+            "interFileDependencies": true,
+            "workspaceDiagnostics": false,
+        }),
     );
 }
