@@ -1,0 +1,13 @@
+# The tree-sitter SurrealQL grammar revision this checkout builds against.
+#
+# The analysis layer in src/semantic/node_kind.rs is coupled to the grammar's
+# emitted node kinds, so the revision is pinned rather than tracked. Everything
+# that needs it reads it from here: scripts/setup-grammar.sh, the CI checkout
+# steps, and build.rs, which fails the build when the checkout does not match.
+#
+# Bump this deliberately, alongside any node_kind.rs change, and run the full
+# suite plus `cargo test --test conformance -- --ignored`.
+#
+# Format: one `key=value` line per entry, `#` comments ignored.
+ref=373e7cd52e3beabfbe8339f2cbf6a0cfb6a35d0e
+repo=https://github.com/surrealdb/surrealql-tree-sitter

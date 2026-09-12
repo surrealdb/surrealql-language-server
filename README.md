@@ -38,12 +38,17 @@ Or set `TREE_SITTER_SURREALQL_DIR` to point to an existing checkout:
 TREE_SITTER_SURREALQL_DIR=/path/to/surrealql-tree-sitter cargo build
 ```
 
-The grammar is **pinned** to a specific commit (`GRAMMAR_REF` in
-[`scripts/setup-grammar.sh`](scripts/setup-grammar.sh) and the checkout steps
-in CI) because the analysis layer is coupled to the grammar's node kinds.
-Bump it deliberately alongside any [`src/semantic/node_kind.rs`](src/semantic/node_kind.rs)
-change. Known grammar parse gaps (and the tests that track them) are listed in
-[`docs/grammar-gaps.md`](docs/grammar-gaps.md).
+The grammar is **pinned**, because the analysis layer is coupled to its node
+kinds. The revision lives in [`grammar.pin`](grammar.pin) and nowhere else: the
+setup script, the CI checkout steps and `build.rs` all read it, and the build
+fails with the fixing command when a checkout has drifted off it. Bump it
+deliberately alongside any [`src/semantic/node_kind.rs`](src/semantic/node_kind.rs)
+change, and run the conformance sweep as well as the suite.
+
+The shapes the grammar still cannot parse are listed in
+[`docs/grammar-gaps.md`](docs/grammar-gaps.md). None of them is valid SurrealQL
+at the current pin: every `parse` error the server reports is a real syntax
+error.
 
 ## Building
 
@@ -93,6 +98,19 @@ first, then:
 ```bash
 cargo test
 ```
+
+Two suites additionally want a SurrealDB checkout at the revision
+[`surrealdb.pin`](surrealdb.pin) names: the catalogue freshness check and the
+conformance sweep over SurrealDB's own corpus:
+
+```bash
+bash scripts/setup-surrealdb.sh   # or: SURREALDB_DIR=/path cargo test
+cargo test --test conformance -- --ignored   # the ~1,900-file sweep, about 4s
+```
+
+Without a checkout both skip and say so. With one at a *different* revision they
+report version skew as though it were a defect, so each prints which revision it
+read when the two disagree.
 
 ## Repository Layout
 
@@ -146,9 +164,12 @@ cargo test
 ├── AGENTS.md                 # agent-facing contract: check loop, codes, gaps
 ├── llms.txt                  # machine-readable resource index
 ├── builtins.json             # @generated catalogue-as-data — do not edit by hand
-├── build.rs                  # compiles tree-sitter grammar (C)
+├── build.rs                  # compiles tree-sitter grammar (C), enforces grammar.pin
+├── grammar.pin               # the tree-sitter grammar revision: single source
+├── surrealdb.pin             # the SurrealDB revision the catalogue + corpus come from
 └── scripts/
-    └── setup-grammar.sh      # clones/updates the grammar sibling repo
+    ├── setup-grammar.sh      # clones/updates the grammar sibling repo to the pin
+    └── setup-surrealdb.sh    # fetches the SurrealDB checkout the tests read
 ```
 
 ## Editor Integration

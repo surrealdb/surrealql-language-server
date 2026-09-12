@@ -27,12 +27,14 @@ use crate::semantic::types::{
 
 impl MergedSemanticModel {
     pub fn build(workspace: &WorkspaceIndex, live: &LiveMetadataSnapshot) -> Self {
-        let mut model = Self::default();
         // A failing (or partially failing) metadata fetch means remote
         // tables are missing from this model — judgments like "this
         // inferred name must be a typo" can't be trusted until the
         // connection recovers.
-        model.metadata_degraded = !live.errors.is_empty();
+        let mut model = Self {
+            metadata_degraded: !live.errors.is_empty(),
+            ..Self::default()
+        };
 
         for analysis in workspace.documents.values() {
             model.absorb_analysis(analysis.as_ref());
@@ -1132,18 +1134,18 @@ impl MergedSemanticModel {
         }
         let parsed_type = TypeExpr::parse(trimmed);
         let record_tables = parsed_type.record_tables();
-        if record_tables.len() == 1 {
-            if let Some(table) = self.tables.get(&record_tables[0]) {
-                return Some(join_hover_blocks([
-                    hover_block(
-                        format!("`{parsed_type}`"),
-                        None,
-                        vec!["Source: type expression".to_string()],
-                        vec!["Resolves to:".to_string()],
-                    ),
-                    format_table_hover(table, self, active_context),
-                ]));
-            }
+        if record_tables.len() == 1
+            && let Some(table) = self.tables.get(&record_tables[0])
+        {
+            return Some(join_hover_blocks([
+                hover_block(
+                    format!("`{parsed_type}`"),
+                    None,
+                    vec!["Source: type expression".to_string()],
+                    vec!["Resolves to:".to_string()],
+                ),
+                format_table_hover(table, self, active_context),
+            ]));
         }
         if KEYWORDS
             .iter()
@@ -1593,17 +1595,17 @@ impl MergedSemanticModel {
                     // Everything else stays untouched — schema
                     // inference from usage is a feature, not an error.
                     Some(table_def) if !table_def.explicit => {
-                        if !self.metadata_degraded && self.target_usage_count(table) <= 1 {
-                            if let Some(suggestion) =
+                        if !self.metadata_degraded
+                            && self.target_usage_count(table) <= 1
+                            && let Some(suggestion) =
                                 self.find_probable_typo_of_explicit_table(table)
-                            {
-                                diagnostics.push(self.unknown_table_diagnostic(
-                                    table,
-                                    table_range,
-                                    Some(suggestion),
-                                ));
-                                continue;
-                            }
+                        {
+                            diagnostics.push(self.unknown_table_diagnostic(
+                                table,
+                                table_range,
+                                Some(suggestion),
+                            ));
+                            continue;
                         }
                         table_def
                     }
@@ -2159,10 +2161,10 @@ struct PermissionOutcome {
 /// in either direction and case-insensitively.
 fn is_plural_variant(left: &str, right: &str) -> bool {
     fn is_plural_of(plural: &str, singular: &str) -> bool {
-        if let Some(stem) = plural.strip_suffix("ies") {
-            if format!("{stem}y") == singular {
-                return true;
-            }
+        if let Some(stem) = plural.strip_suffix("ies")
+            && format!("{stem}y") == singular
+        {
+            return true;
         }
         if let Some(stem) = plural.strip_suffix("es")
             && stem == singular
@@ -2260,20 +2262,20 @@ fn unknown_type_payload(diagnostic: &Diagnostic) -> Option<(String, Option<Strin
 // instead of twice is the whole of the saving here.
 fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: &EventDef) {
     let key = (candidate.table.clone(), candidate.name.clone());
-    if let Some(current) = target.get(&key) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&key)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(key, candidate.clone());
 }
 
 fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: &IndexDef) {
     let key = (candidate.table.clone(), candidate.name.clone());
-    if let Some(current) = target.get(&key) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&key)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(key, candidate.clone());
 }
@@ -2289,10 +2291,10 @@ fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: &Functio
 }
 
 fn merge_param(target: &mut HashMap<String, ParamDef>, candidate: &ParamDef) {
-    if let Some(current) = target.get(&candidate.name) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&candidate.name)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(candidate.name.clone(), candidate.clone());
 }
@@ -2307,10 +2309,10 @@ fn merge_analyzer(target: &mut HashMap<String, AnalyzerDef>, candidate: &Analyze
 }
 
 fn merge_access(target: &mut HashMap<String, AccessDef>, candidate: &AccessDef) {
-    if let Some(current) = target.get(&candidate.name) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&candidate.name)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(candidate.name.clone(), candidate.clone());
 }
@@ -2836,7 +2838,7 @@ fn format_field_hover(field: &FieldDef, model: &MergedSemanticModel) -> String {
     let covering: Vec<String> = model
         .indexes_for_table(&field.table)
         .iter()
-        .filter(|index| index.fields.iter().any(|name| *name == field.name))
+        .filter(|index| index.fields.contains(&field.name))
         .map(|index| {
             let mut details = Vec::new();
             if index.fields.len() > 1 {
@@ -3097,10 +3099,10 @@ pub(crate) fn field_completion_tables(
 
     let mut tables = Vec::new();
     for table in &statement_fact.target_tables {
-        if let Some(normalized) = normalize_completion_table_name(table) {
-            if !tables.contains(&normalized) {
-                tables.push(normalized);
-            }
+        if let Some(normalized) = normalize_completion_table_name(table)
+            && !tables.contains(&normalized)
+        {
+            tables.push(normalized);
         }
     }
     tables

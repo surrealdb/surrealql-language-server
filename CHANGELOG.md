@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+### Fixed
+
+**Every documented false positive is gone.** The grammar pin moved from
+`cb2e6b5` (which was an unmerged pull-request branch, not a revision on
+`master`) to `373e7cd`. That revision parses all seven shapes of valid
+SurrealQL the server used to reject: `%`, a prefix sign on a non-literal
+(`-$x`, `-[1,2,3]`), a sized collection type (`array<float, 10>`), a union in a
+parameter annotation (`LET $a: int | float`), a decimal with a fraction or
+exponent (`102023.1dec`), a nested `SET` target
+(`CREATE person SET name.first = 'x'`), and mock syntax (`|test:1..4|`).
+
+`AGENTS.md` told agents not to repair queries hitting those shapes. It now says
+there are no known false positives, because there are none: every `parse` error
+the server reports is a real syntax error.
+
+Two type-checker bugs that the pin move exposed, both caught by the corpus
+sweep rather than the unit suite:
+
+- **Every prefix expression was typed `bool`.** Correct while `!` was the only
+  prefix operator; once `-x` parsed, `vector::divide([$w, -$h], …)` (from
+  SurrealDB's own benchmark corpus) drew spurious `argument-type` and
+  `operator-type` errors. `!` still answers `bool`, `+` passes the operand's
+  type through (the engine treats it as the identity), and `-` follows `TryNeg`,
+  which accepts only numbers.
+- **`%` was missing from the arithmetic tables.** `"8" % "3"` is now reported in
+  the engine's own words (*Cannot perform remainder with `string` and
+  `string`*), and `8 % 3` types as a number.
+
+**Reproducible builds and honest releases.**
+
+- The grammar revision now lives in `grammar.pin` and nowhere else, read by the
+  setup script, by CI, and by `build.rs`, which fails the build when a checkout
+  has drifted off it. It had been duplicated across six places with no
+  consistency check, and `scripts/setup-grammar.sh` refused to update an
+  existing checkout, so a stale clone failed about twenty tests with `parse`
+  errors on valid SurrealQL and nothing said why. The script now moves a clean
+  checkout onto the pin and refuses only a dirty one.
+- `surrealdb.pin` does the same for the SurrealDB checkout the catalogue tests
+  and the conformance sweep read. Both suites print which revision they read
+  when it disagrees with the pin, because the catalogue and the corpus describe
+  one engine and mixing revisions reports version skew as though it were a
+  defect.
+- **A red test now blocks a release.** The `release`, `wasm` and `builtins` jobs
+  had no `needs: rust`, so a failing test suite did not stop a tag from
+  publishing binaries, the crate, or the npm package.
+- CI gained `cargo clippy -- -D warnings`, a `wasm32` compile check on the pull
+  request path (the npm package was built only on a tag, so a native-only type
+  reaching `src/core/` was invisible until release day), and the conformance
+  sweep, which had been `#[ignore]`d for a runtime the `LineIndex` work cut to
+  about four seconds, and which is the only test that caught either type-checker
+  bug above.
+
+
 ### Performance
 
 Editor-facing latency, measured on a 3200-line (166 KB) file and a 200-document

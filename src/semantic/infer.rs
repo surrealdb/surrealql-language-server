@@ -218,7 +218,7 @@ pub fn infer_expr_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
             .map(|inner| infer_expr_type(inner, ctx))
             .unwrap_or(TypeExpr::Unknown),
 
-        k::PREFIX_EXPRESSION => TypeExpr::Scalar("bool".to_string()),
+        k::PREFIX_EXPRESSION => prefix_type(node, ctx),
 
         k::VARIABLE_NAME => ctx
             .bindings
@@ -1255,6 +1255,62 @@ fn return_candidate<'tree>(
 /// access needs schema resolution the server does not do, and reading past it
 /// would invent a type. An `Optional` link is the exception: `$v.?.trim()` reads
 /// the same value as `$v.trim()`.
+/// The type of `!x`, `-x` or `+x`.
+///
+/// This arm used to answer `bool` unconditionally, which was right while `!`
+/// was the only prefix operator the grammar had. Since the grammar learned the
+/// arithmetic signs, `-$height` also arrives here, and calling that a `bool`
+/// produced `argument-type` and `operator-type` errors on SurrealQL the engine
+/// runs, e.g. `vector::divide([$w, -$h], …)` in SurrealDB's own corpus.
+///
+/// The three operators differ:
+///
+/// * `!` is logical negation and always answers `bool`.
+/// * `+` is the identity (`RETURN +[1]` answers `[1]`), so the operand's type
+///   passes through untouched.
+/// * `-` is [`negation_result`]: a number keeps its own kind, and anything else
+///   fails at run time, which has no type. `Unknown` is the honest answer
+///   there, and it keeps every downstream check silent rather than reporting a
+///   second fault on top of a statement that already cannot run.
+///
+/// The operator is the first `Operator` child; the grammar aliases the token
+/// rather than naming a field, so there is nothing to look up by name.
+fn prefix_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
+    use crate::semantic::operate::{negation_result, value_kind};
+
+    let children = k::named_children(node);
+    let Some(operator) = children
+        .iter()
+        .find(|child| child.kind() == k::OPERATOR)
+        .and_then(|child| k::text_of(ctx.source, *child))
+    else {
+        return TypeExpr::Unknown;
+    };
+
+    if operator == "!" {
+        return TypeExpr::Scalar("bool".to_string());
+    }
+
+    let Some(operand) = children
+        .into_iter()
+        .find(|child| child.kind() != k::OPERATOR && !is_trivia(*child))
+    else {
+        return TypeExpr::Unknown;
+    };
+    let operand = infer_expr_type(operand, ctx);
+
+    match operator {
+        "+" => operand,
+        "-" => match value_kind(&operand).and_then(negation_result) {
+            Some(kind) => kind.as_type(),
+            // Either the operand type is not provably one engine kind, or it is
+            // one the engine refuses to negate. Both are silence.
+            None => TypeExpr::Unknown,
+        },
+        _ => TypeExpr::Unknown,
+    }
+}
+
 fn path_type(node: Node<'_>, ctx: &TypeCtx<'_>) -> TypeExpr {
     path_type_until(node, ctx, None)
 }

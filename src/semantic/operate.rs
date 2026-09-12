@@ -54,7 +54,7 @@ pub enum ValueKind {
 
 impl ValueKind {
     /// True for every kind the engine wraps in `Value::Number`.
-    fn is_number(self) -> bool {
+    pub fn is_number(self) -> bool {
         matches!(self, Self::Int | Self::Float | Self::Decimal | Self::Number)
     }
 
@@ -89,6 +89,7 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    Rem,
     Pow,
 }
 
@@ -104,6 +105,7 @@ impl ArithOp {
             "-" => Self::Sub,
             "*" | "×" => Self::Mul,
             "/" | "÷" => Self::Div,
+            "%" => Self::Rem,
             "**" => Self::Pow,
             _ => return None,
         })
@@ -129,6 +131,7 @@ impl ArithOp {
             Self::Sub => "subtraction",
             Self::Mul => "multiplication",
             Self::Div => "division",
+            Self::Rem => "remainder",
             Self::Pow => {
                 return format!("Cannot raise the value `{lhs}` with `{rhs}`.");
             }
@@ -151,7 +154,7 @@ impl ArithOp {
 /// Anything absent from those impls reaches the engine's catch-all `bail!`, so
 /// `None` here means "the query fails at run time".
 pub fn arith_result(op: ArithOp, lhs: ValueKind, rhs: ValueKind) -> Option<ValueKind> {
-    use ArithOp::{Add, Div, Mul, Pow, Sub};
+    use ArithOp::{Add, Div, Mul, Pow, Rem, Sub};
     use ValueKind::{Array, Datetime, Duration, Object, Set, String};
 
     // Every operator has a `(Number, Number)` arm, and only that arm promotes.
@@ -160,6 +163,12 @@ pub fn arith_result(op: ArithOp, lhs: ValueKind, rhs: ValueKind) -> Option<Value
     }
 
     Some(match (op, lhs, rhs) {
+        // `TryRem for Value` (`val/mod.rs:856-864`) has one arm,
+        // `(Number, Number)`, which the numeric fast path above already took.
+        // Every other pair reaches the engine's `bail!`, including
+        // `"8" % "3"`, which is why the string arm below is `Add`-only.
+        (Rem, _, _) => return None,
+
         // `String + String` concatenates. No other operator takes a string —
         // `"8" % "3"` and `"a" - "b"` both fail.
         (Add, String, String) => String,
@@ -190,6 +199,20 @@ pub fn arith_result(op: ArithOp, lhs: ValueKind, rhs: ValueKind) -> Option<Value
 
         _ => return None,
     })
+}
+
+/// The kind unary `-` produces from this operand, or `None` when the engine
+/// fails.
+///
+/// `TryNeg for Value` (`val/mod.rs:890-898`) has exactly one arm, `Number`, and
+/// `TryNeg for Number` (`val/number.rs:954-961`) preserves the variant: int
+/// stays int, float stays float, decimal stays decimal. Everything else bails
+/// with `Cannot negate the value '<kind>'`, so `-[1, 2, 3]` has no type.
+///
+/// Unary `+` is **not** this function: the engine treats it as the identity, so
+/// `+[1]` answers `[1]`. Its operand's type passes straight through.
+pub fn negation_result(operand: ValueKind) -> Option<ValueKind> {
+    operand.is_number().then_some(operand)
 }
 
 /// The kind the engine promotes a numeric pair to.

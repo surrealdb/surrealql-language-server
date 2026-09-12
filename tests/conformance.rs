@@ -149,6 +149,54 @@ fn the_fixture_still_covers_the_breadth_it_was_built_for() {
     );
 }
 
+/// The SurrealDB revision `surrealdb.pin` names, if the file is readable.
+///
+/// Same trivial `key=value` format the setup scripts parse.
+fn pinned_surrealdb_revision() -> Option<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("surrealdb.pin");
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.trim().strip_prefix("ref=").map(str::trim))
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Returns a sentence naming the revision mismatch, or `None` when the checkout
+/// is on the pin (or either revision cannot be read).
+///
+/// Worth the twenty lines: the catalogue and the corpus describe one engine, so
+/// running either suite against a different checkout reports differences that
+/// are not defects: a corpus file the newer revision deleted reads as a lost
+/// diagnostic, and a signature the newer engine widened reads as a stale
+/// catalogue. Both send you looking in the wrong place.
+fn revision_mismatch(dir: &Path) -> Option<String> {
+    let expected = pinned_surrealdb_revision()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let actual = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if actual.is_empty() || actual == expected {
+        return None;
+    }
+    Some(format!(
+        "NOTE: the SurrealDB checkout at {} is {} but surrealdb.pin names {}. \
+         The catalogue and the corpus must come from one revision: differences \
+         below may be version skew rather than defects. Run \
+         `bash scripts/setup-surrealdb.sh`, or point SURREALDB_DIR at a checkout \
+         of the pinned revision.",
+        dir.display(),
+        &actual[..actual.len().min(9)],
+        &expected[..expected.len().min(9)],
+    ))
+}
+
 /// The SurrealDB corpus, when this machine has a checkout.
 ///
 /// `SURREALDB_DIR` first, then the sibling layout the grammar already uses.
@@ -194,6 +242,13 @@ const EXPECTED: &[(&str, &str)] = &[
     // `Expected a value of type 'string' for argument $arg`.
     ("language/closure/basic.surql", "argument-type"),
     ("language/coerce/regex.surql", "argument-type"),
+    // `"8" % "3"`. The file's own front matter expects `Cannot perform
+    // remainder with 'string' and 'string'`, which is what the check reports:
+    // the engine's one `TryRem` arm is `(Number, Number)`.
+    (
+        "language/expression/operators/modulo.surql",
+        "operator-type",
+    ),
     ("language/functions/array/add.surql", "argument-count"),
     ("language/functions/array/add.surql", "argument-type"),
     ("language/functions/array/any.surql", "argument-type"),
@@ -253,6 +308,22 @@ const EXPECTED: &[(&str, &str)] = &[
     ("language/functions/set/len.surql", "argument-type"),
     ("language/functions/set/remove.surql", "argument-type"),
     ("language/functions/set/union.surql", "argument-type"),
+    // `9.expect(|$n| $n = 9, "a", "b")`: one argument too many. All three
+    // files declare the engine's refusal, "Incorrect arguments for
+    // method/function expect(). Expected 2 to 3 arguments"; the check counts
+    // the method's own arguments rather than the receiver, so it says 1 to 2.
+    (
+        "language/functions/value/expect_all_ro.surql",
+        "argument-count",
+    ),
+    (
+        "language/functions/value/expect_best_effort_ro.surql",
+        "argument-count",
+    ),
+    (
+        "language/functions/value/expect_compute_only.surql",
+        "argument-count",
+    ),
     (
         "language/statements/define/function/custom_optional_args.surql",
         "argument-count",
@@ -326,6 +397,15 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
         return;
     };
 
+    // `corpus_dir` points at `<checkout>/language-tests/tests`; the revision
+    // lives two levels up.
+    let skew = corpus
+        .parent()
+        .and_then(Path::parent)
+        .and_then(revision_mismatch)
+        .map(|note| format!("{note}\n\n"))
+        .unwrap_or_default();
+
     let mut files = Vec::new();
     surql_files(&corpus, &mut files);
     files.sort();
@@ -365,7 +445,7 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
     let unexpected: Vec<&(String, String)> = found.difference(&expected).collect();
     assert!(
         unexpected.is_empty(),
-        "the checks fired on {} file(s) not in the expected set:\n{}",
+        "{skew}the checks fired on {} file(s) not in the expected set:\n{}",
         unexpected.len(),
         detail
             .iter()
@@ -381,6 +461,6 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
     let missing: Vec<&(String, String)> = expected.difference(&found).collect();
     assert!(
         missing.is_empty(),
-        "these known-bad calls are no longer reported: {missing:?}"
+        "{skew}these known-bad calls are no longer reported: {missing:?}"
     );
 }

@@ -19,6 +19,12 @@ fn main() {
         }
     }
 
+    verify_grammar_pin(&manifest_dir, &grammar_dir);
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("grammar.pin").display()
+    );
     println!("cargo:rerun-if-env-changed=TREE_SITTER_SURREALQL_DIR");
     println!("cargo:rerun-if-changed={}", parser_c.display());
     println!("cargo:rerun-if-changed={}", grammar_js.display());
@@ -115,6 +121,59 @@ fn emit_build_provenance(manifest_dir: &Path, grammar_dir: &Path) {
     if head.exists() {
         println!("cargo:rerun-if-changed={}", head.display());
     }
+}
+
+/// Fail the build when the grammar checkout is not the revision `grammar.pin`
+/// names.
+///
+/// The node-kind layer in `src/semantic/node_kind.rs` is coupled to the
+/// grammar's emitted kinds, so a checkout that drifts off the pin does not fail
+/// loudly: it produces `parse` diagnostics on valid SurrealQL, which reads as a
+/// language-server bug. That cost a whole debugging session once; this turns it
+/// into a build error naming the one command that fixes it.
+///
+/// Skipped when `TREE_SITTER_SURREALQL_DIR` points somewhere deliberate, when
+/// the grammar is vendored rather than checked out, or when either revision
+/// cannot be read: a grammar developer building against their own working tree
+/// must not be blocked.
+fn verify_grammar_pin(manifest_dir: &Path, grammar_dir: &Path) {
+    if env::var_os("TREE_SITTER_SURREALQL_DIR").is_some() {
+        return;
+    }
+
+    let Some(expected) = read_grammar_pin(&manifest_dir.join("grammar.pin")) else {
+        return;
+    };
+    let Some(actual) = git(grammar_dir, &["rev-parse", "HEAD"]) else {
+        return;
+    };
+
+    if actual != expected {
+        panic!(
+            "grammar checkout at {} is {} but grammar.pin names {}.\n\
+             Run `bash scripts/setup-grammar.sh` to move it onto the pin, or set\n\
+             TREE_SITTER_SURREALQL_DIR to build against a checkout of your own.",
+            grammar_dir.display(),
+            &actual[..actual.len().min(7)],
+            &expected[..expected.len().min(7)],
+        );
+    }
+}
+
+/// Reads the `ref=` entry out of `grammar.pin`. Same trivial `key=value` format
+/// the setup script parses; `#` starts a comment.
+fn read_grammar_pin(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(value) = line.strip_prefix("ref=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn git_describe(dir: &Path) -> Option<String> {

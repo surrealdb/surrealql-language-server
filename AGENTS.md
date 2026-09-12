@@ -30,9 +30,24 @@ bash scripts/setup-grammar.sh   # or: TREE_SITTER_SURREALQL_DIR=/path cargo buil
 cargo test
 ```
 
-`make help` lists every maintenance target. The catalogue tests additionally
-want a SurrealDB checkout (`SURREALDB_DIR`, or `../surrealdb`); without one
-they skip and say so.
+The grammar revision lives in [`grammar.pin`](grammar.pin) and nowhere else.
+`build.rs` fails the build when the checkout has drifted off it, naming the one
+command that fixes it: a checkout that silently predates the pin used to fail
+about twenty tests with `parse` errors on valid SurrealQL, which reads as a
+language-server bug.
+
+The catalogue tests and the conformance sweep additionally want a SurrealDB
+checkout, at the revision [`surrealdb.pin`](surrealdb.pin) names:
+
+```bash
+bash scripts/setup-surrealdb.sh   # or: SURREALDB_DIR=/path cargo test
+```
+
+Without one they skip and say so. With one at a *different* revision they run
+and report version skew as though it were a defect, so both suites print which
+revision they read when the two disagree.
+
+`make help` lists every maintenance target.
 
 ## Checking SurrealQL
 
@@ -76,7 +91,7 @@ added. Key repairs on the code, not the message text.
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
-| `parse` | error | Tree-sitter could not parse the source (see the false-positive list below). |
+| `parse` | error | Tree-sitter could not parse the source. Every one is a real syntax error: see *Known false positives* below. |
 | `unknown-type` | error | A type position holds a word SurrealQL's kind grammar does not have. |
 | `unknown-table` | warning | A queried table reads as a typo of an explicitly defined one. |
 | `unknown-field` | warning | A field not defined on an explicit (closed-schema) table. |
@@ -98,23 +113,20 @@ Several diagnostics carry structured hints in `data` — for example
 `unknown-table` includes `{"table": …, "suggestion": …}`. Prefer the hint
 over re-deriving the fix.
 
-## Known false positives — do not "fix" these
+## Known false positives
 
-The pinned tree-sitter grammar rejects a few shapes that are **valid
-SurrealQL**. They surface as `parse` errors. A `parse` error on one of these
-shapes is a known grammar gap: **do not change the query**, and do not
-"repair" it into something else. The full list with evidence is
-[`docs/grammar-gaps.md`](docs/grammar-gaps.md); the shapes:
+**There are currently none.** Every `parse` error the server reports is a real
+syntax error, and a query that trips one needs fixing.
 
-- A union type in a `LET` annotation: `LET $a: int | float = 2;`
-- A sized collection type: `LET $b: array<float, 10> = 2;`
-- A nested `SET` target: `CREATE person SET name.first = 'John';`
-- The `%` operator: `8 % 3`
-- Unary minus on a non-number: `-[1, 2, 3]`
-- Mock syntax: `|test:1..4|`
+This section used to list six shapes of valid SurrealQL that the pinned grammar
+rejected: a union type in a `LET` annotation, a sized collection type, a nested
+`SET` target, `%`, unary minus, and mock syntax. All of them were fixed upstream
+in `surrealql-tree-sitter` and the pin now names a revision that parses them.
 
-These are grammar fixes in the `surrealql-tree-sitter` repository, not
-query bugs. Everything else `parse` reports is a real syntax error.
+The category is not closed, only empty. The grammar is pinned in
+[`grammar.pin`](grammar.pin), and when a gap is found again it is recorded in
+[`docs/grammar-gaps.md`](docs/grammar-gaps.md) and listed here before it can
+reach an agent. Until then, treat `parse` as trustworthy.
 
 ## Contributing rules
 

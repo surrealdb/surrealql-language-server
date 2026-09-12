@@ -1085,6 +1085,9 @@ fn infer_fields_from_statement(
     fields
 }
 
+// Each argument is a separate fact about the field being recorded; grouping
+// them would only move the same list behind a struct literal at every call.
+#[allow(clippy::too_many_arguments)]
 fn inferred_field(
     table: &str,
     field: &str,
@@ -1803,6 +1806,11 @@ pub fn syntax_diagnostic_limit(configured: usize) -> usize {
     }
 }
 
+// Nine parameters, five of them shared with its mutually recursive partner.
+// The fix is a walk-context struct holding `uri`/`source`/`lines`/`known_names`,
+// which is also what lets the pair share one depth counter: done together with
+// the recursion guard rather than as a signature change on its own.
+#[allow(clippy::too_many_arguments)]
 fn collect_node_diagnostics(
     uri: Option<&Uri>,
     source: &str,
@@ -2077,6 +2085,11 @@ fn has_error_ancestor(node: Node<'_>) -> bool {
 /// the same underline, so they're descended through without their own
 /// diagnostic; errors on later lines get reported (the parent's range
 /// was clamped to its first line).
+// Nine parameters, five of them shared with its mutually recursive partner.
+// The fix is a walk-context struct holding `uri`/`source`/`lines`/`known_names`,
+// which is also what lets the pair share one depth counter: done together with
+// the recursion guard rather than as a signature change on its own.
+#[allow(clippy::too_many_arguments)]
 fn descend_into_error(
     uri: Option<&Uri>,
     source: &str,

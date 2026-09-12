@@ -846,7 +846,6 @@ where
         let prefix = &analysis.text[..offset];
         let open_paren = prefix.rfind('(')?;
         let function_name = prefix[..open_paren]
-            .trim_end()
             .split_whitespace()
             .last()
             .map(str::trim)

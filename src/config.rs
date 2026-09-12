@@ -772,8 +772,10 @@ mod tests {
     /// historical payload shapes.)
     #[test]
     fn known_key_lists_cover_every_settings_field() {
-        let mut settings = ServerSettings::default();
-        settings.auth_contexts = vec![super::AuthContext::default()];
+        let settings = ServerSettings {
+            auth_contexts: vec![super::AuthContext::default()],
+            ..ServerSettings::default()
+        };
         let value = serde_json::to_value(&settings).expect("serializable");
         let object = value.as_object().expect("object");
 
