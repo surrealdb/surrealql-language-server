@@ -27,6 +27,10 @@ help: ## Show this help
 grammar: ## Clone/update the sibling tree-sitter grammar
 	bash scripts/setup-grammar.sh
 
+.PHONY: vendor-grammar
+vendor-grammar: ## Refresh vendor/ from the pinned grammar (for the published crate)
+	bash scripts/vendor-grammar.sh
+
 .PHONY: build
 build: ## Build the native binary + library (debug)
 	$(CARGO) build

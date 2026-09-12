@@ -15,6 +15,24 @@ authors = ['Chiru Boggavarapu <chiru@foretag.co>', 'Tobie Morgan Hitchcock <tobi
 license-file = 'LICENSE'
 description = 'Language Server Protocol implementation for SurrealQL'
 keywords = ['surrealdb', 'language-server']
+categories = ['development-tools', 'parser-implementations']
+repository = 'https://github.com/surrealdb/surrealql-language-server'
+readme = 'README.md'
+documentation = 'https://docs.rs/surrealql-language-server'
+
+# The published crate carries the vendored grammar (about 0.3 MB compressed)
+# because `build.rs` has nowhere else to look once it is unpacked. Everything
+# below is repository furniture that a consumer never compiles.
+exclude = [
+    '.github/**',
+    'docs/**',
+    'scripts/**',
+    'tests/**',
+    'xtask/**',
+    'pkg/**',
+    'wasm/**',
+    'CHANGELOG.md',
+]
 
 # `cdylib` is required so `scripts/build-wasm.sh` can produce the
 # browser-loadable wasm module; `rlib` keeps `cargo build`/`cargo test`

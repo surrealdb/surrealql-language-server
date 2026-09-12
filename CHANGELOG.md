@@ -47,6 +47,20 @@ rather than leaving them to look as though they work.
 
 ### Added
 
+**`cargo install surrealql-language-server` works.** It never has: `build.rs`
+looked for a sibling `../surrealql-tree-sitter` checkout, which exists in this
+repository's layout and nowhere a crates.io consumer unpacks to, so the build
+panicked every time (pain-points H9). The pinned grammar's four build inputs are
+now vendored under `vendor/`, and `build.rs` falls back to them: a local
+checkout still wins, so grammar development is unchanged. The published crate
+grows by about 0.3 MB compressed, and `--version` reports the vendored revision
+rather than `grammar unknown`.
+
+CI refreshes the vendored copy and fails if it differs from the pin, then
+packages the crate and builds it in isolation, so neither the drift nor the
+original breakage can return silently. The crate also gained the `repository`,
+`readme`, `categories` and `documentation` metadata it was missing.
+
 **Folding ranges and selection ranges.** Both read the parse tree the analysis
 already caches, so neither re-parses. Folding covers multi-line statements,
 blocks, object and array literals, JavaScript function bodies, and runs of

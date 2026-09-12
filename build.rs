@@ -144,8 +144,14 @@ fn verify_grammar_pin(manifest_dir: &Path, grammar_dir: &Path) {
     let Some(expected) = read_grammar_pin(&manifest_dir.join("grammar.pin")) else {
         return;
     };
-    let Some(actual) = git(grammar_dir, &["rev-parse", "HEAD"]) else {
-        return;
+    // The vendored tree is not a git checkout; it records its revision in a
+    // file, written by `scripts/vendor-grammar.sh`.
+    let actual = match fs::read_to_string(grammar_dir.join("REVISION")) {
+        Ok(recorded) => recorded.trim().to_string(),
+        Err(_) => match git(grammar_dir, &["rev-parse", "HEAD"]) {
+            Some(revision) => revision,
+            None => return,
+        },
     };
 
     if actual != expected {
@@ -186,6 +192,17 @@ fn git_describe(dir: &Path) -> Option<String> {
 }
 
 fn git_short_revision(dir: &Path) -> Option<String> {
+    // A vendored tree has no git history, only the revision it was copied from.
+    // Without this every crates.io build would stamp `grammar unknown`, and the
+    // version string is the one place the effective grammar revision is
+    // observable at run time: it is what `--version` and the `check` JSON
+    // report carry.
+    if let Ok(recorded) = fs::read_to_string(dir.join("REVISION")) {
+        let recorded = recorded.trim();
+        if !recorded.is_empty() {
+            return Some(recorded.chars().take(7).collect());
+        }
+    }
     git(dir, &["rev-parse", "--short", "HEAD"])
 }
 
@@ -203,16 +220,33 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Where to find the grammar's build inputs, in order of preference.
+///
+/// 1. `TREE_SITTER_SURREALQL_DIR`, for anyone working on the grammar itself.
+/// 2. The sibling checkout this repository's own layout uses.
+/// 3. The vendored copy under `vendor/`.
+///
+/// The third is what makes the published crate build at all. It has none of the
+/// first two (a crates.io consumer unpacks a tarball, with no sibling anything)
+/// so `cargo install surrealql-language-server` hit the panic below every
+/// time. The vendored tree is refreshed by `make vendor-grammar` and pinned to
+/// the same revision as everything else.
 fn grammar_dir(manifest_dir: &Path) -> PathBuf {
-    let configured = env::var_os("TREE_SITTER_SURREALQL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("../surrealql-tree-sitter"));
-
-    if configured.is_absolute() {
-        configured
-    } else {
-        manifest_dir.join(configured)
+    if let Some(configured) = env::var_os("TREE_SITTER_SURREALQL_DIR") {
+        let configured = PathBuf::from(configured);
+        return if configured.is_absolute() {
+            configured
+        } else {
+            manifest_dir.join(configured)
+        };
     }
+
+    let sibling = manifest_dir.join("../surrealql-tree-sitter");
+    if sibling.join("src/parser.c").is_file() {
+        return sibling;
+    }
+
+    manifest_dir.join("vendor/surrealql-tree-sitter")
 }
 
 /// Extract every SurrealQL keyword referenced by `grammar.js`. Grammar v3

@@ -51,6 +51,27 @@ jobs:
             # where a SurrealDB layout change shows up first.
             - name: Run generator tests
               run: cargo test -p xtask
+            # `cargo install surrealql-language-server` panicked in build.rs for
+            # the whole life of the crate, because a crates.io consumer has no
+            # sibling grammar checkout. The vendored copy fixes that, and this
+            # step is what stops it drifting: it must match the pin, and the
+            # packaged crate must build with no sibling anything in sight.
+            - name: Check the vendored grammar matches the pin
+              run: |
+                  bash scripts/vendor-grammar.sh
+                  git diff --exit-code -- vendor/ || {
+                      echo "::error::vendor/ is stale; run \`make vendor-grammar\` and commit the result."
+                      exit 1
+                  }
+            - name: Verify the published crate builds standalone
+              run: |
+                  cargo package --no-verify
+                  rm -rf /tmp/crate-check && mkdir -p /tmp/crate-check
+                  version=$(cargo metadata --no-deps --format-version 1 |
+                      python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "surrealql-language-server"))')
+                  tar xzf "target/package/surrealql-language-server-${version}.crate" -C /tmp/crate-check
+                  cd "/tmp/crate-check/surrealql-language-server-${version}"
+                  cargo build --locked
 
     # The npm package is built only on a tag, so a native-only type reaching
     # src/core/ used to be invisible until release day. This job is the tripwire

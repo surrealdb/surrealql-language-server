@@ -40,6 +40,12 @@ Or set `TREE_SITTER_SURREALQL_DIR` to point to an existing checkout:
 TREE_SITTER_SURREALQL_DIR=/path/to/surrealql-tree-sitter cargo build
 ```
 
+`cargo install surrealql-language-server` needs none of this: the published
+crate carries the pinned grammar under [`vendor/`](vendor), refreshed by
+`make vendor-grammar`. `build.rs` prefers `TREE_SITTER_SURREALQL_DIR`, then the
+sibling checkout, then the vendored copy, so working on the grammar locally
+behaves exactly as before.
+
 The grammar is **pinned**, because the analysis layer is coupled to its node
 kinds. The revision lives in [`grammar.pin`](grammar.pin) and nowhere else: the
 setup script, the CI checkout steps and `build.rs` all read it, and the build
@@ -169,9 +175,11 @@ read when the two disagree.
 ├── build.rs                  # compiles tree-sitter grammar (C), enforces grammar.pin
 ├── grammar.pin               # the tree-sitter grammar revision: single source
 ├── surrealdb.pin             # the SurrealDB revision the catalogue + corpus come from
+├── vendor/                   # @generated grammar sources for the published crate
 └── scripts/
     ├── setup-grammar.sh      # clones/updates the grammar sibling repo to the pin
-    └── setup-surrealdb.sh    # fetches the SurrealDB checkout the tests read
+    ├── setup-surrealdb.sh    # fetches the SurrealDB checkout the tests read
+    └── vendor-grammar.sh     # refreshes vendor/ from the pinned checkout
 ```
 
 ## Editor Integration
