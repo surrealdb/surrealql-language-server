@@ -62,7 +62,15 @@ if ! git -C "$TARGET" cat-file -e "${GRAMMAR_REF}^{commit}" 2>/dev/null; then
         git -C "$TARGET" fetch -q --tags origin
 fi
 
+# Where HEAD is now, so the message can name something to go back to. A clean
+# checkout sitting on a branch may still hold committed work that is not pushed
+# anywhere, and detaching makes it look gone to anyone who does not think of the
+# reflog.
+branch="$(git -C "$TARGET" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 echo "Moving $TARGET from ${current:0:7} to ${GRAMMAR_REF:0:7}"
+if [ -n "$branch" ]; then
+    echo "       (detaching from '$branch'; \`git -C $TARGET checkout $branch\` returns to it)"
+fi
 git -C "$TARGET" checkout -q --detach "$GRAMMAR_REF"
 
 echo "Grammar ready at $TARGET (${GRAMMAR_REF:0:7})"

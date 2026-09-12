@@ -93,8 +93,11 @@ jobs:
 
     release:
         if: startsWith(github.ref, 'refs/tags/v')
-        # A red test must never ship a binary, a crate or an npm package.
-        needs: rust
+        # A red test must never ship a binary, a crate or an npm package, and a
+        # wasm-only break must not either: the npm package is the wasm build, so
+        # `wasm-check` is the only job that would have caught one before the
+        # release job tried to produce it.
+        needs: [rust, wasm-check]
         permissions:
             contents: write
         strategy:
@@ -169,8 +172,11 @@ jobs:
 
     wasm:
         if: startsWith(github.ref, 'refs/tags/v')
-        # A red test must never ship a binary, a crate or an npm package.
-        needs: rust
+        # A red test must never ship a binary, a crate or an npm package, and a
+        # wasm-only break must not either: the npm package is the wasm build, so
+        # `wasm-check` is the only job that would have caught one before the
+        # release job tried to produce it.
+        needs: [rust, wasm-check]
         permissions:
             contents: write
             id-token: write
@@ -229,8 +235,11 @@ jobs:
     # and the data artifact should not share its fate).
     builtins:
         if: startsWith(github.ref, 'refs/tags/v')
-        # A red test must never ship a binary, a crate or an npm package.
-        needs: rust
+        # A red test must never ship a binary, a crate or an npm package, and a
+        # wasm-only break must not either: the npm package is the wasm build, so
+        # `wasm-check` is the only job that would have caught one before the
+        # release job tried to produce it.
+        needs: [rust, wasm-check]
         permissions:
             contents: write
         runs-on: ubuntu-latest
