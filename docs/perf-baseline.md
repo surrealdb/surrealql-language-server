@@ -154,3 +154,123 @@ without a `COMMENT` clause, the common case in real schema files. The new
 
 D1 and D2 are done. D3, D4 and D5 are not — see the entries in
 `docs/pain-points.md`. Neither failing target needed them.
+
+
+---
+
+# Against master (0.7)
+
+Both branches measured on the same machine with the same harness (`benches/latency.rs`
+is byte-identical between them) each in its own shipped configuration: master on
+grammar `cb2e6b5` at `opt-level = 'z'`, this branch on `373e7cd` at `opt-level = 3`.
+
+| Operation | master | this branch | change |
+|-----------|--------|-------------|--------|
+| `analyze_document`, 3200 lines | 47.57 ms | **30.77 ms** | 1.55x |
+| `analyze_document/schema`, 3200 lines | 27.28 ms | **16.37 ms** | 1.67x |
+| `semantic_tokens_full`, 3200 lines | 10.21 ms | **6.57 ms** | 1.55x |
+| `semantic_tokens_range`, 40 lines | 0.454 ms | **0.304 ms** | 1.49x |
+| `table_completion_items`, 800 tables | 0.183 ms | **0.147 ms** | 1.24x |
+| `semantic_diagnostics`, declared | 0.225 ms | **0.142 ms** | 1.58x |
+| `semantic_diagnostics`, undeclared | 0.719 ms | **0.524 ms** | 1.37x |
+
+## Where that came from, honestly
+
+Almost all of it is the optimisation level. Running **this branch** at master's
+`opt-level = 'z'` isolates the code changes:
+
+| Operation | master (z) | this branch (z) | this branch (3) |
+|-----------|-----------|-----------------|-----------------|
+| `analyze_document` | 47.57 ms | 47.53 ms | 30.77 ms |
+| `analyze_document/schema` | 27.28 ms | 27.06 ms | 16.37 ms |
+| `semantic_tokens_full` | 10.21 ms | 9.86 ms | 6.57 ms |
+| `semantic_tokens_range` | 0.454 ms | 0.469 ms | 0.304 ms |
+| `table_completion_items` | 0.183 ms | 0.194 ms | 0.147 ms |
+| `semantic_diagnostics` | 0.225 ms | 0.230 ms | 0.142 ms |
+| `semantic_diagnostics`, undeclared | 0.719 ms | 0.684 ms | 0.524 ms |
+
+At equal optimisation level the two branches are the same speed. The work added
+in 0.7 (the depth guard, the pre-parse bracket count, two more reference
+indexes, a `codeDescription` per diagnostic) costs nothing measurable. Three
+rows read very slightly slower on this branch (0.454 → 0.469, 0.183 → 0.194,
+0.225 → 0.230); all three are sub-millisecond operations where the difference is
+within run-to-run variance, and all three are faster than master at the profile
+that actually ships.
+
+## What this harness cannot see
+
+It parses every document from scratch, so it measures a **cold** analysis and
+says nothing about the two changes users feel most:
+
+* **Incremental parse.** One settled edit on an already-open buffer, measured
+  through the real `analyze_document_incremental` path:
+
+  | Document | Fresh analysis | After one edit | Saved |
+  |----------|----------------|----------------|-------|
+  | 200 lines (9 KB) | 1.60 ms | **1.13 ms** | 29% |
+  | 800 lines (38 KB) | 6.21 ms | **4.07 ms** | 34% |
+  | 3200 lines (156 KB) | 25.19 ms | **15.81 ms** | 37% |
+
+  NOTE: the parse alone drops by about 95% (16.4 ms to 0.77 ms at 3200 lines),
+  but the parse is only part of `analyze_document`: extraction and the syntax
+  walk are full-document and gain nothing. **37% is the end-to-end number**, and
+  it is the one to quote.
+
+* **Incremental sync.** Not measurable here at all: it removes a 166 KB document
+  crossing the wire and being JSON-unescaped on the reactor for every keystroke,
+  which is paid before any code in this repository runs.
+
+---
+
+# Incremental sync and parse (0.7)
+
+Measured on the same machine and harness, after the Phase 2 work.
+
+## The release profile was the largest single win
+
+`[profile.release]` carried `opt-level = 'z'`, which the benchmark inherited,
+so every number this document recorded described a binary optimised for size,
+which is not what the native binary wants. Same harness, same machine, the only
+change being the optimisation level:
+
+| Operation | `opt-level = 'z'` | `opt-level = 3` | Gain |
+|-----------|-------------------|-----------------|------|
+| `analyze_document`, 3200 lines | 46.39 ms | **28.68 ms** | 1.62x |
+| `analyze_document/schema` | 26.21 ms | **15.73 ms** | 1.67x |
+| `semantic_tokens_full` | 10.26 ms | **6.63 ms** | 1.55x |
+| `semantic_diagnostics`, 200 docs | 0.228 ms | **0.144 ms** | 1.58x |
+
+Larger than anything left in `docs/perf-plan.md`, for a one-line change. The
+default now optimises for speed; `scripts/build-wasm.sh` sets
+`CARGO_PROFILE_RELEASE_OPT_LEVEL=z` for the browser module, where a download is
+a real cost. The native binary grows to 9.5 MB.
+
+## Incremental parse
+
+A reparse against the previous tree, against a fresh parse of the same text:
+
+| Document | Fresh parse | Incremental | Saved |
+|----------|-------------|-------------|-------|
+| 200 lines (9 KB) | 1.054 ms | **0.263 ms** | 0.79 ms (75%) |
+| 800 lines (38 KB) | 4.024 ms | **0.408 ms** | 3.62 ms (90%) |
+| 3200 lines (156 KB) | 16.449 ms | **0.765 ms** | 15.68 ms (95%) |
+
+The parse is the part of `analyze_document` that incremental sync can remove;
+the extraction and syntax walks are full-document and gain nothing.
+
+NOTE: The plan gated this on a differential test, and was right to. Tree-sitter's
+incremental reparse is not *guaranteed* to reproduce a fresh parse when the
+previous tree held ERROR nodes, and ERROR/MISSING nodes are the `parse`
+diagnostics, this server's primary output. Measured over SurrealDB's 1,894
+parseable corpus files with ten random single-character edits each, including
+inserted quotes and parens: **zero mismatches**. Pinned as
+`incremental_reparse_matches_a_fresh_parse` in `tests/conformance.rs`; re-run it
+after a grammar bump.
+
+## What incremental sync actually saves
+
+Not measured here, because no harness in this repository can: a 166 KB document
+used to cross the wire and be JSON-unescaped into a fresh `String` on the reactor
+thread for every keystroke. At ten characters a second that is 1.6 MB/s of
+decoding before the debounce sees the message, and in the browser a full
+JS-to-wasm string copy each time. It is paid before any code here runs.

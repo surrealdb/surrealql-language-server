@@ -82,6 +82,12 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
         settings.connection.username.clone(),
         settings.connection.password.clone(),
     ) {
+        // Deliberately not collapsed into the `else if let` above, which clippy
+        // suggests. The inner condition performs an awaited network sign-in;
+        // hoisting it into the outer `&&` hides a side effect inside what reads
+        // as a pattern match, and buries the "try root, fall back to database
+        // auth" shape this branch exists to express.
+        #[allow(clippy::collapsible_if)]
         if db
             .signin(Root {
                 username: username.clone(),
@@ -111,13 +117,13 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
         }
     }
 
-    if let Some(namespace) = &settings.connection.namespace {
-        if let Some(database) = &settings.connection.database {
-            db.use_ns(namespace)
-                .use_db(database)
-                .await
-                .map_err(|error| format!("failed to select namespace/database: {error}"))?;
-        }
+    if let Some(namespace) = &settings.connection.namespace
+        && let Some(database) = &settings.connection.database
+    {
+        db.use_ns(namespace)
+            .use_db(database)
+            .await
+            .map_err(|error| format!("failed to select namespace/database: {error}"))?;
     }
 
     let mut snapshot = LiveMetadataSnapshot::default();
@@ -141,10 +147,10 @@ async fn fetch_snapshot_inner(settings: &ServerSettings) -> Result<LiveMetadataS
             let query = format!("INFO FOR TABLE {table};");
             match db.query(query).await.and_then(|result| result.check()) {
                 Ok(mut result) => {
-                    if let Ok(value) = result.take::<SurrealValue>(0) {
-                        if let Ok(json) = serde_json::to_value(value) {
-                            collect_define_strings(&json, &mut define_strings);
-                        }
+                    if let Ok(value) = result.take::<SurrealValue>(0)
+                        && let Ok(json) = serde_json::to_value(value)
+                    {
+                        collect_define_strings(&json, &mut define_strings);
                     }
                 }
                 Err(error) => snapshot

@@ -19,6 +19,12 @@ fn main() {
         }
     }
 
+    verify_grammar_pin(&manifest_dir, &grammar_dir);
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("grammar.pin").display()
+    );
     println!("cargo:rerun-if-env-changed=TREE_SITTER_SURREALQL_DIR");
     println!("cargo:rerun-if-changed={}", parser_c.display());
     println!("cargo:rerun-if-changed={}", grammar_js.display());
@@ -117,6 +123,65 @@ fn emit_build_provenance(manifest_dir: &Path, grammar_dir: &Path) {
     }
 }
 
+/// Fail the build when the grammar checkout is not the revision `grammar.pin`
+/// names.
+///
+/// The node-kind layer in `src/semantic/node_kind.rs` is coupled to the
+/// grammar's emitted kinds, so a checkout that drifts off the pin does not fail
+/// loudly: it produces `parse` diagnostics on valid SurrealQL, which reads as a
+/// language-server bug. That cost a whole debugging session once; this turns it
+/// into a build error naming the one command that fixes it.
+///
+/// Skipped when `TREE_SITTER_SURREALQL_DIR` points somewhere deliberate, when
+/// the grammar is vendored rather than checked out, or when either revision
+/// cannot be read: a grammar developer building against their own working tree
+/// must not be blocked.
+fn verify_grammar_pin(manifest_dir: &Path, grammar_dir: &Path) {
+    if env::var_os("TREE_SITTER_SURREALQL_DIR").is_some() {
+        return;
+    }
+
+    let Some(expected) = read_grammar_pin(&manifest_dir.join("grammar.pin")) else {
+        return;
+    };
+    // The vendored tree is not a git checkout; it records its revision in a
+    // file, written by `scripts/vendor-grammar.sh`.
+    let actual = match fs::read_to_string(grammar_dir.join("REVISION")) {
+        Ok(recorded) => recorded.trim().to_string(),
+        Err(_) => match git(grammar_dir, &["rev-parse", "HEAD"]) {
+            Some(revision) => revision,
+            None => return,
+        },
+    };
+
+    if actual != expected {
+        panic!(
+            "grammar checkout at {} is {} but grammar.pin names {}.\n\
+             Run `bash scripts/setup-grammar.sh` to move it onto the pin, or set\n\
+             TREE_SITTER_SURREALQL_DIR to build against a checkout of your own.",
+            grammar_dir.display(),
+            &actual[..actual.len().min(7)],
+            &expected[..expected.len().min(7)],
+        );
+    }
+}
+
+/// Reads the `ref=` entry out of `grammar.pin`. Same trivial `key=value` format
+/// the setup script parses; `#` starts a comment.
+fn read_grammar_pin(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(value) = line.strip_prefix("ref=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn git_describe(dir: &Path) -> Option<String> {
     let described = git(dir, &["describe", "--always", "--dirty", "--tags"])?;
     match git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
@@ -127,6 +192,17 @@ fn git_describe(dir: &Path) -> Option<String> {
 }
 
 fn git_short_revision(dir: &Path) -> Option<String> {
+    // A vendored tree has no git history, only the revision it was copied from.
+    // Without this every crates.io build would stamp `grammar unknown`, and the
+    // version string is the one place the effective grammar revision is
+    // observable at run time: it is what `--version` and the `check` JSON
+    // report carry.
+    if let Ok(recorded) = fs::read_to_string(dir.join("REVISION")) {
+        let recorded = recorded.trim();
+        if !recorded.is_empty() {
+            return Some(recorded.chars().take(7).collect());
+        }
+    }
     git(dir, &["rev-parse", "--short", "HEAD"])
 }
 
@@ -144,16 +220,33 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Where to find the grammar's build inputs, in order of preference.
+///
+/// 1. `TREE_SITTER_SURREALQL_DIR`, for anyone working on the grammar itself.
+/// 2. The sibling checkout this repository's own layout uses.
+/// 3. The vendored copy under `vendor/`.
+///
+/// The third is what makes the published crate build at all. It has none of the
+/// first two (a crates.io consumer unpacks a tarball, with no sibling anything)
+/// so `cargo install surrealql-language-server` hit the panic below every
+/// time. The vendored tree is refreshed by `make vendor-grammar` and pinned to
+/// the same revision as everything else.
 fn grammar_dir(manifest_dir: &Path) -> PathBuf {
-    let configured = env::var_os("TREE_SITTER_SURREALQL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("../surrealql-tree-sitter"));
-
-    if configured.is_absolute() {
-        configured
-    } else {
-        manifest_dir.join(configured)
+    if let Some(configured) = env::var_os("TREE_SITTER_SURREALQL_DIR") {
+        let configured = PathBuf::from(configured);
+        return if configured.is_absolute() {
+            configured
+        } else {
+            manifest_dir.join(configured)
+        };
     }
+
+    let sibling = manifest_dir.join("../surrealql-tree-sitter");
+    if sibling.join("src/parser.c").is_file() {
+        return sibling;
+    }
+
+    manifest_dir.join("vendor/surrealql-tree-sitter")
 }
 
 /// Extract every SurrealQL keyword referenced by `grammar.js`. Grammar v3

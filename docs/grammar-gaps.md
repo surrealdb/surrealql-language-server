@@ -1,14 +1,53 @@
 # Grammar Gaps
 
-The language server compiles against the tree-sitter SurrealQL grammar
-pinned to commit `cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b`
-(`GRAMMAR_REF` in [`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh)
-and the checkout steps in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
-The analysis layer in [`src/semantic/node_kind.rs`](../src/semantic/node_kind.rs)
-is coupled to that revision's node kinds — bump the pin and the
-constants together.
+The language server compiles against the tree-sitter SurrealQL grammar at the
+revision [`grammar.pin`](../grammar.pin) names: the single source, read by
+[`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh), by the CI checkout
+steps, and by [`build.rs`](../build.rs), which fails the build when the checkout
+has drifted off it. The analysis layer in
+[`src/semantic/node_kind.rs`](../src/semantic/node_kind.rs) is coupled to that
+revision's node kinds: bump the pin and the constants together.
 
-## Fixed by the `cb2e6b5` pin
+## Fixed by the `373e7cd` pin
+
+The pin moved from `cb2e6b5` (an unmerged PR branch) to upstream `master`, which
+carries `surrealql-tree-sitter#16`. That revision closed **every false-positive
+shape this document had recorded**: seven shapes of valid SurrealQL that used
+to surface as `parse` errors:
+
+| Shape | Example |
+| --- | --- |
+| The remainder operator | `RETURN 8 % 3` |
+| A prefix sign on a non-literal | `RETURN -$x`, `RETURN -[1, 2, 3]` |
+| A sized collection type | `LET $b: array<float, 10> = [1.0]` |
+| A union in a `ParamDefinition` | `LET $a: int \| float = 2` |
+| A decimal with a fraction or exponent | `RETURN 102023.1dec` |
+| A nested `SET` target | `CREATE person SET name.first = 'John'` |
+| Mock syntax in a value position | `RETURN \|test:1..4\|` |
+
+Verified shape by shape through `check` at the new pin: all seven parse clean,
+and the whole suite passes unchanged. `AGENTS.md` no longer lists any false
+positive.
+
+Two of them needed a matching change on this side, because the shapes had never
+reached the type checker before and it was wrong about both:
+
+- **`PrefixExpression` was typed `bool` unconditionally**
+  ([`src/semantic/infer.rs`](../src/semantic/infer.rs)). True while `!` was the
+  only prefix operator; with `-x` and `+x` parsing it produced `argument-type`
+  and `operator-type` errors on SurrealQL the engine runs: caught by the corpus
+  sweep on `bench/executor/rt_import.surql`, which writes
+  `vector::divide([$viewportWidth, -$viewportHeight], …)`. `!` still answers
+  `bool`; `+` is the engine's identity, so the operand's type passes through;
+  `-` follows `TryNeg`, which accepts only numbers.
+- **`ArithOp` had no `%`** ([`src/semantic/operate.rs`](../src/semantic/operate.rs)).
+  `binding_power` already ranked it at MulDiv, so only the operand table was
+  missing. `TryRem for Value` has exactly one arm, `(Number, Number)`, so
+  `"8" % "3"` is now reported in the engine's own words, and the corpus file
+  `language/expression/operators/modulo.surql`, which declares that very error,
+  is now in the sweep's expected set.
+
+## Fixed by the `cb2e6b5` pin (earlier)
 
 The pin moved from `df12d94` to `cb2e6b5` for the `DEFINE INDEX` kinds
 SurrealDB 3 reads. At `df12d94`, `IndexClause` was
@@ -49,7 +88,7 @@ leaves `OFFERS_THE_GRAMMAR_CANNOT_PARSE` in
 Across SurrealDB's own `language-tests/` corpus the move fixed the parse of
 42 files and regressed none.
 
-## Fixed by the `df12d94` pin
+## Fixed by the `df12d94` pin (earlier)
 
 The pin moved from `826d0c2` to `df12d94` (upstream `master`) for four
 shapes the earlier revision rejected or mis-nested on valid SurrealQL.
@@ -82,88 +121,33 @@ of 91 files and regressed none.
 
 ## Known parse/shape gaps at the pinned revision
 
+None of these is a false positive: they are shapes the analyzer has to work
+*around*, not valid SurrealQL the grammar rejects. The false-positive list is
+empty: see the `373e7cd` section above.
+
 - **No `FromClause` node.** `SELECT … FROM target` lays the targets
   out as direct children after the bare `FROM` keyword. The analyzer's
   target extraction handles both shapes
   (`target_nodes_for_statement` in
   [`src/semantic/analyzer.rs`](../src/semantic/analyzer.rs)).
+
 - **Keyword tokens are aliased.** Every keyword is a hidden `_kw_<word>`
   token aliased to the public `Keyword` kind. `Node::grammar_name()`
   recovers the concrete keyword for MISSING-node diagnostics, but the
   lookahead table only exposes the alias — "expected *which* keyword"
   cannot be derived from parser states (that's why syntax hints use
   the build-generated `KEYWORDS` list instead).
+
 - **Error recovery is coarse.** A single typo often produces one ERROR
   node spanning the rest of the statement (or file); nested statements
   inside the error region may re-parse. The diagnostics layer clamps
   those spans to the first line and surfaces nested errors separately.
+
 - **Statement coverage.** DEFINE ANALYZER / USER / NAMESPACE /
   DATABASE / MODEL / TOKEN / CONFIG parse but get no structured
   analysis; CRUD statements nested in FOR/IF blocks and INSERT
   statements produce no query facts (see
   [`docs/pain-points.md`](pain-points.md)).
-
-- **No `%` operator.** Nothing in `grammar.js` holds `'%'`, so `8 % 3`
-  does not parse. The engine supports it at `MulDiv` precedence and
-  rejects `"8" % "3"`, which the arithmetic check therefore cannot reach.
-- **No unary minus.** A sign belongs to the `Number` token
-  (`optional(choice('-', '+'))`) and `PrefixExpression` accepts `!`
-  alone, so `-[1,2,3]` does not parse. The engine rejects it with
-  `Cannot negate the value 'array'`.
-- **Mock syntax does not parse.** `|test:1..4|` yields `ERROR` nodes
-  *around* a `BinaryExpression` rather than inside one, so a guard that
-  only inspects a subtree sees a well-formed fragment. `has_broken_sibling`
-  in `semantic::infer` exists for exactly this shape.
-- **A union type does not parse in a `LET` annotation.** The
-  `ParamDefinition` type slot takes a single type expression, so
-  `LET $a: int | float = 2;` raises a false `parse` diagnostic on
-  SurrealQL the engine accepts. Tracked by
-  `adds_nothing_where_the_grammar_already_fails_to_parse` in
-  [`tests/lsp.rs`](../tests/lsp.rs), which also pins that the type
-  checker adds no second diagnostic on top of the failed parse.
-- **A sized collection type does not parse.** `LET $b: array<float, 10> = 2;`
-  is valid SurrealQL (the second argument bounds the length), but the
-  pinned grammar rejects it, so it too surfaces as a false `parse`
-  error — at least in the `ParamDefinition` slot the tracked examples
-  use. Same tracker test as the union gap; like the nested `SET`
-  target below, the real fix is cross-repo in `surrealql-tree-sitter`,
-  after which the pin moves here.
-- **A union in a `ParamDefinition` does not parse.** `_safeType` is
-  `choice($._singleType, seq('<', $._type, '>'))` and omits `UnionType`,
-  so `LET $a: int | float = 2` and a closure or function parameter typed
-  the same way leave an `ERROR` node; the bracketed `<int | float>` form
-  parses. `DEFINE FIELD … TYPE int | float` is unaffected, because
-  `TypeClause` uses `_type`. `semantic::infer` refuses to type a closure
-  whose parameter list holds an `ERROR`, rather than invent an arity.
-- **A sized collection does not parse.** `array<float, 10>` and
-  `set<int, 3>` produce `ParameterizedType(TypeName, TypeName,
-  ERROR(Int))` — `ParameterizedType` has no comma list. Both are valid
-  engine kinds.
-- **A signed decimal suffix does not parse.** `math::ceil(-102023.1dec)`
-  leaves an `ERROR` in the argument list, which is why the call checks
-  refuse to count arguments in a list that holds one.
-
-- **A `SET` target cannot be a nested field.** `FieldAssignment` is
-  `seq($.Ident, alias($._assignmentOp, $.Operator), choice($.IfElseStatement, $._value))`, so the
-  assigned-to side is a *single* identifier. `CREATE person SET
-  name.first = 'John'` therefore reports ``Invalid SurrealQL syntax near
-  `.first`.`` on valid SurrealQL — the `.first` becomes an `ERROR` sibling
-  inside the `FieldAssignment`. The engine accepts nested targets, and
-  `DEFINE FIELD name.first ON person` already parses (that rule uses
-  `Idiom`), so a schema can declare a field that no `SET` can assign.
-
-  Fix is one token in `grammar.js` — `$.Ident` → `$.Idiom` in
-  `FieldAssignment` — and it regenerates with no new conflicts. Verified
-  against this repo's suite and the SurrealDB corpus sweep. It is a
-  *cross-repo* change: it lands in `surrealql-tree-sitter`, then the pin
-  moves here.
-
-  The analyzer already reads both shapes, so the pin can move without a
-  matching code change: `field_assignment_target` in
-  [`src/semantic/analyzer.rs`](../src/semantic/analyzer.rs) accepts an
-  `Ident` (pinned revision) or an `Idiom` (fixed revision). Note the
-  fixed grammar wraps *every* target in an `Idiom`, including the plain
-  `SET age = 29` case.
 
 - **A graph hop names no fields.** `Lookup` is
   `seq(choice($.LookupRight, $.LookupLeft, $.LookupBoth), choice($.Ident,

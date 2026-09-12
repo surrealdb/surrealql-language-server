@@ -14,30 +14,37 @@
 //! [`crate::core::client`] for the trait definitions and
 //! [`crate::native`] / [`crate::wasm`] for the per-target impls.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tree_sitter::Tree;
+
 use ls_types::*;
 
-use crate::config::{AuthContext, ServerSettings};
+use crate::config::{AuthContext, ServerSettings, merge_absent};
 use crate::core::client::{LspNotifier, MetadataProvider, WorkspaceLoader};
 use crate::core::completion_context::{
     ColumnSlot, active_query_fact, column_completion_context, completion_prefix,
     completion_table_qualifier, graph_anchors, graph_edge_context, head_slot_at,
     is_table_name_context, statement_target_in_text,
 };
-use crate::core::state::{ServerState, merged_workspace, workspace_signature};
+use crate::core::state::{
+    ClientProfile, OpenBuffer, ServerState, merged_workspace, workspace_signature,
+};
 use crate::core::statement_shape::SlotYield;
 use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
-use crate::semantic::analyzer::{analyze_document, analyze_document_with_limit};
+use crate::semantic::analyzer::{
+    analyze_document, analyze_document_incremental, analyze_document_with_limit,
+};
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
-use crate::semantic::text::{token_at, word_range};
+use crate::semantic::text::{enclosing_call, token_at, word_range};
 use crate::semantic::types::{
-    DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
-    WorkspaceIndex,
+    DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, QueryAction,
+    SymbolOrigin, WorkspaceIndex,
 };
 
 /// The crate version plus the source and grammar revisions this binary was
@@ -70,6 +77,19 @@ pub struct LanguageServerCore<N: LspNotifier, W: WorkspaceLoader, M: MetadataPro
     /// so two read-merge-apply sequences would otherwise interleave
     /// and lose updates or invert the metadata-error status).
     config_lock: Arc<runtime::sync::Mutex<()>>,
+    /// What the client last sent for each open document, before any analysis.
+    ///
+    /// Behind a **`std::sync::Mutex`**, not the async `RwLock` that holds
+    /// everything else, and that is the load-bearing detail. `lock()` has no
+    /// await point, so a handler that only touches this map runs from its first
+    /// poll to completion without yielding, which is what makes the order two
+    /// edits are applied in the order they arrived, rather than whatever order
+    /// the executor gets round to polling them.
+    ///
+    /// Poisoning is unreachable: `panic = 'abort'` means a panic never unwinds
+    /// past the guard. The one hazard is holding it across an await, so every
+    /// critical section is a block that returns owned data.
+    buffers: Arc<std::sync::Mutex<HashMap<Uri, OpenBuffer>>>,
 }
 
 impl<N, W, M> LanguageServerCore<N, W, M>
@@ -85,6 +105,7 @@ where
             metadata_provider: Arc::new(metadata_provider),
             state: Arc::new(runtime::sync::RwLock::new(ServerState::default())),
             config_lock: Arc::new(runtime::sync::Mutex::new(())),
+            buffers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,9 +116,35 @@ where
     }
 
     /// LSP capability advertisement, identical for both targets.
-    pub fn server_capabilities() -> ServerCapabilities {
+    /// What this server offers, given what the client said it can handle.
+    ///
+    /// Almost everything here is unconditional: the capability is the same
+    /// whoever asks. The exception is `diagnosticProvider`, which is only worth
+    /// advertising to a client that pulls, because advertising it *and* pushing
+    /// gives a client that does both every diagnostic twice.
+    pub fn server_capabilities(client: ClientProfile) -> ServerCapabilities {
         ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+            // Echoed, not negotiated. Every conformant client supports UTF-16
+            // (it is the specification's default), and threading a second
+            // encoding through `LineIndex` would touch every range-producing
+            // call site in the server for the benefit of no known client. Saying
+            // so explicitly is still better than leaving it to be assumed.
+            position_encoding: Some(PositionEncodingKind::UTF16),
+            // Incremental since 0.7. A 166 KB document used to cross the wire,
+            // and get JSON-unescaped into a fresh `String` on the reactor: on
+            // *every keystroke*: at ten characters a second that is 1.6 MB/s of
+            // decoding before the debounce even sees the message, and in the
+            // browser a full JS-to-wasm string copy each time. No benchmark here
+            // measures that, because it is paid before any code this repository
+            // owns runs.
+            //
+            // Safe only because the edit is applied on the ordered path: see
+            // `apply_document_change`. A client that ignores this and keeps
+            // sending whole documents still works: that is the `range: None`
+            // branch.
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                TextDocumentSyncKind::INCREMENTAL,
+            )),
             completion_provider: Some(CompletionOptions {
                 // Table items ship without documentation and get it from
                 // `completion_resolve`, so the dropdown does not pay to render
@@ -119,6 +166,9 @@ where
             }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             definition_provider: Some(OneOf::Left(true)),
+            // `record<person>` on a field is a real type-to-definition jump, and
+            // the one place the distinction from `definition` earns its keep.
+            type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
             rename_provider: Some(OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
@@ -129,8 +179,41 @@ where
                 retrigger_characters: Some(vec![",".into()]),
                 work_done_progress_options: Default::default(),
             }),
-            code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+            // Declaring the kinds is what lets a client ask for a subset:
+            // VS Code's Quick Fix menu requests `quickfix`, and a
+            // "fix all on save" request asks for `source.fixAll`. Advertising a
+            // bare `true` meant every request got every action back, including
+            // refactors in a quick-fix menu. The handler honours
+            // `context.only`; this tells the client it is worth sending.
+            code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                code_action_kinds: Some(vec![
+                    CodeActionKind::QUICKFIX,
+                    CodeActionKind::REFACTOR_REWRITE,
+                ]),
+                work_done_progress_options: Default::default(),
+                resolve_provider: None,
+            })),
             document_highlight_provider: Some(OneOf::Left(true)),
+            folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+            // Only offered to a client that asked for it. A client that both
+            // pulls and accepts pushes would otherwise render every diagnostic
+            // twice, so the advertisement and the push suppression have to be
+            // decided by the same answer, and they are.
+            //
+            // `interFileDependencies` is factually true: the merged model spans
+            // the workspace, so a `DEFINE TABLE` in one file changes the
+            // diagnostics of another. `workspaceDiagnostics` is not offered:
+            // a full report over 5,000 files on every poll is a latency hazard,
+            // and it needs a model generation counter to answer "unchanged".
+            diagnostic_provider: client.pull_diagnostics.then(|| {
+                DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                    identifier: Some("surrealql".to_string()),
+                    inter_file_dependencies: true,
+                    workspace_diagnostics: false,
+                    work_done_progress_options: Default::default(),
+                })
+            }),
+            selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
                 InlayHintOptions {
                     resolve_provider: Some(false),
@@ -173,11 +256,55 @@ where
             None,
         );
         let workspace_folders = resolve_workspace_folders(&params);
+        let client = ClientProfile::from_capabilities(&params.capabilities);
+
+        // Every conformant client supports UTF-16 (the specification requires
+        // it, and `positionEncoding` echoes it), so this is effectively
+        // unreachable. But "effectively unreachable" and "silently wrong" look
+        // identical from the outside, and a client that offers only UTF-8 would
+        // otherwise receive ranges counted the other way with nothing said.
+        if let Some(encodings) = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|general| general.position_encodings.as_ref())
+            && !encodings.is_empty()
+            && !encodings.contains(&PositionEncodingKind::UTF16)
+        {
+            self.notifier
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "SurrealQL: this client offers only {} position encoding, and the \
+                         server counts UTF-16. Ranges may be misplaced on lines holding \
+                         non-ASCII characters.",
+                        encodings
+                            .iter()
+                            .map(|encoding| encoding.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    ),
+                )
+                .await;
+        }
+
+        // Which client, and which version. Free, and it turns an
+        // editor-specific bug report into something reproducible.
+        if let Some(info) = &params.client_info {
+            let version = info.version.as_deref().unwrap_or("unknown version");
+            self.notifier
+                .log_message(
+                    MessageType::INFO,
+                    format!("SurrealQL: connected to {} ({version})", info.name),
+                )
+                .await;
+        }
 
         {
             let mut state = self.state.write().await;
             state.settings = Arc::new(settings);
             state.workspace_folders = workspace_folders;
+            state.client = client;
             // The client can't receive `window/logMessage` until the
             // initialize handshake completes; `initialized` drains these.
             state.pending_settings_warnings = warnings;
@@ -188,8 +315,77 @@ where
                 name: "surreal-language-server".to_string(),
                 version: Some(build_version()),
             }),
-            capabilities: Self::server_capabilities(),
+            capabilities: Self::server_capabilities(client),
             ..Default::default()
+        }
+    }
+
+    /// Ask the client to tell us when `.surql` files change outside the editor.
+    ///
+    /// Without this the workspace schema goes stale on a `git checkout`, a
+    /// generated file, or a `rm`, and the symptom is `unknown-table` firing on
+    /// a table that exists, which reads as a language-server bug rather than a
+    /// missed notification. Nothing picked those changes up short of a restart.
+    ///
+    /// Only asked of a client that said it supports dynamic registration; the
+    /// browser host has no filesystem to watch, and its notifier's default
+    /// implementation does nothing.
+    async fn register_file_watcher(&self) {
+        if !self.state.read().await.client.watched_file_registration {
+            return;
+        }
+
+        let watchers = ["**/*.surql", "**/*.surrealql"]
+            .into_iter()
+            .map(|pattern| FileSystemWatcher {
+                glob_pattern: GlobPattern::String(pattern.to_string()),
+                // Created, changed and deleted: the default when omitted.
+                kind: None,
+            })
+            .collect();
+
+        self.notifier
+            .register_capability(vec![Registration {
+                id: "surrealql-watched-files".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers,
+                })
+                .ok(),
+            }])
+            .await;
+    }
+
+    /// A `.surql` file changed outside the editor.
+    ///
+    /// The saved-workspace copy is refreshed (or dropped, for a deletion), the
+    /// model is rebuilt, and every open buffer is republished: a definition in
+    /// the changed file may be exactly what an open document's diagnostics
+    /// depend on.
+    pub async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut touched = false;
+        for event in params.changes {
+            if event.typ == FileChangeType::DELETED {
+                let mut state = self.state.write().await;
+                let mut workspace = (*state.saved_workspace).clone();
+                if workspace.documents.remove(&event.uri).is_some() {
+                    state.saved_workspace = Arc::new(workspace);
+                    touched = true;
+                }
+            } else {
+                // An open buffer is the authority for its own text; a change on
+                // disk under it must not overwrite what the user is editing.
+                if self.buffer_text(&event.uri).is_some() {
+                    continue;
+                }
+                self.sync_saved_document_from_disk(&event.uri).await;
+                touched = true;
+            }
+        }
+
+        if touched {
+            self.recompute_model().await;
+            self.republish_open_diagnostics().await;
         }
     }
 
@@ -201,6 +397,7 @@ where
             std::mem::take(&mut state.pending_settings_warnings)
         };
         self.report_settings_warnings(&pending_warnings).await;
+        self.register_file_watcher().await;
         self.reload_from_client_configuration().await;
         self.notifier
             .log_message(
@@ -217,8 +414,8 @@ where
         // Ask the client before taking the config lock — a slow
         // configuration pull must not stall other settings work.
         let configuration = self.notifier.request_configuration().await;
-        let (settings, warnings) =
-            ServerSettings::from_sources_with_warnings(None, configuration.as_ref());
+        let (settings, warnings, present) =
+            ServerSettings::from_sources_with_presence(None, configuration.as_ref());
         // A client without configuration support answers `None`, and
         // VS Code / Neovim answer the pull with JSON `null` when no
         // `surrealql` section is configured — both always yield zero
@@ -236,7 +433,7 @@ where
             let state = self.state.read().await;
             (*state.settings).clone()
         };
-        let settings = settings.merge_with_env_if_missing(current_settings);
+        let settings = merge_absent(settings, &current_settings, &present);
         self.apply_settings_inner(settings).await;
     }
 
@@ -380,20 +577,40 @@ where
 
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.upsert_open_document(document.uri, document.text, Edit::Opened)
+        self.upsert_open_document(document.uri, document.text, Edit::Opened(document.version))
             .await;
     }
 
+    /// Apply a `didChange` to the authoritative buffer, returning the edit to
+    /// analyse.
+    ///
+    /// Split out so the native adapter can apply on the ordered path and spawn
+    /// only the analysis. See [`Self::apply_document_change`] for why that
+    /// matters.
+    pub fn apply_did_change(&self, params: &DidChangeTextDocumentParams) -> Option<Edit> {
+        if params.content_changes.is_empty() {
+            return None;
+        }
+        let edit = Edit::Changed(params.text_document.version);
+        self.apply_document_change(&params.text_document.uri, &params.content_changes, edit)
+            .map(|_| edit)
+    }
+
+    /// Apply and analyse, for callers with no reason to separate them.
+    ///
+    /// The native adapter does separate them (see
+    /// [`Self::apply_did_change`]), so that the apply stays on the ordered
+    /// path. This is the wasm dispatcher's entry point, where ordering comes
+    /// free from `handleMessage` processing one message at a time.
+    ///
+    /// Note it no longer takes only the *last* change. Under incremental sync a
+    /// notification carries a batch, and every one of them has to be applied, in
+    /// order, against the text the previous one produced.
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Some(change) = params.content_changes.into_iter().last() else {
+        let Some(edit) = self.apply_did_change(&params) else {
             return;
         };
-        self.upsert_open_document(
-            params.text_document.uri,
-            change.text,
-            Edit::Changed(params.text_document.version),
-        )
-        .await;
+        self.analyze_buffer(params.text_document.uri, edit).await;
     }
 
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -418,6 +635,14 @@ where
             let mut state = self.state.write().await;
             state.open_documents.remove(&uri);
         }
+        // The buffer goes with the document, version high-water mark and all. A
+        // client that reopens a file starts counting from 1 again (VS Code
+        // does), and a remembered 57 would make every later edit look stale:
+        // diagnostics frozen at whatever the file looked like when it opened.
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .remove(&uri);
         self.sync_saved_document_from_disk(&uri).await;
         self.recompute_model().await;
         self.notifier.publish_diagnostics(uri, Vec::new()).await;
@@ -437,8 +662,8 @@ where
         // The read-merge-apply sequence runs under the config lock so
         // two spawned configuration changes can't lose each other's
         // updates.
-        let (settings, warnings) =
-            ServerSettings::from_sources_with_warnings(None, Some(&params.settings));
+        let (settings, warnings, present) =
+            ServerSettings::from_sources_with_presence(None, Some(&params.settings));
         self.report_settings_warnings(&warnings).await;
 
         let _guard = self.config_lock.lock().await;
@@ -446,7 +671,7 @@ where
             let state = self.state.read().await;
             (*state.settings).clone()
         };
-        let settings = settings.merge_with_env_if_missing(current_settings);
+        let settings = merge_absent(settings, &current_settings, &present);
         self.apply_settings_inner(settings).await;
     }
 
@@ -793,8 +1018,40 @@ where
         let token = token_at(&analysis.text, &analysis.line_index, position)?;
 
         let token = token.trim().to_string();
+        let target = model.definition_for_token(&token)?;
+
+        // A `LocationLink` carries the origin range as well as the target, so
+        // the editor underlines the token the user is on rather than guessing at
+        // its extent, and peek shows the right thing. Offered only to a client
+        // that said it understands the form.
+        if self.state.read().await.client.location_links {
+            let origin = word_range(&analysis.text, &analysis.line_index, position);
+            return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                origin_selection_range: origin,
+                target_uri: target.uri,
+                target_range: target.range,
+                target_selection_range: target.range,
+            }]));
+        }
+
+        Some(GotoDefinitionResponse::Scalar(target))
+    }
+
+    /// Where the *type* of the token under the cursor is defined.
+    ///
+    /// In SurrealQL that means a `record<…>`: standing on a field declared
+    /// `TYPE record<person>` and asking for its type definition takes you to
+    /// `DEFINE TABLE person`.
+    pub async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         model
-            .definition_for_token(&token)
+            .type_definition_for_token(token.trim())
             .map(GotoDefinitionResponse::Scalar)
     }
 
@@ -807,7 +1064,27 @@ where
         let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
-        model.references_for_function(token.trim())
+        let name = token.trim();
+        let include_declaration = params.context.include_declaration;
+
+        // Tables and fields, not only functions. "Where else is this table
+        // used?" is the most-asked navigation question in a `.surql` workspace,
+        // and the answer used to be an empty list.
+        //
+        // A field is asked for by table first. The statement under the cursor
+        // names its target, and without that, `name` on `person` answers with
+        // `name` on `company` and `product` too, which is a list nobody asked
+        // for. One target only: a multi-target statement does not say which
+        // table the token belongs to, so the bare-name union is the honest
+        // answer there.
+        if let Some(fact) = crate::core::completion_context::active_query_fact(&analysis, position)
+            && let [table] = fact.target_tables.as_slice()
+            && let Some(references) = model.references_for_field(table, name, include_declaration)
+        {
+            return references;
+        }
+
+        model.references_for_name(name, include_declaration)
     }
 
     pub async fn prepare_rename(
@@ -844,17 +1121,15 @@ where
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
         let offset = analysis.line_index.offset(&analysis.text, position);
         let prefix = &analysis.text[..offset];
-        let open_paren = prefix.rfind('(')?;
+        // Depth- and string-aware: `math::max([1, 2], fn::f(a, b` is the second
+        // argument of `fn::f`, not the fifth of `math::max`, and a comma inside
+        // a string literal is not an argument separator. See `enclosing_call`.
+        let (open_paren, active_parameter) = enclosing_call(prefix)?;
         let function_name = prefix[..open_paren]
-            .trim_end()
             .split_whitespace()
             .last()
             .map(str::trim)
             .unwrap_or_default();
-        let active_parameter = prefix[open_paren + 1..]
-            .chars()
-            .filter(|ch| *ch == ',')
-            .count() as u32;
 
         // A method: `'abc'.slice(` reads as one whitespace-delimited token, so the
         // tail after the last `.` is the method name. It resolves through the
@@ -1006,8 +1281,180 @@ where
 
     pub async fn code_action(&self, params: CodeActionParams) -> Option<CodeActionResponse> {
         let uri = params.text_document.uri;
-        let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
-        Some(model.code_actions(&uri, &analysis, &params.context.diagnostics))
+        let (analysis, model, settings) = self.snapshot_for_uri(&uri).await?;
+
+        // `analysis.enableCodeActions` parsed, validated and did nothing for
+        // three releases. A settings surface that lies is worse than a smaller
+        // one, so it is read here.
+        if !settings.analysis.enable_code_actions {
+            return Some(Vec::new());
+        }
+
+        Some(model.code_actions(
+            &uri,
+            &analysis,
+            &params.context.diagnostics,
+            params.range,
+            params.context.only.as_deref(),
+        ))
+    }
+
+    /// Foldable regions: statements, blocks, object and array literals, and
+    /// runs of comments.
+    ///
+    /// Reads the cached tree, so it costs one walk and no re-parse.
+    ///
+    /// Empty for a document past the size or nesting cap. Those store a parse of
+    /// the empty string, because parsing them is what was refused, and parsing
+    /// one anyway to fold it would spend exactly what the cap is there to save.
+    pub async fn folding_range(&self, params: FoldingRangeParams) -> Option<Vec<FoldingRange>> {
+        let uri = params.text_document.uri;
+        let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
+        Some(crate::semantic::folding::folding_ranges(&analysis.tree))
+    }
+
+    /// The expand-selection chain at each requested position.
+    pub async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Option<Vec<SelectionRange>> {
+        let uri = params.text_document.uri;
+        let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
+        Some(
+            params
+                .positions
+                .into_iter()
+                .map(|position| {
+                    // The response array has to correspond one-to-one with the
+                    // requested positions: the client reads the chain for its
+                    // Nth cursor out of the Nth slot. Dropping an entry would
+                    // hand every later cursor the previous one's chain, so a
+                    // position with no chain answers an empty range at itself.
+                    crate::semantic::folding::selection_range(
+                        &analysis.tree,
+                        &analysis.text,
+                        &analysis.line_index,
+                        position,
+                    )
+                    .unwrap_or(SelectionRange {
+                        range: Range::new(position, position),
+                        parent: None,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Check one snippet of SurrealQL and return its diagnostics.
+    ///
+    /// For a host that wants an answer without speaking LSP: a browser
+    /// playground, the docs site, Surrealist validating the editor's contents.
+    /// Nothing is opened, nothing is published, nothing is remembered.
+    ///
+    /// Validated against the **current merged model**, not an empty one. That is
+    /// the difference between a useful answer and a useless one: against an
+    /// empty model every real table in the snippet reports `unknown-table`.
+    ///
+    /// `params` names variables the caller binds at run time, exactly as
+    /// `check --param` and `analysis.externalParams` do, so a snippet using
+    /// `$id` is not told the variable is undefined.
+    ///
+    /// The diagnostics are the same objects the LSP publishes and `check`
+    /// prints: same codes, same `data` hints, same `codeDescription` links.
+    /// There is deliberately no second analysis path to disagree with.
+    pub async fn validate_text(&self, text: &str, params: Vec<String>) -> Vec<Diagnostic> {
+        let (model, settings, limit, max_bytes) = {
+            let state = self.state.read().await;
+            (
+                Arc::clone(&state.model),
+                Arc::clone(&state.settings),
+                state.settings.analysis.max_syntax_diagnostics,
+                state.settings.analysis.max_document_bytes,
+            )
+        };
+
+        // A URI no document uses, so a snippet cannot collide with, or be
+        // mistaken for, an open buffer.
+        let Ok(uri) = "file:///surrealql/validate".parse::<Uri>() else {
+            return Vec::new();
+        };
+        let Some(analysis) =
+            analyze_document_incremental(uri, text, SymbolOrigin::Local, limit, max_bytes, None)
+        else {
+            return Vec::new();
+        };
+
+        let mut settings = (*settings).clone();
+        settings.analysis.external_params.extend(params);
+        model.document_diagnostics(&analysis, &settings)
+    }
+
+    /// The diagnostic a desynced buffer owes its reader, if it is desynced.
+    ///
+    /// The analysis knows nothing about this: it describes the last text that
+    /// could be assembled, which is exactly why the document looks fine while
+    /// the editor's copy has moved on. Reported in the file, not only in the
+    /// log, because a user whose diagnostics have quietly stopped updating has
+    /// no reason to open the output channel.
+    fn desync_diagnostic(&self, uri: &Uri) -> Option<Diagnostic> {
+        let desynced = self
+            .buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .is_some_and(|buffer| buffer.desynced);
+
+        desynced.then(|| Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: crate::semantic::codes::as_code(crate::semantic::codes::BUFFER_DESYNCED),
+            code_description: crate::semantic::codes::description(
+                crate::semantic::codes::BUFFER_DESYNCED,
+            ),
+            source: Some("surreal-language-server".to_string()),
+            message: "The server's copy of this file no longer matches the editor's, \
+                      so edits to it are being ignored and these diagnostics are \
+                      stale. Close the file and reopen it to resynchronise."
+                .to_string(),
+            ..Diagnostic::default()
+        })
+    }
+
+    /// Answer a diagnostic *pull*.
+    ///
+    /// The same set `publish_diagnostics_for_uri` would have pushed: there is
+    /// deliberately no second analysis path, so a pulling client and a pushed
+    /// one cannot disagree.
+    pub async fn document_diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> DocumentDiagnosticReportResult {
+        let empty = || {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                RelatedFullDocumentDiagnosticReport::default(),
+            ))
+        };
+
+        let uri = params.text_document.uri;
+        let Some((analysis, model, settings)) = self.snapshot_for_uri(&uri).await else {
+            return empty();
+        };
+        let Some(mut diagnostics) =
+            off_reactor(move || model.document_diagnostics(&analysis, &settings)).await
+        else {
+            return empty();
+        };
+        diagnostics.extend(self.desync_diagnostic(&uri));
+
+        DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+            RelatedFullDocumentDiagnosticReport {
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    items: diagnostics,
+                    ..FullDocumentDiagnosticReport::default()
+                },
+                ..RelatedFullDocumentDiagnosticReport::default()
+            },
+        ))
     }
 
     pub async fn document_highlight(
@@ -1022,15 +1469,71 @@ where
         let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
-        model
-            .references_for_function(token.trim())
+        let token = token.trim();
+
+        // A custom function. Every occurrence is a call, so every one reads.
+        let mut highlights: Vec<DocumentHighlight> = model
+            .references_for_function(token)
             .into_iter()
             .filter(|location| location.uri == uri)
             .map(|location| DocumentHighlight {
                 range: location.range,
                 kind: Some(DocumentHighlightKind::READ),
             })
-            .collect()
+            .collect();
+
+        // A table or a field, which is what people actually put the cursor on.
+        // This used to return nothing for either, and marked everything it did
+        // return as READ, so an editor could not tell a `SELECT` from the
+        // `DELETE` three lines below it.
+        //
+        // `QueryFact` already carries token-tight ranges per name and the action
+        // that produced them, which is exactly the read/write distinction the
+        // protocol wants.
+        for fact in &analysis.query_facts {
+            let kind = highlight_kind(fact.action);
+            let named = fact.target_refs.iter().chain(fact.field_refs.iter());
+            highlights.extend(
+                named
+                    .filter(|reference| reference.name == token)
+                    .map(|reference| DocumentHighlight {
+                        range: reference.range,
+                        kind: Some(kind),
+                    }),
+            );
+        }
+
+        // The declaration itself is a write: it is where the name is introduced.
+        let declarations = analysis
+            .tables
+            .iter()
+            .filter(|table| table.explicit && table.name == token)
+            .map(|table| table.location.range)
+            .chain(
+                analysis
+                    .fields
+                    .iter()
+                    .filter(|field| field.name == token)
+                    .map(|field| field.location.range),
+            );
+        highlights.extend(declarations.map(|range| DocumentHighlight {
+            range,
+            kind: Some(DocumentHighlightKind::WRITE),
+        }));
+
+        // Two facts can name the same token in the same place: a field read and
+        // written by one statement, say. Keep the first, which is the stronger
+        // claim in source order.
+        highlights.sort_by_key(|highlight| {
+            (
+                highlight.range.start.line,
+                highlight.range.start.character,
+                highlight.range.end.line,
+                highlight.range.end.character,
+            )
+        });
+        highlights.dedup_by_key(|highlight| highlight.range);
+        highlights
     }
 
     /// Emit `parameter_name:` hints next to each argument of every
@@ -1126,52 +1629,206 @@ where
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────
 
-    async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
-        let (limit, debounce_ms) = {
+    /// Apply what the client sent to the authoritative buffer.
+    ///
+    /// **Contains no `.await`, and must not gain one.** Handler futures are
+    /// first-polled in arrival order, so a handler that completes inside its
+    /// first poll applies edits in the order they arrived, which is the whole
+    /// ordering guarantee. Add an await here and two edits in flight can be
+    /// applied out of order, which is harmless under full-document sync and
+    /// corrupting under incremental sync.
+    ///
+    /// Returns the version applied, or `None` when the change was dropped as
+    /// stale or refused.
+    ///
+    /// The escape hatch, if a desync is ever observed in the field:
+    /// `Server::new(…).concurrency_level(1)` in `main.rs` makes the ordering
+    /// unconditional, at the cost of serialising requests behind each other and
+    /// disabling `$/cancelRequest`.
+    pub fn apply_document_change(
+        &self,
+        uri: &Uri,
+        changes: &[TextDocumentContentChangeEvent],
+        edit: Edit,
+    ) -> Option<i32> {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable");
+
+        let version = match edit {
+            Edit::Opened(version) => version,
+            Edit::Changed(version) => {
+                // LSP does not require contiguous versions, so a gap is not
+                // evidence of reordering: only a version below the one already
+                // applied is stale.
+                if buffers
+                    .get(uri)
+                    .is_some_and(|buffer| version < buffer.version)
+                {
+                    return None;
+                }
+                version
+            }
+        };
+
+        let mut desynced = None;
+        for change in changes {
+            match change.range {
+                // A whole-document replacement. Always accepted, and it clears a
+                // desync: this is the client telling us what the buffer is.
+                None => match buffers.get_mut(uri) {
+                    Some(buffer) => buffer.replace(change.text.clone(), version),
+                    None => {
+                        buffers.insert(uri.clone(), OpenBuffer::new(change.text.clone(), version));
+                    }
+                },
+                Some(range) => {
+                    let Some(buffer) = buffers.get_mut(uri) else {
+                        // A ranged change against a document we have no text
+                        // for. There is nothing to splice into.
+                        desynced = Some("a ranged change arrived for a document with no buffer");
+                        continue;
+                    };
+                    if buffer.desynced {
+                        continue;
+                    }
+                    if !buffer.splice(range, &change.text, version) {
+                        buffer.desynced = true;
+                        desynced = Some("a ranged change described text this buffer does not have");
+                    }
+                }
+            }
+        }
+
+        if let Some(reason) = desynced {
+            // Visible and self-healing rather than silently wrong. There is no
+            // LSP request for "please resend the document", so refusing further
+            // ranged changes until a whole one arrives is the recovery
+            // available, and the next full replacement clears it.
+            self.log_desync(uri, version, reason);
+        }
+
+        buffers.get(uri).map(|buffer| buffer.version)
+    }
+
+    /// Report a buffer that has fallen out of step with its client.
+    ///
+    /// Deliberately not `async`: [`Self::apply_document_change`] must not gain
+    /// an await. The message is queued through the notifier's own spawn rather
+    /// than awaited here.
+    fn log_desync(&self, uri: &Uri, version: i32, reason: &str) {
+        let notifier = Arc::clone(&self.notifier);
+        let message = format!(
+            "SurrealQL: {} ({} at version {}). Ranged edits are ignored until the \
+             editor sends the whole document again.",
+            reason,
+            uri.as_str(),
+            version,
+        );
+        runtime::spawn(async move {
+            notifier.log_message(MessageType::WARNING, message).await;
+        });
+    }
+
+    /// Analyse the buffer at `uri` and publish what it says.
+    ///
+    /// The other half of what used to be one function. Everything slow lives
+    /// here (the debounce, the parse, the model rebuild), so the caller can
+    /// spawn it and leave [`Self::apply_document_change`] on the ordered path.
+    pub async fn analyze_buffer(&self, uri: Uri, edit: Edit) {
+        let (limit, max_bytes, debounce_ms) = {
             let state = self.state.read().await;
             (
                 state.settings.analysis.max_syntax_diagnostics,
+                state.settings.analysis.max_document_bytes,
                 state.settings.analysis.diagnostic_debounce_ms,
             )
         };
 
-        // Record the version first, so a later edit can tell that this one is
-        // superseded even while this call is still waiting or analysing.
-        if let Edit::Changed(version) = edit {
-            let mut state = self.state.write().await;
-            if state
-                .document_versions
-                .get(&uri)
-                .is_some_and(|newest| *newest > version)
-            {
-                // A newer edit already arrived. Its own call does the work.
-                return;
-            }
-            state.document_versions.insert(uri.clone(), version);
-        }
-
-        // Let a burst of keystrokes settle. `didOpen` skips this entirely.
+        // Let a burst of keystrokes settle. `didOpen` skips this entirely: the
+        // file just appeared and the user is waiting to see what is wrong.
         if let Edit::Changed(version) = edit
             && debounce_ms > 0
         {
             runtime::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
-            if self.superseded(&uri, version).await {
+            if self.superseded(&uri, version) {
                 return;
             }
         }
 
-        // Parsing and extraction are CPU-bound and now the most frequent work
-        // the server does, so they must not run on a thread that is also
-        // serving requests.
-        let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit).await else {
+        // Text, pending tree and version are taken together, under one lock, so
+        // the tree always describes the text it is paired with and the version
+        // names exactly the buffer this analysis is about to describe.
+        let Some((text, pending_tree, analyzed_version)) = self.buffer_for_analysis(&uri) else {
+            // Closed while the debounce ran.
+            return;
+        };
+
+        // Parsing and extraction are CPU-bound and the most frequent work the
+        // server does, so they must not run on a thread that is also serving
+        // requests.
+        let Some(analysis) = analyze_off_reactor(
+            uri.clone(),
+            text.to_string(),
+            limit,
+            max_bytes,
+            pending_tree,
+        )
+        .await
+        else {
+            // The previous analysis stays in `open_documents`, so the editor
+            // keeps showing diagnostics for text the user has already changed.
+            // That is the worst kind of wrong (stale and silent), so say it
+            // happened. `analyze_document` only answers `None` when the grammar
+            // fails to load, which is a total outage rather than a bad document.
+            self.notifier
+                .log_message(
+                    MessageType::ERROR,
+                    format!(
+                        "SurrealQL: could not analyze {}; its diagnostics are now stale.",
+                        uri.as_str()
+                    ),
+                )
+                .await;
             return;
         };
 
         // The text may have moved on while the analysis ran.
         if let Edit::Changed(version) = edit
-            && self.superseded(&uri, version).await
+            && self.superseded(&uri, version)
         {
             return;
+        }
+
+        // Record the tree for the next parse to build on, in the same critical
+        // section as the desync check so the two cannot disagree. A superseded
+        // analysis leaves it alone: the buffer's tree has already absorbed the
+        // newer edits and is still the right thing to reparse from.
+        {
+            let mut buffers = self
+                .buffers
+                .lock()
+                .expect("panic = 'abort' makes poisoning unreachable");
+            if let Some(buffer) = buffers.get_mut(&uri) {
+                // A refused document (past the size or nesting cap) carries an
+                // *empty* tree, since parsing it is what was declined. Keeping
+                // that as the base for the next parse would apply the
+                // intervening edits, which are byte offsets into a large
+                // document, to a tree describing nothing.
+                //
+                // Everything else the decision needs is the buffer's own
+                // business, and reading the version inside this lock is what
+                // closes the gap between the supersession check above and this
+                // store: `didOpen` never reaches that check at all, so an edit
+                // landing while the open-time analysis ran would otherwise go
+                // unnoticed here.
+                if analysis.parsed_whole_document() {
+                    buffer.set_pending_tree_if_current(analyzed_version, analysis.tree.clone());
+                } else {
+                    buffer.pending_tree = None;
+                }
+            }
         }
 
         {
@@ -1182,34 +1839,138 @@ where
         self.publish_diagnostics_for_uri(&uri).await;
     }
 
-    /// True when a newer `didChange` for `uri` has arrived since `version`.
-    async fn superseded(&self, uri: &Uri, version: i32) -> bool {
-        self.state
-            .read()
-            .await
-            .document_versions
+    /// Whether a reusable tree is held for `uri`. For tests: a stale pending
+    /// tree is worse than none, so the paths that clear it need pinning.
+    pub fn has_pending_tree(&self, uri: &Uri) -> bool {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
             .get(uri)
-            .is_some_and(|newest| *newest > version)
+            .is_some_and(|buffer| buffer.pending_tree.is_some())
+    }
+
+    /// The text, pending tree and version for `uri`, taken together so they
+    /// agree.
+    ///
+    /// The version is what the completed analysis is later compared against:
+    /// it is the only thing that distinguishes "this analysis still describes
+    /// the buffer" from "an edit landed while it ran".
+    fn buffer_for_analysis(&self, uri: &Uri) -> Option<(Arc<String>, Option<Tree>, i32)> {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .map(|buffer| {
+                (
+                    Arc::clone(&buffer.text),
+                    buffer.pending_tree.clone(),
+                    buffer.version,
+                )
+            })
+    }
+
+    /// Apply and analyse in one call, for callers with no reason to separate
+    /// them: the wasm dispatcher, which processes one message at a time, and
+    /// the tests.
+    async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
+        let changes = [TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text,
+        }];
+        if self.apply_document_change(&uri, &changes, edit).is_some() {
+            self.analyze_buffer(uri, edit).await;
+        }
+    }
+
+    /// The s-expression of the analysed tree for `uri`. For tests comparing a
+    /// document reached by editing against the same text opened whole.
+    pub async fn tree_sexp(&self, uri: &Uri) -> Option<String> {
+        let state = self.state.read().await;
+        state
+            .open_documents
+            .get(uri)
+            .map(|analysis| analysis.tree.root_node().to_sexp())
+    }
+
+    /// The authoritative text for `uri`, as a `String`.
+    ///
+    /// Exists for tests: asserting on what the server believes a buffer contains
+    /// is the only way to test incremental sync directly, and going through the
+    /// analysis would only show what survived it.
+    pub fn buffer_snapshot(&self, uri: &Uri) -> Option<String> {
+        self.buffer_text(uri).map(|text| text.to_string())
+    }
+
+    /// The authoritative text for `uri`, if the client has it open.
+    fn buffer_text(&self, uri: &Uri) -> Option<Arc<String>> {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .map(|buffer| Arc::clone(&buffer.text))
+    }
+
+    /// True when a newer `didChange` for `uri` has arrived since `version`.
+    fn superseded(&self, uri: &Uri, version: i32) -> bool {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .is_some_and(|buffer| buffer.version > version)
     }
 
     /// Re-run the analysis of every open document under a new syntax cap.
     ///
-    /// The text is taken from the stored analysis rather than re-read from
-    /// disk: an open buffer may be dirty, and its `DocumentAnalysis.text` is
-    /// the exact content the client last sent.
+    /// The text comes from the authoritative buffer rather than from disk or
+    /// from the stored analysis: an open buffer may be dirty, and the analysis
+    /// may be a debounce window behind what the client last sent.
     async fn reanalyze_open_documents(&self, limit: usize) {
-        let open_documents = self.state.read().await.open_documents.clone();
-        let reanalyzed: Vec<(Uri, Arc<DocumentAnalysis>)> = open_documents
-            .iter()
-            .filter_map(|(uri, analysis)| {
-                analyze_document_with_limit(uri.clone(), &analysis.text, SymbolOrigin::Local, limit)
-                    .map(|fresh| (uri.clone(), Arc::new(fresh)))
-            })
-            .collect();
+        // Copied out before the analysis so the expensive part (one parse per
+        // open buffer) runs off the reactor. At 45 ms for a 3,200-line file,
+        // twenty open buffers was a near-second stall on the thread serving
+        // hover and completion.
+        let sources: Vec<(Uri, String)> = {
+            let buffers = self
+                .buffers
+                .lock()
+                .expect("panic = 'abort' makes poisoning unreachable");
+            buffers
+                .iter()
+                .map(|(uri, buffer)| (uri.clone(), buffer.text.to_string()))
+                .collect()
+        };
+
+        let Some(reanalyzed) = off_reactor(move || {
+            sources
+                .into_iter()
+                .filter_map(|(uri, text)| {
+                    analyze_document_with_limit(uri.clone(), text, SymbolOrigin::Local, limit)
+                        .map(|fresh| (uri, Arc::new(fresh)))
+                })
+                .collect::<Vec<(Uri, Arc<DocumentAnalysis>)>>()
+        })
+        .await
+        else {
+            return;
+        };
+
+        let still_open: std::collections::HashSet<Uri> = {
+            let buffers = self
+                .buffers
+                .lock()
+                .expect("panic = 'abort' makes poisoning unreachable");
+            buffers.keys().cloned().collect()
+        };
 
         let mut state = self.state.write().await;
         for (uri, analysis) in reanalyzed {
-            state.open_documents.insert(uri, analysis);
+            // Only if the document is still open: an edit or a close may have
+            // landed while this ran, and neither should be undone by a
+            // re-analysis of the text as it was.
+            if still_open.contains(&uri) {
+                state.open_documents.insert(uri, analysis);
+            }
         }
     }
 
@@ -1217,7 +1978,12 @@ where
         let Some(text) = self.workspace_loader.read_document(uri).await else {
             return;
         };
-        let Some(analysis) = analyze_document(uri.clone(), &text, SymbolOrigin::Local) else {
+        // Runs on every `didSave` *and* every `didClose`, so it is the most
+        // frequent of the analyses that used to sit on the reactor.
+        let owned = uri.clone();
+        let Some(Some(analysis)) =
+            off_reactor(move || analyze_document(owned, &text, SymbolOrigin::Local)).await
+        else {
             return;
         };
         let mut state = self.state.write().await;
@@ -1235,7 +2001,17 @@ where
             )
         };
 
-        let model = Arc::new(MergedSemanticModel::build(&workspace, &live_metadata));
+        // Rebuilt on every keystroke, over the whole workspace. Cheap today
+        // (1.3 ms at 200 documents), but it scales with workspace size rather
+        // than edit size, and `infer_function_return_types` is 89% of it on a
+        // function-heavy corpus (`docs/pain-points.md` H14). Moving it costs a
+        // thread hand-off and removes a stall that grows with the repository.
+        let Some(model) =
+            off_reactor(move || Arc::new(MergedSemanticModel::build(&workspace, &live_metadata)))
+                .await
+        else {
+            return;
+        };
         let mut state = self.state.write().await;
         state.model = model;
     }
@@ -1361,17 +2137,75 @@ where
     /// Republish diagnostics for every open editor buffer after the
     /// merged model changes without a document edit (e.g. live
     /// metadata arriving from the host).
+    /// Recompute and publish diagnostics for every open buffer.
+    ///
+    /// One hop off the reactor for all of them rather than one per document:
+    /// the per-document cost is small, so at twenty open buffers the thread
+    /// hand-offs would be a meaningful fraction of the work.
     async fn republish_open_diagnostics(&self) {
-        let uris = {
+        if self.state.read().await.client.pull_diagnostics {
+            self.refresh_pulled_diagnostics().await;
+            return;
+        }
+
+        let (documents, model, settings) = {
             let state = self.state.read().await;
-            state.open_documents.keys().cloned().collect::<Vec<_>>()
+            (
+                state
+                    .open_documents
+                    .iter()
+                    .map(|(uri, analysis)| (uri.clone(), Arc::clone(analysis)))
+                    .collect::<Vec<_>>(),
+                Arc::clone(&state.model),
+                Arc::clone(&state.settings),
+            )
         };
-        for uri in uris {
-            self.publish_diagnostics_for_uri(&uri).await;
+
+        let Some(published) = off_reactor(move || {
+            documents
+                .into_iter()
+                .map(|(uri, analysis)| {
+                    let diagnostics = model.document_diagnostics(&analysis, &settings);
+                    (uri, diagnostics)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        else {
+            return;
+        };
+
+        for (uri, diagnostics) in published {
+            self.notifier.publish_diagnostics(uri, diagnostics).await;
+        }
+    }
+
+    /// Ask a pulling client to re-pull every document it is showing.
+    ///
+    /// The request is workspace-wide by design: this server's model spans the
+    /// workspace, which is what `interFileDependencies` declares, so a
+    /// per-document refresh would be the wrong shape even if one existed.
+    ///
+    /// Silent for a client that did not declare `refreshSupport`. Such a client
+    /// re-pulls on its own schedule and cannot be prompted, which is a reason to
+    /// keep the diagnostics it pulls cheap, not a reason to push at it.
+    async fn refresh_pulled_diagnostics(&self) {
+        if self.state.read().await.client.diagnostic_refresh {
+            self.notifier.refresh_diagnostics().await;
         }
     }
 
     async fn publish_diagnostics_for_uri(&self, uri: &Uri) {
+        // A client that pulls is not pushed to. Doing both is how a diagnostic
+        // ends up rendered twice, and the client's own declaration is the only
+        // sound way to decide which it is. It still has to be *told* that the
+        // answer moved: its last pull may predate this analysis, and under a
+        // cross-file model an edit here changes what other open files mean.
+        if self.state.read().await.client.pull_diagnostics {
+            self.refresh_pulled_diagnostics().await;
+            return;
+        }
+
         let (analysis, model, settings) = {
             let state = self.state.read().await;
             let analysis = state
@@ -1386,12 +2220,25 @@ where
             )
         };
 
-        if let Some(analysis) = analysis {
-            let diagnostics = model.document_diagnostics(&analysis, &settings);
-            self.notifier
-                .publish_diagnostics(uri.clone(), diagnostics)
-                .await;
-        }
+        let Some(analysis) = analysis else {
+            return;
+        };
+
+        // `document_diagnostics` runs `type_diagnostics`, which is six full-tree
+        // walks, plus the query-fact loop. Under a millisecond on a typical
+        // document: this is moved for uniformity with the paths above rather
+        // than for a measured win, and the thread hand-off is a real fraction of
+        // it, but it is also where the stack overflow landed before the depth
+        // guard, which is reason enough not to run it on a request thread.
+        let Some(mut diagnostics) =
+            off_reactor(move || model.document_diagnostics(&analysis, &settings)).await
+        else {
+            return;
+        };
+        diagnostics.extend(self.desync_diagnostic(uri));
+        self.notifier
+            .publish_diagnostics(uri.clone(), diagnostics)
+            .await;
     }
 
     async fn snapshot_for_uri(
@@ -1528,17 +2375,56 @@ fn head_slot_items(
     items
 }
 
+/// The folders to index, from whichever of the three `initialize` fields the
+/// client filled in.
+///
+/// `workspaceFolders` is the modern one and what most clients send. The other
+/// two are deprecated but still in wide use (eglot and a number of minimal
+/// clients send `rootUri` alone), and reading only the first meant such a client
+/// got **no workspace schema at all**, silently: every cross-file table came
+/// back undefined and nothing said why.
+#[allow(deprecated)] // root_uri and root_path are how some clients still speak.
 fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
-    params
-        .workspace_folders
+    if let Some(folders) = params.workspace_folders.as_ref()
+        && !folders.is_empty()
+    {
+        let resolved: Vec<PathBuf> = folders
+            .iter()
+            .filter_map(|folder| folder.uri.to_file_path().map(|path| path.into_owned()))
+            .collect();
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+
+    if let Some(root) = params
+        .root_uri
         .as_ref()
-        .map(|folders| {
-            folders
-                .iter()
-                .filter_map(|folder| folder.uri.to_file_path().map(|p| p.into_owned()))
-                .collect()
-        })
+        .and_then(|uri| uri.to_file_path())
+        .map(|path| path.into_owned())
+    {
+        return vec![root];
+    }
+
+    // The oldest spelling, a plain path rather than a URI.
+    params
+        .root_path
+        .as_ref()
+        .map(|path| vec![PathBuf::from(path)])
         .unwrap_or_default()
+}
+
+/// Whether a statement reads or writes the names it touches.
+///
+/// `Execute` is a function call, which reads its arguments. `Relate` writes the
+/// edge and both endpoints.
+fn highlight_kind(action: QueryAction) -> DocumentHighlightKind {
+    match action {
+        QueryAction::Select | QueryAction::Execute => DocumentHighlightKind::READ,
+        QueryAction::Create | QueryAction::Update | QueryAction::Delete | QueryAction::Relate => {
+            DocumentHighlightKind::WRITE
+        }
+    }
 }
 
 fn call_hierarchy_item(function: &FunctionDef) -> CallHierarchyItem {
@@ -1605,78 +2491,70 @@ fn builtin_signature_information(
 /// is never delayed, and it cannot be superseded because there is no earlier
 /// version of the same document in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edit {
-    Opened,
+pub enum Edit {
+    /// `didOpen`, carrying the version the client says the buffer is at.
+    ///
+    /// Per LSP that version is authoritative for the newly-opened document, so
+    /// it *replaces* whatever high-water mark the URI had. A client that
+    /// reopens without closing first (and any client whose counter restarts)
+    /// is covered by this as well as by the removal in `did_close`.
+    Opened(i32),
     Changed(i32),
 }
 
-/// Run [`analyze_document_with_limit`] without occupying a thread that serves
-/// requests.
+/// Run CPU-bound work without occupying a thread that serves requests.
 ///
-/// On native this hands the work to tokio's blocking pool, so a hover or
-/// completion arriving mid-keystroke is not queued behind a reparse. The
-/// workspace walk already did this (see
+/// On native this hands the closure to tokio's blocking pool, so a hover or
+/// completion arriving mid-keystroke is not queued behind it. The workspace walk
+/// already did this (see
 /// [`crate::native::workspace_fs::FilesystemWorkspaceLoader::load`]); the
 /// per-edit path did not, and it is the far more frequent one.
+///
+/// **The guard cannot cross this call.** `RwLockReadGuard` is not `Send`, so
+/// every caller has to snapshot what it needs under the guard, drop it, compute
+/// here, and re-acquire to store. That shape is not incidental: it is what
+/// keeps a request handler from waiting on a model rebuild.
 ///
 /// On `wasm32` it runs inline. `tokio_with_wasm` would move it to a web worker,
 /// which means shipping the module to that worker and a serialisation hop for
 /// every edit — a change to how the browser build works that nothing here can
 /// test, since CI does not exercise the wasm JS surface. Inline keeps the
-/// browser behaviour exactly as it was.
+/// browser behaviour exactly as it was, on a runtime that has one thread anyway.
 #[cfg(not(target_arch = "wasm32"))]
-async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
-    runtime::task::spawn_blocking(move || {
-        analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
-    })
-    .await
-    .ok()
-    .flatten()
+async fn off_reactor<T, F>(work: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    runtime::task::spawn_blocking(work).await.ok()
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
-    analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
+async fn off_reactor<T, F>(work: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Some(work())
 }
 
-/// Extension methods used by [`LanguageServerCore::reload_from_client_configuration`]
-/// to merge incoming `workspace/configuration` snapshots with the
-/// initial settings (which usually carry the connection details from
-/// `initializationOptions`).
-trait SettingsMergeExt {
-    fn merge_with_env_if_missing(self, fallback: ServerSettings) -> ServerSettings;
-}
-
-impl SettingsMergeExt for ServerSettings {
-    fn merge_with_env_if_missing(mut self, fallback: ServerSettings) -> ServerSettings {
-        if self.connection.endpoint.is_none() {
-            self.connection.endpoint = fallback.connection.endpoint;
-        }
-        if self.connection.namespace.is_none() {
-            self.connection.namespace = fallback.connection.namespace;
-        }
-        if self.connection.database.is_none() {
-            self.connection.database = fallback.connection.database;
-        }
-        if self.connection.username.is_none() {
-            self.connection.username = fallback.connection.username;
-        }
-        if self.connection.password.is_none() {
-            self.connection.password = fallback.connection.password;
-        }
-        if self.connection.token.is_none() {
-            self.connection.token = fallback.connection.token;
-        }
-        if self.active_auth_context.is_none() {
-            self.active_auth_context = fallback.active_auth_context;
-        }
-        if self.auth_contexts.is_empty() {
-            self.auth_contexts = fallback.auth_contexts;
-        }
-        let default_mode = crate::config::MetadataSettings::default().mode;
-        if self.metadata.mode == default_mode && fallback.metadata.mode != default_mode {
-            self.metadata.mode = fallback.metadata.mode;
-        }
-        self
-    }
+async fn analyze_off_reactor(
+    uri: Uri,
+    text: String,
+    limit: usize,
+    max_bytes: usize,
+    old_tree: Option<Tree>,
+) -> Option<DocumentAnalysis> {
+    off_reactor(move || {
+        analyze_document_incremental(
+            uri,
+            text,
+            SymbolOrigin::Local,
+            limit,
+            max_bytes,
+            old_tree.as_ref(),
+        )
+    })
+    .await
+    .flatten()
 }

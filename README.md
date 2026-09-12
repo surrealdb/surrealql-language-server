@@ -8,12 +8,25 @@ A Language Server Protocol (LSP) implementation for [SurrealQL](https://surreald
 - Semantic analysis with schema inference from DDL and query flow
 - Hover with type info, permission posture, function signatures, and language badges (SurrealQL vs JavaScript)
 - Contextual completions for `record<table>` types, field names, builtin functions, and statement keywords
-- Go-to definition and references for tables, fields, functions, and params
-- Safe rename of local function definitions
+- Go-to definition for tables, fields, functions and params, and go-to type
+  definition through a `record<…>` to the table it names
+- References for tables and functions; for fields, the places that *write* them
+  (`UPDATE … SET email`), narrowed to the table the statement under the cursor
+  names, so one table's `name` does not answer with every table's. Projections
+  and `WHERE` predicates are not indexed
+- Safe rename of local function definitions. Renaming a **table** or **field**
+  is declined on purpose: those names also appear in record-id literals,
+  `RELATE` arrows, permission clauses and strings that the index does not cover,
+  so a rename would miss occurrences and leave a workspace that parses and is
+  wrong
 - Code actions for missing `PERMISSIONS` clauses
 - Signature help for builtin and user-defined functions
 - Call hierarchy with inbound/outbound function call tracking
 - Document symbols outlining tables, fields, events, indexes, and functions
+- Folding ranges for statements, blocks, object/array literals and comment runs
+- Selection ranges, so expand-selection walks the syntax tree
+- Pull diagnostics for clients that prefer them, with pushing disabled for those clients
+- Watches `.surql` files for changes made outside the editor
 - `function() { ... }` bodies parse cleanly with no false diagnostics; `DEFINE FUNCTION` bodies containing scripting functions are detected and labelled as JavaScript
 
 ## Requirements
@@ -38,12 +51,23 @@ Or set `TREE_SITTER_SURREALQL_DIR` to point to an existing checkout:
 TREE_SITTER_SURREALQL_DIR=/path/to/surrealql-tree-sitter cargo build
 ```
 
-The grammar is **pinned** to a specific commit (`GRAMMAR_REF` in
-[`scripts/setup-grammar.sh`](scripts/setup-grammar.sh) and the checkout steps
-in CI) because the analysis layer is coupled to the grammar's node kinds.
-Bump it deliberately alongside any [`src/semantic/node_kind.rs`](src/semantic/node_kind.rs)
-change. Known grammar parse gaps (and the tests that track them) are listed in
-[`docs/grammar-gaps.md`](docs/grammar-gaps.md).
+`cargo install surrealql-language-server` needs none of this: the published
+crate carries the pinned grammar under [`vendor/`](vendor), refreshed by
+`make vendor-grammar`. `build.rs` prefers `TREE_SITTER_SURREALQL_DIR`, then the
+sibling checkout, then the vendored copy, so working on the grammar locally
+behaves exactly as before.
+
+The grammar is **pinned**, because the analysis layer is coupled to its node
+kinds. The revision lives in [`grammar.pin`](grammar.pin) and nowhere else: the
+setup script, the CI checkout steps and `build.rs` all read it, and the build
+fails with the fixing command when a checkout has drifted off it. Bump it
+deliberately alongside any [`src/semantic/node_kind.rs`](src/semantic/node_kind.rs)
+change, and run the conformance sweep as well as the suite.
+
+The shapes the grammar still cannot parse are listed in
+[`docs/grammar-gaps.md`](docs/grammar-gaps.md). None of them is valid SurrealQL
+at the current pin: every `parse` error the server reports is a real syntax
+error.
 
 ## Building
 
@@ -82,6 +106,20 @@ await init({ module_or_path: wasmCode });
 const server = new WasmLanguageServer({ /* callbacks */ });
 ```
 
+Besides `handleMessage`, which speaks LSP, there is a one-shot check for hosts
+that only want an answer:
+
+```ts
+const problems = await server.validateQuery("SELECT * FROM persn;");
+const bound = await server.validateQuery("SELECT * FROM p WHERE id = $id;", ["id"]);
+```
+
+It returns LSP `Diagnostic` objects (the same ones `handleMessage` publishes,
+with the same stable codes, `data` hints and documentation links) checked
+against whatever the host pushed via `pushWorkspaceDocument` / `setLiveMetadata`,
+and it neither opens a document nor publishes anything. The second argument
+names variables the caller binds at run time.
+
 The `./surrealql_language_server_bg.wasm` export is declared in `pkg/package.json` for bundlers that resolve deep imports.
 
 ## Testing
@@ -93,6 +131,19 @@ first, then:
 ```bash
 cargo test
 ```
+
+Two suites additionally want a SurrealDB checkout at the revision
+[`surrealdb.pin`](surrealdb.pin) names: the catalogue freshness check and the
+conformance sweep over SurrealDB's own corpus:
+
+```bash
+bash scripts/setup-surrealdb.sh   # or: SURREALDB_DIR=/path cargo test
+cargo test --test conformance -- --ignored   # the ~1,900-file sweep, about 4s
+```
+
+Without a checkout both skip and say so. With one at a *different* revision they
+report version skew as though it were a defect, so each prints which revision it
+read when the two disagree.
 
 ## Repository Layout
 
@@ -146,9 +197,14 @@ cargo test
 ├── AGENTS.md                 # agent-facing contract: check loop, codes, gaps
 ├── llms.txt                  # machine-readable resource index
 ├── builtins.json             # @generated catalogue-as-data — do not edit by hand
-├── build.rs                  # compiles tree-sitter grammar (C)
+├── build.rs                  # compiles tree-sitter grammar (C), enforces grammar.pin
+├── grammar.pin               # the tree-sitter grammar revision: single source
+├── surrealdb.pin             # the SurrealDB revision the catalogue + corpus come from
+├── vendor/                   # @generated grammar sources for the published crate
 └── scripts/
-    └── setup-grammar.sh      # clones/updates the grammar sibling repo
+    ├── setup-grammar.sh      # clones/updates the grammar sibling repo to the pin
+    ├── setup-surrealdb.sh    # fetches the SurrealDB checkout the tests read
+    └── vendor-grammar.sh     # refreshes vendor/ from the pinned checkout
 ```
 
 ## Editor Integration
@@ -157,10 +213,16 @@ The server communicates over `stdio` and works with any LSP-compatible editor.
 
 ### Settings
 
-Settings arrive via `initializationOptions` or `workspace/didChangeConfiguration`,
-either under a `surrealql` key or at the root. Every key accepts both `camelCase`
+Settings arrive four ways: `initializationOptions` on `initialize`, a
+`workspace/configuration` pull (which a `null` `didChangeConfiguration` payload
+asks for), a `workspace/didChangeConfiguration` push, and (for the CLI)
+`check --config file.json`, which accepts the same JSON. Either under a
+`surrealql` key or at the root. Every key accepts both `camelCase`
 and `snake_case`. An unknown key is reported through `window/logMessage` with a
 did-you-mean suggestion rather than ignored.
+
+A **partial** payload (which is what an editor sends when one setting changes)
+only changes what it names. Keys it omits keep the values already in force.
 
 #### `analysis.schemalessDiagnostics`
 
@@ -200,9 +262,10 @@ This counts **diagnostics, not lines** — no setting limits how long a document
 may be. Semantic and type diagnostics are uncapped; they are derived from the
 definitions and query facts in the file, so the code itself bounds them.
 
-Two unrelated limits do apply to the *workspace scan*, and neither is
-configurable: files over 2 MB are skipped, and at most 5,000 `.surql` files are
-indexed. Both are reported through `window/logMessage` when they bite. They
+`analysis.maxDocumentBytes` is the companion that *does* bound length, and it
+applies to buffers the editor pushes. Two further limits apply to the *workspace
+scan*, and neither is configurable: files over 2 MB are skipped, and at most
+5,000 `.surql` files are indexed. Both are reported through `window/logMessage` when they bite. They
 affect which files contribute schema, not the diagnostics on the file you have
 open.
 
@@ -212,7 +275,65 @@ open.
 | --- | --- | --- |
 | `analysis.enableTypeChecking` | `true` | Turns off the whole type pass: `argument-type`, `argument-count`, `let-type`, `return-type`, `operator-type`, `unknown-method`, `undefined-variable`, `field-type`, `renamed-function`, `not-callable`. `unknown-type` survives — it is a syntax fault. |
 | `analysis.enablePermissionAnalysis` | `true` | Turns off `permission-denied` and `permission-unknown` on every table. |
+| `analysis.enableCodeActions` | `true` | Stops offering quick fixes and refactors entirely. |
 | `analysis.externalParams` | `[]` | Not a toggle: names the variables your caller binds at runtime (`db.query(sql).bind(("id", id))`, or Surrealist's variables panel) so `undefined-variable` does not flag them. |
+| `analysis.diagnosticDebounceMs` | `200` | Not a toggle: how long a burst of keystrokes must settle before the document is re-analysed. `0` analyses every change. |
+| `analysis.maxDocumentBytes` | `2097152` | Not a toggle: the largest document to analyse, in bytes. An oversize buffer is still tracked, and publishes one informational diagnostic explaining the silence rather than looking clean. `0` removes the limit. |
+
+#### Connecting to a database
+
+Live schema from a running SurrealDB, merged with whatever the workspace's
+`.surql` files define. Every key is optional, and **`check` never connects**:
+these affect the editor only.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `connection.endpoint` | none | `ws://localhost:8000` or `http://…`. Nothing is fetched without it. |
+| `connection.namespace` / `connection.database` | none | Selected after signing in. Also required for database-scoped credentials. |
+| `connection.username` / `connection.password` | none | Tried as root first, then as database credentials. |
+| `connection.token` | none | A bearer token, tried before username/password. |
+| `connection.access` | none | **Accepted but not yet used.** Record/scope access is not wired into sign-in; the three routes above are what authenticate today. |
+
+Each of the six may also come from the environment:
+`SURREALDB_ENDPOINT`, `SURREALDB_NAMESPACE`, `SURREALDB_DATABASE`,
+`SURREALDB_USERNAME`, `SURREALDB_PASSWORD`, `SURREALDB_TOKEN`, which is the
+easier route for a shared machine. A value in the settings wins over the
+environment. There is no `SURREALDB_ACCESS`.
+
+#### `metadata.*`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `metadata.mode` | `workspace+db` | Where schema comes from. `workspace` / `filesystem` reads only `.surql` files; `db` / `remote` reads only the live database; `both` / `workspace+db` reads both. An unknown value warns and falls back to the default. |
+| `metadata.enableLiveMetadata` | `true` | Turns off the database fetch without clearing the connection settings. Ignored by the browser build, which has no connection of its own. |
+| `metadata.refreshOnSave` | `true` | Re-fetches live schema on every `didSave`. |
+
+#### `authContexts` / `activeAuthContext`
+
+What the permission analysis assumes about who is running the query. Each context
+has a `name`, a list of `roles`, and optionally an `authRecord` plus free-form
+`claims`, `session` and `variables` objects. The default is a single `viewer`
+context with the `viewer` role. `activeAuthContext` names the one in force; an
+unknown name warns and the first context is used.
+
+```jsonc
+{ "surrealql": {
+    "authContexts": [
+      { "name": "viewer", "roles": ["viewer"] },
+      { "name": "owner", "roles": ["owner"], "authRecord": "user:me" }
+    ],
+    "activeAuthContext": "owner"
+} }
+```
+
+#### Accepted but not yet implemented
+
+Two keys parse and validate, and are read by nothing. They are listed here rather
+than removed because clients already send them:
+
+- `connection.access`: see the connection table above.
+- `analysis.enableAggressiveSchemaInference`: tables inferred from usage always
+  count toward the model; setting this to `false` does not change that.
 
 ## Using with AI agents
 
@@ -231,6 +352,15 @@ surrealql-language-server check queries/ --format json --fail-on warning
 | 1 | Ran to completion; diagnostics at or above the threshold. |
 | 2 | Usage error, unreadable input, or a skipped target file. |
 
+`--format json` prints exactly one JSON object on stdout for **every** exit
+code. An exit-2 report carries an `error` object naming the kind, so a consumer
+never has to treat empty output as a result:
+
+```jsonc
+{ "files": [], "summary": { … }, "exitCode": 2,
+  "error": { "kind": "unreadable-input", "message": "cannot read `q.surql`: …" } }
+```
+
 `--format json` prints one object whose diagnostics are LSP wire objects
 verbatim (stable codes, 0-based UTF-16 ranges, structured `data` hints),
 plus a `summary`, the `scan` losses, and the `exitCode`:
@@ -242,6 +372,30 @@ plus a `summary`, the `scan` losses, and the `exitCode`:
   "scan": { "walkErrors": 0, "skippedOversize": 0, "skippedUnreadable": 0, "fileCapHit": false },
   "exitCode": 0
 }
+```
+
+For a harness that speaks MCP rather than shell:
+
+```bash
+surrealql-language-server mcp --workspace schema/
+```
+
+Five tools (`validate_surrealql`, `get_schema`, `lookup_function`,
+`search_functions`, `explain_diagnostic`) over stdio, each backed by the same
+analysis the editor runs. No database connection, and no extra dependency: MCP
+is JSON-RPC 2.0 with a small method set, so it is implemented directly.
+
+`--config <file>` takes the same settings file `check --config` does. The
+workspace is re-read before every tool that answers from the schema, so an agent
+that writes a `DEFINE TABLE` and then asks `get_schema` what the schema is gets
+the one it just wrote.
+
+Hand a model the schema before it writes anything, rather than letting it guess
+and correcting afterwards:
+
+```bash
+surrealql-language-server schema schema/              # DDL-shaped, for a prompt
+surrealql-language-server schema schema/ --format json
 ```
 
 [`AGENTS.md`](AGENTS.md) is the agent-facing contract: the check loop, the

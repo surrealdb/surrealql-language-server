@@ -194,6 +194,13 @@ where
                 Err(error) => error,
             }
         }
+        "workspace/didChangeWatchedFiles" => match decode::<DidChangeWatchedFilesParams>(params) {
+            Ok(params) => {
+                core.did_change_watched_files(params).await;
+                Outcome::Notification
+            }
+            Err(error) => error,
+        },
         "workspace/didChangeWorkspaceFolders" => {
             match decode::<DidChangeWorkspaceFoldersParams>(params) {
                 Ok(params) => {
@@ -255,6 +262,22 @@ where
         },
         "textDocument/codeAction" => match decode::<CodeActionParams>(params) {
             Ok(params) => Outcome::from_value(core.code_action(params).await),
+            Err(error) => error,
+        },
+        "textDocument/typeDefinition" => match decode::<GotoDefinitionParams>(params) {
+            Ok(params) => Outcome::from_value(core.goto_type_definition(params).await),
+            Err(error) => error,
+        },
+        "textDocument/diagnostic" => match decode::<DocumentDiagnosticParams>(params) {
+            Ok(params) => Outcome::from_value(core.document_diagnostic(params).await),
+            Err(error) => error,
+        },
+        "textDocument/foldingRange" => match decode::<FoldingRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.folding_range(params).await),
+            Err(error) => error,
+        },
+        "textDocument/selectionRange" => match decode::<SelectionRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.selection_range(params).await),
             Err(error) => error,
         },
         "textDocument/documentHighlight" => match decode::<DocumentHighlightParams>(params) {

@@ -202,6 +202,31 @@ committing.
   everywhere; only the output format differs. `tests/compat.rs` discipline
   applies to every new surface from day one.
 
+## Status
+
+Every opportunity below except the two long-horizon ones has shipped:
+
+| # | Item | State |
+| --- | --- | --- |
+| 1 | Headless `check` mode | ✅ 0.6, hardened in 0.7 (`--only`/`--ignore`, `--fix renamed-function`, `explain`, JSON on every exit code) |
+| 2 | MCP server mode | ✅ `surrealql-language-server mcp`, five tools, no new dependency |
+| 3 | Schema context export | ✅ `surrealql-language-server schema --format llm\|json` |
+| 4 | Catalogue as data | ✅ `builtins.json` |
+| 5 | Diagnostics for machine repair | ✅ stable codes, `data` hints, and `codeDescription` linking to `docs/diagnostics.md` |
+| 6 | Surrealist loop | ✅ `validateQuery(text, params?)` on the browser build |
+| 7 | Agent packaging and docs | ✅ `AGENTS.md`, `llms.txt` |
+| 8 | Eval set | ⏳ own project |
+| 9 | Query → type codegen | ⏳ own project |
+
+**The cross-cutting gate is satisfied**: by its first branch rather than its
+second. It asked that the grammar gaps be *fixed upstream, or* fenced in
+machine-readable output, before phase 1 was promoted to agents. They were fixed:
+the pin moved to a revision that parses all seven shapes, and `AGENTS.md` now
+says there are no known false positives. Building the fencing machinery as well
+would be machinery for a category with no members; when a gap reappears, it is
+recorded in `docs/grammar-gaps.md` and listed in `AGENTS.md` before it can reach
+an agent.
+
 ## Suggested sequencing
 
 | Phase | Items | Why this order |

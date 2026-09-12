@@ -13,9 +13,9 @@ use surrealql_language_server::semantic::model::{
 use surrealql_language_server::semantic::text::LineIndex;
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 use surrealql_language_server::semantic::types::{
-    DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, LookupDirection,
-    MergedSemanticModel, PermissionMode, PermissionRule, QueryAction, QueryFact, SymbolOrigin,
-    TableDef, TargetResolution, WorkspaceIndex,
+    DocumentAnalysis, FieldDef, FunctionDef, FunctionLanguage, LiveMetadataSnapshot,
+    LookupDirection, MergedSemanticModel, PermissionMode, PermissionRule, QueryAction, QueryFact,
+    SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
 };
 
 fn uri(path: &str) -> Uri {
@@ -1647,7 +1647,17 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
         document_symbols: Vec::new(),
     };
     let model = MergedSemanticModel::default();
-    let actions = model.code_actions(&u, &analysis, &[]);
+    let actions = model.code_actions(
+        &u,
+        &analysis,
+        &[],
+        // Whole document: this case is about the action itself, not the cursor.
+        Range {
+            start: Position::new(0, 0),
+            end: Position::new(u32::MAX, u32::MAX),
+        },
+        None,
+    );
     assert!(
         actions.iter().any(|a| {
             if let tower_lsp_server::ls_types::CodeActionOrCommand::CodeAction(ca) = a {
@@ -6689,4 +6699,102 @@ fn every_documented_index_form_parses() {
             messages_of(&diagnostics)
         );
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Deep nesting must not kill the process
+// ──────────────────────────────────────────────────────────────────────
+
+/// Deeply nested input must be refused, not crashed on.
+///
+/// Before the guards in `semantic::limits`, a `didOpen` carrying `RETURN` and
+/// six thousand nested parentheses (a 12 KB file) aborted the server:
+///
+/// ```text
+/// thread 'tokio-rt-worker' has overflowed its stack
+/// fatal runtime error: stack overflow, aborting
+/// ```
+///
+/// `panic = 'abort'` makes that a dead process that loses every open document,
+/// and it is reachable from one paste into an editor.
+///
+/// Runs on a **1 MB** thread deliberately. The test harness's main thread has
+/// 8 MB, more than tokio's blocking pool (2 MB) and more than the wasm default,
+/// so a test that passed here could still crash in production. 1 MB is below
+/// all of them.
+#[test]
+fn deep_nesting_is_refused_rather_than_overflowing_the_stack() {
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            for depth in [2_000usize, 6_000, 50_000] {
+                let text = format!("RETURN {}1{};", "(".repeat(depth), ")".repeat(depth));
+                let analysis = analyze_document(uri("deep.surql"), &text, SymbolOrigin::Local)
+                    .expect("a refusal is still an analysis");
+
+                assert_eq!(
+                    analysis.syntax_diagnostics.len(),
+                    1,
+                    "depth {depth} should report exactly one refusal"
+                );
+                assert!(
+                    analysis.syntax_diagnostics[0]
+                        .message
+                        .contains("nest more than"),
+                    "depth {depth} reported {:?}",
+                    analysis.syntax_diagnostics[0].message
+                );
+                // Its own code, not `parse`. The refusal is the analyzer's
+                // limit rather than a syntax error, and a consumer keying on
+                // `parse` is told every one of those is real.
+                assert_eq!(
+                    analysis.syntax_diagnostics[0].code,
+                    surrealql_language_server::semantic::codes::as_code(
+                        surrealql_language_server::semantic::codes::TOO_DEEPLY_NESTED
+                    ),
+                    "depth {depth} reported the wrong code"
+                );
+                assert!(
+                    analysis.query_facts.is_empty() && analysis.tables.is_empty(),
+                    "a refused document must not claim extracted facts"
+                );
+
+                // The whole pipeline, not just the parse: the model build and
+                // the diagnostic pass walk this tree too.
+                let mut workspace = WorkspaceIndex::default();
+                workspace
+                    .documents
+                    .insert(uri("deep.surql"), std::sync::Arc::new(analysis));
+                let model =
+                    MergedSemanticModel::build(&workspace, &LiveMetadataSnapshot::default());
+                let analysis = workspace.documents.get(&uri("deep.surql")).expect("stored");
+                let _ = model.document_diagnostics(analysis, &ServerSettings::default());
+            }
+        })
+        .expect("spawn");
+
+    handle
+        .join()
+        .expect("the analyzer must not overflow the stack");
+}
+
+/// The guard must not fire on SurrealQL anyone would write. The deepest file in
+/// SurrealDB's own corpus that the engine *accepts* measures under 30 levels;
+/// the cap is 1024.
+#[test]
+fn ordinary_nesting_is_analyzed_normally() {
+    let text = "\
+DEFINE TABLE person SCHEMAFULL;
+DEFINE FIELD data ON person TYPE object;
+CREATE person SET data = { a: [ { b: [ { c: [1, 2, 3] } ] } ] };
+RETURN ((((1 + 2))));
+";
+    let analysis =
+        analyze_document(uri("normal.surql"), text, SymbolOrigin::Local).expect("analyzed");
+    assert!(
+        analysis.syntax_diagnostics.is_empty(),
+        "ordinary nesting tripped the guard: {:?}",
+        analysis.syntax_diagnostics
+    );
+    assert_eq!(analysis.tables.len(), 1, "extraction must still run");
 }

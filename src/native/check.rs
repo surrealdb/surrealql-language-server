@@ -35,6 +35,7 @@ use crate::native::workspace_fs::{
     FilesystemWorkspaceLoader, MAX_FILE_SIZE_BYTES, MAX_WORKSPACE_FILES, should_descend,
 };
 use crate::semantic::analyzer::analyze_document_with_limit;
+use crate::semantic::text::LineIndex;
 use crate::semantic::types::{
     DocumentAnalysis, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
 };
@@ -66,6 +67,13 @@ Options:
                              warning, info, or hint (default: error).
   -h, --help                 Print this help.
 
+Subcommands:
+  explain <code>             Print what one diagnostic code means, and how to
+                             fix it: the same prose every diagnostic links to.
+                             Honours --format json, which wraps the markdown in
+                             one object, and answers an unknown code with an
+                             error object and exit 2.
+
 Exit codes:
   0  ran to completion, nothing at or above --fail-on
   1  ran to completion, diagnostics at or above --fail-on
@@ -88,16 +96,190 @@ pub struct CheckOptions {
     pub format: OutputFormat,
     pub config: Option<PathBuf>,
     pub params: Vec<String>,
+    /// Report only these codes. Empty means every code.
+    pub only: Vec<String>,
+    /// Never report these codes.
+    ///
+    /// Suppresses *reporting*, not analysis: an ignored code still runs, it
+    /// just does not reach the output or the exit code. The report says which
+    /// filters were in force, so a clean run cannot be mistaken for full
+    /// coverage.
+    pub ignore: Vec<String>,
+    /// Codes to repair in place.
+    ///
+    /// Deliberately an allowlist rather than a switch. Most quick fixes here are
+    /// string-distance guesses ("did you mean `person`?"), and applying one
+    /// unattended can silently repoint a query at a *different real table*. Only
+    /// `renamed-function` is mechanical enough: its replacement comes from
+    /// SurrealDB's own rename table.
+    pub fix: Vec<String>,
     /// Severity rank (1 = error … 4 = hint) at or above which the run
     /// exits 1. Stored as the rank so the comparison is a single `<=`.
     pub fail_on: u8,
 }
 
-/// Outcome of [`parse_args`]: a run, or an explicit help request.
+/// Outcome of [`parse_args`]: a run, a help request, or an `explain`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed {
     Run(CheckOptions),
     Help,
+    /// `check explain <code>`: print what one diagnostic code means, in the
+    /// format the run was asked for.
+    Explain(String, OutputFormat),
+}
+
+/// The prose for every diagnostic code, compiled in.
+///
+/// The same file `Diagnostic.codeDescription` links to, so an agent offline or
+/// behind a proxy reads exactly what a human clicking the link would, and the
+/// two cannot drift. Native-only: the browser build has no `explain` and no
+/// reason to carry the markdown.
+const DIAGNOSTICS_DOC: &str = include_str!("../../docs/diagnostics.md");
+
+/// Replace `path`'s contents, or leave them exactly as they were.
+///
+/// `--fix` rewrites a file in a user's working tree, and a plain `fs::write`
+/// truncates before it writes: an interrupt, a full disk or a crash between the
+/// two leaves a truncated `.surql` and no copy of what it held. Writing beside
+/// it and renaming over it makes the replacement a single atomic step, since a
+/// rename within one directory is on one filesystem.
+fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "target".to_string());
+    let temporary = directory
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.{}.surql-fix", std::process::id()));
+
+    fs::write(&temporary, contents)?;
+    // A file an editor could open before must stay one it can open after.
+    if let Ok(metadata) = fs::metadata(path) {
+        let _ = fs::set_permissions(&temporary, metadata.permissions());
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The on-disk path for a target, when there is one.
+///
+/// `--stdin` has no file to rewrite, so a fix there is reported and not applied.
+fn fixable_path(display: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(display);
+    path.is_file().then_some(path)
+}
+
+/// Rewrite the renamed builtins in `text`, returning the new text and how many
+/// were replaced.
+///
+/// Applied right-to-left so an earlier edit cannot shift the offsets of a later
+/// one. Only `renamed-function` reaches here: see `CheckOptions::fix` for why
+/// the allowlist is not a switch.
+fn apply_renames(text: &str, lines: &LineIndex, diagnostics: &[Diagnostic]) -> (String, usize) {
+    let mut edits: Vec<(usize, usize, &'static str)> = diagnostics
+        .iter()
+        .filter(|diagnostic| code_of(diagnostic) == crate::semantic::codes::RENAMED_FUNCTION)
+        .filter_map(|diagnostic| {
+            let start = lines.offset(text, diagnostic.range.start);
+            let end = lines.offset(text, diagnostic.range.end);
+            // The replacement comes from SurrealDB's own rename table, keyed on
+            // the text in the diagnostic's own range, not from the message, and
+            // not from a guess.
+            let current = crate::grammar::renamed_builtin(text.get(start..end)?.trim())?;
+            Some((start, end, current))
+        })
+        .collect();
+
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    edits.dedup_by_key(|(start, _, _)| *start);
+
+    let mut fixed = text.to_string();
+    let applied = edits.len();
+    for (start, end, replacement) in edits {
+        fixed.replace_range(start..end, replacement);
+    }
+    (fixed, applied)
+}
+
+/// Accept a code only if this server can emit it.
+///
+/// A typo'd `--ignore parse-error` would otherwise filter nothing and look like
+/// it worked, which is the failure mode a CI filter can least afford.
+fn known_code(value: &str) -> Result<String, String> {
+    if crate::semantic::codes::ALL.contains(&value) {
+        return Ok(value.to_string());
+    }
+    Err(format!(
+        "`{value}` is not a diagnostic code. Known codes: {}",
+        known_codes().join(", ")
+    ))
+}
+
+/// Every code `explain` will answer for.
+pub fn known_codes() -> Vec<&'static str> {
+    crate::semantic::codes::ALL.to_vec()
+}
+
+/// The section of [`DIAGNOSTICS_DOC`] describing `code`.
+pub fn explain(code: &str) -> Option<String> {
+    let heading = format!("## {code}\n");
+    let start = DIAGNOSTICS_DOC.find(&heading)?;
+    let body = &DIAGNOSTICS_DOC[start..];
+    // Up to the next section, or the end of the file.
+    let end = body[heading.len()..]
+        .find("\n## ")
+        .map(|offset| heading.len() + offset)
+        .unwrap_or(body.len());
+    Some(body[..end].trim_end().to_string())
+}
+
+fn parse_format(value: &str) -> Result<OutputFormat, String> {
+    match value {
+        "text" => Ok(OutputFormat::Text),
+        "json" => Ok(OutputFormat::Json),
+        other => Err(format!("unknown format `{other}` (text or json)")),
+    }
+}
+
+/// The answer to `check explain <code>`, in whichever form was asked for.
+///
+/// Same invariant as a run: under `--format json` this is exactly one JSON
+/// object on stdout, whatever the exit code, so a consumer never has to
+/// special-case an empty stdout.
+pub fn render_explanation(code: &str, format: OutputFormat) -> Result<String, String> {
+    match (explain(code), format) {
+        (Some(prose), OutputFormat::Text) => Ok(prose),
+        (Some(prose), OutputFormat::Json) => Ok(render_json_value(&serde_json::json!({
+            "version": build_version(),
+            "code": code,
+            "markdown": prose,
+            "exitCode": 0,
+        }))),
+        (None, OutputFormat::Text) => Err(format!(
+            "error: `{code}` is not a diagnostic code this server emits\nknown codes: {}",
+            known_codes().join(", ")
+        )),
+        (None, OutputFormat::Json) => Ok(render_json_value(&serde_json::json!({
+            "version": build_version(),
+            "code": code,
+            "error": {
+                "kind": "unknown-code",
+                "message": format!("`{code}` is not a diagnostic code this server emits"),
+            },
+            "knownCodes": known_codes(),
+            "exitCode": 2,
+        }))),
+    }
+}
+
+fn render_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Hand-rolled argument parser, following the `xtask` precedent — no
@@ -112,6 +294,9 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
         config: None,
         params: Vec::new(),
         fail_on: 1,
+        only: Vec::new(),
+        ignore: Vec::new(),
+        fix: Vec::new(),
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -121,6 +306,23 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
         };
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            // `check explain <code>`. A subcommand rather than a flag because it
+            // does not check anything: it takes no paths and produces no report.
+            "explain" if options.paths.is_empty() && !options.stdin => {
+                let code = value_for(&arg, &mut args)?;
+                // `--format` is the one flag that still means something here,
+                // and it has to work on either side of the code: an agent
+                // writing `check explain unknown-table --format json` is asking
+                // the same question as one writing the flag first.
+                while let Some(extra) = args.next() {
+                    if extra == "--format" {
+                        options.format = parse_format(&value_for("--format", &mut args)?)?;
+                        continue;
+                    }
+                    return Err(format!("`explain` takes one code, not `{extra}` as well"));
+                }
+                return Ok(Parsed::Explain(code, options.format));
+            }
             "--stdin" => options.stdin = true,
             "--stdin-filename" => {
                 options.stdin_filename = Some(PathBuf::from(value_for(&arg, &mut args)?));
@@ -130,17 +332,27 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
                     .workspace_dirs
                     .push(PathBuf::from(value_for(&arg, &mut args)?));
             }
-            "--format" => {
-                options.format = match value_for(&arg, &mut args)?.as_str() {
-                    "text" => OutputFormat::Text,
-                    "json" => OutputFormat::Json,
-                    other => return Err(format!("unknown format `{other}` (text or json)")),
-                };
-            }
+            "--format" => options.format = parse_format(&value_for(&arg, &mut args)?)?,
             "--config" => {
                 options.config = Some(PathBuf::from(value_for(&arg, &mut args)?));
             }
             "--param" => options.params.push(value_for(&arg, &mut args)?),
+            "--only" => options.only.push(known_code(&value_for(&arg, &mut args)?)?),
+            "--ignore" => options
+                .ignore
+                .push(known_code(&value_for(&arg, &mut args)?)?),
+            "--fix" => {
+                let code = known_code(&value_for(&arg, &mut args)?)?;
+                if code != crate::semantic::codes::RENAMED_FUNCTION {
+                    return Err(format!(
+                        "`--fix {code}` is not supported. Only `renamed-function` can be \
+                         applied unattended; every other fix is a suggestion whose \
+                         replacement is inferred, and applying one blindly can change what \
+                         a query means"
+                    ));
+                }
+                options.fix.push(code);
+            }
             "--fail-on" => {
                 options.fail_on = match value_for(&arg, &mut args)?.as_str() {
                     "error" => 1,
@@ -206,6 +418,18 @@ pub struct ScanReport {
     pub file_cap_hit: bool,
 }
 
+/// Why a run could not produce diagnostics.
+///
+/// `kind` is the stable machine field; `message` is prose that may be reworded.
+/// Present only on an exit-2 report, and omitted entirely otherwise, so the
+/// golden for a successful run is unchanged.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckError {
+    pub kind: &'static str,
+    pub message: String,
+}
+
 /// The complete machine-readable result. Field names and shape are a
 /// compatibility surface pinned by `tests/compat.rs` — additive changes only.
 #[derive(Debug, Serialize)]
@@ -217,6 +441,55 @@ pub struct CheckReport {
     pub scan: ScanReport,
     pub config_warnings: Vec<String>,
     pub exit_code: u8,
+    /// Set only when the run could not complete. Skipped when absent so a
+    /// clean report serialises exactly as it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<CheckError>,
+    /// Set only when `--only` or `--ignore` was used.
+    ///
+    /// Coverage has to be honest: without this, filtering every code that would
+    /// have failed produces a report indistinguishable from a clean one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Filters>,
+    /// How many diagnostics `--fix` repaired in place. Absent when none were.
+    ///
+    /// Rewriting a file is the only side effect `check` has; a run that did it
+    /// has to say so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<usize>,
+}
+
+/// Which codes a run reported on, when it did not report on all of them.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Filters {
+    pub only: Vec<String>,
+    pub ignore: Vec<String>,
+    /// How many diagnostics were produced and then not reported.
+    pub suppressed: usize,
+}
+
+impl CheckReport {
+    /// The report for a run that could not produce diagnostics.
+    ///
+    /// `--format json` prints exactly one JSON object on stdout for every exit
+    /// code, including this one. Four paths used to write a plain sentence to
+    /// stderr and exit 2 with stdout empty, which made every JSON consumer
+    /// special-case "no output": the exact ambiguity the exit-code contract
+    /// exists to remove.
+    pub fn failed(kind: &'static str, message: String) -> Self {
+        Self {
+            version: build_version(),
+            files: Vec::new(),
+            summary: Summary::default(),
+            scan: ScanReport::default(),
+            config_warnings: Vec::new(),
+            exit_code: 2,
+            error: Some(CheckError { kind, message }),
+            filters: None,
+            fixed: None,
+        }
+    }
 }
 
 /// Render the report as the single JSON object `--format json` prints.
@@ -262,6 +535,23 @@ pub fn render_text(report: &CheckReport) -> String {
         tallies.join(", "),
         plural(report.summary.files_checked, "file")
     ));
+
+    // Both of these exist so a clean-looking run cannot be mistaken for a
+    // complete one, or for one that changed nothing.
+    if let Some(fixed) = report.fixed {
+        out.push_str(&format!(
+            "{} repaired in place\n",
+            plural(fixed, "diagnostic")
+        ));
+    }
+    if let Some(filters) = &report.filters
+        && filters.suppressed > 0
+    {
+        out.push_str(&format!(
+            "{} not reported because of --only/--ignore\n",
+            plural(filters.suppressed, "diagnostic"),
+        ));
+    }
     out
 }
 
@@ -312,6 +602,22 @@ struct Targets {
 /// Run `check` to completion. Every early return is exit code 2 with the
 /// reason on stderr; a completed run prints its report and derives the exit
 /// code from the diagnostics.
+/// Report a run that could not complete, in whatever format the caller asked
+/// for, and exit 2.
+///
+/// The message goes to stderr either way (a human running `--format json` in a
+/// terminal should still see it), and, under `--format json`, stdout carries the
+/// one object the contract promises: exactly one JSON object for every exit
+/// code, so a consumer never has to special-case empty output.
+fn fail(options: &CheckOptions, kind: &'static str, message: String) -> ExitCode {
+    eprintln!("error: {message}");
+    let report = CheckReport::failed(kind, message);
+    if matches!(options.format, OutputFormat::Json) {
+        print!("{}", render_json(&report));
+    }
+    ExitCode::from(report.exit_code)
+}
+
 pub async fn run(options: CheckOptions) -> ExitCode {
     // Settings come from the same parser the LSP path uses, so a config file
     // an editor accepts is accepted here, warnings included.
@@ -320,13 +626,19 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(value) => Some(value),
                 Err(error) => {
-                    eprintln!("error: `{}` is not valid JSON: {error}", path.display());
-                    return ExitCode::from(2);
+                    return fail(
+                        &options,
+                        "invalid-config",
+                        format!("`{}` is not valid JSON: {error}", path.display()),
+                    );
                 }
             },
             Err(error) => {
-                eprintln!("error: cannot read `{}`: {error}", path.display());
-                return ExitCode::from(2);
+                return fail(
+                    &options,
+                    "unreadable-input",
+                    format!("cannot read `{}`: {error}", path.display()),
+                );
             }
         },
         None => None,
@@ -348,8 +660,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     let collected = match collect_targets(&options) {
         Ok(collected) => collected,
         Err(message) => {
-            eprintln!("error: {message}");
-            return ExitCode::from(2);
+            return fail(&options, "unreadable-input", message);
         }
     };
 
@@ -365,8 +676,11 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             SymbolOrigin::Local,
             settings.analysis.max_syntax_diagnostics,
         ) else {
-            eprintln!("error: cannot analyze `{}`", target.display);
-            return ExitCode::from(2);
+            return fail(
+                &options,
+                "analysis-failed",
+                format!("cannot analyze `{}`", target.display),
+            );
         };
         let analysis = Arc::new(analysis);
         // A target shadows the same-uri context entry, exactly like an open
@@ -376,17 +690,81 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     }
 
     // No database, ever: an empty snapshot instead of a metadata provider.
-    let model = MergedSemanticModel::build(&index, &LiveMetadataSnapshot::default());
+    let mut model = MergedSemanticModel::build(&index, &LiveMetadataSnapshot::default());
 
     analyses.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Repairs happen in their own pass, before anything is reported.
+    //
+    // Rewriting a file changes what the workspace says, so the model every
+    // file is then judged against has to be the one built from the repaired
+    // text. Doing this inside the reporting loop meant each file was measured
+    // against a model describing the files as they were before the run, which
+    // is the state nothing is in by the time the report is printed.
+    let mut fixed_count = 0usize;
+    if !options.fix.is_empty() {
+        let mut repaired_any = false;
+        for (display, analysis) in analyses.iter_mut() {
+            let Some(path) = fixable_path(display) else {
+                continue;
+            };
+            // Repair before filtering, so `--ignore` cannot hide something that
+            // was then silently rewritten.
+            let diagnostics = model.document_diagnostics(analysis, &settings);
+            let (fixed, applied) =
+                apply_renames(&analysis.text, &analysis.line_index, &diagnostics);
+            if applied == 0 {
+                continue;
+            }
+            if let Err(error) = write_atomically(&path, &fixed) {
+                eprintln!("warning: could not write `{}`: {error}", path.display());
+                continue;
+            }
+            fixed_count += applied;
+            if let Some(reanalyzed) = analyze_document_with_limit(
+                analysis.uri.clone(),
+                fixed,
+                SymbolOrigin::Local,
+                settings.analysis.max_syntax_diagnostics,
+            ) {
+                let reanalyzed = Arc::new(reanalyzed);
+                index
+                    .documents
+                    .insert(reanalyzed.uri.clone(), Arc::clone(&reanalyzed));
+                *analysis = reanalyzed;
+                repaired_any = true;
+            }
+        }
+        if repaired_any {
+            model = MergedSemanticModel::build(&index, &LiveMetadataSnapshot::default());
+        }
+    }
+
     let mut summary = Summary {
         files_checked: analyses.len(),
         ..Summary::default()
     };
     let mut files = Vec::with_capacity(analyses.len());
     let mut worst_rank: u8 = u8::MAX;
+    let mut suppressed = 0usize;
     for (display, analysis) in analyses {
+        // The repaired text, where there was one, against a model built from
+        // every repair this run made.
         let mut diagnostics = model.document_diagnostics(&analysis, &settings);
+
+        // Filter *reporting*, not analysis. An ignored check still runs; it
+        // simply does not reach the output or the exit code, and the report
+        // records that it happened, so a clean run cannot be read as full
+        // coverage.
+        let before = diagnostics.len();
+        diagnostics.retain(|diagnostic| {
+            let code = code_of(diagnostic);
+            let wanted = options.only.is_empty() || options.only.contains(&code);
+            let barred = options.ignore.contains(&code);
+            wanted && !barred
+        });
+        suppressed += before - diagnostics.len();
+
         diagnostics.sort_by(|a, b| {
             let key = |d: &Diagnostic| {
                 (
@@ -434,6 +812,13 @@ pub async fn run(options: CheckOptions) -> ExitCode {
         },
         config_warnings,
         exit_code,
+        error: None,
+        fixed: (fixed_count > 0).then_some(fixed_count),
+        filters: (!options.only.is_empty() || !options.ignore.is_empty()).then(|| Filters {
+            only: options.only.clone(),
+            ignore: options.ignore.clone(),
+            suppressed,
+        }),
     };
 
     for warning in &report.config_warnings {
@@ -634,7 +1019,7 @@ mod tests {
     fn parsed_options(args: &[&str]) -> CheckOptions {
         match parse(args).expect("parse") {
             Parsed::Run(options) => options,
-            Parsed::Help => panic!("expected a run"),
+            other => panic!("expected a run, got {other:?}"),
         }
     }
 
@@ -747,6 +1132,9 @@ mod tests {
             },
             config_warnings: vec![],
             exit_code: 1,
+            error: None,
+            filters: None,
+            fixed: None,
         }
     }
 

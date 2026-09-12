@@ -6,7 +6,7 @@
 //! depend on, and they run everywhere — including CI, which has no SurrealDB
 //! checkout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use surrealql_language_server::grammar::ParamForm;
@@ -17,6 +17,54 @@ use surrealql_language_server::grammar_generated::{
 use surrealql_language_server::semantic::type_expr::TypeExpr;
 
 /// The SurrealDB checkout, when this machine has one.
+/// The SurrealDB revision `surrealdb.pin` names, if the file is readable.
+///
+/// Same trivial `key=value` format the setup scripts parse.
+fn pinned_surrealdb_revision() -> Option<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("surrealdb.pin");
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.trim().strip_prefix("ref=").map(str::trim))
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Returns a sentence naming the revision mismatch, or `None` when the checkout
+/// is on the pin (or either revision cannot be read).
+///
+/// Worth the twenty lines: the catalogue and the corpus describe one engine, so
+/// running either suite against a different checkout reports differences that
+/// are not defects: a corpus file the newer revision deleted reads as a lost
+/// diagnostic, and a signature the newer engine widened reads as a stale
+/// catalogue. Both send you looking in the wrong place.
+fn revision_mismatch(dir: &Path) -> Option<String> {
+    let expected = pinned_surrealdb_revision()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let actual = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if actual.is_empty() || actual == expected {
+        return None;
+    }
+    Some(format!(
+        "NOTE: the SurrealDB checkout at {} is {} but surrealdb.pin names {}. \
+         The catalogue and the corpus must come from one revision: differences \
+         below may be version skew rather than defects. Run \
+         `bash scripts/setup-surrealdb.sh`, or point SURREALDB_DIR at a checkout \
+         of the pinned revision.",
+        dir.display(),
+        &actual[..actual.len().min(9)],
+        &expected[..expected.len().min(9)],
+    ))
+}
+
 ///
 /// `SURREALDB_DIR` first, then the sibling layout the grammar already uses
 /// (`../surrealdb` beside this repository). Returns `None` when neither holds a
@@ -50,7 +98,10 @@ fn the_committed_catalogue_matches_the_generator() {
 
     assert!(
         output.status.success(),
-        "the committed catalogue is stale:\n{}",
+        "{}the committed catalogue is stale:\n{}",
+        revision_mismatch(&surrealdb)
+            .map(|note| format!("{note}\n\n"))
+            .unwrap_or_default(),
         String::from_utf8_lossy(&output.stderr)
     );
 }

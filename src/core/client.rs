@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use ls_types::{Diagnostic, MessageType, Uri};
+use ls_types::{Diagnostic, MessageType, Registration, Uri};
 use serde_json::Value;
 
 use crate::config::ServerSettings;
@@ -38,6 +38,24 @@ pub trait LspNotifier: Send + Sync + 'static {
     /// `surrealql` section. Returns `None` when the client either
     /// doesn't support configuration pulls or returns nothing.
     async fn request_configuration(&self) -> Option<Value>;
+
+    /// Equivalent to LSP `client/registerCapability`.
+    ///
+    /// Defaults to doing nothing, following the `show_message` precedent, so
+    /// the browser notifier and any external implementor keep compiling. A host
+    /// with no dynamic registration (the browser has no filesystem to watch)
+    /// simply never registers anything, which is the correct behaviour there.
+    async fn register_capability(&self, _registrations: Vec<Registration>) {}
+
+    /// Equivalent to LSP `workspace/diagnostic/refresh`.
+    ///
+    /// Tells a client that pulls diagnostics to pull them again. It is what
+    /// makes `interFileDependencies` honest: a `DEFINE TABLE` edited in one
+    /// file changes what every other open file means, and a pulling client has
+    /// no other way to learn that. Defaults to doing nothing, like
+    /// [`Self::register_capability`], because a host that never pulls has
+    /// nothing to refresh.
+    async fn refresh_diagnostics(&self) {}
 }
 
 /// Source of `.surql` / `.surrealql` documents that already exist on

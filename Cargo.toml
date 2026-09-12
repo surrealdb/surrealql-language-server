@@ -15,6 +15,34 @@ authors = ['Chiru Boggavarapu <chiru@foretag.co>', 'Tobie Morgan Hitchcock <tobi
 license-file = 'LICENSE'
 description = 'Language Server Protocol implementation for SurrealQL'
 keywords = ['surrealdb', 'language-server']
+categories = ['development-tools', 'parser-implementations']
+repository = 'https://github.com/surrealdb/surrealql-language-server'
+readme = 'README.md'
+documentation = 'https://docs.rs/surrealql-language-server'
+
+# The published crate carries the vendored grammar (about 0.3 MB compressed)
+# because `build.rs` has nowhere else to look once it is unpacked. Everything
+# below is repository furniture that a consumer never compiles.
+exclude = [
+    '.github/**',
+    # Everything under docs/ is repository furniture, so the default is to keep
+    # it out and name the exception. Listing the files to drop one by one meant
+    # a doc added later shipped in the crate by default, which is the opposite
+    # of what this list is for.
+    #
+    # `docs/diagnostics.md` is the exception: `check.rs` compiles it in with
+    # `include_str!`, so a published crate without it does not build. The CI
+    # step that packages the crate and builds it in isolation is what caught
+    # that, and is why it exists.
+    'docs/**',
+    '!docs/diagnostics.md',
+    'scripts/**',
+    'tests/**',
+    'xtask/**',
+    'pkg/**',
+    'wasm/**',
+    'CHANGELOG.md',
+]
 
 # `cdylib` is required so `scripts/build-wasm.sh` can produce the
 # browser-loadable wasm module; `rlib` keeps `cargo build`/`cargo test`
@@ -83,4 +111,18 @@ strip = true
 # visibility comes from the stderr panic hook in main.rs (native) and
 # console_error_panic_hook (wasm); editors auto-restart crashed servers.
 panic = 'abort'
-opt-level = 'z'
+# Speed, not size.
+#
+# This used to be `'z'`, which costs roughly 1.6x across the board: measured on
+# the same benchmark harness and machine: `analyze_document` on a 3,200-line file
+# 46.4 ms at 'z' against 28.7 ms at 3, `semantic_tokens_full` 10.3 against 6.6,
+# `semantic_diagnostics` 0.228 against 0.144. A larger win than anything left in
+# `docs/perf-plan.md`, for a one-line change.
+#
+# The default belongs to the common case, which is the native binary: `cargo
+# build --release`, `cargo install`, and every platform artifact CI uploads. The
+# one consumer that *does* want size is the browser module, and
+# `scripts/build-wasm.sh` opts into it with
+# `CARGO_PROFILE_RELEASE_OPT_LEVEL=z`: a wasm artifact is downloaded, so there
+# every kilobyte is a real cost.
+opt-level = 3

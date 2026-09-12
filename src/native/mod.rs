@@ -12,8 +12,10 @@
 
 pub mod backend;
 pub mod check;
+pub mod mcp;
 pub mod metadata_db;
 pub mod notifier;
+pub mod schema;
 pub mod workspace_fs;
 
 pub use backend::Backend;

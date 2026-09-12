@@ -289,6 +289,20 @@ pub struct DocumentAnalysis {
     pub document_symbols: Vec<DocumentSymbol>,
 }
 
+impl DocumentAnalysis {
+    /// True when [`Self::tree`] is a parse of the whole of [`Self::text`].
+    ///
+    /// False for the refusal paths: a document past the size or nesting cap
+    /// gets an *empty* tree, because parsing it is exactly what was declined.
+    /// Anything that reuses the tree has to ask: feeding an empty tree to the
+    /// next incremental parse as though it described a 2 MB buffer produces
+    /// nonsense, and the edits applied to it in the meantime would be byte
+    /// offsets into text it has never seen.
+    pub fn parsed_whole_document(&self) -> bool {
+        self.tree.root_node().end_byte() == self.text.len()
+    }
+}
+
 /// What a workspace scan had to skip. Non-zero counters are reported
 /// to the client so silent truncation doesn't look like coverage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -395,6 +409,27 @@ pub struct MergedSemanticModel {
     pub accesses: HashMap<String, AccessDef>,
     pub analyzers: HashMap<String, AnalyzerDef>,
     pub function_references: HashMap<String, Vec<Location>>,
+    /// Every place a table is *named* by a query, keyed by table name.
+    ///
+    /// Built alongside `function_references` rather than scanned per request:
+    /// `references` for a table is the most-asked navigation question in a
+    /// `.surql` workspace, and it used to answer with nothing at all.
+    pub table_references: HashMap<String, Vec<Location>>,
+    /// Every place a field is named by a query, keyed by field name alone.
+    ///
+    /// The fallback, used when the cursor's table cannot be determined: a field
+    /// token inside a statement with several targets, or outside any statement.
+    /// Prefer [`Self::qualified_field_references`], which does not conflate the
+    /// `name` on `person` with the `name` on `company`.
+    pub field_references: HashMap<String, Vec<Location>>,
+    /// The same references, keyed by table and then by field.
+    ///
+    /// `name` is a field on most schemas, so keying references by the bare word
+    /// makes "find all references" on one table's `name` answer with every
+    /// table's. A query fact already knows which table it targets, so the
+    /// qualified key costs one more insert at build time and is what the
+    /// reference handlers ask for first.
+    pub qualified_field_references: HashMap<String, HashMap<String, Vec<Location>>>,
     pub function_callers: HashMap<String, Vec<String>>,
     /// The return type read out of a function *body*, for the functions that
     /// declare none. Keyed by full name, `fn::` prefix included.

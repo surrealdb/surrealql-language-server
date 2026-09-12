@@ -548,10 +548,7 @@ pub fn completion_prefix(
     }
 }
 
-pub fn active_query_fact<'a>(
-    analysis: &'a DocumentAnalysis,
-    position: Position,
-) -> Option<&'a QueryFact> {
+pub fn active_query_fact(analysis: &DocumentAnalysis, position: Position) -> Option<&QueryFact> {
     analysis
         .query_facts
         .iter()

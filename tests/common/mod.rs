@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tower_lsp_server::ls_types;
 use tower_lsp_server::ls_types::{Diagnostic, MessageType, Uri};
 
 use surrealql_language_server::config::ServerSettings;
@@ -24,6 +25,8 @@ pub struct Recorded {
     pub published: Vec<(Uri, Vec<Diagnostic>)>,
     pub logs: Vec<(MessageType, String)>,
     pub shows: Vec<(MessageType, String)>,
+    pub registrations: Vec<String>,
+    pub diagnostic_refreshes: usize,
 }
 
 /// [`LspNotifier`] that records every outbound call and answers
@@ -45,6 +48,14 @@ impl RecordingNotifier {
 
     pub fn logs(&self) -> Vec<(MessageType, String)> {
         self.recorded.lock().unwrap().logs.clone()
+    }
+
+    pub fn registrations(&self) -> Vec<String> {
+        self.recorded.lock().unwrap().registrations.clone()
+    }
+
+    pub fn diagnostic_refreshes(&self) -> usize {
+        self.recorded.lock().unwrap().diagnostic_refreshes
     }
 
     pub fn shows(&self) -> Vec<(MessageType, String)> {
@@ -81,20 +92,36 @@ impl LspNotifier for RecordingNotifier {
         self.recorded.lock().unwrap().shows.push((level, message));
     }
 
+    async fn refresh_diagnostics(&self) {
+        self.recorded.lock().unwrap().diagnostic_refreshes += 1;
+    }
+
+    async fn register_capability(&self, registrations: Vec<ls_types::Registration>) {
+        self.recorded
+            .lock()
+            .unwrap()
+            .registrations
+            .extend(registrations.into_iter().map(|item| item.method));
+    }
+
     async fn request_configuration(&self) -> Option<serde_json::Value> {
         self.configuration.lock().unwrap().clone()
     }
 }
 
-/// [`WorkspaceLoader`] serving a fixed in-memory snapshot.
-#[derive(Default)]
+/// [`WorkspaceLoader`] serving a fixed in-memory snapshot, and recording which
+/// folders it was asked to walk, which is how a test observes what the server
+/// decided the workspace roots are.
+#[derive(Default, Clone)]
 pub struct StaticWorkspace {
     pub index: WorkspaceIndex,
+    pub folders: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 #[async_trait]
 impl WorkspaceLoader for StaticWorkspace {
-    async fn load(&self, _folders: &[PathBuf]) -> WorkspaceIndex {
+    async fn load(&self, folders: &[PathBuf]) -> WorkspaceIndex {
+        *self.folders.lock().unwrap() = folders.to_vec();
         self.index.clone()
     }
 
@@ -127,17 +154,32 @@ pub fn core_with(
     workspace: WorkspaceIndex,
     metadata: LiveMetadataSnapshot,
 ) -> (TestCore, RecordingNotifier, RecordingMetadata) {
+    let (core, notifier, provider, _) = core_with_loader(workspace, metadata);
+    (core, notifier, provider)
+}
+
+/// [`core_with`], also handing back the loader so a test can read which folders
+/// the server asked it to walk.
+pub fn core_with_loader(
+    workspace: WorkspaceIndex,
+    metadata: LiveMetadataSnapshot,
+) -> (
+    TestCore,
+    RecordingNotifier,
+    RecordingMetadata,
+    StaticWorkspace,
+) {
     let notifier = RecordingNotifier::default();
     let provider = RecordingMetadata {
         snapshot: Arc::new(Mutex::new(metadata)),
         last_settings: Arc::new(Mutex::new(None)),
     };
-    let core = LanguageServerCore::new(
-        notifier.clone(),
-        StaticWorkspace { index: workspace },
-        provider.clone(),
-    );
-    (core, notifier, provider)
+    let loader = StaticWorkspace {
+        index: workspace,
+        folders: Arc::new(Mutex::new(Vec::new())),
+    };
+    let core = LanguageServerCore::new(notifier.clone(), loader.clone(), provider.clone());
+    (core, notifier, provider, loader)
 }
 
 pub fn uri(path: &str) -> Uri {

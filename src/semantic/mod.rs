@@ -1,8 +1,10 @@
 pub mod analyzer;
 pub mod assign;
 pub mod codes;
+pub mod folding;
 pub mod highlight;
 pub mod infer;
+pub mod limits;
 pub mod method;
 pub mod model;
 pub mod node_kind;

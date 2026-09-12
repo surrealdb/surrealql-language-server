@@ -149,6 +149,54 @@ fn the_fixture_still_covers_the_breadth_it_was_built_for() {
     );
 }
 
+/// The SurrealDB revision `surrealdb.pin` names, if the file is readable.
+///
+/// Same trivial `key=value` format the setup scripts parse.
+fn pinned_surrealdb_revision() -> Option<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("surrealdb.pin");
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.trim().strip_prefix("ref=").map(str::trim))
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Returns a sentence naming the revision mismatch, or `None` when the checkout
+/// is on the pin (or either revision cannot be read).
+///
+/// Worth the twenty lines: the catalogue and the corpus describe one engine, so
+/// running either suite against a different checkout reports differences that
+/// are not defects: a corpus file the newer revision deleted reads as a lost
+/// diagnostic, and a signature the newer engine widened reads as a stale
+/// catalogue. Both send you looking in the wrong place.
+fn revision_mismatch(dir: &Path) -> Option<String> {
+    let expected = pinned_surrealdb_revision()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let actual = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if actual.is_empty() || actual == expected {
+        return None;
+    }
+    Some(format!(
+        "NOTE: the SurrealDB checkout at {} is {} but surrealdb.pin names {}. \
+         The catalogue and the corpus must come from one revision: differences \
+         below may be version skew rather than defects. Run \
+         `bash scripts/setup-surrealdb.sh`, or point SURREALDB_DIR at a checkout \
+         of the pinned revision.",
+        dir.display(),
+        &actual[..actual.len().min(9)],
+        &expected[..expected.len().min(9)],
+    ))
+}
+
 /// The SurrealDB corpus, when this machine has a checkout.
 ///
 /// `SURREALDB_DIR` first, then the sibling layout the grammar already uses.
@@ -194,6 +242,13 @@ const EXPECTED: &[(&str, &str)] = &[
     // `Expected a value of type 'string' for argument $arg`.
     ("language/closure/basic.surql", "argument-type"),
     ("language/coerce/regex.surql", "argument-type"),
+    // `"8" % "3"`. The file's own front matter expects `Cannot perform
+    // remainder with 'string' and 'string'`, which is what the check reports:
+    // the engine's one `TryRem` arm is `(Number, Number)`.
+    (
+        "language/expression/operators/modulo.surql",
+        "operator-type",
+    ),
     ("language/functions/array/add.surql", "argument-count"),
     ("language/functions/array/add.surql", "argument-type"),
     ("language/functions/array/any.surql", "argument-type"),
@@ -253,6 +308,22 @@ const EXPECTED: &[(&str, &str)] = &[
     ("language/functions/set/len.surql", "argument-type"),
     ("language/functions/set/remove.surql", "argument-type"),
     ("language/functions/set/union.surql", "argument-type"),
+    // `9.expect(|$n| $n = 9, "a", "b")`: one argument too many. All three
+    // files declare the engine's refusal, "Incorrect arguments for
+    // method/function expect(). Expected 2 to 3 arguments"; the check counts
+    // the method's own arguments rather than the receiver, so it says 1 to 2.
+    (
+        "language/functions/value/expect_all_ro.surql",
+        "argument-count",
+    ),
+    (
+        "language/functions/value/expect_best_effort_ro.surql",
+        "argument-count",
+    ),
+    (
+        "language/functions/value/expect_compute_only.surql",
+        "argument-count",
+    ),
     (
         "language/statements/define/function/custom_optional_args.surql",
         "argument-count",
@@ -309,6 +380,220 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
 ];
 
+/// The gate for incremental parsing: a tree reparsed against its predecessor
+/// must equal a tree parsed from scratch.
+///
+/// This is the risk that made incremental parsing worth gating rather than
+/// assuming. Tree-sitter's incremental reparse is not *guaranteed* to reproduce
+/// a fresh parse when the previous tree contained ERROR nodes, and ERROR and
+/// MISSING nodes are the `parse` diagnostics, which are this server's primary
+/// output. A divergence would show up as a syntax error that appears or vanishes
+/// depending on how the user got to the text, which is the worst kind of bug to
+/// chase.
+///
+/// Measured over SurrealDB's corpus with ten random single-character edits per
+/// file (the shape of typing), including deletions, inserted quotes and
+/// inserted parens, which are exactly the characters that make a document
+/// transiently unparseable. Zero mismatches when this was written.
+///
+/// ```text
+/// cargo test --test conformance -- --ignored incremental_reparse --nocapture
+/// ```
+#[test]
+#[ignore = "sweeps the whole SurrealDB corpus; run it after a grammar bump"]
+fn incremental_reparse_matches_a_fresh_parse() {
+    /// Deterministic, so a failure is reproducible. No dependency: the shared
+    /// `[dependencies]` list is also the wasm graph.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next() as usize) % n
+            }
+        }
+    }
+
+    fn point_of(text: &str, offset: usize) -> tree_sitter::Point {
+        let before = &text[..offset];
+        tree_sitter::Point {
+            row: before.matches('\n').count(),
+            column: offset - before.rfind('\n').map(|index| index + 1).unwrap_or(0),
+        }
+    }
+
+    let Some(corpus) = corpus_dir() else {
+        eprintln!("skipping: no SurrealDB checkout. Set SURREALDB_DIR to run this.");
+        return;
+    };
+    let mut files = Vec::new();
+    surql_files(&corpus, &mut files);
+    files.sort();
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&surrealql_language_server::grammar::language())
+        .expect("grammar");
+
+    let mut checked = 0usize;
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for (index, file) in files.iter().enumerate() {
+        let Ok(original) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        // Big files cost time without adding coverage; the shapes repeat.
+        if original.is_empty() || original.len() > 20_000 {
+            continue;
+        }
+
+        let mut rng = Rng(0x5EED ^ index as u64);
+        let mut text = original;
+        let Some(mut tree) = parser.parse(&text, None) else {
+            continue;
+        };
+
+        for _ in 0..10 {
+            if text.is_empty() {
+                break;
+            }
+            let mut start = rng.below(text.len());
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+
+            let (old_end, inserted): (usize, &str) = if rng.next().is_multiple_of(2) {
+                let mut end = (start + 1).min(text.len());
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                (end, "")
+            } else {
+                // `(`, `'` and `;` are the characters that make a document
+                // transiently unparseable, which is the interesting case.
+                (start, ["x", " ", "(", ";", "'", "\n"][rng.below(6)])
+            };
+
+            let start_position = point_of(&text, start);
+            let old_end_position = point_of(&text, old_end);
+
+            let mut next = String::with_capacity(text.len());
+            next.push_str(&text[..start]);
+            next.push_str(inserted);
+            next.push_str(&text[old_end..]);
+            let new_end = start + inserted.len();
+            let new_end_position = point_of(&next, new_end);
+
+            tree.edit(&tree_sitter::InputEdit {
+                start_byte: start,
+                old_end_byte: old_end,
+                new_end_byte: new_end,
+                start_position,
+                old_end_position,
+                new_end_position,
+            });
+            text = next;
+            let Some(reparsed) = parser.parse(&text, Some(&tree)) else {
+                break;
+            };
+            tree = reparsed;
+        }
+
+        let Some(fresh) = parser.parse(&text, None) else {
+            continue;
+        };
+        checked += 1;
+        if tree.root_node().to_sexp() != fresh.root_node().to_sexp() {
+            mismatches.push(file.display().to_string());
+        }
+    }
+
+    println!("checked {checked} files, {} mismatched", mismatches.len());
+    assert!(
+        checked > 1_000,
+        "expected the corpus, only reached {checked} files"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "an incremental reparse diverged from a fresh parse in {} file(s); the \
+         first few: {:?}",
+        mismatches.len(),
+        &mismatches[..mismatches.len().min(5)]
+    );
+}
+
+/// Reports the deepest tree the corpus produces, which is how
+/// `semantic::limits::MAX_NODE_DEPTH` was sized.
+///
+/// The analyzer descends the tree recursively in about thirty places, and the
+/// guard that keeps a hostile document from overflowing the stack has to sit
+/// far enough above real SurrealQL to never fire on it. Guessing that number
+/// would either leave the crash reachable or silently truncate analysis of
+/// legitimately deep expressions, so it is measured. Kept as a test rather than
+/// a one-off script so the next person can re-run it after a grammar bump.
+///
+/// ```text
+/// cargo test --test conformance -- --ignored measure_corpus_tree_depth --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement, not an assertion; run it when sizing the depth cap"]
+fn measure_corpus_tree_depth() {
+    fn depth_of(node: tree_sitter::Node<'_>) -> usize {
+        let mut deepest = 0;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            deepest = deepest.max(depth_of(child));
+        }
+        deepest + 1
+    }
+
+    let Some(corpus) = corpus_dir() else {
+        eprintln!("skipping: no SurrealDB checkout. Set SURREALDB_DIR to run this.");
+        return;
+    };
+    let mut files = Vec::new();
+    surql_files(&corpus, &mut files);
+    files.sort();
+
+    let mut deepest = 0usize;
+    let mut worst = String::new();
+    let mut histogram = [0usize; 8];
+    for file in &files {
+        let Ok(source) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let Some(analysis) = analyze_document(uri("depth.surql"), &source, SymbolOrigin::Local)
+        else {
+            continue;
+        };
+        let depth = depth_of(analysis.tree.root_node());
+        histogram[(depth / 10).min(7)] += 1;
+        if depth > deepest {
+            deepest = depth;
+            worst = file.display().to_string();
+        }
+    }
+
+    println!("files: {}", files.len());
+    for (bucket, count) in histogram.iter().enumerate() {
+        let label = if bucket == 7 {
+            "70+".to_string()
+        } else {
+            format!("{}-{}", bucket * 10, bucket * 10 + 9)
+        };
+        println!("  depth {label:>6}: {count}");
+    }
+    println!("deepest: {deepest} ({worst})");
+}
+
 /// The exhaustive oracle. Ignored by default because it re-analyses ~1,900
 /// documents and takes about two minutes, which does not belong in a suite that
 /// otherwise finishes in under a second.
@@ -325,6 +610,15 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
         eprintln!("skipping: no SurrealDB checkout. Set SURREALDB_DIR to run this sweep.");
         return;
     };
+
+    // `corpus_dir` points at `<checkout>/language-tests/tests`; the revision
+    // lives two levels up.
+    let skew = corpus
+        .parent()
+        .and_then(Path::parent)
+        .and_then(revision_mismatch)
+        .map(|note| format!("{note}\n\n"))
+        .unwrap_or_default();
 
     let mut files = Vec::new();
     surql_files(&corpus, &mut files);
@@ -365,7 +659,7 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
     let unexpected: Vec<&(String, String)> = found.difference(&expected).collect();
     assert!(
         unexpected.is_empty(),
-        "the checks fired on {} file(s) not in the expected set:\n{}",
+        "{skew}the checks fired on {} file(s) not in the expected set:\n{}",
         unexpected.len(),
         detail
             .iter()
@@ -381,6 +675,6 @@ fn the_surrealdb_corpus_produces_only_expected_diagnostics() {
     let missing: Vec<&(String, String)> = expected.difference(&found).collect();
     assert!(
         missing.is_empty(),
-        "these known-bad calls are no longer reported: {missing:?}"
+        "{skew}these known-bad calls are no longer reported: {missing:?}"
     );
 }

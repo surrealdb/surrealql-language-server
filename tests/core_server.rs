@@ -7,6 +7,7 @@ mod common;
 use common::{core_with, uri};
 use serde_json::json;
 use surrealql_language_server::config::ServerSettings;
+use surrealql_language_server::semantic::codes;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -1790,6 +1791,48 @@ async fn a_stale_change_does_not_overwrite_a_newer_one() {
     );
 }
 
+/// Reopening a file must not freeze its diagnostics.
+///
+/// `document_versions` recorded a high-water mark per URI and `did_close`
+/// removed the document but not its version. A client that restarts versioning
+/// on reopen (VS Code does), then sent `didChange` at version 2 against a
+/// remembered 57, and `upsert_open_document` dropped it as stale. Every edit
+/// after that was dropped too, so the buffer showed the diagnostics it had when
+/// it was opened and never updated again.
+#[tokio::test]
+async fn reopening_a_file_does_not_freeze_its_diagnostics() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    // Edit it up to a high version, the way a real session does.
+    open(&core, "reopen.surql", "DEFINE TABLE t1 SCHEMAFULL;").await;
+    core.did_change(change("reopen.surql", 57, "DEFINE TABLE t57 SCHEMAFULL;"))
+        .await;
+    assert_eq!(
+        defined_table(&core, "reopen.surql").await.as_deref(),
+        Some("TABLE t57"),
+    );
+
+    core.did_close(DidCloseTextDocumentParams {
+        text_document: TextDocumentIdentifier {
+            uri: uri("reopen.surql"),
+        },
+    })
+    .await;
+
+    // The client reopens and starts counting again from 1.
+    open(&core, "reopen.surql", "DEFINE TABLE fresh1 SCHEMAFULL;").await;
+    core.did_change(change("reopen.surql", 2, "DEFINE TABLE fresh2 SCHEMAFULL;"))
+        .await;
+
+    assert_eq!(
+        defined_table(&core, "reopen.surql").await.as_deref(),
+        Some("TABLE fresh2"),
+        "the edit after reopening was dropped as stale against the version the \
+         file had before it was closed"
+    );
+}
+
 /// `didOpen` is never delayed. The file just appeared and the user is waiting to
 /// see what is wrong with it.
 #[tokio::test]
@@ -2579,4 +2622,1834 @@ async fn hovering_the_first_character_of_a_word_resolves_it() {
         hover.contains("TABLE person"),
         "the first glyph of a word must resolve, got {hover}"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Code actions honour the requested range and kinds
+// ──────────────────────────────────────────────────────────────────────
+
+/// Request code actions over `range`, optionally narrowed to `only`.
+async fn actions_at(
+    core: &common::TestCore,
+    path: &str,
+    range: tower_lsp_server::ls_types::Range,
+    only: Option<Vec<tower_lsp_server::ls_types::CodeActionKind>>,
+) -> Vec<String> {
+    core.code_action(tower_lsp_server::ls_types::CodeActionParams {
+        text_document: TextDocumentIdentifier { uri: uri(path) },
+        range,
+        context: tower_lsp_server::ls_types::CodeActionContext {
+            diagnostics: Vec::new(),
+            only,
+            ..Default::default()
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    })
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|action| match action {
+        tower_lsp_server::ls_types::CodeActionOrCommand::CodeAction(action) => Some(action.title),
+        _ => None,
+    })
+    .collect()
+}
+
+fn line_range(line: u32) -> tower_lsp_server::ls_types::Range {
+    tower_lsp_server::ls_types::Range {
+        start: tower_lsp_server::ls_types::Position::new(line, 0),
+        end: tower_lsp_server::ls_types::Position::new(line, 0),
+    }
+}
+
+/// `params.range` was ignored, so a cursor anywhere in a file offered an
+/// "Add PERMISSIONS clause" action for *every* permission-less table in it:
+/// three lightbulb entries for tables nowhere near the cursor.
+#[tokio::test]
+async fn code_actions_are_limited_to_the_requested_range() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "perms.surql",
+        "DEFINE TABLE alpha SCHEMAFULL;\nDEFINE TABLE beta SCHEMAFULL;\nDEFINE TABLE gamma SCHEMAFULL;\n",
+    )
+    .await;
+
+    let on_beta = actions_at(&core, "perms.surql", line_range(1), None).await;
+    assert_eq!(
+        on_beta,
+        vec!["Add PERMISSIONS clause to table `beta`".to_string()],
+        "the cursor is on line 2; the other two tables are not offered"
+    );
+
+    let whole_file = actions_at(
+        &core,
+        "perms.surql",
+        tower_lsp_server::ls_types::Range {
+            start: tower_lsp_server::ls_types::Position::new(0, 0),
+            end: tower_lsp_server::ls_types::Position::new(2, 30),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(
+        whole_file.len(),
+        3,
+        "selecting the whole file still offers all three: {whole_file:?}"
+    );
+}
+
+/// `context.only` was ignored too, so a client asking for quick fixes got
+/// refactors back, which is how a refactor ends up in VS Code's Quick Fix menu.
+#[tokio::test]
+async fn code_actions_honour_the_requested_kinds() {
+    use tower_lsp_server::ls_types::CodeActionKind;
+
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "only.surql", "DEFINE TABLE alpha SCHEMAFULL;\n").await;
+
+    let refactors = actions_at(
+        &core,
+        "only.surql",
+        line_range(0),
+        Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+    )
+    .await;
+    assert_eq!(refactors.len(), 1, "the PERMISSIONS action is a refactor");
+
+    let quick_fixes = actions_at(
+        &core,
+        "only.surql",
+        line_range(0),
+        Some(vec![CodeActionKind::QUICKFIX]),
+    )
+    .await;
+    assert!(
+        quick_fixes.is_empty(),
+        "a quick-fix request must not return a refactor: {quick_fixes:?}"
+    );
+
+    // `refactor` matches `refactor.rewrite`: a requested kind covers the more
+    // specific kinds beneath it.
+    let umbrella = actions_at(
+        &core,
+        "only.surql",
+        line_range(0),
+        Some(vec![CodeActionKind::REFACTOR]),
+    )
+    .await;
+    assert_eq!(
+        umbrella.len(),
+        1,
+        "`refactor` must match `refactor.rewrite`"
+    );
+}
+
+/// `analysis.enableCodeActions` parsed, validated, serialized and did nothing.
+#[tokio::test]
+async fn disabling_code_actions_silences_them() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "off.surql", "DEFINE TABLE alpha SCHEMAFULL;\n").await;
+    assert_eq!(
+        actions_at(&core, "off.surql", line_range(0), None)
+            .await
+            .len(),
+        1
+    );
+
+    let mut settings = ServerSettings::default();
+    settings.analysis.enable_code_actions = false;
+    core.apply_settings(settings).await;
+
+    assert!(
+        actions_at(&core, "off.surql", line_range(0), None)
+            .await
+            .is_empty(),
+        "the setting is advertised; it must do something"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Signature help counts the right argument
+// ──────────────────────────────────────────────────────────────────────
+
+/// The active parameter used to be "every comma after the last `(`", which is
+/// wrong as soon as an argument contains a comma of its own.
+#[tokio::test]
+async fn signature_help_ignores_commas_inside_a_nested_argument() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    // Cursor after `[1, 2, 3], `: the second argument of math::max, not the
+    // fourth. The old count said 3.
+    let text = "RETURN math::max([1, 2, 3], ";
+    open(&core, "nested.surql", text).await;
+
+    let help = signature_help_at(&core, "nested.surql", 0, text.len() as u32).await;
+    assert_eq!(
+        help.active_parameter,
+        Some(1),
+        "an array argument's commas were counted as argument separators"
+    );
+}
+
+/// A comma inside a string literal is not an argument separator either.
+#[tokio::test]
+async fn signature_help_ignores_commas_inside_a_string() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let text = "RETURN string::concat('a, b, c', ";
+    open(&core, "string.surql", text).await;
+
+    let help = signature_help_at(&core, "string.surql", 0, text.len() as u32).await;
+    assert_eq!(help.active_parameter, Some(1));
+}
+
+/// The innermost open call is the one to describe, not the outermost.
+#[tokio::test]
+async fn signature_help_describes_the_innermost_open_call() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let text = "RETURN math::max(1, string::concat('a', ";
+    open(&core, "inner.surql", text).await;
+
+    let help = signature_help_at(&core, "inner.surql", 0, text.len() as u32).await;
+    assert!(
+        help.signatures
+            .first()
+            .is_some_and(|signature| signature.label.contains("string::concat")),
+        "expected the inner call, got {:?}",
+        help.signatures.first().map(|s| s.label.clone())
+    );
+    assert_eq!(help.active_parameter, Some(1));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Document highlight covers tables and fields, with real kinds
+// ──────────────────────────────────────────────────────────────────────
+
+async fn highlights_at(
+    core: &common::TestCore,
+    path: &str,
+    line: u32,
+    character: u32,
+) -> Vec<(u32, tower_lsp_server::ls_types::DocumentHighlightKind)> {
+    let mut found: Vec<_> = core
+        .document_highlight(tower_lsp_server::ls_types::DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(path) },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .into_iter()
+        .map(|highlight| {
+            (
+                highlight.range.start.line,
+                highlight.kind.expect("a kind is always set"),
+            )
+        })
+        .collect();
+    found.sort_by_key(|(line, _)| *line);
+    found
+}
+
+/// Highlighting used to cover custom functions only, and to call every
+/// occurrence a READ, so putting the cursor on a table name lit up nothing, and
+/// an editor could not tell a `SELECT` from the `DELETE` below it.
+#[tokio::test]
+async fn highlighting_a_table_distinguishes_reads_from_writes() {
+    use tower_lsp_server::ls_types::DocumentHighlightKind;
+
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "hl.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         SELECT * FROM person;\n\
+         DELETE person;\n\
+         CREATE person SET name = 'a';\n",
+    )
+    .await;
+
+    // Cursor on `person` in the SELECT.
+    let found = highlights_at(&core, "hl.surql", 1, 15).await;
+    assert_eq!(
+        found,
+        vec![
+            (0, DocumentHighlightKind::WRITE), // the DEFINE introduces it
+            (1, DocumentHighlightKind::READ),  // SELECT
+            (2, DocumentHighlightKind::WRITE), // DELETE
+            (3, DocumentHighlightKind::WRITE), // CREATE
+        ],
+        "expected one highlight per occurrence, with reads and writes distinguished"
+    );
+}
+
+/// A name nothing in the document mentions highlights nothing: the walk must
+/// not match on substrings or light up unrelated tokens.
+#[tokio::test]
+async fn highlighting_an_unrelated_token_finds_nothing() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "none.surql", "SELECT * FROM person;\n").await;
+    assert!(highlights_at(&core, "none.surql", 0, 0).await.is_empty());
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Workspace roots, from whichever field the client filled in
+// ──────────────────────────────────────────────────────────────────────
+
+/// The folders the server decided to index, read back through the loader it
+/// asked to walk them.
+async fn indexed_roots(params: InitializeParams) -> Vec<std::path::PathBuf> {
+    let (core, _notifier, _, loader) =
+        common::core_with_loader(Default::default(), Default::default());
+    core.initialize(params).await;
+    core.initialized().await;
+    loader.folders.lock().unwrap().clone()
+}
+
+/// `rootUri` is deprecated but still what eglot and several minimal clients
+/// send, and reading only `workspaceFolders` meant such a client silently got
+/// **no** workspace schema: every cross-file table came back undefined with
+/// nothing to explain it.
+#[tokio::test]
+async fn a_client_that_sends_only_root_uri_still_gets_a_workspace() {
+    #[allow(deprecated)]
+    let params = InitializeParams {
+        root_uri: Some(uri_for_dir("/tmp/surql-root-uri")),
+        ..InitializeParams::default()
+    };
+    assert_eq!(
+        indexed_roots(params).await,
+        vec![std::path::PathBuf::from("/tmp/surql-root-uri")],
+    );
+}
+
+/// `workspaceFolders` still wins when both are present.
+#[tokio::test]
+async fn workspace_folders_take_precedence_over_root_uri() {
+    #[allow(deprecated)]
+    let params = InitializeParams {
+        root_uri: Some(uri_for_dir("/tmp/surql-old")),
+        workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: uri_for_dir("/tmp/surql-new"),
+            name: "new".to_string(),
+        }]),
+        ..InitializeParams::default()
+    };
+    assert_eq!(
+        indexed_roots(params).await,
+        vec![std::path::PathBuf::from("/tmp/surql-new")],
+    );
+}
+
+fn uri_for_dir(path: &str) -> tower_lsp_server::ls_types::Uri {
+    use std::str::FromStr as _;
+    tower_lsp_server::ls_types::Uri::from_str(&format!("file://{path}")).expect("valid file uri")
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Folding and selection ranges
+// ──────────────────────────────────────────────────────────────────────
+
+async fn folds(core: &common::TestCore, path: &str) -> Vec<(u32, u32, Option<String>)> {
+    let mut found: Vec<_> = core
+        .folding_range(tower_lsp_server::ls_types::FoldingRangeParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|range| {
+            (
+                range.start_line,
+                range.end_line,
+                range.kind.map(|kind| format!("{kind:?}")),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// A multi-line `DEFINE FUNCTION` folds; the one-liner beside it does not.
+#[tokio::test]
+async fn multi_line_regions_fold_and_single_line_ones_do_not() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "fold.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE FUNCTION fn::greet($name: string) {\n\
+         \x20   RETURN 'hi';\n\
+         };\n",
+    )
+    .await;
+
+    let found = folds(&core, "fold.surql").await;
+    assert!(
+        found.iter().any(|(start, end, _)| *start == 1 && *end >= 2),
+        "the multi-line function must fold: {found:?}"
+    );
+    assert!(
+        !found.iter().any(|(start, _, _)| *start == 0),
+        "the single-line DEFINE TABLE must not offer a fold: {found:?}"
+    );
+}
+
+/// The last line is excluded so the closing brace stays visible when collapsed,
+/// which is what every editor's built-in folding does.
+#[tokio::test]
+async fn a_fold_stops_before_its_closing_line() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "brace.surql",
+        "DEFINE FUNCTION fn::f() {\n    RETURN 1;\n};\n",
+    )
+    .await;
+
+    let found = folds(&core, "brace.surql").await;
+    assert!(
+        found.iter().any(|(start, end, _)| *start == 0 && *end == 1),
+        "expected a fold from line 1 to line 2, got {found:?}"
+    );
+}
+
+/// Consecutive comment lines fold as one block; a blank line splits them.
+#[tokio::test]
+async fn consecutive_comments_fold_as_one_block() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "comments.surql",
+        "-- one\n-- two\n-- three\n\n-- separate\nRETURN 1;\n",
+    )
+    .await;
+
+    let found = folds(&core, "comments.surql").await;
+    let comment_folds: Vec<_> = found
+        .iter()
+        .filter(|(_, _, kind)| kind.as_deref() == Some("Comment"))
+        .collect();
+    assert_eq!(
+        comment_folds.len(),
+        1,
+        "the three adjacent comments are one block and the lone one is not foldable: {found:?}"
+    );
+    assert_eq!((comment_folds[0].0, comment_folds[0].1), (0, 2));
+}
+
+/// Expand-selection walks outward, and every step must be strictly larger or an
+/// editor appears stuck.
+#[tokio::test]
+async fn selection_range_widens_at_every_step() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let text = "SELECT name FROM person;\n";
+    open(&core, "sel.surql", text).await;
+
+    let ranges = core
+        .selection_range(tower_lsp_server::ls_types::SelectionRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("sel.surql"),
+            },
+            // On `person`.
+            positions: vec![Position::new(0, 18)],
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("selection ranges");
+    assert_eq!(ranges.len(), 1, "one chain per requested position");
+
+    let mut sizes = Vec::new();
+    let mut current = Some(&ranges[0]);
+    while let Some(selection) = current {
+        let range = selection.range;
+        sizes.push((
+            range.start.character,
+            range.end.character,
+            range.end.line - range.start.line,
+        ));
+        current = selection.parent.as_deref();
+    }
+
+    assert!(sizes.len() >= 2, "expected a chain, got {sizes:?}");
+    for pair in sizes.windows(2) {
+        let (inner, outer) = (pair[0], pair[1]);
+        assert!(
+            outer.0 <= inner.0 && (outer.1 >= inner.1 || outer.2 > inner.2),
+            "each step must widen: {inner:?} then {outer:?}"
+        );
+    }
+}
+
+/// The response array corresponds one-to-one with the requested positions: the
+/// client reads the chain for its Nth cursor out of the Nth slot. Dropping a
+/// position that has no chain would hand every later cursor the previous one's
+/// range, which is a multi-cursor expand-selection silently jumping to the
+/// wrong place.
+#[tokio::test]
+async fn selection_range_answers_one_chain_per_position() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "multi.surql", "SELECT name FROM person;\n").await;
+
+    let positions = vec![
+        // On `name`.
+        Position::new(0, 7),
+        // Past the end of the document, where there is no node at all.
+        Position::new(0, 400),
+        // On `person`.
+        Position::new(0, 18),
+    ];
+    let ranges = core
+        .selection_range(tower_lsp_server::ls_types::SelectionRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("multi.surql"),
+            },
+            positions: positions.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("selection ranges");
+
+    assert_eq!(
+        ranges.len(),
+        positions.len(),
+        "one entry per requested position, whatever each one resolves to"
+    );
+    // The third entry must still be the chain for the third position.
+    assert!(
+        ranges[2].range.start.character <= 18 && ranges[2].range.end.character >= 18,
+        "the chain for `person` landed in the wrong slot: {:?}",
+        ranges[2].range
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Oversize documents are declined, not dropped
+// ──────────────────────────────────────────────────────────────────────
+
+/// The filesystem walk has skipped files over 2 MB since 0.3, but a buffer the
+/// *editor* pushes went straight into the analyzer with no bound: the wider of
+/// the two doors, and the unguarded one.
+///
+/// The document must still be tracked. Dropping its text would lose the
+/// server's record of a buffer the client still has open, and under incremental
+/// sync it would desynchronise permanently.
+#[tokio::test]
+async fn an_oversize_document_is_tracked_but_not_analysed() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 1024;
+    core.apply_settings(settings).await;
+
+    // Well over the cap, and otherwise perfectly valid.
+    let text = "DEFINE TABLE person SCHEMAFULL;\n".repeat(200);
+    open(&core, "big.surql", &text).await;
+
+    let published = notifier
+        .published()
+        .into_iter()
+        .rev()
+        .find(|(published_uri, _)| *published_uri == uri("big.surql"))
+        .map(|(_, diagnostics)| diagnostics)
+        .expect("an oversize document still publishes");
+    assert_eq!(published.len(), 1, "one explanation, not a flood");
+    assert!(
+        published[0].message.contains("analysis limit"),
+        "the user must be told why it is silent: {:?}",
+        published[0].message
+    );
+    assert_eq!(
+        published[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::INFORMATION),
+        "nothing is wrong with the file; the server declined to read it"
+    );
+    // Not `parse`. A machine consumer is told that every `parse` is a real
+    // syntax error, and `--only parse` in a build would otherwise surface a
+    // notice about a file's size as one.
+    assert_eq!(
+        published[0].code,
+        Some(NumberOrString::String(
+            codes::DOCUMENT_TOO_LARGE.to_string()
+        )),
+        "the refusal needs its own code, so it can be filtered on its own"
+    );
+
+    // Tracked: the document answers requests rather than being unknown.
+    assert_eq!(
+        defined_table(&core, "big.surql").await,
+        None,
+        "no symbols, because it was not analysed"
+    );
+}
+
+/// Under the cap, nothing changes.
+#[tokio::test]
+async fn a_document_under_the_cap_is_analysed_normally() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 1024;
+    core.apply_settings(settings).await;
+
+    open(&core, "small.surql", "DEFINE TABLE person SCHEMAFULL;\n").await;
+    assert_eq!(
+        defined_table(&core, "small.surql").await.as_deref(),
+        Some("TABLE person"),
+    );
+}
+
+/// `0` means no cap, for anyone who really does open a generated dump.
+#[tokio::test]
+async fn a_zero_cap_removes_the_limit() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 0;
+    core.apply_settings(settings).await;
+
+    let text = "DEFINE TABLE person SCHEMAFULL;\n".repeat(200);
+    open(&core, "uncapped.surql", &text).await;
+    assert_eq!(
+        defined_table(&core, "uncapped.surql").await.as_deref(),
+        Some("TABLE person"),
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// The authoritative buffer
+// ──────────────────────────────────────────────────────────────────────
+
+/// Edits arriving through the real path produce the same text as the same edits
+/// applied one after another.
+///
+/// Trivially true under full-document sync, where every notification carries the
+/// whole text. The point is that it exists *before* incremental sync, so the
+/// commit that switches over has a test that was already green to break.
+#[tokio::test]
+async fn interleaved_edits_produce_the_same_text_as_serial_ones() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "seq.surql", "DEFINE TABLE t0 SCHEMAFULL;").await;
+
+    for version in 1..=8 {
+        core.did_change(change(
+            "seq.surql",
+            version,
+            &format!("DEFINE TABLE t{version} SCHEMAFULL;"),
+        ))
+        .await;
+    }
+
+    assert_eq!(
+        defined_table(&core, "seq.surql").await.as_deref(),
+        Some("TABLE t8"),
+        "the last edit applied must be the one that stands"
+    );
+}
+
+/// Applying and analysing are separate calls now, so the ordering guarantee can
+/// be tested without racing a spawned task: apply every edit first, then analyse
+/// once. The newest text must win regardless of how many analyses were skipped.
+#[tokio::test]
+async fn applying_ahead_of_analysis_keeps_the_newest_text() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "ahead.surql", "DEFINE TABLE t0 SCHEMAFULL;").await;
+
+    // Five edits land before a single analysis runs: what a burst looks like
+    // when the debounce collapses it.
+    for version in 1..=5 {
+        core.did_change(change(
+            "ahead.surql",
+            version,
+            &format!("DEFINE TABLE t{version} SCHEMAFULL;"),
+        ))
+        .await;
+    }
+
+    assert_eq!(
+        defined_table(&core, "ahead.surql").await.as_deref(),
+        Some("TABLE t5"),
+    );
+}
+
+/// A change for a document the server never saw an open for is taken as the
+/// whole content rather than dropped: the client believes the buffer exists, and
+/// disagreeing with it silently is worse than accepting the text.
+#[tokio::test]
+async fn a_change_without_an_open_is_still_applied() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    core.did_change(change(
+        "unopened.surql",
+        3,
+        "DEFINE TABLE ghost SCHEMAFULL;",
+    ))
+    .await;
+
+    assert_eq!(
+        defined_table(&core, "unopened.surql").await.as_deref(),
+        Some("TABLE ghost"),
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Incremental sync
+// ──────────────────────────────────────────────────────────────────────
+
+/// One ranged edit: `(start line, start character)`, `(end …)`, replacement.
+/// Characters are UTF-16 code units, as the protocol counts them.
+type RangedEdit<'a> = ((u32, u32), (u32, u32), &'a str);
+
+fn ranged(path: &str, version: i32, edits: &[RangedEdit<'_>]) -> DidChangeTextDocumentParams {
+    DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri(path),
+            version,
+        },
+        content_changes: edits
+            .iter()
+            .map(|(start, end, text)| TextDocumentContentChangeEvent {
+                range: Some(tower_lsp_server::ls_types::Range {
+                    start: Position::new(start.0, start.1),
+                    end: Position::new(end.0, end.1),
+                }),
+                range_length: None,
+                text: (*text).to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// Read back exactly what the server believes the buffer contains.
+async fn buffer_text(core: &common::TestCore, path: &str) -> Option<String> {
+    core.buffer_snapshot(&uri(path))
+}
+
+/// Three partial changes must produce the same text as the one full replacement
+/// they add up to. This is the property incremental sync lives or dies on.
+#[tokio::test]
+async fn partial_changes_equal_the_full_replacement() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "inc.surql", "SELECT a FROM t;\n").await;
+
+    // "SELECT a FROM t;" -> "SELECT name FROM person;"
+    core.did_change(ranged(
+        "inc.surql",
+        2,
+        &[
+            ((0, 7), (0, 8), "name"),     // a -> name
+            ((0, 17), (0, 18), "person"), // t -> person
+        ],
+    ))
+    .await;
+
+    assert_eq!(
+        buffer_text(&core, "inc.surql").await.as_deref(),
+        Some("SELECT name FROM person;\n"),
+        "the second edit must be applied against the text the first produced"
+    );
+}
+
+/// The second change in a batch is expressed against the text the first
+/// produced, so the line index has to be rebuilt per change rather than per
+/// notification. An insertion that adds a line proves it.
+#[tokio::test]
+async fn a_later_change_sees_the_earlier_one() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "lines.surql", "one\nthree\n").await;
+
+    core.did_change(ranged(
+        "lines.surql",
+        2,
+        &[
+            ((0, 3), (0, 3), "\ntwo"), // insert a line
+            ((2, 0), (2, 5), "THREE"), // line 2 only exists after the first edit
+        ],
+    ))
+    .await;
+
+    assert_eq!(
+        buffer_text(&core, "lines.surql").await.as_deref(),
+        Some("one\ntwo\nTHREE\n"),
+    );
+}
+
+/// A range crossing a character outside the BMP. `LineIndex` counts UTF-16 code
+/// units, so an emoji is two of them and one `char`: the arithmetic that a full
+/// sync never exercised, and the one where an off-by-one compounds forever.
+#[tokio::test]
+async fn a_range_across_a_surrogate_pair_converts_correctly() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    // 🦀 is one char, two UTF-16 units, four bytes.
+    open(&core, "utf.surql", "RETURN '🦀 crab';\n").await;
+
+    // Replace `crab`, which starts at UTF-16 offset 8+2+1 = 11.
+    core.did_change(ranged("utf.surql", 2, &[((0, 11), (0, 15), "lobster")]))
+        .await;
+
+    assert_eq!(
+        buffer_text(&core, "utf.surql").await.as_deref(),
+        Some("RETURN '🦀 lobster';\n"),
+        "a surrogate pair must count as two UTF-16 units, not one"
+    );
+}
+
+/// A multi-byte character inside the BMP: ₹ is three bytes and one UTF-16 unit.
+#[tokio::test]
+async fn a_range_across_a_multi_byte_character_converts_correctly() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "rupee.surql", "RETURN '₹ 5';\n").await;
+
+    // R E T U R N ␣ ' ₹ ␣ 5 ' ;  `₹` is three bytes but one UTF-16 unit, so
+    // `5` sits at unit 10, which is the whole point of the case.
+    core.did_change(ranged("rupee.surql", 2, &[((0, 10), (0, 11), "10")]))
+        .await;
+
+    assert_eq!(
+        buffer_text(&core, "rupee.surql").await.as_deref(),
+        Some("RETURN '₹ 10';\n"),
+    );
+}
+
+/// Insertion at the very end, and deletion to the end.
+#[tokio::test]
+async fn edits_at_the_document_boundary_apply() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "edge.surql", "RETURN 1;\n").await;
+
+    core.did_change(ranged("edge.surql", 2, &[((1, 0), (1, 0), "RETURN 2;\n")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "edge.surql").await.as_deref(),
+        Some("RETURN 1;\nRETURN 2;\n"),
+    );
+
+    core.did_change(ranged("edge.surql", 3, &[((0, 9), (2, 0), "")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "edge.surql").await.as_deref(),
+        Some("RETURN 1;"),
+    );
+}
+
+/// `\r\n` line endings: the terminator is two bytes but the position of the
+/// next line is unaffected.
+#[tokio::test]
+async fn crlf_line_endings_are_handled() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "crlf.surql", "RETURN 1;\r\nRETURN 2;\r\n").await;
+
+    core.did_change(ranged("crlf.surql", 2, &[((1, 7), (1, 8), "9")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "crlf.surql").await.as_deref(),
+        Some("RETURN 1;\r\nRETURN 9;\r\n"),
+    );
+}
+
+/// Diagnostic codes from the most recent publish for `name`.
+fn published_codes(notifier: &common::RecordingNotifier, name: &str) -> Vec<String> {
+    notifier
+        .published()
+        .iter()
+        .rev()
+        .find(|(uri, _)| uri.as_str().ends_with(name))
+        .map(|(_, diagnostics)| {
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| match &diagnostic.code {
+                    Some(NumberOrString::String(code)) => Some(code.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A position past the end of the document **clamps**, because the protocol
+/// says positions clamp: a line greater than the document's line count is that
+/// line count. `{line: 999999, character: 0}` is a normal way for a client to
+/// say "the end", and refusing it used to wedge the buffer for the rest of the
+/// session.
+#[tokio::test]
+async fn an_out_of_range_position_clamps_to_the_end_of_the_document() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "clamp.surql", "RETURN 1;\n").await;
+
+    // Line 99 does not exist: both ends land at the end of the document, so
+    // this is an append.
+    core.did_change(ranged(
+        "clamp.surql",
+        2,
+        &[((99, 0), (99, 4), "RETURN 2;\n")],
+    ))
+    .await;
+    assert_eq!(
+        buffer_text(&core, "clamp.surql").await.as_deref(),
+        Some("RETURN 1;\nRETURN 2;\n"),
+    );
+
+    // And the buffer is still usable afterwards, which is the whole point.
+    core.did_change(ranged("clamp.surql", 3, &[((0, 7), (0, 8), "9")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "clamp.surql").await.as_deref(),
+        Some("RETURN 9;\nRETURN 2;\n"),
+    );
+
+    // A character past the end of its line clamps to that line's length, per
+    // the same rule.
+    core.did_change(ranged(
+        "clamp.surql",
+        4,
+        &[((0, 400), (0, 400), " -- tail")],
+    ))
+    .await;
+    assert_eq!(
+        buffer_text(&core, "clamp.surql").await.as_deref(),
+        Some("RETURN 9; -- tail\nRETURN 2;\n"),
+    );
+}
+
+/// A range whose end precedes its start cannot be interpreted at all, so the
+/// buffer desyncs rather than splicing something plausible. Ranged edits are
+/// then refused until a whole document arrives, and the document says so: a
+/// user whose diagnostics have stopped moving does not read the output channel.
+#[tokio::test]
+async fn an_inverted_range_desyncs_until_a_full_document_arrives() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "desync.surql", "RETURN 1;\n").await;
+
+    core.did_change(ranged("desync.surql", 2, &[((1, 0), (0, 0), "nope")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 1;\n"),
+        "an uninterpretable range must change nothing"
+    );
+
+    // Further ranged edits are refused while desynced.
+    core.did_change(ranged("desync.surql", 3, &[((0, 7), (0, 8), "2")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 1;\n"),
+        "ranged edits stay refused until the client resends the document"
+    );
+
+    assert!(
+        published_codes(&notifier, "desync.surql").contains(&codes::BUFFER_DESYNCED.to_string()),
+        "the desync has to reach the document, not only the log"
+    );
+
+    // A full replacement re-establishes the baseline.
+    core.did_change(change("desync.surql", 4, "RETURN 7;\n"))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 7;\n"),
+    );
+
+    // And ranged edits work again.
+    core.did_change(ranged("desync.surql", 5, &[((0, 7), (0, 8), "8")]))
+        .await;
+    assert_eq!(
+        buffer_text(&core, "desync.surql").await.as_deref(),
+        Some("RETURN 8;\n"),
+        "the desync must clear, not persist for the life of the document"
+    );
+
+    assert!(
+        notifier
+            .logs()
+            .iter()
+            .any(|(_, message)| message.contains("Ranged edits are ignored")),
+        "a desync has to be visible, not silent"
+    );
+
+    assert!(
+        !published_codes(&notifier, "desync.surql").contains(&codes::BUFFER_DESYNCED.to_string()),
+        "and the diagnostic has to go away once the buffer is back in step"
+    );
+}
+
+/// A client that ignores the advertised kind and keeps sending whole documents
+/// is still handled: that is the `range: None` branch.
+#[tokio::test]
+async fn a_client_sending_full_documents_still_works() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "full.surql", "DEFINE TABLE a SCHEMAFULL;").await;
+
+    core.did_change(change("full.surql", 2, "DEFINE TABLE b SCHEMAFULL;"))
+        .await;
+    assert_eq!(
+        defined_table(&core, "full.surql").await.as_deref(),
+        Some("TABLE b"),
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Incremental parsing
+// ──────────────────────────────────────────────────────────────────────
+
+/// The pending tree must exist after an analysis and vanish when it can no
+/// longer describe the buffer.
+///
+/// Not an implementation detail: a *stale* pending tree is worse than none,
+/// because the next parse would build on a description of text that no longer
+/// exists. Every path that cannot maintain it has to clear it, and this is what
+/// says so.
+#[tokio::test]
+async fn the_pending_tree_is_kept_and_dropped_at_the_right_moments() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    open(&core, "tree.surql", "SELECT a FROM t;\n").await;
+    assert!(
+        core.has_pending_tree(&uri("tree.surql")),
+        "an analysis must leave a tree for the next parse to build on"
+    );
+
+    // A ranged edit keeps it: that is the whole point.
+    core.did_change(ranged("tree.surql", 2, &[((0, 7), (0, 8), "b")]))
+        .await;
+    assert!(
+        core.has_pending_tree(&uri("tree.surql")),
+        "a ranged edit must leave a reusable tree"
+    );
+
+    // A whole-document replacement drops the old tree (there is no edit that
+    // describes a wholesale replacement), and the analysis that follows leaves a
+    // tree of the *new* text, which is what the next parse should build on.
+    core.did_change(change("tree.surql", 3, "SELECT c FROM u;\n"))
+        .await;
+    assert!(core.has_pending_tree(&uri("tree.surql")));
+    assert_eq!(
+        core.buffer_snapshot(&uri("tree.surql")).as_deref(),
+        Some("SELECT c FROM u;\n"),
+    );
+}
+
+/// A document the analyzer *declined* must leave no tree behind.
+///
+/// The refusal paths carry an empty tree, because parsing is what they declined.
+/// Keeping that as the base for the next parse would apply the intervening
+/// edits (byte offsets into a large document) to a tree describing nothing.
+#[tokio::test]
+async fn a_refused_document_leaves_no_tree_to_build_on() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let mut settings = ServerSettings::default();
+    settings.analysis.diagnostic_debounce_ms = 0;
+    settings.analysis.max_document_bytes = 512;
+    core.apply_settings(settings).await;
+
+    open(&core, "refused.surql", &"SELECT * FROM t;\n".repeat(100)).await;
+    assert!(
+        !core.has_pending_tree(&uri("refused.surql")),
+        "an empty tree must not become the base for the next incremental parse"
+    );
+}
+
+/// A document reached through ranged edits must analyse to exactly what the same
+/// final text analyses to when opened directly.
+///
+/// The corpus-wide version of this lives in `tests/conformance.rs`
+/// (`incremental_reparse_matches_a_fresh_parse`); this one drives the real
+/// server path, so it also covers the bookkeeping around the parse rather than
+/// the parse alone.
+#[tokio::test]
+async fn edits_reach_the_same_analysis_as_opening_the_final_text() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    // Type it the way a person would: broken in the middle, then fixed.
+    open(&core, "typed.surql", "DEFINE TABLE p SCHEMAFULL;\n").await;
+    core.did_change(ranged("typed.surql", 2, &[((0, 13), (0, 14), "person")]))
+        .await;
+    core.did_change(ranged(
+        "typed.surql",
+        3,
+        &[((1, 0), (1, 0), "SELECT * FROM ")],
+    ))
+    .await;
+    core.did_change(ranged("typed.surql", 4, &[((1, 14), (1, 14), "person;")]))
+        .await;
+
+    let typed_tree = core.tree_sexp(&uri("typed.surql")).await.expect("analysed");
+    let typed_symbols = document_symbol_names(&core, "typed.surql").await;
+
+    // The same text, opened in one go.
+    open(
+        &core,
+        "opened.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;",
+    )
+    .await;
+    let opened_tree = core
+        .tree_sexp(&uri("opened.surql"))
+        .await
+        .expect("analysed");
+
+    assert_eq!(
+        typed_tree, opened_tree,
+        "a document reached by editing must parse to the same tree as one opened whole"
+    );
+    assert_eq!(
+        typed_symbols,
+        document_symbol_names(&core, "opened.surql").await,
+        "and to the same extracted symbols"
+    );
+}
+
+async fn document_symbol_names(core: &common::TestCore, path: &str) -> Vec<String> {
+    let Some(DocumentSymbolResponse::Nested(symbols)) = core
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    symbols.into_iter().map(|symbol| symbol.name).collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Pull diagnostics, and the switch that stops the pushing
+// ──────────────────────────────────────────────────────────────────────
+
+/// An `initialize` payload from a client that pulls diagnostics.
+fn pulling_client() -> InitializeParams {
+    InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            text_document: Some(tower_lsp_server::ls_types::TextDocumentClientCapabilities {
+                diagnostic: Some(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    }
+}
+
+async fn pulled_diagnostics(core: &common::TestCore, path: &str) -> Vec<Diagnostic> {
+    let result = core
+        .document_diagnostic(tower_lsp_server::ls_types::DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await;
+    match result {
+        tower_lsp_server::ls_types::DocumentDiagnosticReportResult::Report(
+            tower_lsp_server::ls_types::DocumentDiagnosticReport::Full(report),
+        ) => report.full_document_diagnostic_report.items,
+        _ => Vec::new(),
+    }
+}
+
+/// A client that pulls must not also be pushed to: doing both is how every
+/// diagnostic ends up rendered twice.
+#[tokio::test]
+async fn a_pulling_client_is_not_pushed_to() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(pulling_client()).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let before = notifier.published().len();
+    open(&core, "pull.surql", "SELECT * FROM;").await;
+    core.did_change(change("pull.surql", 2, "SELECT * FROM ;;"))
+        .await;
+
+    assert_eq!(
+        notifier.published().len(),
+        before,
+        "a pulling client was pushed to anyway"
+    );
+
+    // But the diagnostics are there when asked for.
+    let pulled = pulled_diagnostics(&core, "pull.surql").await;
+    assert!(
+        !pulled.is_empty(),
+        "a pull must return what the push would have carried"
+    );
+}
+
+/// An `initialize` payload from a client that pulls diagnostics and accepts
+/// being told to pull again. VS Code and Neovim both send this shape.
+fn pulling_client_with_refresh() -> InitializeParams {
+    InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            text_document: Some(tower_lsp_server::ls_types::TextDocumentClientCapabilities {
+                diagnostic: Some(Default::default()),
+                ..Default::default()
+            }),
+            workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                diagnostics: Some(
+                    tower_lsp_server::ls_types::DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    }
+}
+
+/// Not pushing to a pulling client is only half of it. The client's last pull
+/// predates this edit, and under a workspace-wide model an edit in one file
+/// changes what every other open file means, so it has to be told to pull
+/// again. Without this, `interFileDependencies: true` is a claim the server
+/// does not honour: editing a `DEFINE TABLE` in one file leaves another open
+/// file showing diagnostics computed against the old schema, forever.
+#[tokio::test]
+async fn a_pulling_client_is_told_when_the_answer_moves() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(pulling_client_with_refresh()).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    open(&core, "schema.surql", "DEFINE TABLE person SCHEMAFULL;").await;
+    open(&core, "query.surql", "SELECT * FROM person;").await;
+
+    let before = notifier.diagnostic_refreshes();
+    core.did_change(change(
+        "schema.surql",
+        2,
+        "DEFINE TABLE persons SCHEMAFULL;",
+    ))
+    .await;
+
+    assert!(
+        notifier.diagnostic_refreshes() > before,
+        "renaming a table has to prompt a re-pull, or the other file keeps \
+         showing diagnostics for a schema that no longer exists"
+    );
+    assert!(
+        notifier.published().is_empty(),
+        "and it must still not be pushed to"
+    );
+}
+
+/// A client that pulls but cannot be refreshed is left alone rather than
+/// pushed to as a consolation: pushing is what produces double squiggles, which
+/// is the failure this whole branch exists to avoid.
+#[tokio::test]
+async fn a_pulling_client_without_refresh_support_is_not_pushed_to_instead() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(pulling_client()).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    open(&core, "quiet.surql", "SELECT * FROM;").await;
+
+    assert_eq!(notifier.diagnostic_refreshes(), 0);
+    assert!(notifier.published().is_empty());
+}
+
+/// The regression guard that matters: a client which declares nothing (the
+/// browser host sends exactly that today) must keep receiving pushes.
+#[tokio::test]
+async fn a_client_that_declares_nothing_still_receives_pushes() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(InitializeParams::default()).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let before = notifier.published().len();
+    open(&core, "push.surql", "SELECT * FROM;").await;
+
+    assert!(
+        notifier.published().len() > before,
+        "an absent capability must never turn a working behaviour off"
+    );
+}
+
+/// The advertisement follows the same answer as the suppression, so the two
+/// cannot drift apart.
+#[tokio::test]
+async fn the_diagnostic_provider_is_only_advertised_to_a_pulling_client() {
+    let quiet = common::TestCore::server_capabilities(Default::default());
+    assert!(
+        quiet.diagnostic_provider.is_none(),
+        "a client that did not ask must not be offered pulls"
+    );
+
+    let profile = surrealql_language_server::core::state::ClientProfile::from_capabilities(
+        &pulling_client().capabilities,
+    );
+    assert!(profile.pull_diagnostics);
+    assert!(
+        common::TestCore::server_capabilities(profile)
+            .diagnostic_provider
+            .is_some(),
+        "a client that asked must be offered pulls"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Files changed outside the editor
+// ──────────────────────────────────────────────────────────────────────
+
+/// A client that supports dynamic registration.
+fn watching_client() -> InitializeParams {
+    InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                did_change_watched_files: Some(
+                    tower_lsp_server::ls_types::DidChangeWatchedFilesClientCapabilities {
+                        dynamic_registration: Some(true),
+                        relative_pattern_support: None,
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    }
+}
+
+/// The watcher is registered only for a client that can take it.
+#[tokio::test]
+async fn a_file_watcher_is_registered_when_the_client_supports_it() {
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(watching_client()).await;
+    core.initialized().await;
+    assert!(
+        notifier
+            .registrations()
+            .contains(&"workspace/didChangeWatchedFiles".to_string()),
+        "a capable client must be asked to watch .surql files"
+    );
+
+    let (quiet, quiet_notifier, _) = common::core_with(Default::default(), Default::default());
+    quiet.initialize(InitializeParams::default()).await;
+    quiet.initialized().await;
+    assert!(
+        quiet_notifier.registrations().is_empty(),
+        "a client that cannot register must not be asked"
+    );
+}
+
+/// A schema file deleted outside the editor must stop contributing.
+///
+/// This is the `git checkout` case. Nothing picked such a change up short of a
+/// restart, and the symptom was a diagnostic that disagreed with the files on
+/// disk, which reads as a language-server bug rather than a missed
+/// notification.
+///
+/// The probe is a typo: `persn` is only reportable *while* `person` is defined
+/// somewhere to be a typo of. Delete the definition and the report must go.
+#[tokio::test]
+async fn deleting_a_schema_file_updates_the_open_buffer() {
+    let mut workspace = surrealql_language_server::semantic::types::WorkspaceIndex::default();
+    let schema_uri = uri("schema.surql");
+    let analysis = surrealql_language_server::semantic::analyzer::analyze_document(
+        schema_uri.clone(),
+        "DEFINE TABLE person SCHEMAFULL;",
+        surrealql_language_server::semantic::types::SymbolOrigin::Local,
+    )
+    .expect("analysed");
+    workspace
+        .documents
+        .insert(schema_uri.clone(), std::sync::Arc::new(analysis));
+
+    let (core, notifier, _) = common::core_with(workspace, Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "query.surql", "SELECT * FROM persn;").await;
+
+    let latest = |notifier: &common::RecordingNotifier| {
+        notifier
+            .published()
+            .into_iter()
+            .rev()
+            .find(|(published, _)| *published == uri("query.surql"))
+            .map(|(_, diagnostics)| diagnostics)
+            .unwrap_or_default()
+    };
+
+    assert!(
+        latest(&notifier)
+            .iter()
+            .any(|d| has_code(d, "unknown-table")),
+        "`persn` is a typo of a defined table, so it must be reported"
+    );
+
+    core.did_change_watched_files(tower_lsp_server::ls_types::DidChangeWatchedFilesParams {
+        changes: vec![tower_lsp_server::ls_types::FileEvent {
+            uri: schema_uri,
+            typ: tower_lsp_server::ls_types::FileChangeType::DELETED,
+        }],
+    })
+    .await;
+
+    assert!(
+        !latest(&notifier)
+            .iter()
+            .any(|d| has_code(d, "unknown-table")),
+        "with the definition gone there is nothing for `persn` to be a typo of, \
+         and the open buffer must be told"
+    );
+}
+
+/// A file changed on disk *under an open buffer* must not overwrite what the
+/// user is editing: the buffer is the authority for its own text.
+#[tokio::test]
+async fn a_disk_change_does_not_clobber_an_open_buffer() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "live.surql", "DEFINE TABLE edited SCHEMAFULL;").await;
+
+    core.did_change_watched_files(tower_lsp_server::ls_types::DidChangeWatchedFilesParams {
+        changes: vec![tower_lsp_server::ls_types::FileEvent {
+            uri: uri("live.surql"),
+            typ: tower_lsp_server::ls_types::FileChangeType::CHANGED,
+        }],
+    })
+    .await;
+
+    assert_eq!(
+        core.buffer_snapshot(&uri("live.surql")).as_deref(),
+        Some("DEFINE TABLE edited SCHEMAFULL;"),
+        "the editor's unsaved text must survive a change notification"
+    );
+}
+
+fn has_code(diagnostic: &Diagnostic, code: &str) -> bool {
+    matches!(
+        &diagnostic.code,
+        Some(tower_lsp_server::ls_types::NumberOrString::String(value)) if value == code
+    )
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Navigation beyond functions
+// ──────────────────────────────────────────────────────────────────────
+
+async fn references_at(
+    core: &common::TestCore,
+    path: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Vec<(u32, u32)> {
+    let mut found: Vec<_> = core
+        .references(tower_lsp_server::ls_types::ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(path) },
+                position: Position::new(line, character),
+            },
+            context: tower_lsp_server::ls_types::ReferenceContext {
+                include_declaration,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .into_iter()
+        .map(|location| (location.range.start.line, location.range.start.character))
+        .collect();
+    found.sort();
+    found
+}
+
+/// "Where else is this table used?" is the most-asked navigation question in a
+/// `.surql` workspace, and the answer used to be an empty list.
+#[tokio::test]
+async fn references_finds_every_use_of_a_table() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "refs.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         SELECT * FROM person;\n\
+         DELETE person;\n",
+    )
+    .await;
+
+    let without = references_at(&core, "refs.surql", 1, 15, false).await;
+    assert_eq!(without.len(), 2, "both queries name the table: {without:?}");
+
+    let with = references_at(&core, "refs.surql", 1, 15, true).await;
+    assert_eq!(
+        with.len(),
+        3,
+        "include_declaration adds the DEFINE: {with:?}"
+    );
+    assert_eq!(with[0].0, 0, "the declaration sorts first");
+}
+
+/// A field *written* by a query is reachable the same way.
+///
+/// Writes only, and that is a limitation of the extractor rather than of
+/// references: `QueryFact.field_refs` records assignment targets, so
+/// `UPDATE … SET email` is indexed and `SELECT email` is not. Finding the writes
+/// is still worth having (it is the "what touches this column?" question), and
+/// an empty list, which is what this returned before, helps nobody. The README
+/// says so rather than implying more.
+#[tokio::test]
+async fn references_finds_a_written_field() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "field.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE FIELD email ON person TYPE string;\n\
+         UPDATE person SET email = 'a';\n\
+         UPDATE person SET email = 'b';\n",
+    )
+    .await;
+
+    let found = references_at(&core, "field.surql", 2, 18, false).await;
+    assert_eq!(found.len(), 2, "both assignments name the field: {found:?}");
+
+    let with_declaration = references_at(&core, "field.surql", 2, 18, true).await;
+    assert_eq!(
+        with_declaration.len(),
+        3,
+        "include_declaration adds the DEFINE FIELD: {with_declaration:?}"
+    );
+}
+
+/// `name` is a field on almost every schema. Keyed by the bare word, "find all
+/// references" on `person`'s `name` answered with `company`'s and `product`'s
+/// too, plus every `DEFINE FIELD name ON …` in the workspace: a list nobody
+/// asked for, in the one place a user is trying to narrow down.
+///
+/// The statement under the cursor names its target, so the answer can be
+/// specific.
+#[tokio::test]
+async fn references_to_a_field_stay_on_the_table_the_cursor_names() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "shared.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE FIELD name ON person TYPE string;\n\
+         DEFINE TABLE company SCHEMAFULL;\n\
+         DEFINE FIELD name ON company TYPE string;\n\
+         UPDATE person SET name = 'a';\n\
+         UPDATE company SET name = 'b';\n\
+         UPDATE company SET name = 'c';\n",
+    )
+    .await;
+
+    // On `name` in the `person` update.
+    let person = references_at(&core, "shared.surql", 4, 21, false).await;
+    assert_eq!(
+        person,
+        vec![(4, 18)],
+        "only person's own use of the field: {person:?}"
+    );
+
+    // On `name` in the first `company` update.
+    let company = references_at(&core, "shared.surql", 5, 20, false).await;
+    assert_eq!(
+        company,
+        vec![(5, 19), (6, 19)],
+        "both company updates, and neither person one: {company:?}"
+    );
+
+    // And the declaration it adds is that table's own DEFINE FIELD.
+    let with_declaration = references_at(&core, "shared.surql", 5, 20, true).await;
+    assert_eq!(
+        with_declaration,
+        vec![(3, 0), (5, 19), (6, 19)],
+        "company's DEFINE FIELD is on line 3, person's on line 1: {with_declaration:?}"
+    );
+}
+
+/// `TYPE record<person>` on a field takes you to `DEFINE TABLE person`: the one
+/// place type-definition means something different from definition here.
+#[tokio::test]
+async fn type_definition_follows_a_record_type_to_its_table() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "typed.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE TABLE post SCHEMAFULL;\n\
+         DEFINE FIELD author ON post TYPE record<person>;\n",
+    )
+    .await;
+
+    let response = core
+        .goto_type_definition(tower_lsp_server::ls_types::GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("typed.surql"),
+                },
+                // On `author`.
+                position: Position::new(2, 13),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("a record-typed field has a type definition");
+
+    let tower_lsp_server::ls_types::GotoDefinitionResponse::Scalar(location) = response else {
+        panic!("expected one location");
+    };
+    assert_eq!(
+        location.range.start.line, 0,
+        "must land on DEFINE TABLE person, not on the field"
+    );
+}
+
+/// A client that understands `LocationLink` gets the origin range, so the editor
+/// underlines the token rather than guessing at its extent.
+#[tokio::test]
+async fn definition_answers_with_a_link_when_the_client_supports_it() {
+    let linking = InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            text_document: Some(tower_lsp_server::ls_types::TextDocumentClientCapabilities {
+                definition: Some(tower_lsp_server::ls_types::GotoCapability {
+                    link_support: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    };
+
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(linking).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "link.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;\n",
+    )
+    .await;
+
+    let response = core
+        .goto_definition(tower_lsp_server::ls_types::GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("link.surql"),
+                },
+                position: Position::new(1, 15),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("definition");
+
+    let tower_lsp_server::ls_types::GotoDefinitionResponse::Link(links) = response else {
+        panic!("a link-capable client must get links");
+    };
+    assert_eq!(links.len(), 1);
+    assert!(
+        links[0].origin_selection_range.is_some(),
+        "the origin range is the reason to use a link at all"
+    );
+}
+
+/// Rename stays functions-only, **deliberately**.
+///
+/// A table name appears in record-id literals, `RELATE` arrows, permission
+/// clauses and strings that the reference index does not cover, so a rename
+/// would miss occurrences and leave a workspace that parses and is wrong. The
+/// decline is pinned here so it cannot quietly become partial coverage.
+#[tokio::test]
+async fn rename_declines_on_a_table() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "rename.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;\n",
+    )
+    .await;
+
+    let response = core
+        .prepare_rename(TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("rename.surql"),
+            },
+            position: Position::new(1, 15),
+        })
+        .await;
+
+    assert!(
+        response.is_none(),
+        "renaming a table is not supported, and offering it would be worse than not"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// One-shot validation
+// ──────────────────────────────────────────────────────────────────────
+
+/// The logic behind the browser's `validateQuery`, tested here because CI does
+/// not build wasm on the pull-request path: a wasm-only implementation would
+/// have no coverage at all.
+#[tokio::test]
+async fn validate_text_checks_a_snippet_against_the_workspace() {
+    let mut workspace = surrealql_language_server::semantic::types::WorkspaceIndex::default();
+    let schema_uri = uri("schema.surql");
+    let analysis = surrealql_language_server::semantic::analyzer::analyze_document(
+        schema_uri.clone(),
+        "DEFINE TABLE person SCHEMAFULL;",
+        surrealql_language_server::semantic::types::SymbolOrigin::Local,
+    )
+    .expect("analysed");
+    workspace
+        .documents
+        .insert(schema_uri, std::sync::Arc::new(analysis));
+
+    let (core, notifier, _) = common::core_with(workspace, Default::default());
+    core.apply_settings(ServerSettings::default()).await;
+    let published_before = notifier.published().len();
+
+    // A typo of a table the workspace defines. Against an *empty* model this
+    // would say nothing useful, which is why the model matters.
+    let problems = core.validate_text("SELECT * FROM persn;", Vec::new()).await;
+    assert!(
+        problems.iter().any(|d| has_code(d, "unknown-table")),
+        "a snippet must be checked against the pushed workspace: {problems:?}"
+    );
+
+    // Nothing is opened, published or remembered.
+    assert_eq!(
+        notifier.published().len(),
+        published_before,
+        "validation must not publish"
+    );
+    assert!(
+        core.buffer_snapshot(&uri("validate")).is_none(),
+        "validation must not open a document"
+    );
+}
+
+/// A caller-bound variable is declared, not reported: the same contract
+/// `check --param` and `analysis.externalParams` have.
+#[tokio::test]
+async fn validate_text_accepts_caller_bound_variables() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(ServerSettings::default()).await;
+
+    let without = core
+        .validate_text("SELECT * FROM person WHERE id = $id;", Vec::new())
+        .await;
+    assert!(
+        without.iter().any(|d| has_code(d, "undefined-variable")),
+        "an unbound variable is a real problem: {without:?}"
+    );
+
+    let with = core
+        .validate_text(
+            "SELECT * FROM person WHERE id = $id;",
+            vec!["id".to_string()],
+        )
+        .await;
+    assert!(
+        !with.iter().any(|d| has_code(d, "undefined-variable")),
+        "a declared variable must not be reported: {with:?}"
+    );
+}
+
+/// The diagnostics are the same objects the LSP publishes, links included.
+#[tokio::test]
+async fn validate_text_returns_the_same_diagnostics_the_server_publishes() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let snippet = "RETURN type::thing('person', '1');";
+    let validated = core.validate_text(snippet, Vec::new()).await;
+    assert_eq!(validated.len(), 1);
+    assert!(has_code(&validated[0], "renamed-function"));
+    assert!(
+        validated[0].code_description.is_some(),
+        "a one-shot check must carry the documentation link too"
+    );
+}
+
+/// The server counts UTF-16 and says so. A client that cannot take UTF-16 is
+/// told, because "effectively unreachable" and "silently wrong" look identical
+/// from the outside: such a client would otherwise get ranges counted the other
+/// way with nothing said.
+#[tokio::test]
+async fn a_client_that_cannot_take_utf16_is_warned() {
+    use tower_lsp_server::ls_types::PositionEncodingKind;
+
+    let utf8_only = InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            general: Some(tower_lsp_server::ls_types::GeneralClientCapabilities {
+                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    };
+
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(utf8_only).await;
+    assert!(
+        notifier
+            .logs()
+            .iter()
+            .any(|(_, message)| message.contains("position encoding")),
+        "a client offering only utf-8 must be told the server counts utf-16"
+    );
+
+    // A client that offers utf-16 (or says nothing, which is every client
+    // today) hears nothing about it.
+    for capabilities in [
+        tower_lsp_server::ls_types::ClientCapabilities {
+            general: Some(tower_lsp_server::ls_types::GeneralClientCapabilities {
+                position_encodings: Some(vec![
+                    PositionEncodingKind::UTF8,
+                    PositionEncodingKind::UTF16,
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        tower_lsp_server::ls_types::ClientCapabilities::default(),
+    ] {
+        let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+        core.initialize(InitializeParams {
+            capabilities,
+            ..InitializeParams::default()
+        })
+        .await;
+        assert!(
+            !notifier
+                .logs()
+                .iter()
+                .any(|(_, message)| message.contains("position encoding")),
+            "a capable client must not be warned"
+        );
+    }
 }

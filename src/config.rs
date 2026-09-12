@@ -125,6 +125,17 @@ pub struct AnalysisSettings {
         alias = "max_syntax_diagnostics"
     )]
     pub max_syntax_diagnostics: usize,
+    /// Largest document to analyse, in bytes. `0` removes the limit.
+    ///
+    /// Unlike [`Self::max_syntax_diagnostics`], this one *is* about length. The
+    /// workspace walk has always skipped files over 2 MB; a buffer the editor
+    /// pushes was unbounded, which is the wider door of the two.
+    ///
+    /// An oversize buffer is still **tracked**: only its analysis is skipped.
+    /// Dropping the text would be worse than useless: the server would lose its
+    /// record of a document the client still has open.
+    #[serde(default = "default_max_document_bytes", alias = "max_document_bytes")]
+    pub max_document_bytes: usize,
     /// How long to wait for typing to settle before analysing an edited buffer,
     /// in milliseconds. `0` disables the wait.
     ///
@@ -199,6 +210,7 @@ impl Default for AnalysisSettings {
             enable_type_checking: true,
             schemaless_diagnostics: default_schemaless_diagnostics(),
             max_syntax_diagnostics: default_max_syntax_diagnostics(),
+            max_document_bytes: default_max_document_bytes(),
             diagnostic_debounce_ms: default_diagnostic_debounce_ms(),
             external_params: Vec::new(),
         }
@@ -253,6 +265,21 @@ impl ServerSettings {
         initialization_options: Option<&Value>,
         configuration: Option<&Value>,
     ) -> (Self, Vec<String>) {
+        let (settings, warnings, _) =
+            Self::from_sources_with_presence(initialization_options, configuration);
+        (settings, warnings)
+    }
+
+    /// [`Self::from_sources_with_warnings`], also reporting which dotted paths
+    /// the payload actually named.
+    ///
+    /// The caller needs that to merge a *partial* payload without resetting the
+    /// fields it left out: see [`PresentKeys`].
+    pub fn from_sources_with_presence(
+        initialization_options: Option<&Value>,
+        configuration: Option<&Value>,
+    ) -> (Self, Vec<String>, PresentKeys) {
+        let mut present = PresentKeys::default();
         let mut warnings = Vec::new();
         let mut settings = Self::default();
         let mut parsed_any = false;
@@ -265,6 +292,11 @@ impl ServerSettings {
             let mut sweep_warnings = Vec::new();
             match parse_settings_value(value, &mut sweep_warnings) {
                 Ok(Some(parsed)) => {
+                    // The section that actually deserialized is the one whose
+                    // keys count as present: a nested `surrealql` wrapper is
+                    // unwrapped first so paths read `analysis.x`, not
+                    // `surrealql.analysis.x`.
+                    present.absorb(value.get("surrealql").unwrap_or(value), "");
                     settings = parsed.merge_with_env();
                     parsed_any = true;
                 }
@@ -300,7 +332,7 @@ impl ServerSettings {
 
         warnings.extend(settings.validate_and_repair());
 
-        (settings, warnings)
+        (settings, warnings, present)
     }
 
     /// Repair unknown enum-like values back to safe defaults and
@@ -404,6 +436,126 @@ impl ConnectionSettings {
 /// payload that *tried* to configure `surrealql` but was malformed —
 /// previously that error was swallowed and the whole object silently
 /// dropped.
+/// The dotted paths a configuration payload actually carried.
+///
+/// The point of recording them is the difference between "the client set
+/// `analysis.enableTypeChecking` to its default" and "the client did not
+/// mention it". A partial `didChangeConfiguration` (which is what an editor
+/// sends when one setting changes) used to reset every field it omitted,
+/// because the merge asked `is_none()` and a `bool` or a `usize` is never
+/// `None`. Users saw one toggle silently change `maxSyntaxDiagnostics`,
+/// `schemalessDiagnostics`, `externalParams` and the debounce back to defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresentKeys(std::collections::BTreeSet<String>);
+
+impl PresentKeys {
+    /// True when the payload named this dotted path, in either casing.
+    ///
+    /// Every settings key accepts both `camelCase` and `snake_case`, so the
+    /// lookup normalises rather than trusting the spelling the client chose.
+    pub fn contains(&self, path: &str) -> bool {
+        self.0.contains(&normalize_path(path))
+    }
+
+    /// True when the payload named nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Record every dotted leaf path in `value`, descending through objects.
+    ///
+    /// An array is a leaf: `analysis.externalParams` is present or it is not,
+    /// and there is no meaningful per-element merge.
+    fn absorb(&mut self, value: &Value, prefix: &str) {
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        for (key, child) in object {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            self.0.insert(normalize_path(&path));
+            if child.is_object() {
+                self.absorb(child, &path);
+            }
+        }
+    }
+}
+
+/// Largest document the analyzer will look at, in bytes.
+///
+/// The filesystem walk has skipped oversize files since 0.3, but that limit
+/// never applied to what an editor *pushes*: `didOpen` and `didChange` went
+/// straight into the analyzer with no bound at all, so the widest input door was
+/// the one nothing guarded. Kept equal to the walk's limit so a file is treated
+/// the same whether it is opened or indexed.
+pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Lower-case a dotted path and drop the `_` separators, so `analysis.max_syntax_diagnostics`
+/// and `analysis.maxSyntaxDiagnostics` compare equal.
+fn normalize_path(path: &str) -> String {
+    path.chars()
+        .filter(|character| *character != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Replace every field of `overrides` that `present` did not name with the
+/// value `fallback` holds for it.
+///
+/// Done over the serialized form on purpose. The previous version listed the
+/// fields to carry over by hand and, predictably, was missing some (the whole
+/// `analysis` block and `connection.access`), so the class of bug came back
+/// every time a field was added. Here a new field is covered the day it exists,
+/// and `settings_merge_keeps_every_absent_field` asserts exactly that by
+/// comparing whole structs rather than fields.
+pub fn merge_absent(
+    overrides: ServerSettings,
+    fallback: &ServerSettings,
+    present: &PresentKeys,
+) -> ServerSettings {
+    fn overlay(mine: &mut Value, theirs: &Value, prefix: &str, present: &PresentKeys) {
+        let (Some(mine_object), Some(theirs_object)) = (mine.as_object_mut(), theirs.as_object())
+        else {
+            return;
+        };
+        for (key, theirs_child) in theirs_object {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+
+            if theirs_child.is_object() && mine_object.get(key).is_some_and(Value::is_object) {
+                // Always descend into a section, present or not. Naming
+                // `analysis` says the section exists, not that every key inside
+                // it was set: a payload of `{"analysis": {"maxSyntaxDiagnostics":
+                // 99}}` must change that one key and leave its siblings alone.
+                // Only leaves are decided by presence.
+                if let Some(mine_child) = mine_object.get_mut(key) {
+                    overlay(mine_child, theirs_child, &path, present);
+                }
+                continue;
+            }
+
+            if !present.contains(&path) {
+                mine_object.insert(key.clone(), theirs_child.clone());
+            }
+        }
+    }
+
+    let (Ok(mut mine), Ok(theirs)) = (
+        serde_json::to_value(&overrides),
+        serde_json::to_value(fallback),
+    ) else {
+        return overrides;
+    };
+    overlay(&mut mine, &theirs, "", present);
+    serde_json::from_value(mine).unwrap_or(overrides)
+}
+
 fn parse_settings_value(
     value: &Value,
     warnings: &mut Vec<String>,
@@ -480,6 +632,8 @@ const ANALYSIS_KEYS: &[&str] = &[
     "schemaless_diagnostics",
     "maxSyntaxDiagnostics",
     "max_syntax_diagnostics",
+    "maxDocumentBytes",
+    "max_document_bytes",
     "diagnosticDebounceMs",
     "diagnostic_debounce_ms",
     "externalParams",
@@ -588,6 +742,10 @@ fn default_diagnostic_debounce_ms() -> u64 {
 
 fn default_max_syntax_diagnostics() -> usize {
     crate::semantic::analyzer::DEFAULT_MAX_SYNTAX_DIAGNOSTICS
+}
+
+fn default_max_document_bytes() -> usize {
+    DEFAULT_MAX_DOCUMENT_BYTES
 }
 
 #[cfg(test)]
@@ -772,8 +930,10 @@ mod tests {
     /// historical payload shapes.)
     #[test]
     fn known_key_lists_cover_every_settings_field() {
-        let mut settings = ServerSettings::default();
-        settings.auth_contexts = vec![super::AuthContext::default()];
+        let settings = ServerSettings {
+            auth_contexts: vec![super::AuthContext::default()],
+            ..ServerSettings::default()
+        };
         let value = serde_json::to_value(&settings).expect("serializable");
         let object = value.as_object().expect("object");
 

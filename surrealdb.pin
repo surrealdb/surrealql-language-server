@@ -1,0 +1,14 @@
+# The SurrealDB revision the builtin catalogue was generated from, and the
+# revision whose `language-tests/` corpus the conformance sweep reads.
+#
+# Both must be the same revision. `src/grammar_generated.rs` records the
+# abbreviation in SURREALDB_REVISION; the corpus and the catalogue describe one
+# engine, and mixing versions makes the sweep report differences that are not
+# defects: a file the newer corpus deleted looks like a lost diagnostic.
+#
+# Bump with `make builtins` (which rewrites the catalogue) and re-run
+# `cargo test --test conformance -- --ignored`.
+#
+# Format: one `key=value` line per entry, `#` comments ignored.
+ref=9d9a5b0693e499e0d030cac6b618062ec02cd2bc
+repo=https://github.com/surrealdb/surrealdb

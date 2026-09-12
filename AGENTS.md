@@ -17,6 +17,9 @@ surfaces built for machines:
   accepts (signatures, return types, arity, renames, method receivers),
   generated from the engine's own source. Use it instead of guessing a
   function's shape.
+- **`surrealql-language-server schema`**: the tables, fields, types,
+  permissions, indexes and functions a workspace defines. Read it *before*
+  writing a query rather than discovering the schema from `check` afterwards.
 
 The opportunity map behind both is [`docs/ai-plan.md`](docs/ai-plan.md).
 
@@ -30,9 +33,24 @@ bash scripts/setup-grammar.sh   # or: TREE_SITTER_SURREALQL_DIR=/path cargo buil
 cargo test
 ```
 
-`make help` lists every maintenance target. The catalogue tests additionally
-want a SurrealDB checkout (`SURREALDB_DIR`, or `../surrealdb`); without one
-they skip and say so.
+The grammar revision lives in [`grammar.pin`](grammar.pin) and nowhere else.
+`build.rs` fails the build when the checkout has drifted off it, naming the one
+command that fixes it: a checkout that silently predates the pin used to fail
+about twenty tests with `parse` errors on valid SurrealQL, which reads as a
+language-server bug.
+
+The catalogue tests and the conformance sweep additionally want a SurrealDB
+checkout, at the revision [`surrealdb.pin`](surrealdb.pin) names:
+
+```bash
+bash scripts/setup-surrealdb.sh   # or: SURREALDB_DIR=/path cargo test
+```
+
+Without one they skip and say so. With one at a *different* revision they run
+and report version skew as though it were a defect, so both suites print which
+revision they read when the two disagree.
+
+`make help` lists every maintenance target.
 
 ## Checking SurrealQL
 
@@ -65,8 +83,61 @@ Facts a machine consumer must know:
 - **`--param <name>` declares a variable your caller binds at runtime**
   (`db.query(sql).bind(("id", id))`), suppressing `undefined-variable` for
   it. `--config file.json` accepts the same JSON an editor sends the LSP.
+- **`--format json` prints exactly one JSON object on stdout, for every exit
+  code.** A run that could not complete (exit 2) prints a report whose `files`
+  is empty and whose `error` names the kind (`usage`, `invalid-config`,
+  `unreadable-input` or `analysis-failed`) alongside prose in `message`. Key
+  repairs on `error.kind`; it is stable, the message is not. A clean run carries
+  no `error` key at all. Never treat empty stdout as a result.
 - **`check` never connects to a database.** `SURREALDB_ENDPOINT` has no
   effect on it.
+
+## As an MCP server
+
+For a harness that calls tools rather than shelling out:
+
+```bash
+surrealql-language-server mcp --workspace schema/
+```
+
+Five tools over stdio, each a thin adapter over the same analysis everything
+else here uses: `validate_surrealql`, `get_schema`, `lookup_function`,
+`search_functions`, `explain_diagnostic`. `tools/list` describes them.
+
+Two conventions worth knowing:
+
+- A tool that cannot answer returns a **result** carrying `isError`, not a
+  JSON-RPC error, and the text says why. A JSON-RPC error means the protocol
+  broke, not that the question had no answer.
+- `validate_surrealql` checks against the schema in `--workspace`, so it catches
+  a misspelled table as well as a syntax error. Without `--workspace` it still
+  checks syntax and types; `get_schema` says so rather than returning an empty
+  schema that reads as "this database has no tables".
+
+Tool names and their input schemas are a permanent surface, pinned by
+[`tests/mcp.rs`](tests/mcp.rs).
+
+## Reading the schema
+
+```bash
+surrealql-language-server schema schema/            # SurrealQL-shaped, for a prompt
+surrealql-language-server schema schema/ --format json
+```
+
+The default format is DDL-shaped prose, which is both denser than JSON and the
+form a model has seen most of. It marks two things worth noticing:
+
+- a table or field with `-- inferred` was **not defined anywhere**: it is what
+  the queries imply, not a promise about what exists;
+- a table's `PERMISSIONS` clause is printed, because it is the thing most likely
+  to make a syntactically perfect query fail at run time.
+
+`--format json` is a compatibility surface: `schemaVersion` is `1`, the field
+shape is pinned by [`tests/compat.rs`](tests/compat.rs), and changes to it are
+additive. Exit 2 means nothing readable was found: never an empty schema that
+looks like an answer.
+
+Like `check`, `schema` never connects to a database.
 
 ## Diagnostic codes
 
@@ -76,7 +147,10 @@ added. Key repairs on the code, not the message text.
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
-| `parse` | error | Tree-sitter could not parse the source (see the false-positive list below). |
+| `parse` | error | Tree-sitter could not parse the source. Syntax only, and every one is a real syntax error: see *Known false positives* below. |
+| `document-too-large` | information | Over `analysis.maxDocumentBytes`, so nothing in it was analysed. Not a fault in the file. |
+| `too-deeply-nested` | error | Nests past 1,024 levels. SurrealDB refuses this too, at a lower limit. Nothing was extracted. |
+| `buffer-desynced` | error | The server's copy of the file stopped matching the editor's. Its diagnostics are frozen; reopen the file. |
 | `unknown-type` | error | A type position holds a word SurrealQL's kind grammar does not have. |
 | `unknown-table` | warning | A queried table reads as a typo of an explicitly defined one. |
 | `unknown-field` | warning | A field not defined on an explicit (closed-schema) table. |
@@ -98,23 +172,57 @@ Several diagnostics carry structured hints in `data` — for example
 `unknown-table` includes `{"table": …, "suggestion": …}`. Prefer the hint
 over re-deriving the fix.
 
-## Known false positives — do not "fix" these
+Every diagnostic also carries `codeDescription.href`, pointing at the section of
+[`docs/diagnostics.md`](docs/diagnostics.md) that explains it. Offline, the same
+prose is one command away:
 
-The pinned tree-sitter grammar rejects a few shapes that are **valid
-SurrealQL**. They surface as `parse` errors. A `parse` error on one of these
-shapes is a known grammar gap: **do not change the query**, and do not
-"repair" it into something else. The full list with evidence is
-[`docs/grammar-gaps.md`](docs/grammar-gaps.md); the shapes:
+```bash
+surrealql-language-server check explain unknown-table
+surrealql-language-server check explain unknown-table --format json
+```
 
-- A union type in a `LET` annotation: `LET $a: int | float = 2;`
-- A sized collection type: `LET $b: array<float, 10> = 2;`
-- A nested `SET` target: `CREATE person SET name.first = 'John';`
-- The `%` operator: `8 % 3`
-- Unary minus on a non-number: `-[1, 2, 3]`
-- Mock syntax: `|test:1..4|`
+`--format json` follows the same rule the rest of `check` does: exactly one JSON
+object on stdout, whatever the exit code. A known code answers with `markdown`
+and exit 0; an unknown one answers with an `error` object, the list of
+`knownCodes`, and exit 2.
 
-These are grammar fixes in the `surrealql-tree-sitter` repository, not
-query bugs. Everything else `parse` reports is a real syntax error.
+### Narrowing and repairing
+
+```bash
+check q.surql --only argument-type --only argument-count   # report these codes
+check q.surql --ignore dynamic-target                      # report all but these
+check q.surql --fix renamed-function                       # repair in place
+```
+
+- `--only` / `--ignore` filter **reporting**, not analysis, and the JSON report
+  carries a `filters` object saying what was hidden: a filtered clean run is
+  not a clean run, and the report must not let it look like one. An unknown code
+  is a usage error rather than a filter that silently matches nothing.
+- `--fix` takes an explicit code and **only `renamed-function` is accepted**.
+  That is not a temporary limitation: its replacement comes from SurrealDB's own
+  rename table, while every other fix here is inferred: `unknown-table`'s is a
+  string-distance guess, and applying it unattended can repoint a query at a
+  *different real table*. A run that rewrote files reports `fixed` and
+  re-analyses, so it never reports the errors it just repaired: repairs happen
+  in their own pass, before anything is reported, and the model every file is
+  then judged against is built from the repaired text. Each file is written by
+  renaming a complete temporary file over it, so an interrupted run leaves the
+  original intact rather than a truncated one.
+
+## Known false positives
+
+**There are currently none.** Every `parse` error the server reports is a real
+syntax error, and a query that trips one needs fixing.
+
+This section used to list six shapes of valid SurrealQL that the pinned grammar
+rejected: a union type in a `LET` annotation, a sized collection type, a nested
+`SET` target, `%`, unary minus, and mock syntax. All of them were fixed upstream
+in `surrealql-tree-sitter` and the pin now names a revision that parses them.
+
+The category is not closed, only empty. The grammar is pinned in
+[`grammar.pin`](grammar.pin), and when a gap is found again it is recorded in
+[`docs/grammar-gaps.md`](docs/grammar-gaps.md) and listed here before it can
+reach an agent. Until then, treat `parse` as trustworthy.
 
 ## Contributing rules
 

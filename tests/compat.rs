@@ -6,7 +6,7 @@
 mod common;
 
 use serde_json::json;
-use surrealql_language_server::config::ServerSettings;
+use surrealql_language_server::config::{ServerSettings, merge_absent};
 use surrealql_language_server::semantic::analyzer::analyze_document;
 use surrealql_language_server::semantic::types::SymbolOrigin;
 use tower_lsp_server::ls_types::NumberOrString;
@@ -18,9 +18,15 @@ use tower_lsp_server::ls_types::NumberOrString;
 #[test]
 fn server_capabilities_golden() {
     let capabilities =
-        serde_json::to_value(common::TestCore::server_capabilities()).expect("serializable");
+        serde_json::to_value(common::TestCore::server_capabilities(Default::default()))
+            .expect("serializable");
     let expected = json!({
-        "textDocumentSync": 1,
+        // Changed from 1 (Full) to 2 (Incremental) in 0.7. The win is not the
+        // parse: it is that a 166 KB document no longer crosses the wire and
+        // gets JSON-decoded on every keystroke. Safe because the edit is applied
+        // synchronously on the ordered path; a client that keeps sending whole
+        // documents is still handled.
+        "textDocumentSync": 2,
         "hoverProvider": true,
         "completionProvider": {
             "resolveProvider": true,
@@ -33,11 +39,33 @@ fn server_capabilities_golden() {
             "retriggerCharacters": [","],
         },
         "definitionProvider": true,
+        // Added in 0.7. `record<person>` on a field is a real type-to-definition
+        // jump, and the one place the distinction from `definition` earns its
+        // keep in SurrealQL.
+        "typeDefinitionProvider": true,
         "referencesProvider": true,
+        // Added in 0.7. Echoed rather than negotiated: UTF-16 is the
+        // specification's default and every conformant client supports it, so
+        // threading a second encoding through LineIndex would touch every
+        // range-producing call site for no known client. Saying so is still
+        // better than leaving it to be assumed.
+        "positionEncoding": "utf-16",
         "documentHighlightProvider": true,
+        // Added in 0.7. Both read the cached parse tree, so they cost a walk and
+        // no re-parse; folding is what collapses a function body, and selection
+        // range is what expand-selection binds to in every editor.
+        "foldingRangeProvider": true,
+        "selectionRangeProvider": true,
         "documentSymbolProvider": true,
         "workspaceSymbolProvider": true,
-        "codeActionProvider": true,
+        // Changed from `true` in 0.7: declaring the kinds is what lets a
+        // client request a subset, which is how VS Code's Quick Fix menu and
+        // "fix all on save" ask for `quickfix` and `source.fixAll`. A bare
+        // `true` meant every request got every action, refactors included. The
+        // handler honours `context.only` as of the same change.
+        "codeActionProvider": {
+            "codeActionKinds": ["quickfix", "refactor.rewrite"],
+        },
         "renameProvider": { "prepareProvider": true },
         "workspace": {
             "workspaceFolders": {
@@ -353,6 +381,9 @@ fn check_json_report_shape_golden() {
         scan: ScanReport::default(),
         config_warnings: vec![],
         exit_code: 0,
+        error: None,
+        filters: None,
+        fixed: None,
     };
     let value: serde_json::Value =
         serde_json::from_str(&render_json(&report)).expect("render_json emits one JSON object");
@@ -455,5 +486,287 @@ fn check_exit_codes_and_flags_are_stable() {
         ]),
         0,
         "the documented flag surface"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Partial configuration must not reset what it does not mention
+// ──────────────────────────────────────────────────────────────────────
+
+/// A fully non-default settings value, so any field the merge forgets shows up
+/// as a difference rather than coinciding with a default.
+fn every_field_non_default() -> ServerSettings {
+    let json = json!({
+        "connection": {
+            "endpoint": "ws://example:8000",
+            "namespace": "ns",
+            "database": "db",
+            "username": "root",
+            "password": "secret",
+            "token": "tok",
+            "access": "acc"
+        },
+        "metadata": {
+            "mode": "workspace",
+            "enableLiveMetadata": false,
+            "refreshOnSave": false
+        },
+        "analysis": {
+            "enablePermissionAnalysis": false,
+            "enableAggressiveSchemaInference": false,
+            "enableCodeActions": false,
+            "enableTypeChecking": false,
+            "schemalessDiagnostics": "strict",
+            "maxSyntaxDiagnostics": 7,
+            "diagnosticDebounceMs": 42,
+            "externalParams": ["id", "limit"]
+        },
+        "authContexts": [{ "name": "admin", "roles": ["owner"] }],
+        "activeAuthContext": "admin"
+    });
+    let (settings, warnings, _) = ServerSettings::from_sources_with_presence(Some(&json), None);
+    assert!(warnings.is_empty(), "fixture must be clean: {warnings:?}");
+    settings
+}
+
+/// The whole point of the presence-aware merge, in one assertion.
+///
+/// An editor sends the *whole* `surrealql` section when one setting changes, but
+/// a client that sends a partial payload (or `null`, or an empty object) must
+/// not have every omitted field reset. The previous merge listed fields to carry
+/// over by hand and was missing `connection.access` and the entire `analysis`
+/// block, so toggling one setting silently restored default
+/// `maxSyntaxDiagnostics`, `schemalessDiagnostics`, `externalParams` and
+/// debounce.
+///
+/// Comparing whole structs is deliberate: a field added later is covered by this
+/// test the day it exists, with no edit here.
+#[test]
+fn an_empty_payload_keeps_every_previous_setting() {
+    let previous = every_field_non_default();
+    let empty = json!({});
+    let (incoming, _, present) = ServerSettings::from_sources_with_presence(None, Some(&empty));
+
+    let merged = merge_absent(incoming, &previous, &present);
+    assert_eq!(
+        merged, previous,
+        "an empty configuration payload reset settings it never mentioned"
+    );
+}
+
+/// The other direction: a payload that names exactly one key changes exactly
+/// that key.
+#[test]
+fn a_partial_payload_changes_only_what_it_names() {
+    let previous = every_field_non_default();
+    let payload = json!({ "analysis": { "maxSyntaxDiagnostics": 99 } });
+    let (incoming, _, present) = ServerSettings::from_sources_with_presence(None, Some(&payload));
+
+    let merged = merge_absent(incoming, &previous, &present);
+
+    assert_eq!(merged.analysis.max_syntax_diagnostics, 99, "the named key");
+
+    let mut expected = previous.clone();
+    expected.analysis.max_syntax_diagnostics = 99;
+    assert_eq!(
+        merged, expected,
+        "a one-key payload changed something other than that key"
+    );
+}
+
+/// Both casings name the same key, so a `snake_case` payload must not read as
+/// "absent" and get overwritten by the fallback.
+#[test]
+fn snake_case_keys_count_as_present() {
+    let previous = every_field_non_default();
+    let payload = json!({ "analysis": { "max_syntax_diagnostics": 5 } });
+    let (incoming, _, present) = ServerSettings::from_sources_with_presence(None, Some(&payload));
+
+    let merged = merge_absent(incoming, &previous, &present);
+    assert_eq!(
+        merged.analysis.max_syntax_diagnostics, 5,
+        "a snake_case key was treated as absent and overwritten"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Capability-dependent advertising
+// ──────────────────────────────────────────────────────────────────────
+
+/// `server_capabilities` now depends on what the client said, so the golden
+/// above pins only half the answer. This pins the other half.
+///
+/// The difference must be *exactly* `diagnosticProvider`: a capability that
+/// appears or vanishes for any other reason is a client-visible change that
+/// nobody decided.
+#[test]
+fn a_pulling_client_is_offered_exactly_one_more_capability() {
+    use surrealql_language_server::core::state::ClientProfile;
+
+    let quiet = serde_json::to_value(common::TestCore::server_capabilities(
+        ClientProfile::default(),
+    ))
+    .expect("serializable");
+    let pulling = serde_json::to_value(common::TestCore::server_capabilities(ClientProfile {
+        pull_diagnostics: true,
+        ..ClientProfile::default()
+    }))
+    .expect("serializable");
+
+    let quiet_keys: std::collections::BTreeSet<&String> =
+        quiet.as_object().expect("object").keys().collect();
+    let pulling_keys: std::collections::BTreeSet<&String> =
+        pulling.as_object().expect("object").keys().collect();
+
+    let added: Vec<&&String> = pulling_keys.difference(&quiet_keys).collect();
+    assert_eq!(
+        added.len(),
+        1,
+        "expected exactly one added capability, got {added:?}"
+    );
+    assert_eq!(added[0].as_str(), "diagnosticProvider");
+    assert!(
+        quiet_keys.difference(&pulling_keys).next().is_none(),
+        "declaring a capability must never take one away"
+    );
+
+    assert_eq!(
+        pulling["diagnosticProvider"],
+        serde_json::json!({
+            "identifier": "surrealql",
+            "interFileDependencies": true,
+            "workspaceDiagnostics": false,
+        }),
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Every code has prose, and every prose section has a code
+// ──────────────────────────────────────────────────────────────────────
+
+/// A `codeDescription` pointing at a section that does not exist renders as a
+/// dead hyperlink in VS Code, which is worse than no link at all. This is what
+/// keeps the registry, the prose and the link from drifting apart.
+#[test]
+fn every_code_is_documented() {
+    use surrealql_language_server::semantic::codes;
+
+    let doc = include_str!("../docs/diagnostics.md");
+    let headings: std::collections::BTreeSet<&str> = doc
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .map(str::trim)
+        .collect();
+
+    for code in codes::ALL {
+        assert!(
+            headings.contains(code),
+            "`{code}` has no `## {code}` section in docs/diagnostics.md, so its \
+             codeDescription link would 404"
+        );
+        assert!(
+            codes::description(code).is_some(),
+            "`{code}` is in ALL but builds no codeDescription"
+        );
+    }
+
+    for heading in &headings {
+        assert!(
+            codes::ALL.contains(heading),
+            "docs/diagnostics.md documents `{heading}`, which is not a code this \
+             server emits: rename it or remove the section"
+        );
+    }
+
+    assert!(
+        codes::description("not-a-real-code").is_none(),
+        "an unknown code must not be given a link"
+    );
+}
+
+/// The `data` hints AGENTS.md tells agents to prefer are part of the contract.
+#[test]
+fn documented_codes_match_the_agent_guide() {
+    let agents = include_str!("../AGENTS.md");
+    for code in surrealql_language_server::semantic::codes::ALL {
+        assert!(
+            agents.contains(&format!("`{code}`")),
+            "`{code}` is not in the AGENTS.md code table, so an agent keying on \
+             the table would not know it exists"
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// The schema report shape
+// ──────────────────────────────────────────────────────────────────────
+
+/// `schema --format json` is a compatibility surface from its first release,
+/// like `builtins.json` and the check report. Pinned here on day one rather
+/// than after the first consumer discovers a change.
+///
+/// Additive changes only. `schemaVersion` moves if that ever stops being
+/// possible, which is what it is for.
+#[test]
+fn schema_json_shape_golden() {
+    use surrealql_language_server::native::schema;
+
+    let report = schema::SchemaReport {
+        schema_version: 1,
+        version: "0.0.0 (test)".to_string(),
+        tables: vec![schema::TableReport {
+            name: "person".to_string(),
+            schema_mode: Some("schemafull".to_string()),
+            explicit: true,
+            comment: Some("People.".to_string()),
+            fields: vec![schema::FieldReport {
+                name: "email".to_string(),
+                r#type: Some("option<string>".to_string()),
+                explicit: true,
+                comment: None,
+            }],
+            permissions: vec!["PERMISSIONS FOR select FULL".to_string()],
+            indexes: vec!["email_unique".to_string()],
+            events: Vec::new(),
+        }],
+        functions: vec![schema::FunctionReport {
+            name: "fn::greet".to_string(),
+            parameters: vec!["$who: string".to_string()],
+            returns: Some("string".to_string()),
+            comment: None,
+        }],
+        params: Vec::new(),
+    };
+
+    assert_eq!(
+        serde_json::to_value(&report).expect("serializable"),
+        json!({
+            "schemaVersion": 1,
+            "version": "0.0.0 (test)",
+            "tables": [{
+                "name": "person",
+                "schemaMode": "schemafull",
+                // Whether the table was *defined* or merely inferred from a
+                // query. An agent writing against an inferred table is writing
+                // against a guess, and has to be able to tell.
+                "explicit": true,
+                "comment": "People.",
+                "fields": [{
+                    "name": "email",
+                    "type": "option<string>",
+                    "explicit": true,
+                }],
+                "permissions": ["PERMISSIONS FOR select FULL"],
+                "indexes": ["email_unique"],
+            }],
+            "functions": [{
+                "name": "fn::greet",
+                "parameters": ["$who: string"],
+                "returns": "string",
+            }],
+            "params": [],
+        }),
+        "the schema report shape changed: additive changes only, and bump \
+         schemaVersion if it cannot be additive"
     );
 }

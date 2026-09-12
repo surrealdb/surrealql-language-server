@@ -2,6 +2,434 @@
 
 ## Unreleased
 
+### Fixed
+
+**The reusable parse tree is kept by version, not by byte count.** A completed
+analysis recorded its tree as the base for the next parse whenever the buffer's
+text was the same *length*, which calls an overtype, or replacing a selection
+with the same number of characters, "unchanged". `didOpen` skipped the
+supersession check entirely, so an edit landing while the open-time analysis ran
+passed both tests. The tree then described text the buffer no longer held, with
+no `tree_sitter::Tree::edit` recorded for the edit, and the next reparse fed
+tree-sitter byte ranges into text that no longer existed. The comparison is now
+the buffer's version, read inside the same lock that stores the tree, which also
+closes the window between checking and storing.
+
+**A pulling client is told when the answer moves.** `diagnosticProvider` is
+advertised with `interFileDependencies: true` and push is suppressed for clients
+that pull, but nothing ever sent `workspace/diagnostic/refresh`. Editing a
+`DEFINE TABLE` in one file left every other open file showing diagnostics
+computed against the schema before the edit, and a pull issued right after a
+keystroke got the pre-edit analysis with nothing to prompt a re-pull once the
+new one landed. Under push, `republish_open_diagnostics` had always handled
+this. Both paths now refresh instead, for clients that declare `refreshSupport`.
+`republish_open_diagnostics` was also pushing to pulling clients on the
+configuration and watched-file paths, which is the duplicate-squiggle case the
+suppression exists to prevent.
+
+**Out-of-range positions clamp instead of wedging the buffer.** The protocol
+says a line past the end of the document is the document's line count and a
+character past the end of its line is that line's length; `{line: 999999,
+character: 0}` is a normal way for a client to say "the end". Refusing one
+desynchronised the buffer and refused every later ranged edit, so the file's
+diagnostics froze for the rest of the session. Desync is now reserved for a
+change that cannot be interpreted at all, and it reports itself **in the
+document** as `buffer-desynced` rather than only in the output channel, since a
+user whose squiggles have stopped moving has no reason to read a log.
+
+**`textDocument/selectionRange` answers one chain per requested position.** The
+response array has to correspond one-to-one with the request's positions.
+Dropping a position that resolved to nothing handed every later cursor the
+previous one's chain, so a multi-cursor expand-selection jumped to the wrong
+place. A position with no chain now answers with an empty range at itself.
+
+**References to a field stay on the table the cursor names.** Field references
+were keyed by the bare word, so "find all references" on `person`'s `name`
+answered with `company`'s and `product`'s too, plus every `DEFINE FIELD name ON
+…` in the workspace. A query fact already knows which table it targets, so the
+index now also carries the qualified key and the handler asks for it first,
+falling back to the union only when the statement does not say which table it
+means.
+
+**The analyzer's refusals no longer report as `parse`.** A document over
+`analysis.maxDocumentBytes`, and one nesting past the depth cap, both reported
+under `parse` while the contract told agents every `parse` is a real syntax
+error. They now carry `document-too-large` and `too-deeply-nested`, which are
+also filterable on their own with `--only` and `--ignore`.
+
+**`check explain` honours `--format json`,** on either side of the code, and
+follows the same rule as the rest of `check`: exactly one JSON object on stdout
+for every exit code. An unknown code answers with an `error` object, the known
+codes, and exit 2.
+
+**`check --fix` writes atomically and reports against the repaired workspace.**
+`fs::write` truncates before it writes, so an interrupted run left a truncated
+`.surql` and no copy of what it held; the replacement is now a complete
+temporary file renamed over the original. Repairs also happen in their own pass
+before anything is reported, so the model each file is judged against is built
+from the repaired text rather than from the workspace as it was when the run
+started.
+
+**`mcp` re-reads the workspace before every tool that answers from the schema,**
+and takes the same `--config` as `check`. The context was loaded once at
+startup, so an agent that wrote a `DEFINE TABLE` and then asked `get_schema`
+what the schema was got the answer from before its own edit, and
+`validate_surrealql` judged every query against default settings whatever the
+project's config said.
+
+### Changed
+
+- `Diagnostic.codeDescription` points at this build's own `v<version>` tag
+  rather than at `master`, so the prose a user is sent to matches the binary
+  they are running.
+- The packaging `exclude` list drops all of `docs/**` and names the one file the
+  crate needs, instead of listing files to drop one at a time, so a doc added
+  later does not ship by default.
+- `release`, `wasm` and `builtins` are gated on `wasm-check` as well as on the
+  test job. The npm package *is* the wasm build, so a wasm-only break could
+  otherwise still reach a tag.
+- Splicing an edit into a buffer no longer builds a second `LineIndex` to find
+  where the edit ended: it is derived from the replacement's own bytes and
+  newlines, which halves the full-buffer scans per keystroke.
+- `scripts/setup-grammar.sh` names the branch it is detaching from, so committed
+  but unpushed work in the grammar checkout does not look lost.
+
+**Deeply nested input no longer kills the server.** A `didOpen` carrying
+`RETURN` and six thousand nested parentheses (a 12 KB file) aborted the
+process with `thread 'tokio-rt-worker' has overflowed its stack`. Around forty
+functions walk the tree by recursion, tree-sitter's parser is iterative so it
+builds whatever depth the text asks for, and `panic = 'abort'` turns the first
+walk to run out of stack into a dead process that loses every open document.
+
+Bounded in one place rather than forty: `analyze_document` measures the tree
+once, iteratively, and refuses a document deeper than 1,024 levels with a single
+`parse` diagnostic. A cheaper bracket count runs before the parser, because
+tree-sitter frees a tree by recursing through it, so a deep enough document
+overflowed in tree-sitter's own `Drop`, after every walk of ours had correctly
+declined it.
+
+The cap is measured, not guessed: across SurrealDB's 1,897 test queries, 1,896
+parse to fewer than 30 levels, and the one outlier at 204 is a file that exists
+to prove the *engine* rejects it (SurrealDB's own defaults are
+`expr_recursion_limit: 128`, `object_recursion_limit: 100`). The benchmark is
+unchanged: `analyze_document` measures 45.7 ms against 46.4 ms before.
+
+**Reopening a file no longer freezes its diagnostics.** `did_close` removed the
+document but not its version high-water mark, so a client that restarts
+versioning on reopen (VS Code does) had every subsequent edit dropped as
+stale, and the buffer showed whatever it looked like when it was opened. The
+mark is now removed on close and replaced on open, which the LSP says is
+authoritative.
+
+**A client that sends only `rootUri` gets a workspace.** `resolve_workspace_folders`
+read `workspaceFolders` and nothing else, so a client using the deprecated
+(but still common) `rootUri` or `rootPath` indexed no files at all: every
+cross-file table came back undefined with nothing to explain it.
+
+### Documentation
+
+The README documented 5 of about 20 settings. It now covers the whole
+`connection.*` block and the six `SURREALDB_*` environment fallbacks,
+`metadata.*`, `authContexts` / `activeAuthContext`,
+`analysis.diagnosticDebounceMs`, all four ways settings arrive, and (under a
+heading of their own) the two keys that are accepted and not yet implemented,
+rather than leaving them to look as though they work.
+
+### Added
+
+**`surrealql-language-server mcp`** serves the Model Context Protocol over
+stdio, so an agent calls the analysis directly instead of shelling out and
+parsing output. Five tools, each a thin adapter over machinery that already
+exists and is already tested: `validate_surrealql`, `get_schema`,
+`lookup_function`, `search_functions`, `explain_diagnostic`.
+
+No dependency was added. MCP is JSON-RPC 2.0 with a small method set carried as
+newline-delimited JSON, which is the same size of problem as the argument
+parsers and the LSP dispatcher already hand-rolled here, and `[dependencies]` is
+also the wasm dependency graph, where an MCP crate has no business.
+
+A tool that cannot answer returns a *result* carrying `isError` rather than a
+JSON-RPC error, because the call was well-formed and the connection is fine; the
+model needs to read why. Tool names and input schemas are a permanent surface and
+are pinned by `tests/mcp.rs` from the first release.
+
+**`validateQuery(text, params?)` on the browser build.** A one-shot check for a
+host that wants an answer without speaking LSP: a playground, the docs site,
+Surrealist validating an editor's contents. It returns the same `Diagnostic`
+objects the server publishes, checked against whatever workspace the host has
+pushed rather than against an empty model (which would report every real table
+as unknown), and opens nothing. The logic lives in the core, not the wasm shim,
+so it is covered by tests that run on the pull-request path.
+
+**`surrealql-language-server schema`** prints what a workspace defines
+(tables, fields and types, permissions, indexes, events and functions) from the
+same merged model the editor uses, and without connecting to a database. An
+agent writing against an unfamiliar schema invents names because nothing tells
+it what exists; this is the answer before the fact rather than `check`
+correcting it afterwards.
+
+The default format is SurrealQL-shaped prose, which is denser than JSON and the
+form a model has seen most of. It marks tables and fields that were *inferred
+from queries* rather than defined, and prints `PERMISSIONS` clauses, which are
+the thing most likely to make a syntactically perfect query fail at run time.
+`--format json` is a compatibility surface with `schemaVersion: 1`, pinned by a
+golden from its first release.
+
+**Every diagnostic links to its explanation.** `codeDescription.href` points at a
+new [`docs/diagnostics.md`](docs/diagnostics.md), one section per code: what it
+means, why SurrealDB refuses the query, and what fixing it looks like. Attached
+at the single funnel both the LSP and `check` go through, so a code that gains
+prose gains the link everywhere, and a code that has none gets no link rather
+than a dead one, which is what `every_code_is_documented` enforces.
+
+**`check explain <code>`** prints the same prose, compiled in, so an agent
+offline or behind a proxy reads exactly what a human clicking the link would.
+
+**`check --only` / `--ignore`** filter reporting by code. The JSON report gains
+a `filters` object recording what was hidden, because a filtered clean run is
+not a clean run. An unknown code is a usage error, not a filter that silently
+matches nothing.
+
+**`check --fix renamed-function`** repairs in place, and takes only that code.
+Its replacement comes from SurrealDB's own rename table; every other fix here is
+inferred, and `unknown-table`'s is a string-distance guess that could repoint a
+query at a *different real table*. A run that rewrote files reports `fixed` and
+re-analyses, so it never reports the errors it just repaired.
+
+**The server reads what the client can do.** `initialize` discarded
+`params.capabilities` entirely, which is why every optional protocol feature was
+either unavailable or unconditional. A small `ClientProfile` is now read once and
+cached. Every field defaults to false, which is what a client declaring nothing
+gets: an absent capability must never turn a working behaviour off. The client's
+name and version are logged, which makes an editor-specific bug report
+reproducible.
+
+**Pull diagnostics** (`textDocument/diagnostic`), offered only to a client that
+asked for them, and that client is no longer pushed to. Advertising both is how
+a diagnostic ends up rendered twice, so the advertisement and the push
+suppression are decided by the same answer.
+
+**`workspace/didChangeWatchedFiles`.** A `.surql` file created, changed or
+deleted outside the editor was invisible until restart, so the schema went stale
+on a `git checkout` and `unknown-table` started firing on tables that exist. The
+server now registers a watcher for `**/*.surql` and `**/*.surrealql` when the
+client supports dynamic registration, refreshes the workspace copy, and
+republishes every open buffer: a definition in the changed file may be exactly
+what their diagnostics depend on. A change on disk *under an open buffer* is
+ignored: the editor is the authority for text the user is editing.
+
+**References for tables and fields.** `textDocument/references` covered custom
+functions only, so asking "where else is this table used?" (the most common
+navigation question in a `.surql` workspace) returned an empty list. Tables are
+now indexed from the query facts that already carry token-tight ranges, and
+`includeDeclaration` adds the `DEFINE`. Fields are indexed where they are
+*written* (`UPDATE … SET email`); projections and `WHERE` predicates are not
+recorded by the extractor, and the README says so rather than implying more.
+
+**`textDocument/typeDefinition`.** Standing on a field declared
+`TYPE record<person>` and asking for its type takes you to `DEFINE TABLE person`,
+the one place the distinction from `definition` means something in SurrealQL.
+Declines when the answer is ambiguous (`record<a | b>`, or two tables declaring
+the same field name differently) rather than picking one.
+
+**`LocationLink` for go-to-definition**, when the client says it understands the
+form, so the editor underlines the token rather than guessing at its extent.
+
+Renaming a **table** or **field** remains declined, deliberately, and there is
+now a test pinning the decline: those names also appear in record-id literals,
+`RELATE` arrows and permission clauses the index does not cover, so a rename
+would miss occurrences and leave a workspace that parses and is wrong.
+
+**`positionEncoding: utf-16`** is now stated rather than left to be assumed.
+
+### Performance
+
+**The release profile now optimises for speed.** It carried `opt-level = 'z'`,
+which costs roughly 1.6x across the board: against master, `analyze_document`
+on a 3,200-line file goes from 47.6 ms to 30.8 ms, and `semantic_tokens_full`
+from 10.2 ms to 6.6 ms. Measured at equal optimisation level the two branches
+are the same speed, so this profile change is where essentially all of the
+one-shot improvement comes from; the 0.7 code changes cost nothing measurable. That is a larger win than
+anything left in `docs/perf-plan.md`. The default belongs to the common case,
+which is the native binary; `scripts/build-wasm.sh` opts the browser module back
+into size, where a download is a real cost. The native binary grows to 9.5 MB.
+
+The benchmark inherited `'z'` too, so every number in `docs/perf-baseline.md`
+described a binary no user of the `surrealql-language-server` executable ever
+ran.
+
+**Incremental parsing.** An edited document is reparsed against its previous
+tree rather than from scratch. The parse itself drops about 95% (16.4 ms to
+0.77 ms on a 3,200-line file), but the parse is only part of an analysis
+(extraction and the syntax walk are full-document and gain nothing), so the
+end-to-end saving on one settled edit is **37%**: 25.2 ms to 15.8 ms. Gated on a
+differential test rather than assumed, because
+tree-sitter's incremental reparse is not guaranteed to reproduce a fresh parse
+when the previous tree held ERROR nodes, and ERROR nodes are the `parse`
+diagnostics. Zero mismatches over SurrealDB's 1,894 corpus files with ten random
+edits each.
+
+**The analysis pipeline no longer runs on the reactor thread.** Five paths still
+did, including one at ~45 ms per open buffer on every settings change and one on
+every save and close.
+
+### Changed
+
+**Incremental document sync** (`textDocumentSync: 2`). The server used to
+receive the whole document on every keystroke: a 166 KB file crossed the wire
+and was JSON-decoded into a fresh `String` *on the reactor thread* ten times a
+second, which is 1.6 MB/s of decoding before the debounce even saw the message,
+and in the browser a full JS-to-wasm string copy each time. No benchmark here
+measured it, because it is paid before any code in this repository runs.
+
+A client that ignores the advertised kind and keeps sending whole documents is
+still handled: that is the `range: None` path, and it is tested.
+
+The risk this carries is worth naming: under full sync a conversion bug
+self-corrects, because the next keystroke resends everything; under incremental
+sync a single off-by-one in a UTF-16 column compounds and never recovers. So an
+out-of-bounds range marks the buffer desynced, logs it, and refuses further
+ranged edits until the editor sends a whole document: visible and self-healing
+rather than silently wrong. `LineIndex::offset` *clamps* rather than failing, so
+the requested position is bounds-checked before its conversion is trusted.
+
+### Added
+
+**`analysis.maxDocumentBytes`** (default 2 MB, `0` to disable). The workspace
+walk has skipped oversize files since 0.3, but a buffer the *editor* pushes went
+straight into the analyzer with no bound at all: the wider of the two doors, and
+the unguarded one. An oversize document is still tracked; only its analysis is
+skipped, and it publishes one informational diagnostic explaining the silence
+rather than looking clean.
+
+**`cargo install surrealql-language-server` works.** It never has: `build.rs`
+looked for a sibling `../surrealql-tree-sitter` checkout, which exists in this
+repository's layout and nowhere a crates.io consumer unpacks to, so the build
+panicked every time (pain-points H9). The pinned grammar's four build inputs are
+now vendored under `vendor/`, and `build.rs` falls back to them: a local
+checkout still wins, so grammar development is unchanged. The published crate
+grows by about 0.3 MB compressed, and `--version` reports the vendored revision
+rather than `grammar unknown`.
+
+CI refreshes the vendored copy and fails if it differs from the pin, then
+packages the crate and builds it in isolation, so neither the drift nor the
+original breakage can return silently. The crate also gained the `repository`,
+`readme`, `categories` and `documentation` metadata it was missing.
+
+**Folding ranges and selection ranges.** Both read the parse tree the analysis
+already caches, so neither re-parses. Folding covers multi-line statements,
+blocks, object and array literals, JavaScript function bodies, and runs of
+adjacent comments; the closing line is excluded so the brace stays visible when
+a region is collapsed. Selection range is what expand-selection binds to in
+VS Code, Zed, Helix and Neovim. Their absence is the kind of thing that makes a
+server feel unfinished in every editor.
+
+Both answer for a document the analyzer has declined, which is deliberate: a
+fold is a fact about the shape of the text, and a file that will not analyse is
+exactly when someone is folding their way through it.
+
+### Fixed
+
+**Signature help counts the right argument.** The active parameter was "every
+comma after the last `(`", so `math::max([1, 2, 3], ` reported argument 4 instead
+of 2, and a comma inside a string literal counted as an argument separator. The
+scan now tracks bracket depth and string state, and describes the innermost open
+call rather than whichever `(` came last in the text.
+
+**Document highlight covers tables and fields, and tells reads from writes.** It
+handled custom functions only (so putting the cursor on a table name lit up
+nothing), and marked every occurrence `READ`, so an editor could not distinguish
+a `SELECT` from the `DELETE` below it. `CREATE`, `UPDATE`, `DELETE` and `RELATE`
+now highlight as writes, as does the `DEFINE` that introduces the name.
+
+**Code actions respect where you asked and what you asked for.** The handler
+discarded both `params.range` and `context.only`, so a cursor anywhere in a file
+with three permission-less tables offered "Add PERMISSIONS clause" three times
+(for tables nowhere near the cursor), and a client asking for quick fixes got
+refactors back. The advertised capability now also declares its kinds
+(`quickfix`, `refactor.rewrite`), which is what lets a client request a subset at
+all; that is a **shape change** from `codeActionProvider: true` to an object, and
+the compat golden moved deliberately with it.
+
+**`analysis.enableCodeActions` does something.** It parsed, validated,
+serialized and was read by nothing.
+
+**`check --format json` now prints exactly one JSON object for every exit
+code.** Four failure paths (an unreadable or malformed `--config`, an
+unreadable target, a document that could not be analyzed) wrote a sentence to
+stderr and exited 2 with stdout empty, so every JSON consumer had to
+special-case "no output", which is the ambiguity the exit-code contract exists
+to remove. A failed run now carries `error: { kind, message }`, where `kind` is
+the stable field to key a repair on (`usage`, `invalid-config`,
+`unreadable-input`, `analysis-failed`). A clean report is unchanged and carries
+no `error` key.
+
+**A partial `didChangeConfiguration` no longer resets the settings it does not
+mention.** The merge that carries settings across a configuration reload listed
+the fields to keep by hand, and was missing `connection.access` and the entire
+`analysis` block, so changing one setting silently restored default
+`maxSyntaxDiagnostics`, `schemalessDiagnostics`, `externalParams` and
+`diagnosticDebounceMs`. The merge is now driven by which dotted paths the
+payload actually named, so a field added later is covered the day it exists. It
+also removes a heuristic that guessed at `metadata.mode` by comparing it against
+its default, which got the opposite case wrong: a user who deliberately set the
+default value could not make it stick.
+
+**A document the analyzer cannot parse now says so.** When analysis failed the
+previous result stayed in place with no log and no diagnostic, so the editor
+kept showing diagnostics for text the user had already changed.
+
+**Every documented false positive is gone.** The grammar pin moved from
+`cb2e6b5` (which was an unmerged pull-request branch, not a revision on
+`master`) to `373e7cd`. That revision parses all seven shapes of valid
+SurrealQL the server used to reject: `%`, a prefix sign on a non-literal
+(`-$x`, `-[1,2,3]`), a sized collection type (`array<float, 10>`), a union in a
+parameter annotation (`LET $a: int | float`), a decimal with a fraction or
+exponent (`102023.1dec`), a nested `SET` target
+(`CREATE person SET name.first = 'x'`), and mock syntax (`|test:1..4|`).
+
+`AGENTS.md` told agents not to repair queries hitting those shapes. It now says
+there are no known false positives, because there are none: every `parse` error
+the server reports is a real syntax error.
+
+Two type-checker bugs that the pin move exposed, both caught by the corpus
+sweep rather than the unit suite:
+
+- **Every prefix expression was typed `bool`.** Correct while `!` was the only
+  prefix operator; once `-x` parsed, `vector::divide([$w, -$h], …)` (from
+  SurrealDB's own benchmark corpus) drew spurious `argument-type` and
+  `operator-type` errors. `!` still answers `bool`, `+` passes the operand's
+  type through (the engine treats it as the identity), and `-` follows `TryNeg`,
+  which accepts only numbers.
+- **`%` was missing from the arithmetic tables.** `"8" % "3"` is now reported in
+  the engine's own words (*Cannot perform remainder with `string` and
+  `string`*), and `8 % 3` types as a number.
+
+**Reproducible builds and honest releases.**
+
+- The grammar revision now lives in `grammar.pin` and nowhere else, read by the
+  setup script, by CI, and by `build.rs`, which fails the build when a checkout
+  has drifted off it. It had been duplicated across six places with no
+  consistency check, and `scripts/setup-grammar.sh` refused to update an
+  existing checkout, so a stale clone failed about twenty tests with `parse`
+  errors on valid SurrealQL and nothing said why. The script now moves a clean
+  checkout onto the pin and refuses only a dirty one.
+- `surrealdb.pin` does the same for the SurrealDB checkout the catalogue tests
+  and the conformance sweep read. Both suites print which revision they read
+  when it disagrees with the pin, because the catalogue and the corpus describe
+  one engine and mixing revisions reports version skew as though it were a
+  defect.
+- **A red test now blocks a release.** The `release`, `wasm` and `builtins` jobs
+  had no `needs: rust`, so a failing test suite did not stop a tag from
+  publishing binaries, the crate, or the npm package.
+- CI gained `cargo clippy -- -D warnings`, a `wasm32` compile check on the pull
+  request path (the npm package was built only on a tag, so a native-only type
+  reaching `src/core/` was invisible until release day), and the conformance
+  sweep, which had been `#[ignore]`d for a runtime the `LineIndex` work cut to
+  about four seconds, and which is the only test that caught either type-checker
+  bug above.
+
+
 ### Performance
 
 Editor-facing latency, measured on a 3200-line (166 KB) file and a 200-document

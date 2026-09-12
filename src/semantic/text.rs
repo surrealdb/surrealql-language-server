@@ -135,6 +135,20 @@ impl LineIndex {
         line_end
     }
 
+    /// The tree-sitter position of a byte offset.
+    ///
+    /// Note the unit: `tree_sitter::Point.column` counts **bytes**, where
+    /// `lsp::Position.character` counts UTF-16 code units. Mixing them is the
+    /// classic way to corrupt an incremental reparse, so the conversion lives
+    /// here rather than being written out at each call site.
+    pub fn point(&self, source: &str, offset: usize) -> tree_sitter::Point {
+        let (line, line_start) = self.line_at(offset.min(source.len()));
+        tree_sitter::Point {
+            row: line,
+            column: offset.min(source.len()).saturating_sub(line_start),
+        }
+    }
+
     /// The text of one line, without its terminator.
     ///
     /// `None` past the end of the document. Exists so a caller that needs a few
@@ -941,5 +955,202 @@ mod tests {
         assert!(preview.ends_with("..."));
         assert!(preview.contains('₹'));
         assert!(preview.is_char_boundary(preview.len()));
+    }
+}
+
+/// True when two LSP ranges share at least one position, or touch.
+///
+/// Touching counts: a zero-width request range at the exact start of a
+/// diagnostic is a cursor sitting on it, and an editor asking "what can I do
+/// here" means that diagnostic. Comparing `(line, character)` tuples is the
+/// spec's own ordering: ranges are ordered by line first, then character.
+pub fn ranges_overlap(a: Range, b: Range) -> bool {
+    let start = |range: Range| (range.start.line, range.start.character);
+    let end = |range: Range| (range.end.line, range.end.character);
+    start(a) <= end(b) && start(b) <= end(a)
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use ls_types::Position;
+
+    fn range(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Range {
+        Range {
+            start: Position::new(start_line, start_char),
+            end: Position::new(end_line, end_char),
+        }
+    }
+
+    #[test]
+    fn disjoint_ranges_do_not_overlap() {
+        assert!(!ranges_overlap(range(0, 0, 0, 5), range(1, 0, 1, 5)));
+        assert!(!ranges_overlap(range(1, 0, 1, 5), range(0, 0, 0, 5)));
+    }
+
+    #[test]
+    fn a_cursor_on_the_edge_counts() {
+        // A zero-width range at the start of a diagnostic: the cursor is on it.
+        assert!(ranges_overlap(range(0, 5, 0, 5), range(0, 5, 0, 9)));
+        assert!(ranges_overlap(range(0, 9, 0, 9), range(0, 5, 0, 9)));
+    }
+
+    #[test]
+    fn containment_counts_either_way() {
+        assert!(ranges_overlap(range(0, 0, 9, 0), range(3, 2, 3, 4)));
+        assert!(ranges_overlap(range(3, 2, 3, 4), range(0, 0, 9, 0)));
+    }
+
+    #[test]
+    fn a_multi_line_range_meets_a_line_inside_it() {
+        assert!(ranges_overlap(range(1, 8, 4, 2), range(2, 0, 2, 30)));
+    }
+}
+
+/// Where the innermost still-open call starts, and which argument the cursor is
+/// in.
+///
+/// Returns `(offset of the `(`, zero-based argument index)`, or `None` when the
+/// cursor is not inside an argument list.
+///
+/// The previous version was `prefix.rfind('(')` plus a count of every comma
+/// after it. Both halves are wrong the moment a call is not trivial:
+///
+/// ```text
+/// math::max([1, 2], fn::f(a, b|      rfind finds fn::f's paren (correct here)
+///                                    but the comma count includes the two in
+///                                    the array, so it says argument 4.
+/// string::concat('a, b', |           the comma inside the string counts.
+/// ```
+///
+/// This scans forward once, tracking bracket depth and string state, so nested
+/// calls, arrays, objects and string contents are all accounted for. Commas are
+/// counted only at the depth of the call the cursor is actually in.
+///
+/// It works on text rather than the tree deliberately, and that is not laziness:
+/// signature help is most useful on the `(` keystroke, and at that moment
+/// `'abc'.slice(` has no call node at all: the grammar reads `.slice` as a
+/// field access and leaves the `(` as an ERROR sibling.
+pub fn enclosing_call(prefix: &str) -> Option<(usize, u32)> {
+    // One frame per open bracket; only paren frames can be a call.
+    struct Frame {
+        open: usize,
+        is_paren: bool,
+        commas: u32,
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let bytes = prefix.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let at = index;
+        index += 1;
+
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'-' | b'/' if bytes.get(index) == Some(&byte) => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => stack.push(Frame {
+                open: at,
+                is_paren: byte == b'(',
+                commas: 0,
+            }),
+            b')' | b']' | b'}' => {
+                stack.pop();
+            }
+            b',' => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.commas += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The innermost *paren* frame. A cursor inside `foo([1, |` is in foo's
+    // argument list as far as the array allows, but the array is what encloses
+    // it, so there is no signature to show.
+    let frame = stack.last()?;
+    frame.is_paren.then_some((frame.open, frame.commas))
+}
+
+#[cfg(test)]
+mod enclosing_call_tests {
+    use super::*;
+
+    #[test]
+    fn a_simple_call_counts_its_own_commas() {
+        assert_eq!(enclosing_call("string::concat(a, b"), Some((14, 1)));
+        assert_eq!(enclosing_call("string::concat("), Some((14, 0)));
+    }
+
+    #[test]
+    fn a_nested_call_reports_the_inner_one() {
+        let prefix = "math::max(1, fn::f(a, b";
+        let (open, argument) = enclosing_call(prefix).expect("inside fn::f");
+        assert_eq!(&prefix[open - 5..open], "fn::f");
+        assert_eq!(argument, 1, "second argument of the inner call");
+    }
+
+    #[test]
+    fn commas_inside_a_nested_argument_do_not_count() {
+        // The old rfind+count said argument 4 here.
+        let prefix = "math::max([1, 2, 3], ";
+        assert_eq!(
+            enclosing_call(prefix),
+            Some((9, 1)),
+            "the array's commas belong to the array"
+        );
+    }
+
+    #[test]
+    fn commas_inside_a_string_do_not_count() {
+        assert_eq!(enclosing_call("string::concat('a, b, c', "), Some((14, 1)));
+        assert_eq!(enclosing_call("string::concat(\"a, b\", "), Some((14, 1)));
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_the_string() {
+        assert_eq!(enclosing_call("f('it\\'s, fine', "), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_closed_call_is_not_enclosing() {
+        assert_eq!(enclosing_call("string::len('abc') "), None);
+        assert_eq!(enclosing_call("RETURN 1 + 2"), None);
+    }
+
+    #[test]
+    fn a_bracket_encloses_more_tightly_than_the_call() {
+        // Inside the array, not inside the argument list.
+        assert_eq!(enclosing_call("math::max([1, "), None);
+    }
+
+    #[test]
+    fn a_comment_is_skipped() {
+        assert_eq!(enclosing_call("f(a, -- ), (\n"), Some((1, 1)));
     }
 }

@@ -41,6 +41,16 @@ fn run_check(cwd: &Path, args: &[&str]) -> Output {
         .expect("spawn check")
 }
 
+/// Run the binary with no implied subcommand, for `schema` and anything else
+/// that is not part of `check`.
+fn run_cli(cwd: &Path, args: &[&str]) -> Output {
+    Command::new(binary())
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("spawn")
+}
+
 fn exit_code(output: &Output) -> i32 {
     output.status.code().expect("exit code")
 }
@@ -291,4 +301,364 @@ fn an_unreadable_config_exits_two() {
     write(&dir, "surql.json", "{ not json ");
     let output = run_check(&dir, &["query.surql", "--config", "surql.json"]);
     assert_eq!(exit_code(&output), 2);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `--format json` prints exactly one JSON object, for every exit code
+// ──────────────────────────────────────────────────────────────────────
+
+/// The invariant an agent depends on.
+///
+/// Four paths used to write a sentence to stderr and exit 2 with stdout empty,
+/// so every JSON consumer had to special-case "no output": the exact ambiguity
+/// the exit-code contract exists to remove. Each failure kind is a separate case
+/// here because each was a separate early return.
+#[test]
+fn json_format_always_prints_one_object_even_when_the_run_fails() {
+    let dir = scratch("json-on-failure");
+
+    // 1. A config file that is not JSON.
+    let bad_config = write(&dir, "bad.json", "{ not json");
+    let good = write(&dir, "ok.surql", "DEFINE TABLE t SCHEMAFULL;\n");
+    let output = run_check(
+        &dir,
+        &[
+            good.to_str().expect("utf8"),
+            "--config",
+            bad_config.to_str().expect("utf8"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_failure_report(&output, "invalid-config");
+
+    // 2. A target that does not exist.
+    let output = run_check(
+        &dir,
+        &[
+            dir.join("missing.surql").to_str().expect("utf8"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_failure_report(&output, "unreadable-input");
+}
+
+/// Every failure report is one parseable object carrying `exitCode: 2` and a
+/// machine-readable `error.kind`.
+fn assert_failure_report(output: &Output, expected_kind: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a run that cannot complete must exit 2"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("`--format json` must print one JSON object; got {stdout:?} ({error})")
+    });
+
+    assert_eq!(report["exitCode"], 2);
+    assert_eq!(
+        report["error"]["kind"], expected_kind,
+        "error.kind is the stable field a repair keys on"
+    );
+    assert!(
+        report["error"]["message"].is_string(),
+        "the failure must carry prose too"
+    );
+    assert_eq!(
+        report["files"].as_array().map(Vec::len),
+        Some(0),
+        "a failed run must not claim to have checked anything"
+    );
+
+    // The human still gets the message.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("error:"),
+        "the message must reach stderr as well"
+    );
+}
+
+/// A clean run must keep serialising exactly as it always has: no `error` key.
+#[test]
+fn a_successful_report_carries_no_error_field() {
+    let dir = scratch("json-clean");
+    let file = write(&dir, "clean.surql", "DEFINE TABLE t SCHEMAFULL;\n");
+    let output = run_check(&dir, &[file.to_str().expect("utf8"), "--format", "json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON object");
+    assert!(
+        report.get("error").is_none(),
+        "a clean report gained an `error` key: {report}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// explain, filters, and the one safe fix
+// ──────────────────────────────────────────────────────────────────────
+
+/// `explain` prints the same prose the `codeDescription` link points at, so an
+/// agent offline or behind a proxy reads exactly what a human would.
+#[test]
+fn explain_prints_a_codes_documentation() {
+    let dir = scratch("explain");
+    let output = run_check(&dir, &["explain", "renamed-function"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("## renamed-function"));
+    assert!(
+        stdout.contains("rename table"),
+        "the explanation must say where the replacement comes from: {stdout}"
+    );
+    assert!(
+        !stdout.contains("## not-callable"),
+        "the slice must stop at the next section: {stdout}"
+    );
+}
+
+/// An unknown code is a usage error that names the alternatives, not a silent
+/// empty answer.
+#[test]
+fn explain_rejects_a_code_that_does_not_exist() {
+    let dir = scratch("explain-bad");
+    let output = run_check(&dir, &["explain", "not-a-code"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a diagnostic code"));
+    assert!(
+        stderr.contains("unknown-table"),
+        "it must list the real ones"
+    );
+}
+
+/// `--only` reports one code; `--ignore` reports everything else. Both record
+/// what they hid, because a filtered clean run is not a clean run.
+#[test]
+fn only_and_ignore_filter_reporting_and_say_so() {
+    let dir = scratch("filters");
+    let file = write(
+        &dir,
+        "mixed.surql",
+        "RETURN type::thing('person', '1');\nRETURN \"a\" + 1;\n",
+    );
+    let path = file.to_str().expect("utf8");
+
+    let all = run_check(&dir, &[path, "--format", "json"]);
+    let all: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&all.stdout)).expect("json");
+    let total = all["files"][0]["diagnostics"]
+        .as_array()
+        .expect("array")
+        .len();
+    assert!(total >= 2, "fixture must produce more than one code");
+    assert!(
+        all.get("filters").is_none(),
+        "an unfiltered run must not claim filters"
+    );
+
+    let only = run_check(
+        &dir,
+        &[path, "--format", "json", "--only", "renamed-function"],
+    );
+    let only: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&only.stdout)).expect("json");
+    let kept = only["files"][0]["diagnostics"].as_array().expect("array");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0]["code"], "renamed-function");
+    assert_eq!(only["filters"]["only"][0], "renamed-function");
+    assert_eq!(
+        only["filters"]["suppressed"].as_u64(),
+        Some((total - 1) as u64),
+        "the report must say how many it did not show"
+    );
+
+    let ignored = run_check(
+        &dir,
+        &[path, "--format", "json", "--ignore", "renamed-function"],
+    );
+    let ignored: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&ignored.stdout)).expect("json");
+    assert!(
+        ignored["files"][0]["diagnostics"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|d| d["code"] != "renamed-function"),
+    );
+}
+
+/// A typo'd code is a usage error. Silently filtering nothing is the failure a
+/// CI filter can least afford.
+#[test]
+fn an_unknown_code_in_a_filter_is_rejected() {
+    let dir = scratch("filter-typo");
+    let file = write(&dir, "q.surql", "RETURN 1;\n");
+    let output = run_check(
+        &dir,
+        &[file.to_str().expect("utf8"), "--ignore", "parse-error"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a diagnostic code"),);
+}
+
+/// `--fix renamed-function` rewrites the file, re-analyses it, and says what it
+/// did. The replacement comes from SurrealDB's own rename table.
+#[test]
+fn fix_rewrites_a_renamed_builtin() {
+    let dir = scratch("fix");
+    let file = write(&dir, "old.surql", "RETURN type::thing('person', '1');\n");
+    let path = file.to_str().expect("utf8");
+
+    let output = run_check(
+        &dir,
+        &[path, "--fix", "renamed-function", "--format", "json"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json");
+    assert_eq!(report["fixed"].as_u64(), Some(1));
+    assert!(
+        report["files"][0]["diagnostics"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "the report must describe the file as it now is, not as it was"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&file).expect("read"),
+        "RETURN type::record('person', '1');\n",
+    );
+}
+
+/// Every other code is a suggestion, and applying one unattended can change what
+/// a query means: `unknown-table`'s fix is a string-distance guess that could
+/// repoint a query at a different real table.
+#[test]
+fn fix_refuses_any_code_but_the_mechanical_one() {
+    let dir = scratch("fix-refuse");
+    let file = write(&dir, "q.surql", "SELECT * FROM persn;\n");
+    let output = run_check(
+        &dir,
+        &[file.to_str().expect("utf8"), "--fix", "unknown-table"],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not supported"),
+        "the refusal must explain itself: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).expect("read"),
+        "SELECT * FROM persn;\n",
+        "a refused fix must not touch the file"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// schema export
+// ──────────────────────────────────────────────────────────────────────
+
+fn schema_fixture(dir: &Path) -> PathBuf {
+    write(
+        dir,
+        "schema.surql",
+        "-- People who can sign in.\n\
+         DEFINE TABLE person SCHEMAFULL PERMISSIONS FOR select FULL;\n\
+         DEFINE FIELD name ON person TYPE string;\n\
+         DEFINE FIELD email ON person TYPE option<string>;\n\
+         DEFINE INDEX email_unique ON person FIELDS email UNIQUE;\n\
+         DEFINE FUNCTION fn::greet($who: string) -> string { RETURN 'hi'; };\n",
+    )
+}
+
+/// The LLM form is SurrealQL-shaped, because that is the form a model has seen
+/// most of, and denser than JSON, which matters when it goes into a prompt.
+#[test]
+fn schema_llm_output_reads_as_ddl() {
+    let dir = scratch("schema-llm");
+    schema_fixture(&dir);
+
+    let output = run_cli(&dir, &["schema", dir.to_str().expect("utf8")]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("DEFINE TABLE person SCHEMAFULL;"));
+    assert!(stdout.contains("DEFINE FIELD name ON person TYPE string;"));
+    assert!(stdout.contains("DEFINE FIELD email ON person TYPE option<string>;"));
+    assert!(
+        stdout.contains("PERMISSIONS FOR select FULL"),
+        "permissions are the thing most likely to make a generated query fail: {stdout}"
+    );
+    assert!(
+        stdout.contains("DEFINE FUNCTION fn::greet($who: string) -> string"),
+        "a parameter must carry exactly one `$`: {stdout}"
+    );
+    assert!(
+        stdout.contains("-- People who can sign in."),
+        "a table's comment is context worth keeping: {stdout}"
+    );
+}
+
+/// The JSON form is a compatibility surface, versioned from the first release so
+/// a consumer can branch rather than sniff.
+#[test]
+fn schema_json_output_is_versioned_and_shaped() {
+    let dir = scratch("schema-json");
+    schema_fixture(&dir);
+
+    let output = run_cli(
+        &dir,
+        &["schema", dir.to_str().expect("utf8"), "--format", "json"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON object");
+
+    assert_eq!(report["schemaVersion"], 1);
+    assert!(report["version"].is_string());
+
+    let person = report["tables"]
+        .as_array()
+        .expect("tables")
+        .iter()
+        .find(|table| table["name"] == "person")
+        .expect("person");
+    assert_eq!(person["schemaMode"], "schemafull");
+    assert_eq!(person["explicit"], true);
+    assert_eq!(person["indexes"][0], "email_unique");
+
+    let email = person["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .find(|field| field["name"] == "email")
+        .expect("email");
+    assert_eq!(email["type"], "option<string>");
+    assert_eq!(email["explicit"], true);
+
+    let greet = report["functions"]
+        .as_array()
+        .expect("functions")
+        .iter()
+        .find(|function| function["name"] == "fn::greet")
+        .expect("greet");
+    assert_eq!(greet["parameters"][0], "$who: string");
+    assert_eq!(greet["returns"], "string");
+}
+
+/// Nothing readable is exit 2, not an empty schema that looks like an answer.
+#[test]
+fn schema_reports_when_there_is_nothing_to_read() {
+    let dir = scratch("schema-empty");
+    let output = run_cli(&dir, &["schema", dir.to_str().expect("utf8")]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no readable"));
 }

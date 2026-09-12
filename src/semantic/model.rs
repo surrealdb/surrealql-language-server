@@ -15,7 +15,7 @@ use crate::grammar::{
     builtin_signature,
 };
 use crate::semantic::codes;
-use crate::semantic::text::{LineIndex, compact_preview};
+use crate::semantic::text::{LineIndex, compact_preview, ranges_overlap};
 use crate::semantic::type_expr::TypeExpr;
 use crate::semantic::type_name;
 use crate::semantic::types::{
@@ -27,12 +27,14 @@ use crate::semantic::types::{
 
 impl MergedSemanticModel {
     pub fn build(workspace: &WorkspaceIndex, live: &LiveMetadataSnapshot) -> Self {
-        let mut model = Self::default();
         // A failing (or partially failing) metadata fetch means remote
         // tables are missing from this model — judgments like "this
         // inferred name must be a typo" can't be trusted until the
         // connection recovers.
-        model.metadata_degraded = !live.errors.is_empty();
+        let mut model = Self {
+            metadata_degraded: !live.errors.is_empty(),
+            ..Self::default()
+        };
 
         for analysis in workspace.documents.values() {
             model.absorb_analysis(analysis.as_ref());
@@ -49,6 +51,39 @@ impl MergedSemanticModel {
                         .entry(reference.name.clone())
                         .or_default()
                         .push(reference.location.clone());
+                }
+            }
+
+            // Tables and fields come from the query facts, which already carry
+            // token-tight ranges per name: the same ranges the diagnostics use,
+            // so a reference lands exactly where the squiggle would.
+            for fact in &analysis.query_facts {
+                for named in &fact.target_refs {
+                    model
+                        .table_references
+                        .entry(named.name.clone())
+                        .or_default()
+                        .push(Location::new(analysis.uri.clone(), named.range));
+                }
+                for named in &fact.field_refs {
+                    let location = Location::new(analysis.uri.clone(), named.range);
+                    model
+                        .field_references
+                        .entry(named.name.clone())
+                        .or_default()
+                        .push(location.clone());
+                    // The same reference again, under the table it was written
+                    // against, so a later lookup can be specific when the cursor
+                    // says which table it means.
+                    for table in &fact.target_tables {
+                        model
+                            .qualified_field_references
+                            .entry(table.clone())
+                            .or_default()
+                            .entry(named.name.clone())
+                            .or_default()
+                            .push(location.clone());
+                    }
                 }
             }
         }
@@ -1132,18 +1167,18 @@ impl MergedSemanticModel {
         }
         let parsed_type = TypeExpr::parse(trimmed);
         let record_tables = parsed_type.record_tables();
-        if record_tables.len() == 1 {
-            if let Some(table) = self.tables.get(&record_tables[0]) {
-                return Some(join_hover_blocks([
-                    hover_block(
-                        format!("`{parsed_type}`"),
-                        None,
-                        vec!["Source: type expression".to_string()],
-                        vec!["Resolves to:".to_string()],
-                    ),
-                    format_table_hover(table, self, active_context),
-                ]));
-            }
+        if record_tables.len() == 1
+            && let Some(table) = self.tables.get(&record_tables[0])
+        {
+            return Some(join_hover_blocks([
+                hover_block(
+                    format!("`{parsed_type}`"),
+                    None,
+                    vec!["Source: type expression".to_string()],
+                    vec!["Resolves to:".to_string()],
+                ),
+                format_table_hover(table, self, active_context),
+            ]));
         }
         if KEYWORDS
             .iter()
@@ -1522,6 +1557,18 @@ impl MergedSemanticModel {
         let mut diagnostics = analysis.syntax_diagnostics.clone();
         diagnostics.extend(self.semantic_diagnostics(analysis, settings));
         self.apply_schemaless_policy(&mut diagnostics, settings);
+
+        // Attached here rather than at each of the thirteen places a diagnostic
+        // is built. This is the one funnel both surfaces go through (the LSP
+        // publish path and `check`), so a code that gains prose gains the link
+        // everywhere at once, and a code that never gets prose gets no link
+        // rather than a dead one.
+        for diagnostic in &mut diagnostics {
+            if let Some(ls_types::NumberOrString::String(code)) = &diagnostic.code {
+                diagnostic.code_description = codes::description(code);
+            }
+        }
+
         diagnostics
     }
 
@@ -1593,17 +1640,17 @@ impl MergedSemanticModel {
                     // Everything else stays untouched — schema
                     // inference from usage is a feature, not an error.
                     Some(table_def) if !table_def.explicit => {
-                        if !self.metadata_degraded && self.target_usage_count(table) <= 1 {
-                            if let Some(suggestion) =
+                        if !self.metadata_degraded
+                            && self.target_usage_count(table) <= 1
+                            && let Some(suggestion) =
                                 self.find_probable_typo_of_explicit_table(table)
-                            {
-                                diagnostics.push(self.unknown_table_diagnostic(
-                                    table,
-                                    table_range,
-                                    Some(suggestion),
-                                ));
-                                continue;
-                            }
+                        {
+                            diagnostics.push(self.unknown_table_diagnostic(
+                                table,
+                                table_range,
+                                Some(suggestion),
+                            ));
+                            continue;
                         }
                         table_def
                     }
@@ -1776,13 +1823,30 @@ impl MergedSemanticModel {
         }
     }
 
+    /// Code actions offered for `range`, optionally narrowed to `only`.
+    ///
+    /// Both arguments used to be discarded. The consequence was visible: putting
+    /// the cursor anywhere in a file with three permission-less tables offered
+    /// "Add PERMISSIONS clause" three times, for tables nowhere near the cursor,
+    /// and a client asking for `source.fixAll` got the whole list back.
     pub fn code_actions(
         &self,
         uri: &Uri,
         analysis: &DocumentAnalysis,
         diagnostics: &[Diagnostic],
+        range: Range,
+        only: Option<&[CodeActionKind]>,
     ) -> Vec<CodeActionOrCommand> {
         let mut actions = Vec::new();
+
+        // The client passes the diagnostics under the cursor in `context`, but
+        // is not required to filter them to `range`: VS Code sends the ones it
+        // considers relevant, other clients send more. Filtering here makes the
+        // answer the same everywhere.
+        let diagnostics: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| ranges_overlap(diagnostic.range, range))
+            .collect();
 
         for diagnostic in diagnostics {
             if let Some((table, suggestion)) = unknown_table_payload(diagnostic) {
@@ -1877,11 +1941,11 @@ impl MergedSemanticModel {
             }
         }
 
-        for table in analysis
-            .tables
-            .iter()
-            .filter(|table| table.permissions.is_empty() && table.explicit)
-        {
+        for table in analysis.tables.iter().filter(|table| {
+            table.permissions.is_empty()
+                && table.explicit
+                && ranges_overlap(table.location.range, range)
+        }) {
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title: format!("Add PERMISSIONS clause to table `{}`", table.name),
                 kind: Some(CodeActionKind::REFACTOR_REWRITE),
@@ -1905,6 +1969,26 @@ impl MergedSemanticModel {
                 }),
                 ..CodeAction::default()
             }));
+        }
+
+        if let Some(only) = only {
+            // A requested kind matches an action whose kind is that kind or a
+            // more specific one: `quickfix` requests `quickfix.foo` too. That is
+            // the prefix rule the specification states.
+            actions.retain(|action| {
+                let CodeActionOrCommand::CodeAction(action) = action else {
+                    return true;
+                };
+                let Some(kind) = action.kind.as_ref() else {
+                    return true;
+                };
+                only.iter().any(|wanted| {
+                    let (kind, wanted) = (kind.as_str(), wanted.as_str());
+                    kind == wanted
+                        || (kind.starts_with(wanted)
+                            && kind.as_bytes().get(wanted.len()) == Some(&b'.'))
+                })
+            });
         }
 
         actions
@@ -1951,11 +2035,149 @@ impl MergedSemanticModel {
             })
     }
 
+    /// Where the *type* of `token` is defined.
+    ///
+    /// For SurrealQL that means one thing and it is worth having: a field
+    /// declared `TYPE record<person>` takes you to `DEFINE TABLE person`, not to
+    /// the field. `definition_for_token` already knew how to read a record type
+    /// out of a string: this lifts it into its own entry point and teaches it to
+    /// look a field's declared type up by name, which is what a cursor on a
+    /// field actually gives you.
+    pub fn type_definition_for_token(&self, token: &str) -> Option<Location> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let from_record_type = |type_expr: &TypeExpr| -> Option<Location> {
+            let mut found = type_expr.record_tables().into_iter().filter_map(|name| {
+                self.tables
+                    .get(&name)
+                    .filter(|table| table.origin == SymbolOrigin::Local)
+                    .map(|table| table.location.clone())
+            });
+            // Only when it is unambiguous: `record<a | b>` has two answers and
+            // picking one arbitrarily is worse than declining.
+            let first = found.next()?;
+            found.next().is_none().then_some(first)
+        };
+
+        // The cursor is on a type expression itself.
+        if let Some(location) = from_record_type(&TypeExpr::parse(trimmed)) {
+            return Some(location);
+        }
+
+        // The cursor is on a field. Take its declared type, and require every
+        // table that declares this field name to agree: otherwise the answer
+        // depends on which table the user meant, and nothing here knows.
+        let mut declared: Option<Location> = None;
+        for fields in self.fields.values() {
+            let Some(field) = fields.get(trimmed) else {
+                continue;
+            };
+            let Some(type_expr) = field.type_expr.as_ref() else {
+                continue;
+            };
+            match from_record_type(type_expr) {
+                Some(location) if declared.as_ref().is_none_or(|seen| *seen == location) => {
+                    declared = Some(location);
+                }
+                _ => return None,
+            }
+        }
+        declared
+    }
+
     pub fn references_for_function(&self, name: &str) -> Vec<Location> {
         self.function_references
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Every reference to `table`'s `field`, and nothing from any other table.
+    ///
+    /// `None` when this table is not seen using that field anywhere, which is
+    /// the signal to fall back to [`Self::references_for_name`]: the cursor was
+    /// probably not on a field of this table at all.
+    pub fn references_for_field(
+        &self,
+        table: &str,
+        field: &str,
+        include_declaration: bool,
+    ) -> Option<Vec<Location>> {
+        let mut found = self
+            .qualified_field_references
+            .get(table)?
+            .get(field)?
+            .clone();
+
+        if include_declaration
+            && let Some(declaration) = self.fields.get(table).and_then(|fields| fields.get(field))
+        {
+            found.push(declaration.location.clone());
+        }
+
+        found.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        found.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+        Some(found)
+    }
+
+    /// Every reference to `name`, whatever kind of thing it is.
+    ///
+    /// The three maps are searched rather than one being chosen, because the
+    /// cursor gives a bare word: `person` may be a table, and `fn::person` a
+    /// function, and nothing in the token says which the user meant. Returning
+    /// the union is the answer available once the name is all there is to go on.
+    /// When the cursor *does* say which table it means,
+    /// [`Self::references_for_field`] answers the narrower question and callers
+    /// should ask it first.
+    ///
+    /// `include_declaration` prepends the `DEFINE` that introduces the name, as
+    /// `ReferenceParams.context` asks.
+    pub fn references_for_name(&self, name: &str, include_declaration: bool) -> Vec<Location> {
+        let mut found: Vec<Location> = self
+            .function_references
+            .get(name)
+            .into_iter()
+            .chain(self.table_references.get(name))
+            .chain(self.field_references.get(name))
+            .flatten()
+            .cloned()
+            .collect();
+
+        if include_declaration {
+            if let Some(function) = self.functions.get(name) {
+                found.push(Location::new(
+                    function.location.uri.clone(),
+                    function.selection_range,
+                ));
+            }
+            if let Some(table) = self.tables.get(name).filter(|table| table.explicit) {
+                found.push(table.location.clone());
+            }
+            for fields in self.fields.values() {
+                if let Some(field) = fields.get(name) {
+                    found.push(field.location.clone());
+                }
+            }
+        }
+
+        found.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        found.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+        found
     }
 
     pub fn rename_edits(&self, name: &str, new_name: &str) -> Option<HashMap<Uri, Vec<TextEdit>>> {
@@ -2159,10 +2381,10 @@ struct PermissionOutcome {
 /// in either direction and case-insensitively.
 fn is_plural_variant(left: &str, right: &str) -> bool {
     fn is_plural_of(plural: &str, singular: &str) -> bool {
-        if let Some(stem) = plural.strip_suffix("ies") {
-            if format!("{stem}y") == singular {
-                return true;
-            }
+        if let Some(stem) = plural.strip_suffix("ies")
+            && format!("{stem}y") == singular
+        {
+            return true;
         }
         if let Some(stem) = plural.strip_suffix("es")
             && stem == singular
@@ -2260,20 +2482,20 @@ fn unknown_type_payload(diagnostic: &Diagnostic) -> Option<(String, Option<Strin
 // instead of twice is the whole of the saving here.
 fn merge_event(target: &mut HashMap<(String, String), EventDef>, candidate: &EventDef) {
     let key = (candidate.table.clone(), candidate.name.clone());
-    if let Some(current) = target.get(&key) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&key)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(key, candidate.clone());
 }
 
 fn merge_index(target: &mut HashMap<(String, String), IndexDef>, candidate: &IndexDef) {
     let key = (candidate.table.clone(), candidate.name.clone());
-    if let Some(current) = target.get(&key) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&key)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(key, candidate.clone());
 }
@@ -2289,10 +2511,10 @@ fn merge_function(target: &mut HashMap<String, FunctionDef>, candidate: &Functio
 }
 
 fn merge_param(target: &mut HashMap<String, ParamDef>, candidate: &ParamDef) {
-    if let Some(current) = target.get(&candidate.name) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&candidate.name)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(candidate.name.clone(), candidate.clone());
 }
@@ -2307,10 +2529,10 @@ fn merge_analyzer(target: &mut HashMap<String, AnalyzerDef>, candidate: &Analyze
 }
 
 fn merge_access(target: &mut HashMap<String, AccessDef>, candidate: &AccessDef) {
-    if let Some(current) = target.get(&candidate.name) {
-        if symbol_priority(candidate.origin) < symbol_priority(current.origin) {
-            return;
-        }
+    if let Some(current) = target.get(&candidate.name)
+        && symbol_priority(candidate.origin) < symbol_priority(current.origin)
+    {
+        return;
     }
     target.insert(candidate.name.clone(), candidate.clone());
 }
@@ -2836,7 +3058,7 @@ fn format_field_hover(field: &FieldDef, model: &MergedSemanticModel) -> String {
     let covering: Vec<String> = model
         .indexes_for_table(&field.table)
         .iter()
-        .filter(|index| index.fields.iter().any(|name| *name == field.name))
+        .filter(|index| index.fields.contains(&field.name))
         .map(|index| {
             let mut details = Vec::new();
             if index.fields.len() > 1 {
@@ -3097,10 +3319,10 @@ pub(crate) fn field_completion_tables(
 
     let mut tables = Vec::new();
     for table in &statement_fact.target_tables {
-        if let Some(normalized) = normalize_completion_table_name(table) {
-            if !tables.contains(&normalized) {
-                tables.push(normalized);
-            }
+        if let Some(normalized) = normalize_completion_table_name(table)
+            && !tables.contains(&normalized)
+        {
+            tables.push(normalized);
         }
     }
     tables
@@ -3185,6 +3407,14 @@ mod tests {
 
     use crate::config::{AuthContext, ServerSettings};
     use crate::semantic::text::LineIndex;
+
+    /// A range covering any document, for cases that are not about the cursor.
+    fn whole_document_range() -> ls_types::Range {
+        ls_types::Range {
+            start: ls_types::Position::new(0, 0),
+            end: ls_types::Position::new(u32::MAX, u32::MAX),
+        }
+    }
     use crate::semantic::types::{
         DocumentAnalysis, EventDef, FunctionDef, IndexDef, PermissionMode, PermissionRule,
         QueryAction, SymbolOrigin, TableDef, TargetResolution, WorkspaceIndex,
@@ -4262,7 +4492,15 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         let quick_fix = actions
             .iter()
             .find_map(|action| match action {
@@ -4288,7 +4526,15 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(
             actions.iter().any(|action| matches!(
                 action,
@@ -4312,7 +4558,15 @@ mod tests {
             ..Default::default()
         };
 
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
             ls_types::CodeActionOrCommand::CodeAction(action)
@@ -4333,7 +4587,15 @@ mod tests {
 
         // `zzz` has no near-miss, so only the parsed suggestion can
         // produce this action.
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
             ls_types::CodeActionOrCommand::CodeAction(action)
@@ -4354,7 +4616,15 @@ mod tests {
 
         // `zzz` is nowhere near `person` by string distance, so only
         // the precomputed suggestion can produce this action.
-        let actions = model.code_actions(&analysis.uri.clone(), &analysis, &[diagnostic]);
+        let actions = model.code_actions(
+            &analysis.uri.clone(),
+            &analysis,
+            &[diagnostic],
+            // The whole document: these cases are about the payload
+            // matching, not about where the cursor is.
+            whole_document_range(),
+            None,
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
             ls_types::CodeActionOrCommand::CodeAction(action)
