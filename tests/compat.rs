@@ -6,7 +6,7 @@
 mod common;
 
 use serde_json::json;
-use surrealql_language_server::config::ServerSettings;
+use surrealql_language_server::config::{ServerSettings, merge_absent};
 use surrealql_language_server::semantic::analyzer::analyze_document;
 use surrealql_language_server::semantic::types::SymbolOrigin;
 use tower_lsp_server::ls_types::NumberOrString;
@@ -455,5 +455,105 @@ fn check_exit_codes_and_flags_are_stable() {
         ]),
         0,
         "the documented flag surface"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Partial configuration must not reset what it does not mention
+// ──────────────────────────────────────────────────────────────────────
+
+/// A fully non-default settings value, so any field the merge forgets shows up
+/// as a difference rather than coinciding with a default.
+fn every_field_non_default() -> ServerSettings {
+    let json = json!({
+        "connection": {
+            "endpoint": "ws://example:8000",
+            "namespace": "ns",
+            "database": "db",
+            "username": "root",
+            "password": "secret",
+            "token": "tok",
+            "access": "acc"
+        },
+        "metadata": {
+            "mode": "workspace",
+            "enableLiveMetadata": false,
+            "refreshOnSave": false
+        },
+        "analysis": {
+            "enablePermissionAnalysis": false,
+            "enableAggressiveSchemaInference": false,
+            "enableCodeActions": false,
+            "enableTypeChecking": false,
+            "schemalessDiagnostics": "strict",
+            "maxSyntaxDiagnostics": 7,
+            "diagnosticDebounceMs": 42,
+            "externalParams": ["id", "limit"]
+        },
+        "authContexts": [{ "name": "admin", "roles": ["owner"] }],
+        "activeAuthContext": "admin"
+    });
+    let (settings, warnings, _) = ServerSettings::from_sources_with_presence(Some(&json), None);
+    assert!(warnings.is_empty(), "fixture must be clean: {warnings:?}");
+    settings
+}
+
+/// The whole point of the presence-aware merge, in one assertion.
+///
+/// An editor sends the *whole* `surrealql` section when one setting changes, but
+/// a client that sends a partial payload (or `null`, or an empty object) must
+/// not have every omitted field reset. The previous merge listed fields to carry
+/// over by hand and was missing `connection.access` and the entire `analysis`
+/// block, so toggling one setting silently restored default
+/// `maxSyntaxDiagnostics`, `schemalessDiagnostics`, `externalParams` and
+/// debounce.
+///
+/// Comparing whole structs is deliberate: a field added later is covered by this
+/// test the day it exists, with no edit here.
+#[test]
+fn an_empty_payload_keeps_every_previous_setting() {
+    let previous = every_field_non_default();
+    let empty = json!({});
+    let (incoming, _, present) = ServerSettings::from_sources_with_presence(None, Some(&empty));
+
+    let merged = merge_absent(incoming, &previous, &present);
+    assert_eq!(
+        merged, previous,
+        "an empty configuration payload reset settings it never mentioned"
+    );
+}
+
+/// The other direction: a payload that names exactly one key changes exactly
+/// that key.
+#[test]
+fn a_partial_payload_changes_only_what_it_names() {
+    let previous = every_field_non_default();
+    let payload = json!({ "analysis": { "maxSyntaxDiagnostics": 99 } });
+    let (incoming, _, present) = ServerSettings::from_sources_with_presence(None, Some(&payload));
+
+    let merged = merge_absent(incoming, &previous, &present);
+
+    assert_eq!(merged.analysis.max_syntax_diagnostics, 99, "the named key");
+
+    let mut expected = previous.clone();
+    expected.analysis.max_syntax_diagnostics = 99;
+    assert_eq!(
+        merged, expected,
+        "a one-key payload changed something other than that key"
+    );
+}
+
+/// Both casings name the same key, so a `snake_case` payload must not read as
+/// "absent" and get overwritten by the fallback.
+#[test]
+fn snake_case_keys_count_as_present() {
+    let previous = every_field_non_default();
+    let payload = json!({ "analysis": { "max_syntax_diagnostics": 5 } });
+    let (incoming, _, present) = ServerSettings::from_sources_with_presence(None, Some(&payload));
+
+    let merged = merge_absent(incoming, &previous, &present);
+    assert_eq!(
+        merged.analysis.max_syntax_diagnostics, 5,
+        "a snake_case key was treated as absent and overwritten"
     );
 }

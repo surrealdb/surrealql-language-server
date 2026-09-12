@@ -31,6 +31,21 @@ stale, and the buffer showed whatever it looked like when it was opened. The
 mark is now removed on close and replaced on open, which the LSP says is
 authoritative.
 
+**A partial `didChangeConfiguration` no longer resets the settings it does not
+mention.** The merge that carries settings across a configuration reload listed
+the fields to keep by hand, and was missing `connection.access` and the entire
+`analysis` block, so changing one setting silently restored default
+`maxSyntaxDiagnostics`, `schemalessDiagnostics`, `externalParams` and
+`diagnosticDebounceMs`. The merge is now driven by which dotted paths the
+payload actually named, so a field added later is covered the day it exists. It
+also removes a heuristic that guessed at `metadata.mode` by comparing it against
+its default, which got the opposite case wrong: a user who deliberately set the
+default value could not make it stick.
+
+**A document the analyzer cannot parse now says so.** When analysis failed the
+previous result stayed in place with no log and no diagnostic, so the editor
+kept showing diagnostics for text the user had already changed.
+
 **Every documented false positive is gone.** The grammar pin moved from
 `cb2e6b5` (which was an unmerged pull-request branch, not a revision on
 `master`) to `373e7cd`. That revision parses all seven shapes of valid

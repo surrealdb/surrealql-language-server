@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use ls_types::*;
 
-use crate::config::{AuthContext, ServerSettings};
+use crate::config::{AuthContext, ServerSettings, merge_absent};
 use crate::core::client::{LspNotifier, MetadataProvider, WorkspaceLoader};
 use crate::core::completion_context::{
     ColumnSlot, active_query_fact, column_completion_context, completion_prefix,
@@ -217,8 +217,8 @@ where
         // Ask the client before taking the config lock — a slow
         // configuration pull must not stall other settings work.
         let configuration = self.notifier.request_configuration().await;
-        let (settings, warnings) =
-            ServerSettings::from_sources_with_warnings(None, configuration.as_ref());
+        let (settings, warnings, present) =
+            ServerSettings::from_sources_with_presence(None, configuration.as_ref());
         // A client without configuration support answers `None`, and
         // VS Code / Neovim answer the pull with JSON `null` when no
         // `surrealql` section is configured — both always yield zero
@@ -236,7 +236,7 @@ where
             let state = self.state.read().await;
             (*state.settings).clone()
         };
-        let settings = settings.merge_with_env_if_missing(current_settings);
+        let settings = merge_absent(settings, &current_settings, &present);
         self.apply_settings_inner(settings).await;
     }
 
@@ -443,8 +443,8 @@ where
         // The read-merge-apply sequence runs under the config lock so
         // two spawned configuration changes can't lose each other's
         // updates.
-        let (settings, warnings) =
-            ServerSettings::from_sources_with_warnings(None, Some(&params.settings));
+        let (settings, warnings, present) =
+            ServerSettings::from_sources_with_presence(None, Some(&params.settings));
         self.report_settings_warnings(&warnings).await;
 
         let _guard = self.config_lock.lock().await;
@@ -452,7 +452,7 @@ where
             let state = self.state.read().await;
             (*state.settings).clone()
         };
-        let settings = settings.merge_with_env_if_missing(current_settings);
+        let settings = merge_absent(settings, &current_settings, &present);
         self.apply_settings_inner(settings).await;
     }
 
@@ -1177,6 +1177,20 @@ where
         // the server does, so they must not run on a thread that is also
         // serving requests.
         let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit).await else {
+            // The previous analysis stays in `open_documents`, so the editor
+            // keeps showing diagnostics for text the user has already changed.
+            // That is the worst kind of wrong (stale and silent), so say it
+            // happened. `analyze_document` only answers `None` when the grammar
+            // fails to load, which is a total outage rather than a bad document.
+            self.notifier
+                .log_message(
+                    MessageType::ERROR,
+                    format!(
+                        "SurrealQL: could not analyze {}; its diagnostics are now stale.",
+                        uri.as_str()
+                    ),
+                )
+                .await;
             return;
         };
 
@@ -1656,46 +1670,4 @@ async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<Doc
 #[cfg(target_arch = "wasm32")]
 async fn analyze_off_reactor(uri: Uri, text: String, limit: usize) -> Option<DocumentAnalysis> {
     analyze_document_with_limit(uri, text, SymbolOrigin::Local, limit)
-}
-
-/// Extension methods used by [`LanguageServerCore::reload_from_client_configuration`]
-/// to merge incoming `workspace/configuration` snapshots with the
-/// initial settings (which usually carry the connection details from
-/// `initializationOptions`).
-trait SettingsMergeExt {
-    fn merge_with_env_if_missing(self, fallback: ServerSettings) -> ServerSettings;
-}
-
-impl SettingsMergeExt for ServerSettings {
-    fn merge_with_env_if_missing(mut self, fallback: ServerSettings) -> ServerSettings {
-        if self.connection.endpoint.is_none() {
-            self.connection.endpoint = fallback.connection.endpoint;
-        }
-        if self.connection.namespace.is_none() {
-            self.connection.namespace = fallback.connection.namespace;
-        }
-        if self.connection.database.is_none() {
-            self.connection.database = fallback.connection.database;
-        }
-        if self.connection.username.is_none() {
-            self.connection.username = fallback.connection.username;
-        }
-        if self.connection.password.is_none() {
-            self.connection.password = fallback.connection.password;
-        }
-        if self.connection.token.is_none() {
-            self.connection.token = fallback.connection.token;
-        }
-        if self.active_auth_context.is_none() {
-            self.active_auth_context = fallback.active_auth_context;
-        }
-        if self.auth_contexts.is_empty() {
-            self.auth_contexts = fallback.auth_contexts;
-        }
-        let default_mode = crate::config::MetadataSettings::default().mode;
-        if self.metadata.mode == default_mode && fallback.metadata.mode != default_mode {
-            self.metadata.mode = fallback.metadata.mode;
-        }
-        self
-    }
 }

@@ -324,6 +324,20 @@ fn encode(tokens: Vec<AbsToken>) -> Vec<SemanticToken> {
     let mut prev_line = 0u32;
     let mut prev_start = 0u32;
     for token in tokens {
+        // Both subtractions below are unchecked `u32`. They are sound only
+        // because `collect` sorted the tokens into non-decreasing position:
+        // a hundred lines away, in a different function. Release builds have
+        // overflow checks off, so breaking that invariant would not panic here;
+        // it would silently emit garbage token positions and paint the file
+        // wrong. Assert it where it is relied on.
+        debug_assert!(
+            (token.line, token.start_char) >= (prev_line, prev_start),
+            "semantic tokens must be sorted before delta encoding: \
+             ({prev_line}, {prev_start}) then ({}, {})",
+            token.line,
+            token.start_char,
+        );
+
         let delta_line = token.line - prev_line;
         let delta_start = if delta_line == 0 {
             token.start_char - prev_start
