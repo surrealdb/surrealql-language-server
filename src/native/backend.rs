@@ -159,6 +159,13 @@ impl LanguageServer for Backend {
         Ok(self.core.goto_definition(params).await)
     }
 
+    async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        Ok(self.core.goto_type_definition(params).await)
+    }
+
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         Ok(Some(self.core.references(params).await))
     }

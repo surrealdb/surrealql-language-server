@@ -8,8 +8,15 @@ A Language Server Protocol (LSP) implementation for [SurrealQL](https://surreald
 - Semantic analysis with schema inference from DDL and query flow
 - Hover with type info, permission posture, function signatures, and language badges (SurrealQL vs JavaScript)
 - Contextual completions for `record<table>` types, field names, builtin functions, and statement keywords
-- Go-to definition and references for tables, fields, functions, and params
-- Safe rename of local function definitions
+- Go-to definition for tables, fields, functions and params, and go-to type
+  definition through a `record<…>` to the table it names
+- References for tables and functions; for fields, the places that *write* them
+  (`UPDATE … SET email`): projections and `WHERE` predicates are not indexed
+- Safe rename of local function definitions. Renaming a **table** or **field**
+  is declined on purpose: those names also appear in record-id literals,
+  `RELATE` arrows, permission clauses and strings that the index does not cover,
+  so a rename would miss occurrences and leave a workspace that parses and is
+  wrong
 - Code actions for missing `PERMISSIONS` clauses
 - Signature help for builtin and user-defined functions
 - Call hierarchy with inbound/outbound function call tracking

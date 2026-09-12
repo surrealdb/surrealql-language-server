@@ -39,6 +39,10 @@ fn server_capabilities_golden() {
             "retriggerCharacters": [","],
         },
         "definitionProvider": true,
+        // Added in 0.7. `record<person>` on a field is a real type-to-definition
+        // jump, and the one place the distinction from `definition` earns its
+        // keep in SurrealQL.
+        "typeDefinitionProvider": true,
         "referencesProvider": true,
         // Added in 0.7. Echoed rather than negotiated: UTF-16 is the
         // specification's default and every conformant client supports it, so

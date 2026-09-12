@@ -264,6 +264,10 @@ where
             Ok(params) => Outcome::from_value(core.code_action(params).await),
             Err(error) => error,
         },
+        "textDocument/typeDefinition" => match decode::<GotoDefinitionParams>(params) {
+            Ok(params) => Outcome::from_value(core.goto_type_definition(params).await),
+            Err(error) => error,
+        },
         "textDocument/diagnostic" => match decode::<DocumentDiagnosticParams>(params) {
             Ok(params) => Outcome::from_value(core.document_diagnostic(params).await),
             Err(error) => error,

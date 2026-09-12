@@ -3842,3 +3842,217 @@ fn has_code(diagnostic: &Diagnostic, code: &str) -> bool {
         Some(tower_lsp_server::ls_types::NumberOrString::String(value)) if value == code
     )
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Navigation beyond functions
+// ──────────────────────────────────────────────────────────────────────
+
+async fn references_at(
+    core: &common::TestCore,
+    path: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Vec<(u32, u32)> {
+    let mut found: Vec<_> = core
+        .references(tower_lsp_server::ls_types::ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(path) },
+                position: Position::new(line, character),
+            },
+            context: tower_lsp_server::ls_types::ReferenceContext {
+                include_declaration,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .into_iter()
+        .map(|location| (location.range.start.line, location.range.start.character))
+        .collect();
+    found.sort();
+    found
+}
+
+/// "Where else is this table used?" is the most-asked navigation question in a
+/// `.surql` workspace, and the answer used to be an empty list.
+#[tokio::test]
+async fn references_finds_every_use_of_a_table() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "refs.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         SELECT * FROM person;\n\
+         DELETE person;\n",
+    )
+    .await;
+
+    let without = references_at(&core, "refs.surql", 1, 15, false).await;
+    assert_eq!(without.len(), 2, "both queries name the table: {without:?}");
+
+    let with = references_at(&core, "refs.surql", 1, 15, true).await;
+    assert_eq!(
+        with.len(),
+        3,
+        "include_declaration adds the DEFINE: {with:?}"
+    );
+    assert_eq!(with[0].0, 0, "the declaration sorts first");
+}
+
+/// A field *written* by a query is reachable the same way.
+///
+/// Writes only, and that is a limitation of the extractor rather than of
+/// references: `QueryFact.field_refs` records assignment targets, so
+/// `UPDATE … SET email` is indexed and `SELECT email` is not. Finding the writes
+/// is still worth having (it is the "what touches this column?" question), and
+/// an empty list, which is what this returned before, helps nobody. The README
+/// says so rather than implying more.
+#[tokio::test]
+async fn references_finds_a_written_field() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "field.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE FIELD email ON person TYPE string;\n\
+         UPDATE person SET email = 'a';\n\
+         UPDATE person SET email = 'b';\n",
+    )
+    .await;
+
+    let found = references_at(&core, "field.surql", 2, 18, false).await;
+    assert_eq!(found.len(), 2, "both assignments name the field: {found:?}");
+
+    let with_declaration = references_at(&core, "field.surql", 2, 18, true).await;
+    assert_eq!(
+        with_declaration.len(),
+        3,
+        "include_declaration adds the DEFINE FIELD: {with_declaration:?}"
+    );
+}
+
+/// `TYPE record<person>` on a field takes you to `DEFINE TABLE person`: the one
+/// place type-definition means something different from definition here.
+#[tokio::test]
+async fn type_definition_follows_a_record_type_to_its_table() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "typed.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE TABLE post SCHEMAFULL;\n\
+         DEFINE FIELD author ON post TYPE record<person>;\n",
+    )
+    .await;
+
+    let response = core
+        .goto_type_definition(tower_lsp_server::ls_types::GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("typed.surql"),
+                },
+                // On `author`.
+                position: Position::new(2, 13),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("a record-typed field has a type definition");
+
+    let tower_lsp_server::ls_types::GotoDefinitionResponse::Scalar(location) = response else {
+        panic!("expected one location");
+    };
+    assert_eq!(
+        location.range.start.line, 0,
+        "must land on DEFINE TABLE person, not on the field"
+    );
+}
+
+/// A client that understands `LocationLink` gets the origin range, so the editor
+/// underlines the token rather than guessing at its extent.
+#[tokio::test]
+async fn definition_answers_with_a_link_when_the_client_supports_it() {
+    let linking = InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            text_document: Some(tower_lsp_server::ls_types::TextDocumentClientCapabilities {
+                definition: Some(tower_lsp_server::ls_types::GotoCapability {
+                    link_support: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    };
+
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(linking).await;
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "link.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;\n",
+    )
+    .await;
+
+    let response = core
+        .goto_definition(tower_lsp_server::ls_types::GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri("link.surql"),
+                },
+                position: Position::new(1, 15),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("definition");
+
+    let tower_lsp_server::ls_types::GotoDefinitionResponse::Link(links) = response else {
+        panic!("a link-capable client must get links");
+    };
+    assert_eq!(links.len(), 1);
+    assert!(
+        links[0].origin_selection_range.is_some(),
+        "the origin range is the reason to use a link at all"
+    );
+}
+
+/// Rename stays functions-only, **deliberately**.
+///
+/// A table name appears in record-id literals, `RELATE` arrows, permission
+/// clauses and strings that the reference index does not cover, so a rename
+/// would miss occurrences and leave a workspace that parses and is wrong. The
+/// decline is pinned here so it cannot quietly become partial coverage.
+#[tokio::test]
+async fn rename_declines_on_a_table() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(
+        &core,
+        "rename.surql",
+        "DEFINE TABLE person SCHEMAFULL;\nSELECT * FROM person;\n",
+    )
+    .await;
+
+    let response = core
+        .prepare_rename(TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("rename.surql"),
+            },
+            position: Position::new(1, 15),
+        })
+        .await;
+
+    assert!(
+        response.is_none(),
+        "renaming a table is not supported, and offering it would be worse than not"
+    );
+}

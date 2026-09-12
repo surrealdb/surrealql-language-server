@@ -69,6 +69,28 @@ republishes every open buffer: a definition in the changed file may be exactly
 what their diagnostics depend on. A change on disk *under an open buffer* is
 ignored: the editor is the authority for text the user is editing.
 
+**References for tables and fields.** `textDocument/references` covered custom
+functions only, so asking "where else is this table used?" (the most common
+navigation question in a `.surql` workspace) returned an empty list. Tables are
+now indexed from the query facts that already carry token-tight ranges, and
+`includeDeclaration` adds the `DEFINE`. Fields are indexed where they are
+*written* (`UPDATE … SET email`); projections and `WHERE` predicates are not
+recorded by the extractor, and the README says so rather than implying more.
+
+**`textDocument/typeDefinition`.** Standing on a field declared
+`TYPE record<person>` and asking for its type takes you to `DEFINE TABLE person`,
+the one place the distinction from `definition` means something in SurrealQL.
+Declines when the answer is ambiguous (`record<a | b>`, or two tables declaring
+the same field name differently) rather than picking one.
+
+**`LocationLink` for go-to-definition**, when the client says it understands the
+form, so the editor underlines the token rather than guessing at its extent.
+
+Renaming a **table** or **field** remains declined, deliberately, and there is
+now a test pinning the decline: those names also appear in record-id literals,
+`RELATE` arrows and permission clauses the index does not cover, so a rename
+would miss occurrences and leave a workspace that parses and is wrong.
+
 **`positionEncoding: utf-16`** is now stated rather than left to be assumed.
 
 ### Performance

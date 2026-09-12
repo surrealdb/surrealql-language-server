@@ -53,6 +53,26 @@ impl MergedSemanticModel {
                         .push(reference.location.clone());
                 }
             }
+
+            // Tables and fields come from the query facts, which already carry
+            // token-tight ranges per name: the same ranges the diagnostics use,
+            // so a reference lands exactly where the squiggle would.
+            for fact in &analysis.query_facts {
+                for named in &fact.target_refs {
+                    model
+                        .table_references
+                        .entry(named.name.clone())
+                        .or_default()
+                        .push(Location::new(analysis.uri.clone(), named.range));
+                }
+                for named in &fact.field_refs {
+                    model
+                        .field_references
+                        .entry(named.name.clone())
+                        .or_default()
+                        .push(Location::new(analysis.uri.clone(), named.range));
+                }
+            }
         }
 
         model.reindex_target_usage();
@@ -1990,11 +2010,112 @@ impl MergedSemanticModel {
             })
     }
 
+    /// Where the *type* of `token` is defined.
+    ///
+    /// For SurrealQL that means one thing and it is worth having: a field
+    /// declared `TYPE record<person>` takes you to `DEFINE TABLE person`, not to
+    /// the field. `definition_for_token` already knew how to read a record type
+    /// out of a string: this lifts it into its own entry point and teaches it to
+    /// look a field's declared type up by name, which is what a cursor on a
+    /// field actually gives you.
+    pub fn type_definition_for_token(&self, token: &str) -> Option<Location> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let from_record_type = |type_expr: &TypeExpr| -> Option<Location> {
+            let mut found = type_expr.record_tables().into_iter().filter_map(|name| {
+                self.tables
+                    .get(&name)
+                    .filter(|table| table.origin == SymbolOrigin::Local)
+                    .map(|table| table.location.clone())
+            });
+            // Only when it is unambiguous: `record<a | b>` has two answers and
+            // picking one arbitrarily is worse than declining.
+            let first = found.next()?;
+            found.next().is_none().then_some(first)
+        };
+
+        // The cursor is on a type expression itself.
+        if let Some(location) = from_record_type(&TypeExpr::parse(trimmed)) {
+            return Some(location);
+        }
+
+        // The cursor is on a field. Take its declared type, and require every
+        // table that declares this field name to agree: otherwise the answer
+        // depends on which table the user meant, and nothing here knows.
+        let mut declared: Option<Location> = None;
+        for fields in self.fields.values() {
+            let Some(field) = fields.get(trimmed) else {
+                continue;
+            };
+            let Some(type_expr) = field.type_expr.as_ref() else {
+                continue;
+            };
+            match from_record_type(type_expr) {
+                Some(location) if declared.as_ref().is_none_or(|seen| *seen == location) => {
+                    declared = Some(location);
+                }
+                _ => return None,
+            }
+        }
+        declared
+    }
+
     pub fn references_for_function(&self, name: &str) -> Vec<Location> {
         self.function_references
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Every reference to `name`, whatever kind of thing it is.
+    ///
+    /// The three maps are searched rather than one being chosen, because the
+    /// cursor gives a bare word: `person` may be a table, and `fn::person` a
+    /// function, and nothing in the token says which the user meant. Returning
+    /// the union is both the honest answer and the useful one.
+    ///
+    /// `include_declaration` prepends the `DEFINE` that introduces the name, as
+    /// `ReferenceParams.context` asks.
+    pub fn references_for_name(&self, name: &str, include_declaration: bool) -> Vec<Location> {
+        let mut found: Vec<Location> = self
+            .function_references
+            .get(name)
+            .into_iter()
+            .chain(self.table_references.get(name))
+            .chain(self.field_references.get(name))
+            .flatten()
+            .cloned()
+            .collect();
+
+        if include_declaration {
+            if let Some(function) = self.functions.get(name) {
+                found.push(Location::new(
+                    function.location.uri.clone(),
+                    function.selection_range,
+                ));
+            }
+            if let Some(table) = self.tables.get(name).filter(|table| table.explicit) {
+                found.push(table.location.clone());
+            }
+            for fields in self.fields.values() {
+                if let Some(field) = fields.get(name) {
+                    found.push(field.location.clone());
+                }
+            }
+        }
+
+        found.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        found.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+        found
     }
 
     pub fn rename_edits(&self, name: &str, new_name: &str) -> Option<HashMap<Uri, Vec<TextEdit>>> {

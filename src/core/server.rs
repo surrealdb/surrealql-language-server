@@ -166,6 +166,9 @@ where
             }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             definition_provider: Some(OneOf::Left(true)),
+            // `record<person>` on a field is a real type-to-definition jump, and
+            // the one place the distinction from `definition` earns its keep.
+            type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
             rename_provider: Some(OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
@@ -985,8 +988,40 @@ where
         let token = token_at(&analysis.text, &analysis.line_index, position)?;
 
         let token = token.trim().to_string();
+        let target = model.definition_for_token(&token)?;
+
+        // A `LocationLink` carries the origin range as well as the target, so
+        // the editor underlines the token the user is on rather than guessing at
+        // its extent, and peek shows the right thing. Offered only to a client
+        // that said it understands the form.
+        if self.state.read().await.client.location_links {
+            let origin = word_range(&analysis.text, &analysis.line_index, position);
+            return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                origin_selection_range: origin,
+                target_uri: target.uri,
+                target_range: target.range,
+                target_selection_range: target.range,
+            }]));
+        }
+
+        Some(GotoDefinitionResponse::Scalar(target))
+    }
+
+    /// Where the *type* of the token under the cursor is defined.
+    ///
+    /// In SurrealQL that means a `record<…>`: standing on a field declared
+    /// `TYPE record<person>` and asking for its type definition takes you to
+    /// `DEFINE TABLE person`.
+    pub async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
+        let token = token_at(&analysis.text, &analysis.line_index, position)?;
         model
-            .definition_for_token(&token)
+            .type_definition_for_token(token.trim())
             .map(GotoDefinitionResponse::Scalar)
     }
 
@@ -999,7 +1034,10 @@ where
         let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
-        model.references_for_function(token.trim())
+        // Tables and fields, not only functions. "Where else is this table
+        // used?" is the most-asked navigation question in a `.surql` workspace,
+        // and the answer used to be an empty list.
+        model.references_for_name(token.trim(), params.context.include_declaration)
     }
 
     pub async fn prepare_rename(

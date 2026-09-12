@@ -409,6 +409,18 @@ pub struct MergedSemanticModel {
     pub accesses: HashMap<String, AccessDef>,
     pub analyzers: HashMap<String, AnalyzerDef>,
     pub function_references: HashMap<String, Vec<Location>>,
+    /// Every place a table is *named* by a query, keyed by table name.
+    ///
+    /// Built alongside `function_references` rather than scanned per request:
+    /// `references` for a table is the most-asked navigation question in a
+    /// `.surql` workspace, and it used to answer with nothing at all.
+    pub table_references: HashMap<String, Vec<Location>>,
+    /// Every place a field is named by a query, keyed by field name.
+    ///
+    /// Keyed by the bare name rather than by `table.field`, because that is what
+    /// the cursor gives: a user on `email` means every `email`, and narrowing to
+    /// one table would silently hide the rest.
+    pub field_references: HashMap<String, Vec<Location>>,
     pub function_callers: HashMap<String, Vec<String>>,
     /// The return type read out of a function *body*, for the functions that
     /// declare none. Keyed by full name, `fn::` prefix included.
