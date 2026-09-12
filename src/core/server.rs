@@ -1288,6 +1288,50 @@ where
         )
     }
 
+    /// Check one snippet of SurrealQL and return its diagnostics.
+    ///
+    /// For a host that wants an answer without speaking LSP: a browser
+    /// playground, the docs site, Surrealist validating the editor's contents.
+    /// Nothing is opened, nothing is published, nothing is remembered.
+    ///
+    /// Validated against the **current merged model**, not an empty one. That is
+    /// the difference between a useful answer and a useless one: against an
+    /// empty model every real table in the snippet reports `unknown-table`.
+    ///
+    /// `params` names variables the caller binds at run time, exactly as
+    /// `check --param` and `analysis.externalParams` do, so a snippet using
+    /// `$id` is not told the variable is undefined.
+    ///
+    /// The diagnostics are the same objects the LSP publishes and `check`
+    /// prints: same codes, same `data` hints, same `codeDescription` links.
+    /// There is deliberately no second analysis path to disagree with.
+    pub async fn validate_text(&self, text: &str, params: Vec<String>) -> Vec<Diagnostic> {
+        let (model, settings, limit, max_bytes) = {
+            let state = self.state.read().await;
+            (
+                Arc::clone(&state.model),
+                Arc::clone(&state.settings),
+                state.settings.analysis.max_syntax_diagnostics,
+                state.settings.analysis.max_document_bytes,
+            )
+        };
+
+        // A URI no document uses, so a snippet cannot collide with, or be
+        // mistaken for, an open buffer.
+        let Ok(uri) = "file:///surrealql/validate".parse::<Uri>() else {
+            return Vec::new();
+        };
+        let Some(analysis) =
+            analyze_document_incremental(uri, text, SymbolOrigin::Local, limit, max_bytes, None)
+        else {
+            return Vec::new();
+        };
+
+        let mut settings = (*settings).clone();
+        settings.analysis.external_params.extend(params);
+        model.document_diagnostics(&analysis, &settings)
+    }
+
     /// Answer a diagnostic *pull*.
     ///
     /// The same set `publish_diagnostics_for_uri` would have pushed: there is

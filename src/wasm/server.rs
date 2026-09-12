@@ -134,6 +134,41 @@ impl WasmLanguageServer {
         Ok(())
     }
 
+    /// Check one snippet and return its diagnostics, without opening a document.
+    ///
+    /// ```js
+    /// const problems = await server.validateQuery("SELECT * FROM persn;");
+    /// const bound = await server.validateQuery("SELECT * FROM p WHERE id = $id;", ["id"]);
+    /// ```
+    ///
+    /// Returns LSP `Diagnostic` objects: the same ones `handleMessage` would
+    /// publish, with the same stable codes, `data` hints and documentation
+    /// links, so a host can render them with whatever it already uses.
+    ///
+    /// Checked against the workspace the host has pushed, so tables defined in
+    /// `pushWorkspaceDocument` or `setLiveMetadata` are known. `params` names
+    /// variables the caller binds at run time, so a snippet using `$id` is not
+    /// told the variable is undefined.
+    #[wasm_bindgen(js_name = validateQuery)]
+    pub async fn validate_query(&self, text: String, params: JsValue) -> Result<JsValue, JsValue> {
+        // Absent or null means no bound variables, which is the common case;
+        // only a value that is present and not a string array is an error.
+        let params: Vec<String> = if params.is_undefined() || params.is_null() {
+            Vec::new()
+        } else {
+            serde_wasm_bindgen::from_value(params).map_err(|error| {
+                JsValue::from_str(&format!(
+                    "validateQuery: `params` must be an array of strings: {error}"
+                ))
+            })?
+        };
+
+        let diagnostics = self.core.validate_text(&text, params).await;
+        serde_wasm_bindgen::to_value(&diagnostics).map_err(|error| {
+            JsValue::from_str(&format!("could not serialise diagnostics: {error}"))
+        })
+    }
+
     /// Replace the live SurrealDB metadata snapshot from a JS-supplied
     /// list of `DEFINE …` strings (typically the result of running
     /// `INFO FOR DB` / `INFO FOR TABLE` from the host's existing

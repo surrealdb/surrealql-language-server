@@ -4056,3 +4056,91 @@ async fn rename_declines_on_a_table() {
         "renaming a table is not supported, and offering it would be worse than not"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// One-shot validation
+// ──────────────────────────────────────────────────────────────────────
+
+/// The logic behind the browser's `validateQuery`, tested here because CI does
+/// not build wasm on the pull-request path: a wasm-only implementation would
+/// have no coverage at all.
+#[tokio::test]
+async fn validate_text_checks_a_snippet_against_the_workspace() {
+    let mut workspace = surrealql_language_server::semantic::types::WorkspaceIndex::default();
+    let schema_uri = uri("schema.surql");
+    let analysis = surrealql_language_server::semantic::analyzer::analyze_document(
+        schema_uri.clone(),
+        "DEFINE TABLE person SCHEMAFULL;",
+        surrealql_language_server::semantic::types::SymbolOrigin::Local,
+    )
+    .expect("analysed");
+    workspace
+        .documents
+        .insert(schema_uri, std::sync::Arc::new(analysis));
+
+    let (core, notifier, _) = common::core_with(workspace, Default::default());
+    core.apply_settings(ServerSettings::default()).await;
+    let published_before = notifier.published().len();
+
+    // A typo of a table the workspace defines. Against an *empty* model this
+    // would say nothing useful, which is why the model matters.
+    let problems = core.validate_text("SELECT * FROM persn;", Vec::new()).await;
+    assert!(
+        problems.iter().any(|d| has_code(d, "unknown-table")),
+        "a snippet must be checked against the pushed workspace: {problems:?}"
+    );
+
+    // Nothing is opened, published or remembered.
+    assert_eq!(
+        notifier.published().len(),
+        published_before,
+        "validation must not publish"
+    );
+    assert!(
+        core.buffer_snapshot(&uri("validate")).is_none(),
+        "validation must not open a document"
+    );
+}
+
+/// A caller-bound variable is declared, not reported: the same contract
+/// `check --param` and `analysis.externalParams` have.
+#[tokio::test]
+async fn validate_text_accepts_caller_bound_variables() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(ServerSettings::default()).await;
+
+    let without = core
+        .validate_text("SELECT * FROM person WHERE id = $id;", Vec::new())
+        .await;
+    assert!(
+        without.iter().any(|d| has_code(d, "undefined-variable")),
+        "an unbound variable is a real problem: {without:?}"
+    );
+
+    let with = core
+        .validate_text(
+            "SELECT * FROM person WHERE id = $id;",
+            vec!["id".to_string()],
+        )
+        .await;
+    assert!(
+        !with.iter().any(|d| has_code(d, "undefined-variable")),
+        "a declared variable must not be reported: {with:?}"
+    );
+}
+
+/// The diagnostics are the same objects the LSP publishes, links included.
+#[tokio::test]
+async fn validate_text_returns_the_same_diagnostics_the_server_publishes() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    let snippet = "RETURN type::thing('person', '1');";
+    let validated = core.validate_text(snippet, Vec::new()).await;
+    assert_eq!(validated.len(), 1);
+    assert!(has_code(&validated[0], "renamed-function"));
+    assert!(
+        validated[0].code_description.is_some(),
+        "a one-shot check must carry the documentation link too"
+    );
+}

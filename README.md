@@ -104,6 +104,20 @@ await init({ module_or_path: wasmCode });
 const server = new WasmLanguageServer({ /* callbacks */ });
 ```
 
+Besides `handleMessage`, which speaks LSP, there is a one-shot check for hosts
+that only want an answer:
+
+```ts
+const problems = await server.validateQuery("SELECT * FROM persn;");
+const bound = await server.validateQuery("SELECT * FROM p WHERE id = $id;", ["id"]);
+```
+
+It returns LSP `Diagnostic` objects (the same ones `handleMessage` publishes,
+with the same stable codes, `data` hints and documentation links) checked
+against whatever the host pushed via `pushWorkspaceDocument` / `setLiveMetadata`,
+and it neither opens a document nor publishes anything. The second argument
+names variables the caller binds at run time.
+
 The `./surrealql_language_server_bg.wasm` export is declared in `pkg/package.json` for bundlers that resolve deep imports.
 
 ## Testing

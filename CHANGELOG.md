@@ -47,6 +47,14 @@ rather than leaving them to look as though they work.
 
 ### Added
 
+**`validateQuery(text, params?)` on the browser build.** A one-shot check for a
+host that wants an answer without speaking LSP: a playground, the docs site,
+Surrealist validating an editor's contents. It returns the same `Diagnostic`
+objects the server publishes, checked against whatever workspace the host has
+pushed rather than against an empty model (which would report every real table
+as unknown), and opens nothing. The logic lives in the core, not the wasm shim,
+so it is covered by tests that run on the pull-request path.
+
 **`surrealql-language-server schema`** prints what a workspace defines
 (tables, fields and types, permissions, indexes, events and functions) from the
 same merged model the editor uses, and without connecting to a database. An
