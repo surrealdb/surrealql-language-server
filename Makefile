@@ -8,9 +8,12 @@
 # `make grammar` once to fetch it before building.
 #
 # The builtin catalogue targets need a SurrealDB checkout instead, at the
-# revision `src/grammar_generated.rs` records. They do not need the grammar:
-# `cargo run --package xtask` never builds the root package, so build.rs does
-# not run. Override the path with `make builtins SURREALDB=/path/to/surrealdb`.
+# revision `surrealdb.pin` names: `bash scripts/setup-surrealdb.sh` fetches it.
+# A checkout at any *other* revision will regenerate a catalogue describing a
+# different engine, so `builtins-check` reports it stale and is right to. They do
+# not need the grammar: `cargo run --package xtask` never builds the root
+# package, so build.rs does not run. Override the path with
+# `make builtins SURREALDB=/path/to/surrealdb`.
 
 CARGO       ?= cargo
 SURREALDB   ?= ../surrealdb
