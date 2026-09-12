@@ -1637,16 +1637,42 @@ fn head_slot_items(
     items
 }
 
+/// The folders to index, from whichever of the three `initialize` fields the
+/// client filled in.
+///
+/// `workspaceFolders` is the modern one and what most clients send. The other
+/// two are deprecated but still in wide use (eglot and a number of minimal
+/// clients send `rootUri` alone), and reading only the first meant such a client
+/// got **no workspace schema at all**, silently: every cross-file table came
+/// back undefined and nothing said why.
+#[allow(deprecated)] // root_uri and root_path are how some clients still speak.
 fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
-    params
-        .workspace_folders
+    if let Some(folders) = params.workspace_folders.as_ref()
+        && !folders.is_empty()
+    {
+        let resolved: Vec<PathBuf> = folders
+            .iter()
+            .filter_map(|folder| folder.uri.to_file_path().map(|path| path.into_owned()))
+            .collect();
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+
+    if let Some(root) = params
+        .root_uri
         .as_ref()
-        .map(|folders| {
-            folders
-                .iter()
-                .filter_map(|folder| folder.uri.to_file_path().map(|p| p.into_owned()))
-                .collect()
-        })
+        .and_then(|uri| uri.to_file_path())
+        .map(|path| path.into_owned())
+    {
+        return vec![root];
+    }
+
+    // The oldest spelling, a plain path rather than a URI.
+    params
+        .root_path
+        .as_ref()
+        .map(|path| vec![PathBuf::from(path)])
         .unwrap_or_default()
 }
 

@@ -31,6 +31,22 @@ stale, and the buffer showed whatever it looked like when it was opened. The
 mark is now removed on close and replaced on open, which the LSP says is
 authoritative.
 
+**A client that sends only `rootUri` gets a workspace.** `resolve_workspace_folders`
+read `workspaceFolders` and nothing else, so a client using the deprecated
+(but still common) `rootUri` or `rootPath` indexed no files at all: every
+cross-file table came back undefined with nothing to explain it.
+
+### Documentation
+
+The README documented 5 of about 20 settings. It now covers the whole
+`connection.*` block and the six `SURREALDB_*` environment fallbacks,
+`metadata.*`, `authContexts` / `activeAuthContext`,
+`analysis.diagnosticDebounceMs`, all four ways settings arrive, and (under a
+heading of their own) the two keys that are accepted and not yet implemented,
+rather than leaving them to look as though they work.
+
+### Fixed
+
 **Signature help counts the right argument.** The active parameter was "every
 comma after the last `(`", so `math::max([1, 2, 3], ` reported argument 4 instead
 of 2, and a comma inside a string literal counted as an argument separator. The

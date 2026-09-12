@@ -178,10 +178,16 @@ The server communicates over `stdio` and works with any LSP-compatible editor.
 
 ### Settings
 
-Settings arrive via `initializationOptions` or `workspace/didChangeConfiguration`,
-either under a `surrealql` key or at the root. Every key accepts both `camelCase`
+Settings arrive four ways: `initializationOptions` on `initialize`, a
+`workspace/configuration` pull (which a `null` `didChangeConfiguration` payload
+asks for), a `workspace/didChangeConfiguration` push, and (for the CLI)
+`check --config file.json`, which accepts the same JSON. Either under a
+`surrealql` key or at the root. Every key accepts both `camelCase`
 and `snake_case`. An unknown key is reported through `window/logMessage` with a
 did-you-mean suggestion rather than ignored.
+
+A **partial** payload (which is what an editor sends when one setting changes)
+only changes what it names. Keys it omits keep the values already in force.
 
 #### `analysis.schemalessDiagnostics`
 
@@ -233,7 +239,64 @@ open.
 | --- | --- | --- |
 | `analysis.enableTypeChecking` | `true` | Turns off the whole type pass: `argument-type`, `argument-count`, `let-type`, `return-type`, `operator-type`, `unknown-method`, `undefined-variable`, `field-type`, `renamed-function`, `not-callable`. `unknown-type` survives — it is a syntax fault. |
 | `analysis.enablePermissionAnalysis` | `true` | Turns off `permission-denied` and `permission-unknown` on every table. |
+| `analysis.enableCodeActions` | `true` | Stops offering quick fixes and refactors entirely. |
 | `analysis.externalParams` | `[]` | Not a toggle: names the variables your caller binds at runtime (`db.query(sql).bind(("id", id))`, or Surrealist's variables panel) so `undefined-variable` does not flag them. |
+| `analysis.diagnosticDebounceMs` | `200` | Not a toggle: how long a burst of keystrokes must settle before the document is re-analysed. `0` analyses every change. |
+
+#### Connecting to a database
+
+Live schema from a running SurrealDB, merged with whatever the workspace's
+`.surql` files define. Every key is optional, and **`check` never connects**:
+these affect the editor only.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `connection.endpoint` | none | `ws://localhost:8000` or `http://…`. Nothing is fetched without it. |
+| `connection.namespace` / `connection.database` | none | Selected after signing in. Also required for database-scoped credentials. |
+| `connection.username` / `connection.password` | none | Tried as root first, then as database credentials. |
+| `connection.token` | none | A bearer token, tried before username/password. |
+| `connection.access` | none | **Accepted but not yet used.** Record/scope access is not wired into sign-in; the three routes above are what authenticate today. |
+
+Each of the six may also come from the environment:
+`SURREALDB_ENDPOINT`, `SURREALDB_NAMESPACE`, `SURREALDB_DATABASE`,
+`SURREALDB_USERNAME`, `SURREALDB_PASSWORD`, `SURREALDB_TOKEN`, which is the
+easier route for a shared machine. A value in the settings wins over the
+environment. There is no `SURREALDB_ACCESS`.
+
+#### `metadata.*`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `metadata.mode` | `workspace+db` | Where schema comes from. `workspace` / `filesystem` reads only `.surql` files; `db` / `remote` reads only the live database; `both` / `workspace+db` reads both. An unknown value warns and falls back to the default. |
+| `metadata.enableLiveMetadata` | `true` | Turns off the database fetch without clearing the connection settings. Ignored by the browser build, which has no connection of its own. |
+| `metadata.refreshOnSave` | `true` | Re-fetches live schema on every `didSave`. |
+
+#### `authContexts` / `activeAuthContext`
+
+What the permission analysis assumes about who is running the query. Each context
+has a `name`, a list of `roles`, and optionally an `authRecord` plus free-form
+`claims`, `session` and `variables` objects. The default is a single `viewer`
+context with the `viewer` role. `activeAuthContext` names the one in force; an
+unknown name warns and the first context is used.
+
+```jsonc
+{ "surrealql": {
+    "authContexts": [
+      { "name": "viewer", "roles": ["viewer"] },
+      { "name": "owner", "roles": ["owner"], "authRecord": "user:me" }
+    ],
+    "activeAuthContext": "owner"
+} }
+```
+
+#### Accepted but not yet implemented
+
+Two keys parse and validate, and are read by nothing. They are listed here rather
+than removed because clients already send them:
+
+- `connection.access`: see the connection table above.
+- `analysis.enableAggressiveSchemaInference`: tables inferred from usage always
+  count toward the model; setting this to `false` does not change that.
 
 ## Using with AI agents
 

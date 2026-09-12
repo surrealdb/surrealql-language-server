@@ -2892,3 +2892,57 @@ async fn highlighting_an_unrelated_token_finds_nothing() {
     open(&core, "none.surql", "SELECT * FROM person;\n").await;
     assert!(highlights_at(&core, "none.surql", 0, 0).await.is_empty());
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Workspace roots, from whichever field the client filled in
+// ──────────────────────────────────────────────────────────────────────
+
+/// The folders the server decided to index, read back through the loader it
+/// asked to walk them.
+async fn indexed_roots(params: InitializeParams) -> Vec<std::path::PathBuf> {
+    let (core, _notifier, _, loader) =
+        common::core_with_loader(Default::default(), Default::default());
+    core.initialize(params).await;
+    core.initialized().await;
+    loader.folders.lock().unwrap().clone()
+}
+
+/// `rootUri` is deprecated but still what eglot and several minimal clients
+/// send, and reading only `workspaceFolders` meant such a client silently got
+/// **no** workspace schema: every cross-file table came back undefined with
+/// nothing to explain it.
+#[tokio::test]
+async fn a_client_that_sends_only_root_uri_still_gets_a_workspace() {
+    #[allow(deprecated)]
+    let params = InitializeParams {
+        root_uri: Some(uri_for_dir("/tmp/surql-root-uri")),
+        ..InitializeParams::default()
+    };
+    assert_eq!(
+        indexed_roots(params).await,
+        vec![std::path::PathBuf::from("/tmp/surql-root-uri")],
+    );
+}
+
+/// `workspaceFolders` still wins when both are present.
+#[tokio::test]
+async fn workspace_folders_take_precedence_over_root_uri() {
+    #[allow(deprecated)]
+    let params = InitializeParams {
+        root_uri: Some(uri_for_dir("/tmp/surql-old")),
+        workspace_folders: Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: uri_for_dir("/tmp/surql-new"),
+            name: "new".to_string(),
+        }]),
+        ..InitializeParams::default()
+    };
+    assert_eq!(
+        indexed_roots(params).await,
+        vec![std::path::PathBuf::from("/tmp/surql-new")],
+    );
+}
+
+fn uri_for_dir(path: &str) -> tower_lsp_server::ls_types::Uri {
+    use std::str::FromStr as _;
+    tower_lsp_server::ls_types::Uri::from_str(&format!("file://{path}")).expect("valid file uri")
+}
