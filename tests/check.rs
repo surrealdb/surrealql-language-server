@@ -41,6 +41,16 @@ fn run_check(cwd: &Path, args: &[&str]) -> Output {
         .expect("spawn check")
 }
 
+/// Run the binary with no implied subcommand, for `schema` and anything else
+/// that is not part of `check`.
+fn run_cli(cwd: &Path, args: &[&str]) -> Output {
+    Command::new(binary())
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("spawn")
+}
+
 fn exit_code(output: &Output) -> i32 {
     output.status.code().expect("exit code")
 }
@@ -549,4 +559,106 @@ fn fix_refuses_any_code_but_the_mechanical_one() {
         "SELECT * FROM persn;\n",
         "a refused fix must not touch the file"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// schema export
+// ──────────────────────────────────────────────────────────────────────
+
+fn schema_fixture(dir: &Path) -> PathBuf {
+    write(
+        dir,
+        "schema.surql",
+        "-- People who can sign in.\n\
+         DEFINE TABLE person SCHEMAFULL PERMISSIONS FOR select FULL;\n\
+         DEFINE FIELD name ON person TYPE string;\n\
+         DEFINE FIELD email ON person TYPE option<string>;\n\
+         DEFINE INDEX email_unique ON person FIELDS email UNIQUE;\n\
+         DEFINE FUNCTION fn::greet($who: string) -> string { RETURN 'hi'; };\n",
+    )
+}
+
+/// The LLM form is SurrealQL-shaped, because that is the form a model has seen
+/// most of, and denser than JSON, which matters when it goes into a prompt.
+#[test]
+fn schema_llm_output_reads_as_ddl() {
+    let dir = scratch("schema-llm");
+    schema_fixture(&dir);
+
+    let output = run_cli(&dir, &["schema", dir.to_str().expect("utf8")]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("DEFINE TABLE person SCHEMAFULL;"));
+    assert!(stdout.contains("DEFINE FIELD name ON person TYPE string;"));
+    assert!(stdout.contains("DEFINE FIELD email ON person TYPE option<string>;"));
+    assert!(
+        stdout.contains("PERMISSIONS FOR select FULL"),
+        "permissions are the thing most likely to make a generated query fail: {stdout}"
+    );
+    assert!(
+        stdout.contains("DEFINE FUNCTION fn::greet($who: string) -> string"),
+        "a parameter must carry exactly one `$`: {stdout}"
+    );
+    assert!(
+        stdout.contains("-- People who can sign in."),
+        "a table's comment is context worth keeping: {stdout}"
+    );
+}
+
+/// The JSON form is a compatibility surface, versioned from the first release so
+/// a consumer can branch rather than sniff.
+#[test]
+fn schema_json_output_is_versioned_and_shaped() {
+    let dir = scratch("schema-json");
+    schema_fixture(&dir);
+
+    let output = run_cli(
+        &dir,
+        &["schema", dir.to_str().expect("utf8"), "--format", "json"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON object");
+
+    assert_eq!(report["schemaVersion"], 1);
+    assert!(report["version"].is_string());
+
+    let person = report["tables"]
+        .as_array()
+        .expect("tables")
+        .iter()
+        .find(|table| table["name"] == "person")
+        .expect("person");
+    assert_eq!(person["schemaMode"], "schemafull");
+    assert_eq!(person["explicit"], true);
+    assert_eq!(person["indexes"][0], "email_unique");
+
+    let email = person["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .find(|field| field["name"] == "email")
+        .expect("email");
+    assert_eq!(email["type"], "option<string>");
+    assert_eq!(email["explicit"], true);
+
+    let greet = report["functions"]
+        .as_array()
+        .expect("functions")
+        .iter()
+        .find(|function| function["name"] == "fn::greet")
+        .expect("greet");
+    assert_eq!(greet["parameters"][0], "$who: string");
+    assert_eq!(greet["returns"], "string");
+}
+
+/// Nothing readable is exit 2, not an empty schema that looks like an answer.
+#[test]
+fn schema_reports_when_there_is_nothing_to_read() {
+    let dir = scratch("schema-empty");
+    let output = run_cli(&dir, &["schema", dir.to_str().expect("utf8")]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no readable"));
 }

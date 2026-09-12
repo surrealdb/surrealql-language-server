@@ -20,6 +20,8 @@ Commands:
   (none) | --stdio   Serve the Language Server Protocol over stdio.
   check              Check .surql files and report diagnostics
                      (see `check --help`).
+  schema             Print the schema the workspace defines, for a person
+                     or a model to read (see `schema --help`).
 
 Options:
   -V, --version      Print the version and build revision.
@@ -31,7 +33,7 @@ async fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
     use surrealql_language_server::core::server::build_version;
-    use surrealql_language_server::native::{Backend, check};
+    use surrealql_language_server::native::{Backend, check, schema};
     use tower_lsp_server::{LspService, Server};
 
     // The release profile aborts on panic, so this hook is the only
@@ -54,6 +56,18 @@ async fn main() -> std::process::ExitCode {
             Server::new(stdin, stdout, socket).serve(service).await;
             ExitCode::SUCCESS
         }
+        Some("schema") => match schema::parse_args(args) {
+            Ok(schema::Parsed::Run(options)) => schema::run(options).await,
+            Ok(schema::Parsed::Help) => {
+                println!("{}", schema::USAGE);
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("error: {message}");
+                eprintln!("{}", schema::USAGE);
+                ExitCode::from(2)
+            }
+        },
         Some("check") => match check::parse_args(args) {
             Ok(check::Parsed::Run(options)) => check::run(options).await,
             Ok(check::Parsed::Help) => {

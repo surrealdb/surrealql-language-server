@@ -358,6 +358,14 @@ plus a `summary`, the `scan` losses, and the `exitCode`:
 }
 ```
 
+Hand a model the schema before it writes anything, rather than letting it guess
+and correcting afterwards:
+
+```bash
+surrealql-language-server schema schema/              # DDL-shaped, for a prompt
+surrealql-language-server schema schema/ --format json
+```
+
 [`AGENTS.md`](AGENTS.md) is the agent-facing contract: the check loop, the
 diagnostic-code table, and the known grammar gaps an agent must not "fix".
 [`llms.txt`](llms.txt) indexes the machine-consumable resources, including

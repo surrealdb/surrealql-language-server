@@ -17,6 +17,9 @@ surfaces built for machines:
   accepts (signatures, return types, arity, renames, method receivers),
   generated from the engine's own source. Use it instead of guessing a
   function's shape.
+- **`surrealql-language-server schema`**: the tables, fields, types,
+  permissions, indexes and functions a workspace defines. Read it *before*
+  writing a query rather than discovering the schema from `check` afterwards.
 
 The opportunity map behind both is [`docs/ai-plan.md`](docs/ai-plan.md).
 
@@ -88,6 +91,28 @@ Facts a machine consumer must know:
   no `error` key at all. Never treat empty stdout as a result.
 - **`check` never connects to a database.** `SURREALDB_ENDPOINT` has no
   effect on it.
+
+## Reading the schema
+
+```bash
+surrealql-language-server schema schema/            # SurrealQL-shaped, for a prompt
+surrealql-language-server schema schema/ --format json
+```
+
+The default format is DDL-shaped prose, which is both denser than JSON and the
+form a model has seen most of. It marks two things worth noticing:
+
+- a table or field with `-- inferred` was **not defined anywhere**: it is what
+  the queries imply, not a promise about what exists;
+- a table's `PERMISSIONS` clause is printed, because it is the thing most likely
+  to make a syntactically perfect query fail at run time.
+
+`--format json` is a compatibility surface: `schemaVersion` is `1`, the field
+shape is pinned by [`tests/compat.rs`](tests/compat.rs), and changes to it are
+additive. Exit 2 means nothing readable was found: never an empty schema that
+looks like an answer.
+
+Like `check`, `schema` never connects to a database.
 
 ## Diagnostic codes
 

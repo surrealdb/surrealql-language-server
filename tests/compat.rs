@@ -696,3 +696,77 @@ fn documented_codes_match_the_agent_guide() {
         );
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// The schema report shape
+// ──────────────────────────────────────────────────────────────────────
+
+/// `schema --format json` is a compatibility surface from its first release,
+/// like `builtins.json` and the check report. Pinned here on day one rather
+/// than after the first consumer discovers a change.
+///
+/// Additive changes only. `schemaVersion` moves if that ever stops being
+/// possible, which is what it is for.
+#[test]
+fn schema_json_shape_golden() {
+    use surrealql_language_server::native::schema;
+
+    let report = schema::SchemaReport {
+        schema_version: 1,
+        version: "0.0.0 (test)".to_string(),
+        tables: vec![schema::TableReport {
+            name: "person".to_string(),
+            schema_mode: Some("schemafull".to_string()),
+            explicit: true,
+            comment: Some("People.".to_string()),
+            fields: vec![schema::FieldReport {
+                name: "email".to_string(),
+                r#type: Some("option<string>".to_string()),
+                explicit: true,
+                comment: None,
+            }],
+            permissions: vec!["PERMISSIONS FOR select FULL".to_string()],
+            indexes: vec!["email_unique".to_string()],
+            events: Vec::new(),
+        }],
+        functions: vec![schema::FunctionReport {
+            name: "fn::greet".to_string(),
+            parameters: vec!["$who: string".to_string()],
+            returns: Some("string".to_string()),
+            comment: None,
+        }],
+        params: Vec::new(),
+    };
+
+    assert_eq!(
+        serde_json::to_value(&report).expect("serializable"),
+        json!({
+            "schemaVersion": 1,
+            "version": "0.0.0 (test)",
+            "tables": [{
+                "name": "person",
+                "schemaMode": "schemafull",
+                // Whether the table was *defined* or merely inferred from a
+                // query. An agent writing against an inferred table is writing
+                // against a guess, and has to be able to tell.
+                "explicit": true,
+                "comment": "People.",
+                "fields": [{
+                    "name": "email",
+                    "type": "option<string>",
+                    "explicit": true,
+                }],
+                "permissions": ["PERMISSIONS FOR select FULL"],
+                "indexes": ["email_unique"],
+            }],
+            "functions": [{
+                "name": "fn::greet",
+                "parameters": ["$who: string"],
+                "returns": "string",
+            }],
+            "params": [],
+        }),
+        "the schema report shape changed: additive changes only, and bump \
+         schemaVersion if it cannot be additive"
+    );
+}

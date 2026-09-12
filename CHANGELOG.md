@@ -47,6 +47,20 @@ rather than leaving them to look as though they work.
 
 ### Added
 
+**`surrealql-language-server schema`** prints what a workspace defines
+(tables, fields and types, permissions, indexes, events and functions) from the
+same merged model the editor uses, and without connecting to a database. An
+agent writing against an unfamiliar schema invents names because nothing tells
+it what exists; this is the answer before the fact rather than `check`
+correcting it afterwards.
+
+The default format is SurrealQL-shaped prose, which is denser than JSON and the
+form a model has seen most of. It marks tables and fields that were *inferred
+from queries* rather than defined, and prints `PERMISSIONS` clauses, which are
+the thing most likely to make a syntactically perfect query fail at run time.
+`--format json` is a compatibility surface with `schemaVersion: 1`, pinned by a
+golden from its first release.
+
 **Every diagnostic links to its explanation.** `codeDescription.href` points at a
 new [`docs/diagnostics.md`](docs/diagnostics.md), one section per code: what it
 means, why SurrealDB refuses the query, and what fixing it looks like. Attached
