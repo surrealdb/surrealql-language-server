@@ -4,6 +4,96 @@
 
 ### Fixed
 
+**The reusable parse tree is kept by version, not by byte count.** A completed
+analysis recorded its tree as the base for the next parse whenever the buffer's
+text was the same *length*, which calls an overtype, or replacing a selection
+with the same number of characters, "unchanged". `didOpen` skipped the
+supersession check entirely, so an edit landing while the open-time analysis ran
+passed both tests. The tree then described text the buffer no longer held, with
+no `tree_sitter::Tree::edit` recorded for the edit, and the next reparse fed
+tree-sitter byte ranges into text that no longer existed. The comparison is now
+the buffer's version, read inside the same lock that stores the tree, which also
+closes the window between checking and storing.
+
+**A pulling client is told when the answer moves.** `diagnosticProvider` is
+advertised with `interFileDependencies: true` and push is suppressed for clients
+that pull, but nothing ever sent `workspace/diagnostic/refresh`. Editing a
+`DEFINE TABLE` in one file left every other open file showing diagnostics
+computed against the schema before the edit, and a pull issued right after a
+keystroke got the pre-edit analysis with nothing to prompt a re-pull once the
+new one landed. Under push, `republish_open_diagnostics` had always handled
+this. Both paths now refresh instead, for clients that declare `refreshSupport`.
+`republish_open_diagnostics` was also pushing to pulling clients on the
+configuration and watched-file paths, which is the duplicate-squiggle case the
+suppression exists to prevent.
+
+**Out-of-range positions clamp instead of wedging the buffer.** The protocol
+says a line past the end of the document is the document's line count and a
+character past the end of its line is that line's length; `{line: 999999,
+character: 0}` is a normal way for a client to say "the end". Refusing one
+desynchronised the buffer and refused every later ranged edit, so the file's
+diagnostics froze for the rest of the session. Desync is now reserved for a
+change that cannot be interpreted at all, and it reports itself **in the
+document** as `buffer-desynced` rather than only in the output channel, since a
+user whose squiggles have stopped moving has no reason to read a log.
+
+**`textDocument/selectionRange` answers one chain per requested position.** The
+response array has to correspond one-to-one with the request's positions.
+Dropping a position that resolved to nothing handed every later cursor the
+previous one's chain, so a multi-cursor expand-selection jumped to the wrong
+place. A position with no chain now answers with an empty range at itself.
+
+**References to a field stay on the table the cursor names.** Field references
+were keyed by the bare word, so "find all references" on `person`'s `name`
+answered with `company`'s and `product`'s too, plus every `DEFINE FIELD name ON
+…` in the workspace. A query fact already knows which table it targets, so the
+index now also carries the qualified key and the handler asks for it first,
+falling back to the union only when the statement does not say which table it
+means.
+
+**The analyzer's refusals no longer report as `parse`.** A document over
+`analysis.maxDocumentBytes`, and one nesting past the depth cap, both reported
+under `parse` while the contract told agents every `parse` is a real syntax
+error. They now carry `document-too-large` and `too-deeply-nested`, which are
+also filterable on their own with `--only` and `--ignore`.
+
+**`check explain` honours `--format json`,** on either side of the code, and
+follows the same rule as the rest of `check`: exactly one JSON object on stdout
+for every exit code. An unknown code answers with an `error` object, the known
+codes, and exit 2.
+
+**`check --fix` writes atomically and reports against the repaired workspace.**
+`fs::write` truncates before it writes, so an interrupted run left a truncated
+`.surql` and no copy of what it held; the replacement is now a complete
+temporary file renamed over the original. Repairs also happen in their own pass
+before anything is reported, so the model each file is judged against is built
+from the repaired text rather than from the workspace as it was when the run
+started.
+
+**`mcp` re-reads the workspace before every tool that answers from the schema,**
+and takes the same `--config` as `check`. The context was loaded once at
+startup, so an agent that wrote a `DEFINE TABLE` and then asked `get_schema`
+what the schema was got the answer from before its own edit, and
+`validate_surrealql` judged every query against default settings whatever the
+project's config said.
+
+### Changed
+
+- `Diagnostic.codeDescription` points at this build's own `v<version>` tag
+  rather than at `master`, so the prose a user is sent to matches the binary
+  they are running.
+- The packaging `exclude` list drops all of `docs/**` and names the one file the
+  crate needs, instead of listing files to drop one at a time, so a doc added
+  later does not ship by default.
+- `release`, `wasm` and `builtins` are gated on `wasm-check` as well as on the
+  test job. The npm package *is* the wasm build, so a wasm-only break could
+  otherwise still reach a tag.
+- Splicing an edit into a buffer no longer builds a second `LineIndex` to find
+  where the edit ended: it is derived from the replacement's own bytes and
+  newlines, which halves the full-buffer scans per keystroke.
+- `scripts/setup-grammar.sh` names the branch it is detaching from, so committed
+  but unpushed work in the grammar checkout does not look lost.
+
 **Deeply nested input no longer kills the server.** A `didOpen` carrying
 `RETURN` and six thousand nested parentheses (a 12 KB file) aborted the
 process with `thread 'tokio-rt-worker' has overflowed its stack`. Around forty

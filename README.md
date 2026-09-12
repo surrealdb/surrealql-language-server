@@ -11,7 +11,9 @@ A Language Server Protocol (LSP) implementation for [SurrealQL](https://surreald
 - Go-to definition for tables, fields, functions and params, and go-to type
   definition through a `record<…>` to the table it names
 - References for tables and functions; for fields, the places that *write* them
-  (`UPDATE … SET email`): projections and `WHERE` predicates are not indexed
+  (`UPDATE … SET email`), narrowed to the table the statement under the cursor
+  names, so one table's `name` does not answer with every table's. Projections
+  and `WHERE` predicates are not indexed
 - Safe rename of local function definitions. Renaming a **table** or **field**
   is declined on purpose: those names also appear in record-id literals,
   `RELATE` arrows, permission clauses and strings that the index does not cover,
@@ -382,6 +384,11 @@ Five tools (`validate_surrealql`, `get_schema`, `lookup_function`,
 `search_functions`, `explain_diagnostic`) over stdio, each backed by the same
 analysis the editor runs. No database connection, and no extra dependency: MCP
 is JSON-RPC 2.0 with a small method set, so it is implemented directly.
+
+`--config <file>` takes the same settings file `check --config` does. The
+workspace is re-read before every tool that answers from the schema, so an agent
+that writes a `DEFINE TABLE` and then asks `get_schema` what the schema is gets
+the one it just wrote.
 
 Hand a model the schema before it writes anything, rather than letting it guess
 and correcting afterwards:
