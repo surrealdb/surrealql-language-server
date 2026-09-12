@@ -158,6 +158,70 @@ D1 and D2 are done. D3, D4 and D5 are not — see the entries in
 
 ---
 
+# Against master (0.7)
+
+Both branches measured on the same machine with the same harness (`benches/latency.rs`
+is byte-identical between them) each in its own shipped configuration: master on
+grammar `cb2e6b5` at `opt-level = 'z'`, this branch on `373e7cd` at `opt-level = 3`.
+
+| Operation | master | this branch | change |
+|-----------|--------|-------------|--------|
+| `analyze_document`, 3200 lines | 47.57 ms | **30.77 ms** | 1.55x |
+| `analyze_document/schema`, 3200 lines | 27.28 ms | **16.37 ms** | 1.67x |
+| `semantic_tokens_full`, 3200 lines | 10.21 ms | **6.57 ms** | 1.55x |
+| `semantic_tokens_range`, 40 lines | 0.454 ms | **0.304 ms** | 1.49x |
+| `table_completion_items`, 800 tables | 0.183 ms | **0.147 ms** | 1.24x |
+| `semantic_diagnostics`, declared | 0.225 ms | **0.142 ms** | 1.58x |
+| `semantic_diagnostics`, undeclared | 0.719 ms | **0.524 ms** | 1.37x |
+
+## Where that came from, honestly
+
+Almost all of it is the optimisation level. Running **this branch** at master's
+`opt-level = 'z'` isolates the code changes:
+
+| Operation | master (z) | this branch (z) | this branch (3) |
+|-----------|-----------|-----------------|-----------------|
+| `analyze_document` | 47.57 ms | 47.53 ms | 30.77 ms |
+| `analyze_document/schema` | 27.28 ms | 27.06 ms | 16.37 ms |
+| `semantic_tokens_full` | 10.21 ms | 9.86 ms | 6.57 ms |
+| `semantic_tokens_range` | 0.454 ms | 0.469 ms | 0.304 ms |
+| `table_completion_items` | 0.183 ms | 0.194 ms | 0.147 ms |
+| `semantic_diagnostics` | 0.225 ms | 0.230 ms | 0.142 ms |
+| `semantic_diagnostics`, undeclared | 0.719 ms | 0.684 ms | 0.524 ms |
+
+At equal optimisation level the two branches are the same speed. The work added
+in 0.7 (the depth guard, the pre-parse bracket count, two more reference
+indexes, a `codeDescription` per diagnostic) costs nothing measurable. Three
+rows read very slightly slower on this branch (0.454 → 0.469, 0.183 → 0.194,
+0.225 → 0.230); all three are sub-millisecond operations where the difference is
+within run-to-run variance, and all three are faster than master at the profile
+that actually ships.
+
+## What this harness cannot see
+
+It parses every document from scratch, so it measures a **cold** analysis and
+says nothing about the two changes users feel most:
+
+* **Incremental parse.** One settled edit on an already-open buffer, measured
+  through the real `analyze_document_incremental` path:
+
+  | Document | Fresh analysis | After one edit | Saved |
+  |----------|----------------|----------------|-------|
+  | 200 lines (9 KB) | 1.60 ms | **1.13 ms** | 29% |
+  | 800 lines (38 KB) | 6.21 ms | **4.07 ms** | 34% |
+  | 3200 lines (156 KB) | 25.19 ms | **15.81 ms** | 37% |
+
+  NOTE: the parse alone drops by about 95% (16.4 ms to 0.77 ms at 3200 lines),
+  but the parse is only part of `analyze_document`: extraction and the syntax
+  walk are full-document and gain nothing. **37% is the end-to-end number**, and
+  it is the one to quote.
+
+* **Incremental sync.** Not measurable here at all: it removes a 166 KB document
+  crossing the wire and being JSON-unescaped on the reactor for every keystroke,
+  which is paid before any code in this repository runs.
+
+---
+
 # Incremental sync and parse (0.7)
 
 Measured on the same machine and harness, after the Phase 2 work.

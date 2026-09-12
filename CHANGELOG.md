@@ -18,7 +18,7 @@ tree-sitter frees a tree by recursing through it, so a deep enough document
 overflowed in tree-sitter's own `Drop`, after every walk of ours had correctly
 declined it.
 
-The cap is measured, not guessed: across SurrealDB's 1,897 test queries, 1,893
+The cap is measured, not guessed: across SurrealDB's 1,897 test queries, 1,896
 parse to fewer than 30 levels, and the one outlier at 204 is a file that exists
 to prove the *engine* rejects it (SurrealDB's own defaults are
 `expr_recursion_limit: 128`, `object_recursion_limit: 100`). The benchmark is
@@ -155,8 +155,11 @@ would miss occurrences and leave a workspace that parses and is wrong.
 ### Performance
 
 **The release profile now optimises for speed.** It carried `opt-level = 'z'`,
-which costs roughly 1.6x across the board: `analyze_document` on a 3,200-line
-file measures 46.4 ms at `'z'` against 28.7 ms at `3`. That is a larger win than
+which costs roughly 1.6x across the board: against master, `analyze_document`
+on a 3,200-line file goes from 47.6 ms to 30.8 ms, and `semantic_tokens_full`
+from 10.2 ms to 6.6 ms. Measured at equal optimisation level the two branches
+are the same speed, so this profile change is where essentially all of the
+one-shot improvement comes from; the 0.7 code changes cost nothing measurable. That is a larger win than
 anything left in `docs/perf-plan.md`. The default belongs to the common case,
 which is the native binary; `scripts/build-wasm.sh` opts the browser module back
 into size, where a download is a real cost. The native binary grows to about
@@ -167,8 +170,11 @@ described a binary no user of the `surrealql-language-server` executable ever
 ran.
 
 **Incremental parsing.** An edited document is reparsed against its previous
-tree rather than from scratch: 0.77 ms against 16.4 ms on a 3,200-line file, 95%
-of the parse. Gated on a differential test rather than assumed, because
+tree rather than from scratch. The parse itself drops about 95% (16.4 ms to
+0.77 ms on a 3,200-line file), but the parse is only part of an analysis
+(extraction and the syntax walk are full-document and gain nothing), so the
+end-to-end saving on one settled edit is **37%**: 25.2 ms to 15.8 ms. Gated on a
+differential test rather than assumed, because
 tree-sitter's incremental reparse is not guaranteed to reproduce a fresh parse
 when the previous tree held ERROR nodes, and ERROR nodes are the `parse`
 diagnostics. Zero mismatches over SurrealDB's 1,894 corpus files with ten random
