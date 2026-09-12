@@ -29,12 +29,14 @@
 //!
 //! Like `check` and `schema`, this never connects to a database.
 
+use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
+use crate::config::ServerSettings;
 use crate::core::client::WorkspaceLoader;
 use crate::native::workspace_fs::FilesystemWorkspaceLoader;
 use crate::semantic::types::{
@@ -51,7 +53,11 @@ Options:
       --workspace <dir>  Read schema definitions from this directory.
                          Repeatable. Without one, only the tools that need
                          no schema are useful.
+      --config <file>    The same settings file `check --config` takes.
   -h, --help             Print this help.
+
+The workspace is re-read before every tool that answers from the schema, so a
+file this agent has just written is in scope for the next call.
 
 `mcp` never connects to a database.";
 
@@ -61,6 +67,10 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 #[derive(Debug)]
 pub struct McpOptions {
     pub workspace_dirs: Vec<PathBuf>,
+    /// The same `--config` the `check` subcommand takes, so a workspace whose
+    /// settings declare external params or turn a check off behaves the same
+    /// way through an agent as it does through an editor.
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -72,6 +82,7 @@ pub enum Parsed {
 pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     let mut options = McpOptions {
         workspace_dirs: Vec::new(),
+        config: None,
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -82,6 +93,12 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> 
                     .next()
                     .ok_or_else(|| "`--workspace` needs a value".to_string())?;
                 options.workspace_dirs.push(PathBuf::from(value));
+            }
+            "--config" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "`--config` needs a value".to_string())?;
+                options.config = Some(PathBuf::from(value));
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -204,14 +221,64 @@ pub fn tools() -> Vec<Value> {
 struct Context {
     workspace: WorkspaceIndex,
     model: MergedSemanticModel,
+    settings: ServerSettings,
+    dirs: Vec<PathBuf>,
 }
 
 impl Context {
-    async fn load(dirs: &[PathBuf]) -> Self {
-        let workspace = FilesystemWorkspaceLoader::new().load(dirs).await;
-        let model = MergedSemanticModel::build(&workspace, &LiveMetadataSnapshot::default());
-        Self { workspace, model }
+    async fn load(options: &McpOptions) -> Result<Self, String> {
+        let config =
+            match &options.config {
+                Some(path) => {
+                    let text = fs::read_to_string(path)
+                        .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
+                    Some(serde_json::from_str::<Value>(&text).map_err(|error| {
+                        format!("`{}` is not valid JSON: {error}", path.display())
+                    })?)
+                }
+                None => None,
+            };
+        // The same parser the LSP and `check` paths use, so a config file an
+        // editor accepts is accepted here too.
+        let (settings, _warnings) =
+            ServerSettings::from_sources_with_warnings(config.as_ref(), None);
+
+        let mut context = Self {
+            workspace: WorkspaceIndex::default(),
+            model: MergedSemanticModel::build(
+                &WorkspaceIndex::default(),
+                &LiveMetadataSnapshot::default(),
+            ),
+            settings,
+            dirs: options.workspace_dirs.clone(),
+        };
+        context.reload().await;
+        Ok(context)
     }
+
+    /// Re-read the workspace from disk.
+    ///
+    /// Called before every tool that answers from the schema, because the agent
+    /// on the other end of this connection is the thing most likely to have
+    /// just changed it: writing a `DEFINE TABLE` and then asking `get_schema`
+    /// what the schema is, and being told what it was at startup, is the
+    /// obvious way for an agent to talk itself into a wrong edit.
+    ///
+    /// One walk plus one model build, on a call an agent makes deliberately
+    /// rather than per keystroke, so the cost lands in the right place.
+    async fn reload(&mut self) {
+        self.workspace = FilesystemWorkspaceLoader::new().load(&self.dirs).await;
+        self.model = MergedSemanticModel::build(&self.workspace, &LiveMetadataSnapshot::default());
+    }
+}
+
+/// Whether a tool reads the workspace schema, and therefore needs it fresh.
+///
+/// The catalogue-only tools (`lookup_function`, `search_functions`,
+/// `explain_diagnostic`) answer from data compiled into the binary and cannot
+/// go stale, so they skip the walk.
+fn reads_the_workspace(tool: &str) -> bool {
+    matches!(tool, "validate_surrealql" | "get_schema")
 }
 
 /// Run one tool, returning its text content.
@@ -242,8 +309,11 @@ fn call_tool(context: &Context, name: &str, arguments: &Value) -> Result<String,
                 })
                 .unwrap_or_default();
 
-            let mut settings = crate::config::ServerSettings::default();
-            settings.analysis.external_params = params;
+            // The workspace's own settings, with the caller's params added
+            // rather than replacing them: `--config` names what the project
+            // binds, the call names what this query binds.
+            let mut settings = context.settings.clone();
+            settings.analysis.external_params.extend(params);
 
             let Ok(uri) = "file:///surrealql/validate".parse() else {
                 return Err("could not build a document uri".to_string());
@@ -382,7 +452,16 @@ fn describe_function(name: &str) -> Option<String> {
 
 /// Serve MCP over stdio until the client closes it.
 pub async fn run(options: McpOptions) -> ExitCode {
-    let context = Context::load(&options.workspace_dirs).await;
+    let mut context = match Context::load(&options).await {
+        Ok(context) => context,
+        Err(message) => {
+            // Before the handshake there is no client to send an error to, so
+            // this goes to stderr and the process stops rather than serving a
+            // schema built from settings nobody asked for.
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -392,6 +471,13 @@ pub async fn run(options: McpOptions) -> ExitCode {
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+
+        if requested_tool(line)
+            .as_deref()
+            .is_some_and(reads_the_workspace)
+        {
+            context.reload().await;
         }
 
         let Some(response) = handle_message(&context, line) else {
@@ -404,6 +490,23 @@ pub async fn run(options: McpOptions) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The tool a `tools/call` message names, if it is one.
+///
+/// Read before dispatch so the reload can be `await`ed: `handle_message` is
+/// synchronous, and keeping it that way keeps every tool a pure function of the
+/// context it is handed.
+fn requested_tool(message: &str) -> Option<String> {
+    let request: Value = serde_json::from_str(message).ok()?;
+    if request.get("method").and_then(Value::as_str)? != "tools/call" {
+        return None;
+    }
+    request
+        .get("params")?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Handle one JSON-RPC message, returning the response to write, if any.
