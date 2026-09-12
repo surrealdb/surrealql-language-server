@@ -1,6 +1,7 @@
 pub mod analyzer;
 pub mod assign;
 pub mod codes;
+pub mod folding;
 pub mod highlight;
 pub mod infer;
 pub mod limits;

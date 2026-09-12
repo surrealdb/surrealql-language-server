@@ -148,3 +148,53 @@ async fn did_open_notification_returns_none_and_publishes() {
         "didOpen must publish diagnostics"
     );
 }
+
+/// Both new methods must be reachable over the wire, because this is the only
+/// coverage the browser path gets: `handleMessage` routes through exactly this
+/// dispatcher, and CI does not build wasm on the pull-request path.
+#[tokio::test]
+async fn folding_and_selection_range_are_reachable_over_the_wire() {
+    let (core, _, _) = core_with(Default::default(), Default::default());
+
+    let open = json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": { "textDocument": {
+            "uri": "file:///workspace/w.surql",
+            "languageId": "surrealql",
+            "version": 1,
+            "text": "DEFINE FUNCTION fn::f() {\n    RETURN 1;\n};\n"
+        }}
+    })
+    .to_string();
+    assert!(matches!(
+        dispatch_json_rpc(&core, &open).await,
+        DispatchOutput::None
+    ));
+
+    let folding = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "textDocument/foldingRange",
+        "params": { "textDocument": { "uri": "file:///workspace/w.surql" } }
+    })
+    .to_string();
+    let response = response_json(dispatch_json_rpc(&core, &folding).await);
+    assert!(response.get("error").is_none(), "{response}");
+    let folds = response["result"].as_array().expect("an array of ranges");
+    assert!(!folds.is_empty(), "the function body must fold: {response}");
+    assert_eq!(folds[0]["startLine"], 0);
+
+    let selection = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "textDocument/selectionRange",
+        "params": {
+            "textDocument": { "uri": "file:///workspace/w.surql" },
+            "positions": [{ "line": 1, "character": 11 }]
+        }
+    })
+    .to_string();
+    let response = response_json(dispatch_json_rpc(&core, &selection).await);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"][0]["parent"].is_object(),
+        "a chain must have a parent to expand into: {response}"
+    );
+}

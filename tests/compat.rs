@@ -35,6 +35,11 @@ fn server_capabilities_golden() {
         "definitionProvider": true,
         "referencesProvider": true,
         "documentHighlightProvider": true,
+        // Added in 0.7. Both read the cached parse tree, so they cost a walk and
+        // no re-parse; folding is what collapses a function body, and selection
+        // range is what expand-selection binds to in every editor.
+        "foldingRangeProvider": true,
+        "selectionRangeProvider": true,
         "documentSymbolProvider": true,
         "workspaceSymbolProvider": true,
         // Changed from `true` in 0.7: declaring the kinds is what lets a

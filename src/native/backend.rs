@@ -165,6 +165,17 @@ impl LanguageServer for Backend {
         Ok(self.core.code_action(params).await)
     }
 
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        Ok(self.core.folding_range(params).await)
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        Ok(self.core.selection_range(params).await)
+    }
+
     async fn document_highlight(
         &self,
         params: DocumentHighlightParams,

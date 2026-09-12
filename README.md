@@ -14,6 +14,8 @@ A Language Server Protocol (LSP) implementation for [SurrealQL](https://surreald
 - Signature help for builtin and user-defined functions
 - Call hierarchy with inbound/outbound function call tracking
 - Document symbols outlining tables, fields, events, indexes, and functions
+- Folding ranges for statements, blocks, object/array literals and comment runs
+- Selection ranges, so expand-selection walks the syntax tree
 - `function() { ... }` bodies parse cleanly with no false diagnostics; `DEFINE FUNCTION` bodies containing scripting functions are detected and labelled as JavaScript
 
 ## Requirements

@@ -144,6 +144,8 @@ where
                 resolve_provider: None,
             })),
             document_highlight_provider: Some(OneOf::Left(true)),
+            folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+            selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
                 InlayHintOptions {
                     resolve_provider: Some(false),
@@ -1039,6 +1041,42 @@ where
             params.range,
             params.context.only.as_deref(),
         ))
+    }
+
+    /// Foldable regions: statements, blocks, object and array literals, and
+    /// runs of comments.
+    ///
+    /// Reads the cached tree, so it costs one walk and no re-parse, and it
+    /// answers for a document the analyzer declined too: folding is a fact
+    /// about the shape of the text, and a file that will not analyse is exactly
+    /// when someone is folding their way through it.
+    pub async fn folding_range(&self, params: FoldingRangeParams) -> Option<Vec<FoldingRange>> {
+        let uri = params.text_document.uri;
+        let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
+        Some(crate::semantic::folding::folding_ranges(&analysis.tree))
+    }
+
+    /// The expand-selection chain at each requested position.
+    pub async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Option<Vec<SelectionRange>> {
+        let uri = params.text_document.uri;
+        let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
+        Some(
+            params
+                .positions
+                .into_iter()
+                .filter_map(|position| {
+                    crate::semantic::folding::selection_range(
+                        &analysis.tree,
+                        &analysis.text,
+                        &analysis.line_index,
+                        position,
+                    )
+                })
+                .collect(),
+        )
     }
 
     pub async fn document_highlight(

@@ -2946,3 +2946,141 @@ fn uri_for_dir(path: &str) -> tower_lsp_server::ls_types::Uri {
     use std::str::FromStr as _;
     tower_lsp_server::ls_types::Uri::from_str(&format!("file://{path}")).expect("valid file uri")
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Folding and selection ranges
+// ──────────────────────────────────────────────────────────────────────
+
+async fn folds(core: &common::TestCore, path: &str) -> Vec<(u32, u32, Option<String>)> {
+    let mut found: Vec<_> = core
+        .folding_range(tower_lsp_server::ls_types::FoldingRangeParams {
+            text_document: TextDocumentIdentifier { uri: uri(path) },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|range| {
+            (
+                range.start_line,
+                range.end_line,
+                range.kind.map(|kind| format!("{kind:?}")),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// A multi-line `DEFINE FUNCTION` folds; the one-liner beside it does not.
+#[tokio::test]
+async fn multi_line_regions_fold_and_single_line_ones_do_not() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "fold.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         DEFINE FUNCTION fn::greet($name: string) {\n\
+         \x20   RETURN 'hi';\n\
+         };\n",
+    )
+    .await;
+
+    let found = folds(&core, "fold.surql").await;
+    assert!(
+        found.iter().any(|(start, end, _)| *start == 1 && *end >= 2),
+        "the multi-line function must fold: {found:?}"
+    );
+    assert!(
+        !found.iter().any(|(start, _, _)| *start == 0),
+        "the single-line DEFINE TABLE must not offer a fold: {found:?}"
+    );
+}
+
+/// The last line is excluded so the closing brace stays visible when collapsed,
+/// which is what every editor's built-in folding does.
+#[tokio::test]
+async fn a_fold_stops_before_its_closing_line() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "brace.surql",
+        "DEFINE FUNCTION fn::f() {\n    RETURN 1;\n};\n",
+    )
+    .await;
+
+    let found = folds(&core, "brace.surql").await;
+    assert!(
+        found.iter().any(|(start, end, _)| *start == 0 && *end == 1),
+        "expected a fold from line 1 to line 2, got {found:?}"
+    );
+}
+
+/// Consecutive comment lines fold as one block; a blank line splits them.
+#[tokio::test]
+async fn consecutive_comments_fold_as_one_block() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "comments.surql",
+        "-- one\n-- two\n-- three\n\n-- separate\nRETURN 1;\n",
+    )
+    .await;
+
+    let found = folds(&core, "comments.surql").await;
+    let comment_folds: Vec<_> = found
+        .iter()
+        .filter(|(_, _, kind)| kind.as_deref() == Some("Comment"))
+        .collect();
+    assert_eq!(
+        comment_folds.len(),
+        1,
+        "the three adjacent comments are one block and the lone one is not foldable: {found:?}"
+    );
+    assert_eq!((comment_folds[0].0, comment_folds[0].1), (0, 2));
+}
+
+/// Expand-selection walks outward, and every step must be strictly larger or an
+/// editor appears stuck.
+#[tokio::test]
+async fn selection_range_widens_at_every_step() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let text = "SELECT name FROM person;\n";
+    open(&core, "sel.surql", text).await;
+
+    let ranges = core
+        .selection_range(tower_lsp_server::ls_types::SelectionRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri("sel.surql"),
+            },
+            // On `person`.
+            positions: vec![Position::new(0, 18)],
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("selection ranges");
+    assert_eq!(ranges.len(), 1, "one chain per requested position");
+
+    let mut sizes = Vec::new();
+    let mut current = Some(&ranges[0]);
+    while let Some(selection) = current {
+        let range = selection.range;
+        sizes.push((
+            range.start.character,
+            range.end.character,
+            range.end.line - range.start.line,
+        ));
+        current = selection.parent.as_deref();
+    }
+
+    assert!(sizes.len() >= 2, "expected a chain, got {sizes:?}");
+    for pair in sizes.windows(2) {
+        let (inner, outer) = (pair[0], pair[1]);
+        assert!(
+            outer.0 <= inner.0 && (outer.1 >= inner.1 || outer.2 > inner.2),
+            "each step must widen: {inner:?} then {outer:?}"
+        );
+    }
+}

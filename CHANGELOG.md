@@ -45,6 +45,20 @@ The README documented 5 of about 20 settings. It now covers the whole
 heading of their own) the two keys that are accepted and not yet implemented,
 rather than leaving them to look as though they work.
 
+### Added
+
+**Folding ranges and selection ranges.** Both read the parse tree the analysis
+already caches, so neither re-parses. Folding covers multi-line statements,
+blocks, object and array literals, JavaScript function bodies, and runs of
+adjacent comments; the closing line is excluded so the brace stays visible when
+a region is collapsed. Selection range is what expand-selection binds to in
+VS Code, Zed, Helix and Neovim. Their absence is the kind of thing that makes a
+server feel unfinished in every editor.
+
+Both answer for a document the analyzer has declined, which is deliberate: a
+fold is a fact about the shape of the text, and a file that will not analyse is
+exactly when someone is folding their way through it.
+
 ### Fixed
 
 **Signature help counts the right argument.** The active parameter was "every

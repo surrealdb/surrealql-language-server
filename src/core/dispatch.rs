@@ -257,6 +257,14 @@ where
             Ok(params) => Outcome::from_value(core.code_action(params).await),
             Err(error) => error,
         },
+        "textDocument/foldingRange" => match decode::<FoldingRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.folding_range(params).await),
+            Err(error) => error,
+        },
+        "textDocument/selectionRange" => match decode::<SelectionRangeParams>(params) {
+            Ok(params) => Outcome::from_value(core.selection_range(params).await),
+            Err(error) => error,
+        },
         "textDocument/documentHighlight" => match decode::<DocumentHighlightParams>(params) {
             Ok(params) => Outcome::from_value(core.document_highlight(params).await),
             Err(error) => error,
