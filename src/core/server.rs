@@ -34,10 +34,10 @@ use crate::semantic::analyzer::{analyze_document, analyze_document_with_limit};
 use crate::semantic::model::{
     field_completion_tables, function_signature_with_return, is_record_type_context, param_label,
 };
-use crate::semantic::text::{token_at, word_range};
+use crate::semantic::text::{enclosing_call, token_at, word_range};
 use crate::semantic::types::{
-    DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
-    WorkspaceIndex,
+    DocumentAnalysis, FunctionDef, LiveMetadataSnapshot, MergedSemanticModel, QueryAction,
+    SymbolOrigin, WorkspaceIndex,
 };
 
 /// The crate version plus the source and grammar revisions this binary was
@@ -863,16 +863,15 @@ where
         let (analysis, model, _) = self.snapshot_for_uri(&uri).await?;
         let offset = analysis.line_index.offset(&analysis.text, position);
         let prefix = &analysis.text[..offset];
-        let open_paren = prefix.rfind('(')?;
+        // Depth- and string-aware: `math::max([1, 2], fn::f(a, b` is the second
+        // argument of `fn::f`, not the fifth of `math::max`, and a comma inside
+        // a string literal is not an argument separator. See `enclosing_call`.
+        let (open_paren, active_parameter) = enclosing_call(prefix)?;
         let function_name = prefix[..open_paren]
             .split_whitespace()
             .last()
             .map(str::trim)
             .unwrap_or_default();
-        let active_parameter = prefix[open_paren + 1..]
-            .chars()
-            .filter(|ch| *ch == ',')
-            .count() as u32;
 
         // A method: `'abc'.slice(` reads as one whitespace-delimited token, so the
         // tail after the last `.` is the method name. It resolves through the
@@ -1054,15 +1053,71 @@ where
         let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
-        model
-            .references_for_function(token.trim())
+        let token = token.trim();
+
+        // A custom function. Every occurrence is a call, so every one reads.
+        let mut highlights: Vec<DocumentHighlight> = model
+            .references_for_function(token)
             .into_iter()
             .filter(|location| location.uri == uri)
             .map(|location| DocumentHighlight {
                 range: location.range,
                 kind: Some(DocumentHighlightKind::READ),
             })
-            .collect()
+            .collect();
+
+        // A table or a field, which is what people actually put the cursor on.
+        // This used to return nothing for either, and marked everything it did
+        // return as READ, so an editor could not tell a `SELECT` from the
+        // `DELETE` three lines below it.
+        //
+        // `QueryFact` already carries token-tight ranges per name and the action
+        // that produced them, which is exactly the read/write distinction the
+        // protocol wants.
+        for fact in &analysis.query_facts {
+            let kind = highlight_kind(fact.action);
+            let named = fact.target_refs.iter().chain(fact.field_refs.iter());
+            highlights.extend(
+                named
+                    .filter(|reference| reference.name == token)
+                    .map(|reference| DocumentHighlight {
+                        range: reference.range,
+                        kind: Some(kind),
+                    }),
+            );
+        }
+
+        // The declaration itself is a write: it is where the name is introduced.
+        let declarations = analysis
+            .tables
+            .iter()
+            .filter(|table| table.explicit && table.name == token)
+            .map(|table| table.location.range)
+            .chain(
+                analysis
+                    .fields
+                    .iter()
+                    .filter(|field| field.name == token)
+                    .map(|field| field.location.range),
+            );
+        highlights.extend(declarations.map(|range| DocumentHighlight {
+            range,
+            kind: Some(DocumentHighlightKind::WRITE),
+        }));
+
+        // Two facts can name the same token in the same place: a field read and
+        // written by one statement, say. Keep the first, which is the stronger
+        // claim in source order.
+        highlights.sort_by_key(|highlight| {
+            (
+                highlight.range.start.line,
+                highlight.range.start.character,
+                highlight.range.end.line,
+                highlight.range.end.character,
+            )
+        });
+        highlights.dedup_by_key(|highlight| highlight.range);
+        highlights
     }
 
     /// Emit `parameter_name:` hints next to each argument of every
@@ -1593,6 +1648,19 @@ fn resolve_workspace_folders(params: &InitializeParams) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether a statement reads or writes the names it touches.
+///
+/// `Execute` is a function call, which reads its arguments. `Relate` writes the
+/// edge and both endpoints.
+fn highlight_kind(action: QueryAction) -> DocumentHighlightKind {
+    match action {
+        QueryAction::Select | QueryAction::Execute => DocumentHighlightKind::READ,
+        QueryAction::Create | QueryAction::Update | QueryAction::Delete | QueryAction::Relate => {
+            DocumentHighlightKind::WRITE
+        }
+    }
 }
 
 fn call_hierarchy_item(function: &FunctionDef) -> CallHierarchyItem {

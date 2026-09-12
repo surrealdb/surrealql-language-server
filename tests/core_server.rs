@@ -2768,3 +2768,127 @@ async fn disabling_code_actions_silences_them() {
         "the setting is advertised; it must do something"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Signature help counts the right argument
+// ──────────────────────────────────────────────────────────────────────
+
+/// The active parameter used to be "every comma after the last `(`", which is
+/// wrong as soon as an argument contains a comma of its own.
+#[tokio::test]
+async fn signature_help_ignores_commas_inside_a_nested_argument() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    // Cursor after `[1, 2, 3], `: the second argument of math::max, not the
+    // fourth. The old count said 3.
+    let text = "RETURN math::max([1, 2, 3], ";
+    open(&core, "nested.surql", text).await;
+
+    let help = signature_help_at(&core, "nested.surql", 0, text.len() as u32).await;
+    assert_eq!(
+        help.active_parameter,
+        Some(1),
+        "an array argument's commas were counted as argument separators"
+    );
+}
+
+/// A comma inside a string literal is not an argument separator either.
+#[tokio::test]
+async fn signature_help_ignores_commas_inside_a_string() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let text = "RETURN string::concat('a, b, c', ";
+    open(&core, "string.surql", text).await;
+
+    let help = signature_help_at(&core, "string.surql", 0, text.len() as u32).await;
+    assert_eq!(help.active_parameter, Some(1));
+}
+
+/// The innermost open call is the one to describe, not the outermost.
+#[tokio::test]
+async fn signature_help_describes_the_innermost_open_call() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    let text = "RETURN math::max(1, string::concat('a', ";
+    open(&core, "inner.surql", text).await;
+
+    let help = signature_help_at(&core, "inner.surql", 0, text.len() as u32).await;
+    assert!(
+        help.signatures
+            .first()
+            .is_some_and(|signature| signature.label.contains("string::concat")),
+        "expected the inner call, got {:?}",
+        help.signatures.first().map(|s| s.label.clone())
+    );
+    assert_eq!(help.active_parameter, Some(1));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Document highlight covers tables and fields, with real kinds
+// ──────────────────────────────────────────────────────────────────────
+
+async fn highlights_at(
+    core: &common::TestCore,
+    path: &str,
+    line: u32,
+    character: u32,
+) -> Vec<(u32, tower_lsp_server::ls_types::DocumentHighlightKind)> {
+    let mut found: Vec<_> = core
+        .document_highlight(tower_lsp_server::ls_types::DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(path) },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .into_iter()
+        .map(|highlight| {
+            (
+                highlight.range.start.line,
+                highlight.kind.expect("a kind is always set"),
+            )
+        })
+        .collect();
+    found.sort_by_key(|(line, _)| *line);
+    found
+}
+
+/// Highlighting used to cover custom functions only, and to call every
+/// occurrence a READ, so putting the cursor on a table name lit up nothing, and
+/// an editor could not tell a `SELECT` from the `DELETE` below it.
+#[tokio::test]
+async fn highlighting_a_table_distinguishes_reads_from_writes() {
+    use tower_lsp_server::ls_types::DocumentHighlightKind;
+
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(
+        &core,
+        "hl.surql",
+        "DEFINE TABLE person SCHEMAFULL;\n\
+         SELECT * FROM person;\n\
+         DELETE person;\n\
+         CREATE person SET name = 'a';\n",
+    )
+    .await;
+
+    // Cursor on `person` in the SELECT.
+    let found = highlights_at(&core, "hl.surql", 1, 15).await;
+    assert_eq!(
+        found,
+        vec![
+            (0, DocumentHighlightKind::WRITE), // the DEFINE introduces it
+            (1, DocumentHighlightKind::READ),  // SELECT
+            (2, DocumentHighlightKind::WRITE), // DELETE
+            (3, DocumentHighlightKind::WRITE), // CREATE
+        ],
+        "expected one highlight per occurrence, with reads and writes distinguished"
+    );
+}
+
+/// A name nothing in the document mentions highlights nothing: the walk must
+/// not match on substrings or light up unrelated tokens.
+#[tokio::test]
+async fn highlighting_an_unrelated_token_finds_nothing() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    open(&core, "none.surql", "SELECT * FROM person;\n").await;
+    assert!(highlights_at(&core, "none.surql", 0, 0).await.is_empty());
+}

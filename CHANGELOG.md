@@ -31,6 +31,18 @@ stale, and the buffer showed whatever it looked like when it was opened. The
 mark is now removed on close and replaced on open, which the LSP says is
 authoritative.
 
+**Signature help counts the right argument.** The active parameter was "every
+comma after the last `(`", so `math::max([1, 2, 3], ` reported argument 4 instead
+of 2, and a comma inside a string literal counted as an argument separator. The
+scan now tracks bracket depth and string state, and describes the innermost open
+call rather than whichever `(` came last in the text.
+
+**Document highlight covers tables and fields, and tells reads from writes.** It
+handled custom functions only (so putting the cursor on a table name lit up
+nothing), and marked every occurrence `READ`, so an editor could not distinguish
+a `SELECT` from the `DELETE` below it. `CREATE`, `UPDATE`, `DELETE` and `RELATE`
+now highlight as writes, as does the `DEFINE` that introduces the name.
+
 **Code actions respect where you asked and what you asked for.** The handler
 discarded both `params.range` and `context.only`, so a cursor anywhere in a file
 with three permission-less tables offered "Add PERMISSIONS clause" three times
