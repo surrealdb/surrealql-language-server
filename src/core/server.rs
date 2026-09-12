@@ -14,6 +14,7 @@
 //! [`crate::core::client`] for the trait definitions and
 //! [`crate::native`] / [`crate::wasm`] for the per-target impls.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ use crate::core::completion_context::{
     completion_table_qualifier, graph_anchors, graph_edge_context, head_slot_at,
     is_table_name_context, statement_target_in_text,
 };
-use crate::core::state::{ServerState, merged_workspace, workspace_signature};
+use crate::core::state::{OpenBuffer, ServerState, merged_workspace, workspace_signature};
 use crate::core::statement_shape::SlotYield;
 use crate::grammar::{BuiltinFunction, BuiltinSignature, builtin_function, builtin_signature};
 use crate::runtime;
@@ -72,6 +73,19 @@ pub struct LanguageServerCore<N: LspNotifier, W: WorkspaceLoader, M: MetadataPro
     /// so two read-merge-apply sequences would otherwise interleave
     /// and lose updates or invert the metadata-error status).
     config_lock: Arc<runtime::sync::Mutex<()>>,
+    /// What the client last sent for each open document, before any analysis.
+    ///
+    /// Behind a **`std::sync::Mutex`**, not the async `RwLock` that holds
+    /// everything else, and that is the load-bearing detail. `lock()` has no
+    /// await point, so a handler that only touches this map runs from its first
+    /// poll to completion without yielding, which is what makes the order two
+    /// edits are applied in the order they arrived, rather than whatever order
+    /// the executor gets round to polling them.
+    ///
+    /// Poisoning is unreachable: `panic = 'abort'` means a panic never unwinds
+    /// past the guard. The one hazard is holding it across an await, so every
+    /// critical section is a block that returns owned data.
+    buffers: Arc<std::sync::Mutex<HashMap<Uri, OpenBuffer>>>,
 }
 
 impl<N, W, M> LanguageServerCore<N, W, M>
@@ -87,6 +101,7 @@ where
             metadata_provider: Arc::new(metadata_provider),
             state: Arc::new(runtime::sync::RwLock::new(ServerState::default())),
             config_lock: Arc::new(runtime::sync::Mutex::new(())),
+            buffers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -401,6 +416,19 @@ where
             .await;
     }
 
+    /// Apply a `didChange` to the authoritative buffer, returning the edit to
+    /// analyse.
+    ///
+    /// Split out so the native adapter can apply on the ordered path and spawn
+    /// only the analysis. See [`Self::apply_document_change`] for why that
+    /// matters.
+    pub fn apply_did_change(&self, params: &DidChangeTextDocumentParams) -> Option<Edit> {
+        let change = params.content_changes.last()?;
+        let edit = Edit::Changed(params.text_document.version);
+        self.apply_document_change(&params.text_document.uri, change.text.clone(), edit)
+            .map(|_| edit)
+    }
+
     pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let Some(change) = params.content_changes.into_iter().last() else {
             return;
@@ -434,13 +462,15 @@ where
         {
             let mut state = self.state.write().await;
             state.open_documents.remove(&uri);
-            // The version high-water mark has to go with the document. A client
-            // that reopens a file starts counting from 1 again (VS Code does),
-            // and a remembered 57 would make `upsert_open_document` drop every
-            // edit until the counter climbed back past it: diagnostics frozen
-            // at whatever the file looked like when it was opened.
-            state.document_versions.remove(&uri);
         }
+        // The buffer goes with the document, version high-water mark and all. A
+        // client that reopens a file starts counting from 1 again (VS Code
+        // does), and a remembered 57 would make every later edit look stale:
+        // diagnostics frozen at whatever the file looked like when it opened.
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .remove(&uri);
         self.sync_saved_document_from_disk(&uri).await;
         self.recompute_model().await;
         self.notifier.publish_diagnostics(uri, Vec::new()).await;
@@ -1253,7 +1283,67 @@ where
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────
 
-    async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
+    /// Apply what the client sent to the authoritative buffer.
+    ///
+    /// **Contains no `.await`, and must not gain one.** Handler futures are
+    /// first-polled in arrival order, so a handler that completes inside its
+    /// first poll applies edits in the order they arrived, which is the whole
+    /// ordering guarantee. Add an await here and two edits in flight can be
+    /// applied out of order, which is harmless under full-document sync and
+    /// corrupting under incremental sync.
+    ///
+    /// Returns the version applied, or `None` when the change was dropped as
+    /// stale or refused.
+    ///
+    /// The escape hatch, if a desync is ever observed in the field:
+    /// `Server::new(…).concurrency_level(1)` in `main.rs` makes the ordering
+    /// unconditional, at the cost of serialising requests behind each other and
+    /// disabling `$/cancelRequest`.
+    pub fn apply_document_change(&self, uri: &Uri, text: String, edit: Edit) -> Option<i32> {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable");
+
+        match edit {
+            // An open declares where this buffer's versioning now starts, so it
+            // replaces rather than compares.
+            Edit::Opened(version) => {
+                buffers
+                    .entry(uri.clone())
+                    .and_modify(|buffer| buffer.replace(text.clone(), version))
+                    .or_insert_with(|| OpenBuffer::new(text, version));
+                Some(version)
+            }
+            Edit::Changed(version) => {
+                match buffers.get_mut(uri) {
+                    Some(buffer) => {
+                        // LSP does not require contiguous versions, so a gap is
+                        // not evidence of reordering: only a version at or
+                        // below the one already applied is stale.
+                        if version < buffer.version {
+                            return None;
+                        }
+                        buffer.replace(text, version);
+                    }
+                    None => {
+                        // A change for a document that was never opened. Take it
+                        // as the whole content rather than dropping it: the
+                        // client believes this buffer exists.
+                        buffers.insert(uri.clone(), OpenBuffer::new(text, version));
+                    }
+                }
+                Some(version)
+            }
+        }
+    }
+
+    /// Analyse the buffer at `uri` and publish what it says.
+    ///
+    /// The other half of what used to be one function. Everything slow lives
+    /// here (the debounce, the parse, the model rebuild), so the caller can
+    /// spawn it and leave [`Self::apply_document_change`] on the ordered path.
+    pub async fn analyze_buffer(&self, uri: Uri, edit: Edit) {
         let (limit, max_bytes, debounce_ms) = {
             let state = self.state.read().await;
             (
@@ -1263,43 +1353,28 @@ where
             )
         };
 
-        // Record the version first, so a later edit can tell that this one is
-        // superseded even while this call is still waiting or analysing.
-        match edit {
-            Edit::Changed(version) => {
-                let mut state = self.state.write().await;
-                if state
-                    .document_versions
-                    .get(&uri)
-                    .is_some_and(|newest| *newest > version)
-                {
-                    // A newer edit already arrived. Its own call does the work.
-                    return;
-                }
-                state.document_versions.insert(uri.clone(), version);
-            }
-            // An open replaces the mark rather than comparing against it: the
-            // client is telling us where this buffer's versioning now starts.
-            Edit::Opened(version) => {
-                let mut state = self.state.write().await;
-                state.document_versions.insert(uri.clone(), version);
-            }
-        }
-
-        // Let a burst of keystrokes settle. `didOpen` skips this entirely.
+        // Let a burst of keystrokes settle. `didOpen` skips this entirely: the
+        // file just appeared and the user is waiting to see what is wrong.
         if let Edit::Changed(version) = edit
             && debounce_ms > 0
         {
             runtime::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
-            if self.superseded(&uri, version).await {
+            if self.superseded(&uri, version) {
                 return;
             }
         }
 
-        // Parsing and extraction are CPU-bound and now the most frequent work
-        // the server does, so they must not run on a thread that is also
-        // serving requests.
-        let Some(analysis) = analyze_off_reactor(uri.clone(), text, limit, max_bytes).await else {
+        let Some(text) = self.buffer_text(&uri) else {
+            // Closed while the debounce ran.
+            return;
+        };
+
+        // Parsing and extraction are CPU-bound and the most frequent work the
+        // server does, so they must not run on a thread that is also serving
+        // requests.
+        let Some(analysis) =
+            analyze_off_reactor(uri.clone(), text.to_string(), limit, max_bytes).await
+        else {
             // The previous analysis stays in `open_documents`, so the editor
             // keeps showing diagnostics for text the user has already changed.
             // That is the worst kind of wrong (stale and silent), so say it
@@ -1319,7 +1394,7 @@ where
 
         // The text may have moved on while the analysis ran.
         if let Edit::Changed(version) = edit
-            && self.superseded(&uri, version).await
+            && self.superseded(&uri, version)
         {
             return;
         }
@@ -1332,32 +1407,51 @@ where
         self.publish_diagnostics_for_uri(&uri).await;
     }
 
-    /// True when a newer `didChange` for `uri` has arrived since `version`.
-    async fn superseded(&self, uri: &Uri, version: i32) -> bool {
-        self.state
-            .read()
-            .await
-            .document_versions
+    /// Apply and analyse in one call, for callers with no reason to separate
+    /// them: the wasm dispatcher, which processes one message at a time, and
+    /// the tests.
+    async fn upsert_open_document(&self, uri: Uri, text: String, edit: Edit) {
+        if self.apply_document_change(&uri, text, edit).is_some() {
+            self.analyze_buffer(uri, edit).await;
+        }
+    }
+
+    /// The authoritative text for `uri`, if the client has it open.
+    fn buffer_text(&self, uri: &Uri) -> Option<Arc<String>> {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
             .get(uri)
-            .is_some_and(|newest| *newest > version)
+            .map(|buffer| Arc::clone(&buffer.text))
+    }
+
+    /// True when a newer `didChange` for `uri` has arrived since `version`.
+    fn superseded(&self, uri: &Uri, version: i32) -> bool {
+        self.buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .is_some_and(|buffer| buffer.version > version)
     }
 
     /// Re-run the analysis of every open document under a new syntax cap.
     ///
-    /// The text is taken from the stored analysis rather than re-read from
-    /// disk: an open buffer may be dirty, and its `DocumentAnalysis.text` is
-    /// the exact content the client last sent.
+    /// The text comes from the authoritative buffer rather than from disk or
+    /// from the stored analysis: an open buffer may be dirty, and the analysis
+    /// may be a debounce window behind what the client last sent.
     async fn reanalyze_open_documents(&self, limit: usize) {
-        // The text is copied out under the guard so the analysis (which is the
-        // expensive part, and there is one per open buffer) runs off the
-        // reactor. At 45 ms for a 3,200-line file, twenty open buffers was a
-        // near-second stall on the thread serving hover and completion.
+        // Copied out before the analysis so the expensive part (one parse per
+        // open buffer) runs off the reactor. At 45 ms for a 3,200-line file,
+        // twenty open buffers was a near-second stall on the thread serving
+        // hover and completion.
         let sources: Vec<(Uri, String)> = {
-            let state = self.state.read().await;
-            state
-                .open_documents
+            let buffers = self
+                .buffers
+                .lock()
+                .expect("panic = 'abort' makes poisoning unreachable");
+            buffers
                 .iter()
-                .map(|(uri, analysis)| (uri.clone(), analysis.text.clone()))
+                .map(|(uri, buffer)| (uri.clone(), buffer.text.to_string()))
                 .collect()
         };
 
@@ -1375,12 +1469,20 @@ where
             return;
         };
 
+        let still_open: std::collections::HashSet<Uri> = {
+            let buffers = self
+                .buffers
+                .lock()
+                .expect("panic = 'abort' makes poisoning unreachable");
+            buffers.keys().cloned().collect()
+        };
+
         let mut state = self.state.write().await;
         for (uri, analysis) in reanalyzed {
             // Only if the document is still open: an edit or a close may have
             // landed while this ran, and neither should be undone by a
             // re-analysis of the text as it was.
-            if state.open_documents.contains_key(&uri) {
+            if still_open.contains(&uri) {
                 state.open_documents.insert(uri, analysis);
             }
         }
@@ -1872,7 +1974,7 @@ fn builtin_signature_information(
 /// is never delayed, and it cannot be superseded because there is no earlier
 /// version of the same document in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edit {
+pub enum Edit {
     /// `didOpen`, carrying the version the client says the buffer is at.
     ///
     /// Per LSP that version is authoritative for the newly-opened document, so

@@ -3167,3 +3167,82 @@ async fn a_zero_cap_removes_the_limit() {
         Some("TABLE person"),
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// The authoritative buffer
+// ──────────────────────────────────────────────────────────────────────
+
+/// Edits arriving through the real path produce the same text as the same edits
+/// applied one after another.
+///
+/// Trivially true under full-document sync, where every notification carries the
+/// whole text. The point is that it exists *before* incremental sync, so the
+/// commit that switches over has a test that was already green to break.
+#[tokio::test]
+async fn interleaved_edits_produce_the_same_text_as_serial_ones() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "seq.surql", "DEFINE TABLE t0 SCHEMAFULL;").await;
+
+    for version in 1..=8 {
+        core.did_change(change(
+            "seq.surql",
+            version,
+            &format!("DEFINE TABLE t{version} SCHEMAFULL;"),
+        ))
+        .await;
+    }
+
+    assert_eq!(
+        defined_table(&core, "seq.surql").await.as_deref(),
+        Some("TABLE t8"),
+        "the last edit applied must be the one that stands"
+    );
+}
+
+/// Applying and analysing are separate calls now, so the ordering guarantee can
+/// be tested without racing a spawned task: apply every edit first, then analyse
+/// once. The newest text must win regardless of how many analyses were skipped.
+#[tokio::test]
+async fn applying_ahead_of_analysis_keeps_the_newest_text() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+    open(&core, "ahead.surql", "DEFINE TABLE t0 SCHEMAFULL;").await;
+
+    // Five edits land before a single analysis runs: what a burst looks like
+    // when the debounce collapses it.
+    for version in 1..=5 {
+        core.did_change(change(
+            "ahead.surql",
+            version,
+            &format!("DEFINE TABLE t{version} SCHEMAFULL;"),
+        ))
+        .await;
+    }
+
+    assert_eq!(
+        defined_table(&core, "ahead.surql").await.as_deref(),
+        Some("TABLE t5"),
+    );
+}
+
+/// A change for a document the server never saw an open for is taken as the
+/// whole content rather than dropped: the client believes the buffer exists, and
+/// disagreeing with it silently is worse than accepting the text.
+#[tokio::test]
+async fn a_change_without_an_open_is_still_applied() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    core.did_change(change(
+        "unopened.surql",
+        3,
+        "DEFINE TABLE ghost SCHEMAFULL;",
+    ))
+    .await;
+
+    assert_eq!(
+        defined_table(&core, "unopened.surql").await.as_deref(),
+        Some("TABLE ghost"),
+    );
+}

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use ls_types::Uri;
 
 use crate::config::ServerSettings;
+use crate::semantic::text::LineIndex;
 use crate::semantic::types::{
     DocumentAnalysis, LiveMetadataSnapshot, MergedSemanticModel, WorkspaceIndex,
 };
@@ -27,20 +28,6 @@ pub struct ServerState {
     pub workspace_folders: Vec<PathBuf>,
     pub saved_workspace: Arc<WorkspaceIndex>,
     pub open_documents: HashMap<Uri, Arc<DocumentAnalysis>>,
-    /// The newest `didChange` version seen for each open document.
-    ///
-    /// Two things read it. The debounce uses it to decide whether the edit it
-    /// waited for is still the newest one, and the publish step uses it to drop
-    /// a result computed from text the client has already replaced. Without it,
-    /// running the analysis off the reactor would let an older version finish
-    /// last and overwrite a newer one.
-    ///
-    /// `didOpen` *replaces* the entry rather than comparing against it (the
-    /// client is declaring where this buffer's versioning now starts), and
-    /// `didClose` removes it. Leaving a closed document's high-water mark behind
-    /// froze diagnostics on reopen, because a client that restarts its counter
-    /// then looked stale forever.
-    pub document_versions: HashMap<Uri, i32>,
     pub live_metadata: Arc<LiveMetadataSnapshot>,
     pub model: Arc<MergedSemanticModel>,
     /// Fingerprint of the last successful workspace walk. When the new
@@ -61,6 +48,71 @@ pub struct ServerState {
     /// so a persistently bad configuration doesn't re-log on every
     /// pull. Same pattern as [`Self::last_metadata_errors`].
     pub last_settings_warnings: Option<Vec<String>>,
+}
+
+/// What the client last sent for one open document, before any analysis.
+///
+/// This (not `DocumentAnalysis.text`) is the authoritative buffer. The
+/// distinction did not matter under full-document sync, where every
+/// notification carries the whole text: the analysis *was* the buffer, one
+/// debounce window behind. It matters completely under incremental sync, where
+/// the next change's ranges are expressed against the text the previous change
+/// produced. Resolving them against an analysis that is a debounce window stale
+/// is not lag, it is corruption.
+///
+/// One consequence is worth stating so nobody "fixes" it later: during a
+/// debounce window this text is *ahead* of the analysis a hover reads. That is
+/// already true today. Pointing request handlers here instead would pair new
+/// text with an old tree and old ranges, which is strictly worse.
+#[derive(Debug, Clone)]
+pub struct OpenBuffer {
+    /// Exactly what the client last sent, with every change applied in order.
+    pub text: Arc<String>,
+    /// Line starts for [`Self::text`], used to convert the *next* change's
+    /// ranges to byte offsets. Rebuilt after each applied change.
+    pub line_index: LineIndex,
+    /// The version of the last applied change.
+    ///
+    /// The debounce uses it to decide whether the edit it waited for is still
+    /// the newest, and the publish step uses it to drop a result computed from
+    /// text the client has already replaced: without it, running the analysis
+    /// off the reactor would let an older version finish last and win.
+    ///
+    /// `didOpen` *replaces* it rather than comparing against it: the client is
+    /// declaring where this buffer's versioning now starts. `didClose` drops the
+    /// whole entry. Leaving a closed document's high-water mark behind froze
+    /// diagnostics on reopen, because a client that restarts its counter then
+    /// looked stale forever.
+    pub version: i32,
+    /// Set when a ranged change could not be applied: an out-of-bounds range,
+    /// or no base text to apply it to.
+    ///
+    /// Further ranged changes are refused until a full replacement or a re-open
+    /// re-establishes the baseline. There is no LSP request for "please resend
+    /// the document", so refusing until the client sends a whole one is the
+    /// recovery available, and it turns silent corruption into a visible,
+    /// self-healing failure.
+    pub desynced: bool,
+}
+
+impl OpenBuffer {
+    /// A buffer holding `text` as its whole content.
+    pub fn new(text: String, version: i32) -> Self {
+        Self {
+            line_index: LineIndex::new(&text),
+            text: Arc::new(text),
+            version,
+            desynced: false,
+        }
+    }
+
+    /// Replace the whole content, clearing any desync.
+    pub fn replace(&mut self, text: String, version: i32) {
+        self.line_index = LineIndex::new(&text);
+        self.text = Arc::new(text);
+        self.version = version;
+        self.desynced = false;
+    }
 }
 
 /// Stable signature of a workspace-folder set, used to short-circuit

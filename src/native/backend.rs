@@ -62,18 +62,28 @@ impl LanguageServer for Backend {
         self.core.did_open(params).await;
     }
 
-    /// Spawned, not awaited. The handler has to return before the debounce
-    /// elapses, or tower-lsp holds every following request behind it — and the
-    /// debounce only coalesces a burst if the burst can reach the server while
-    /// an earlier edit is still waiting.
+    /// Applied here, analysed there.
     ///
-    /// Spawning makes the order of two edits arrive-order rather than
-    /// completion-order, which is why the core carries a version per document
-    /// and drops a result the client has already superseded.
+    /// The edit is written to the authoritative buffer **synchronously**, before
+    /// anything is spawned. That is what keeps two edits in flight applied in
+    /// the order they arrived: `apply_document_change` contains no await, and
+    /// handler futures are first-polled in arrival order, so it completes inside
+    /// its first poll. Spawning the whole handler (which is what this used to
+    /// do) hands that ordering to the executor instead, which is harmless while
+    /// every notification carries the whole document and corrupting the moment
+    /// one carries a range.
+    ///
+    /// Only the analysis is spawned, and it has to be: it waits out the
+    /// debounce, and tower-lsp would hold every following request behind a
+    /// handler that does.
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let Some(edit) = self.core.apply_did_change(&params) else {
+            return;
+        };
+        let uri = params.text_document.uri;
         let core = Arc::clone(&self.core);
         tokio::spawn(async move {
-            core.did_change(params).await;
+            core.analyze_buffer(uri, edit).await;
         });
     }
 
