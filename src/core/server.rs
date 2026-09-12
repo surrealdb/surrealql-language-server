@@ -1064,10 +1064,27 @@ where
         let Some(token) = token_at(&analysis.text, &analysis.line_index, position) else {
             return Vec::new();
         };
+        let name = token.trim();
+        let include_declaration = params.context.include_declaration;
+
         // Tables and fields, not only functions. "Where else is this table
         // used?" is the most-asked navigation question in a `.surql` workspace,
         // and the answer used to be an empty list.
-        model.references_for_name(token.trim(), params.context.include_declaration)
+        //
+        // A field is asked for by table first. The statement under the cursor
+        // names its target, and without that, `name` on `person` answers with
+        // `name` on `company` and `product` too, which is a list nobody asked
+        // for. One target only: a multi-target statement does not say which
+        // table the token belongs to, so the bare-name union is the honest
+        // answer there.
+        if let Some(fact) = crate::core::completion_context::active_query_fact(&analysis, position)
+            && let [table] = fact.target_tables.as_slice()
+            && let Some(references) = model.references_for_field(table, name, include_declaration)
+        {
+            return references;
+        }
+
+        model.references_for_name(name, include_declaration)
     }
 
     pub async fn prepare_rename(
@@ -1285,10 +1302,11 @@ where
     /// Foldable regions: statements, blocks, object and array literals, and
     /// runs of comments.
     ///
-    /// Reads the cached tree, so it costs one walk and no re-parse, and it
-    /// answers for a document the analyzer declined too: folding is a fact
-    /// about the shape of the text, and a file that will not analyse is exactly
-    /// when someone is folding their way through it.
+    /// Reads the cached tree, so it costs one walk and no re-parse.
+    ///
+    /// Empty for a document past the size or nesting cap. Those store a parse of
+    /// the empty string, because parsing them is what was refused, and parsing
+    /// one anyway to fold it would spend exactly what the cap is there to save.
     pub async fn folding_range(&self, params: FoldingRangeParams) -> Option<Vec<FoldingRange>> {
         let uri = params.text_document.uri;
         let (analysis, _, _) = self.snapshot_for_uri(&uri).await?;
@@ -1306,13 +1324,22 @@ where
             params
                 .positions
                 .into_iter()
-                .filter_map(|position| {
+                .map(|position| {
+                    // The response array has to correspond one-to-one with the
+                    // requested positions: the client reads the chain for its
+                    // Nth cursor out of the Nth slot. Dropping an entry would
+                    // hand every later cursor the previous one's chain, so a
+                    // position with no chain answers an empty range at itself.
                     crate::semantic::folding::selection_range(
                         &analysis.tree,
                         &analysis.text,
                         &analysis.line_index,
                         position,
                     )
+                    .unwrap_or(SelectionRange {
+                        range: Range::new(position, position),
+                        parent: None,
+                    })
                 })
                 .collect(),
         )
@@ -1362,6 +1389,37 @@ where
         model.document_diagnostics(&analysis, &settings)
     }
 
+    /// The diagnostic a desynced buffer owes its reader, if it is desynced.
+    ///
+    /// The analysis knows nothing about this: it describes the last text that
+    /// could be assembled, which is exactly why the document looks fine while
+    /// the editor's copy has moved on. Reported in the file, not only in the
+    /// log, because a user whose diagnostics have quietly stopped updating has
+    /// no reason to open the output channel.
+    fn desync_diagnostic(&self, uri: &Uri) -> Option<Diagnostic> {
+        let desynced = self
+            .buffers
+            .lock()
+            .expect("panic = 'abort' makes poisoning unreachable")
+            .get(uri)
+            .is_some_and(|buffer| buffer.desynced);
+
+        desynced.then(|| Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: crate::semantic::codes::as_code(crate::semantic::codes::BUFFER_DESYNCED),
+            code_description: crate::semantic::codes::description(
+                crate::semantic::codes::BUFFER_DESYNCED,
+            ),
+            source: Some("surreal-language-server".to_string()),
+            message: "The server's copy of this file no longer matches the editor's, \
+                      so edits to it are being ignored and these diagnostics are \
+                      stale. Close the file and reopen it to resynchronise."
+                .to_string(),
+            ..Diagnostic::default()
+        })
+    }
+
     /// Answer a diagnostic *pull*.
     ///
     /// The same set `publish_diagnostics_for_uri` would have pushed: there is
@@ -1381,11 +1439,12 @@ where
         let Some((analysis, model, settings)) = self.snapshot_for_uri(&uri).await else {
             return empty();
         };
-        let Some(diagnostics) =
+        let Some(mut diagnostics) =
             off_reactor(move || model.document_diagnostics(&analysis, &settings)).await
         else {
             return empty();
         };
+        diagnostics.extend(self.desync_diagnostic(&uri));
 
         DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
             RelatedFullDocumentDiagnosticReport {
@@ -1698,9 +1757,10 @@ where
             }
         }
 
-        // Text and pending tree are taken together, under one lock, so the tree
-        // always describes the text it is paired with.
-        let Some((text, pending_tree)) = self.buffer_for_analysis(&uri) else {
+        // Text, pending tree and version are taken together, under one lock, so
+        // the tree always describes the text it is paired with and the version
+        // names exactly the buffer this analysis is about to describe.
+        let Some((text, pending_tree, analyzed_version)) = self.buffer_for_analysis(&uri) else {
             // Closed while the debounce ran.
             return;
         };
@@ -1750,19 +1810,24 @@ where
                 .buffers
                 .lock()
                 .expect("panic = 'abort' makes poisoning unreachable");
-            if let Some(buffer) = buffers.get_mut(&uri)
-                && !buffer.desynced
+            if let Some(buffer) = buffers.get_mut(&uri) {
                 // A refused document (past the size or nesting cap) carries an
                 // *empty* tree, since parsing it is what was declined. Keeping
                 // that as the base for the next parse would apply the
                 // intervening edits, which are byte offsets into a large
                 // document, to a tree describing nothing.
-                && analysis.parsed_whole_document()
-                && buffer.text.len() == analysis.text.len()
-            {
-                buffer.set_pending_tree(analysis.tree.clone());
-            } else if let Some(buffer) = buffers.get_mut(&uri) {
-                buffer.pending_tree = None;
+                //
+                // Everything else the decision needs is the buffer's own
+                // business, and reading the version inside this lock is what
+                // closes the gap between the supersession check above and this
+                // store: `didOpen` never reaches that check at all, so an edit
+                // landing while the open-time analysis ran would otherwise go
+                // unnoticed here.
+                if analysis.parsed_whole_document() {
+                    buffer.set_pending_tree_if_current(analyzed_version, analysis.tree.clone());
+                } else {
+                    buffer.pending_tree = None;
+                }
             }
         }
 
@@ -1784,13 +1849,24 @@ where
             .is_some_and(|buffer| buffer.pending_tree.is_some())
     }
 
-    /// The text and pending tree for `uri`, taken together so they agree.
-    fn buffer_for_analysis(&self, uri: &Uri) -> Option<(Arc<String>, Option<Tree>)> {
+    /// The text, pending tree and version for `uri`, taken together so they
+    /// agree.
+    ///
+    /// The version is what the completed analysis is later compared against:
+    /// it is the only thing that distinguishes "this analysis still describes
+    /// the buffer" from "an edit landed while it ran".
+    fn buffer_for_analysis(&self, uri: &Uri) -> Option<(Arc<String>, Option<Tree>, i32)> {
         self.buffers
             .lock()
             .expect("panic = 'abort' makes poisoning unreachable")
             .get(uri)
-            .map(|buffer| (Arc::clone(&buffer.text), buffer.pending_tree.clone()))
+            .map(|buffer| {
+                (
+                    Arc::clone(&buffer.text),
+                    buffer.pending_tree.clone(),
+                    buffer.version,
+                )
+            })
     }
 
     /// Apply and analyse in one call, for callers with no reason to separate
@@ -2067,6 +2143,11 @@ where
     /// the per-document cost is small, so at twenty open buffers the thread
     /// hand-offs would be a meaningful fraction of the work.
     async fn republish_open_diagnostics(&self) {
+        if self.state.read().await.client.pull_diagnostics {
+            self.refresh_pulled_diagnostics().await;
+            return;
+        }
+
         let (documents, model, settings) = {
             let state = self.state.read().await;
             (
@@ -2099,7 +2180,32 @@ where
         }
     }
 
+    /// Ask a pulling client to re-pull every document it is showing.
+    ///
+    /// The request is workspace-wide by design: this server's model spans the
+    /// workspace, which is what `interFileDependencies` declares, so a
+    /// per-document refresh would be the wrong shape even if one existed.
+    ///
+    /// Silent for a client that did not declare `refreshSupport`. Such a client
+    /// re-pulls on its own schedule and cannot be prompted, which is a reason to
+    /// keep the diagnostics it pulls cheap, not a reason to push at it.
+    async fn refresh_pulled_diagnostics(&self) {
+        if self.state.read().await.client.diagnostic_refresh {
+            self.notifier.refresh_diagnostics().await;
+        }
+    }
+
     async fn publish_diagnostics_for_uri(&self, uri: &Uri) {
+        // A client that pulls is not pushed to. Doing both is how a diagnostic
+        // ends up rendered twice, and the client's own declaration is the only
+        // sound way to decide which it is. It still has to be *told* that the
+        // answer moved: its last pull may predate this analysis, and under a
+        // cross-file model an edit here changes what other open files mean.
+        if self.state.read().await.client.pull_diagnostics {
+            self.refresh_pulled_diagnostics().await;
+            return;
+        }
+
         let (analysis, model, settings) = {
             let state = self.state.read().await;
             let analysis = state
@@ -2118,24 +2224,18 @@ where
             return;
         };
 
-        // A client that pulls is not told. Doing both is how a diagnostic ends
-        // up rendered twice, and the client's own declaration is the only sound
-        // way to decide which it is.
-        if self.state.read().await.client.pull_diagnostics {
-            return;
-        }
-
         // `document_diagnostics` runs `type_diagnostics`, which is six full-tree
         // walks, plus the query-fact loop. Under a millisecond on a typical
         // document: this is moved for uniformity with the paths above rather
         // than for a measured win, and the thread hand-off is a real fraction of
         // it, but it is also where the stack overflow landed before the depth
         // guard, which is reason enough not to run it on a request thread.
-        let Some(diagnostics) =
+        let Some(mut diagnostics) =
             off_reactor(move || model.document_diagnostics(&analysis, &settings)).await
         else {
             return;
         };
+        diagnostics.extend(self.desync_diagnostic(uri));
         self.notifier
             .publish_diagnostics(uri.clone(), diagnostics)
             .await;

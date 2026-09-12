@@ -6744,6 +6744,16 @@ fn deep_nesting_is_refused_rather_than_overflowing_the_stack() {
                     "depth {depth} reported {:?}",
                     analysis.syntax_diagnostics[0].message
                 );
+                // Its own code, not `parse`. The refusal is the analyzer's
+                // limit rather than a syntax error, and a consumer keying on
+                // `parse` is told every one of those is real.
+                assert_eq!(
+                    analysis.syntax_diagnostics[0].code,
+                    surrealql_language_server::semantic::codes::as_code(
+                        surrealql_language_server::semantic::codes::TOO_DEEPLY_NESTED
+                    ),
+                    "depth {depth} reported the wrong code"
+                );
                 assert!(
                     analysis.query_facts.is_empty() && analysis.tables.is_empty(),
                     "a refused document must not claim extracted facts"

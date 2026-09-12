@@ -34,9 +34,55 @@ that the pinned grammar rejects. When that stops being true it is recorded in
 [grammar-gaps.md](grammar-gaps.md) and listed in [AGENTS.md](../AGENTS.md)
 before it can reach an agent.
 
-Two shapes report `parse` for a reason other than syntax, and say so in the
-message: a document nesting deeper than 1,024 levels, and one larger than
-`analysis.maxDocumentBytes`. Neither is analysed at all.
+`parse` means syntax and nothing else. The analyzer's own refusals carry their
+own codes, below, so `--only parse` in a build cannot pick up a notice about a
+file size.
+
+## document-too-large
+
+**Severity:** information.
+
+The document is larger than `analysis.maxDocumentBytes` (2 MB by default), so
+nothing in it was analysed. Reported once, at the top of the file.
+
+Nothing is wrong with the file. The alternative to saying so would be a document
+with no diagnostics at all, which reads as "clean".
+
+The text is still tracked, so editing it stays correct and reopening it under a
+larger limit analyses it. Raise `analysis.maxDocumentBytes`, or set it to `0`,
+to remove the limit.
+
+## too-deeply-nested
+
+**Severity:** error.
+
+Brackets, or the parse tree they produce, nest more than 1,024 levels deep. The
+analyzer stops there and extracts nothing.
+
+SurrealDB refuses this shape too, and at a lower limit: its parser carries an
+`expr_recursion_limit` and an `object_recursion_limit` of its own. So "this does
+not parse" is the right answer rather than a limitation being apologised for.
+
+The limit is measured, not guessed: across SurrealDB's own 1,897 test queries,
+1,896 parse under depth 30.
+
+## buffer-desynced
+
+**Severity:** error.
+
+The server's copy of the file no longer matches the editor's, so ranged edits to
+it are being ignored and the diagnostics on it are frozen at the last text that
+could be assembled.
+
+Reported in the document rather than only in the log, because a user whose
+diagnostics have stopped updating has no reason to open the output channel.
+
+**Close the file and reopen it.** That re-establishes the baseline, and it is
+the only recovery available: the protocol has no "please resend the document"
+request, and a client under incremental sync will not volunteer a whole document
+on its own. Worth reporting if it happens, with the log line that accompanies
+it, since it means either a change this server could not interpret or an
+ordering bug in the edit path.
 
 ## unknown-type
 

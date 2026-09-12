@@ -147,7 +147,10 @@ added. Key repairs on the code, not the message text.
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
-| `parse` | error | Tree-sitter could not parse the source. Every one is a real syntax error: see *Known false positives* below. |
+| `parse` | error | Tree-sitter could not parse the source. Syntax only, and every one is a real syntax error: see *Known false positives* below. |
+| `document-too-large` | information | Over `analysis.maxDocumentBytes`, so nothing in it was analysed. Not a fault in the file. |
+| `too-deeply-nested` | error | Nests past 1,024 levels. SurrealDB refuses this too, at a lower limit. Nothing was extracted. |
+| `buffer-desynced` | error | The server's copy of the file stopped matching the editor's. Its diagnostics are frozen; reopen the file. |
 | `unknown-type` | error | A type position holds a word SurrealQL's kind grammar does not have. |
 | `unknown-table` | warning | A queried table reads as a typo of an explicitly defined one. |
 | `unknown-field` | warning | A field not defined on an explicit (closed-schema) table. |
@@ -175,7 +178,13 @@ prose is one command away:
 
 ```bash
 surrealql-language-server check explain unknown-table
+surrealql-language-server check explain unknown-table --format json
 ```
+
+`--format json` follows the same rule the rest of `check` does: exactly one JSON
+object on stdout, whatever the exit code. A known code answers with `markdown`
+and exit 0; an unknown one answers with an `error` object, the list of
+`knownCodes`, and exit 2.
 
 ### Narrowing and repairing
 
@@ -194,7 +203,11 @@ check q.surql --fix renamed-function                       # repair in place
   rename table, while every other fix here is inferred: `unknown-table`'s is a
   string-distance guess, and applying it unattended can repoint a query at a
   *different real table*. A run that rewrote files reports `fixed` and
-  re-analyses, so it never reports the errors it just repaired.
+  re-analyses, so it never reports the errors it just repaired: repairs happen
+  in their own pass, before anything is reported, and the model every file is
+  then judged against is built from the repaired text. Each file is written by
+  renaming a complete temporary file over it, so an interrupted run leaves the
+  original intact rather than a truncated one.
 
 ## Known false positives
 

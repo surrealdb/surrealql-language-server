@@ -7,10 +7,15 @@
 //! object literal; selection range is what expand-selection binds to in VS Code,
 //! Zed, Helix and Neovim alike.
 //!
-//! Neither reads the *semantic* model. A folding range is a fact about the
-//! shape of the text, so it must still be right in a document the analyzer has
-//! declined, which is exactly when a user is most likely to be folding their
-//! way through it.
+//! Neither reads the *semantic* model, only the tree, so both answer for a
+//! document whose semantic analysis was skipped.
+//!
+//! They answer *nothing* for a document the analyzer **refused**, though, and
+//! that is not a bug to fix here: a refusal past the size or nesting cap stores
+//! a parse of the empty string, since parsing the real text is precisely what
+//! was declined. Walking that empty tree is what these functions then do. The
+//! alternative, parsing a document specifically because it was too large or too
+//! deeply nested to parse, is the cost the cap exists to avoid.
 
 use ls_types::{FoldingRange, FoldingRangeKind, Position, Range, SelectionRange};
 use tree_sitter::{Node, Tree};

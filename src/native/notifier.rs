@@ -35,6 +35,19 @@ impl LspNotifier for TowerNotifier {
         self.client.show_message(level, message).await;
     }
 
+    async fn refresh_diagnostics(&self) {
+        if let Err(error) = self.client.workspace_diagnostic_refresh().await {
+            // Not fatal, but it does mean this client is now looking at
+            // diagnostics computed before the edit that prompted the refresh.
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("SurrealQL: could not refresh diagnostics: {error}"),
+                )
+                .await;
+        }
+    }
+
     async fn register_capability(&self, registrations: Vec<Registration>) {
         if let Err(error) = self.client.register_capability(registrations).await {
             // Not fatal: the server keeps working, it just will not hear about

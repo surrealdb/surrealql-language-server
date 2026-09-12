@@ -46,6 +46,16 @@ pub trait LspNotifier: Send + Sync + 'static {
     /// with no dynamic registration (the browser has no filesystem to watch)
     /// simply never registers anything, which is the correct behaviour there.
     async fn register_capability(&self, _registrations: Vec<Registration>) {}
+
+    /// Equivalent to LSP `workspace/diagnostic/refresh`.
+    ///
+    /// Tells a client that pulls diagnostics to pull them again. It is what
+    /// makes `interFileDependencies` honest: a `DEFINE TABLE` edited in one
+    /// file changes what every other open file means, and a pulling client has
+    /// no other way to learn that. Defaults to doing nothing, like
+    /// [`Self::register_capability`], because a host that never pulls has
+    /// nothing to refresh.
+    async fn refresh_diagnostics(&self) {}
 }
 
 /// Source of `.surql` / `.surrealql` documents that already exist on

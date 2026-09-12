@@ -2051,7 +2051,7 @@ fn too_large_diagnostic(lines: &LineIndex, size: usize, max_bytes: usize) -> Dia
     Diagnostic {
         range: lines.range("", 0, 0),
         severity: Some(DiagnosticSeverity::INFORMATION),
-        code: codes::as_code(codes::PARSE),
+        code: codes::as_code(codes::DOCUMENT_TOO_LARGE),
         source: Some("surreal-language-server".to_string()),
         message: format!(
             "Document is {} KB, over the {} KB analysis limit, so it was not \
@@ -2073,7 +2073,7 @@ fn too_deeply_nested_text_diagnostic(lines: &LineIndex) -> Diagnostic {
     Diagnostic {
         range: lines.range("", 0, 0),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: codes::as_code(codes::PARSE),
+        code: codes::as_code(codes::TOO_DEEPLY_NESTED),
         source: Some("surreal-language-server".to_string()),
         message: format!(
             "Brackets nest more than {} levels deep. SurrealDB will not parse \
@@ -2097,7 +2097,7 @@ fn too_deeply_nested_diagnostic(source: &str, lines: &LineIndex, node: Node<'_>)
     Diagnostic {
         range: lines.range(source, start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: codes::as_code(codes::PARSE),
+        code: codes::as_code(codes::TOO_DEEPLY_NESTED),
         source: Some("surreal-language-server".to_string()),
         message: format!(
             "Expression nests more than {} levels deep. SurrealDB will not parse \

@@ -66,11 +66,24 @@ impl MergedSemanticModel {
                         .push(Location::new(analysis.uri.clone(), named.range));
                 }
                 for named in &fact.field_refs {
+                    let location = Location::new(analysis.uri.clone(), named.range);
                     model
                         .field_references
                         .entry(named.name.clone())
                         .or_default()
-                        .push(Location::new(analysis.uri.clone(), named.range));
+                        .push(location.clone());
+                    // The same reference again, under the table it was written
+                    // against, so a later lookup can be specific when the cursor
+                    // says which table it means.
+                    for table in &fact.target_tables {
+                        model
+                            .qualified_field_references
+                            .entry(table.clone())
+                            .or_default()
+                            .entry(named.name.clone())
+                            .or_default()
+                            .push(location.clone());
+                    }
                 }
             }
         }
@@ -2082,12 +2095,49 @@ impl MergedSemanticModel {
             .unwrap_or_default()
     }
 
+    /// Every reference to `table`'s `field`, and nothing from any other table.
+    ///
+    /// `None` when this table is not seen using that field anywhere, which is
+    /// the signal to fall back to [`Self::references_for_name`]: the cursor was
+    /// probably not on a field of this table at all.
+    pub fn references_for_field(
+        &self,
+        table: &str,
+        field: &str,
+        include_declaration: bool,
+    ) -> Option<Vec<Location>> {
+        let mut found = self
+            .qualified_field_references
+            .get(table)?
+            .get(field)?
+            .clone();
+
+        if include_declaration
+            && let Some(declaration) = self.fields.get(table).and_then(|fields| fields.get(field))
+        {
+            found.push(declaration.location.clone());
+        }
+
+        found.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        found.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+        Some(found)
+    }
+
     /// Every reference to `name`, whatever kind of thing it is.
     ///
     /// The three maps are searched rather than one being chosen, because the
     /// cursor gives a bare word: `person` may be a table, and `fn::person` a
     /// function, and nothing in the token says which the user meant. Returning
-    /// the union is both the honest answer and the useful one.
+    /// the union is the answer available once the name is all there is to go on.
+    /// When the cursor *does* say which table it means,
+    /// [`Self::references_for_field`] answers the narrower question and callers
+    /// should ask it first.
     ///
     /// `include_declaration` prepends the `DEFINE` that introduces the name, as
     /// `ReferenceParams.context` asks.

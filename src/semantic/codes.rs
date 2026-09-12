@@ -7,7 +7,22 @@
 use ls_types::NumberOrString;
 
 /// Tree-sitter parse failures (both `ERROR` and `MISSING` nodes).
+///
+/// Only syntax. The analyzer's own refusals carry [`DOCUMENT_TOO_LARGE`],
+/// [`TOO_DEEPLY_NESTED`] and [`BUFFER_DESYNCED`] instead: a machine consumer is
+/// told to treat `parse` as "this query does not compile", and a size-limit
+/// notice reported under that code would be a lie it acts on.
 pub const PARSE: &str = "parse";
+/// The document is over `analysis.maxDocumentBytes`, so nothing was analysed.
+/// A notice about the server's own limit, not a judgement about the file.
+pub const DOCUMENT_TOO_LARGE: &str = "document-too-large";
+/// Brackets or tree nodes nest past `MAX_NODE_DEPTH`, so the analyzer declined
+/// to descend. SurrealDB's parser refuses this shape too, at a lower limit.
+pub const TOO_DEEPLY_NESTED: &str = "too-deeply-nested";
+/// The server's copy of the buffer fell out of step with the editor's, so
+/// ranged edits are being ignored. Reported in the document because the output
+/// channel is not somewhere a user looks when diagnostics stop moving.
+pub const BUFFER_DESYNCED: &str = "buffer-desynced";
 /// A query targets a table with no known definition.
 pub const UNKNOWN_TABLE: &str = "unknown-table";
 /// A query touches a field that isn't defined on an explicit table.
@@ -75,6 +90,9 @@ pub const UNKNOWN_TYPE: &str = "unknown-type";
 /// `every_code_is_documented` in `tests/compat.rs`.
 pub const ALL: &[&str] = &[
     PARSE,
+    DOCUMENT_TOO_LARGE,
+    TOO_DEEPLY_NESTED,
+    BUFFER_DESYNCED,
     UNKNOWN_TYPE,
     UNKNOWN_TABLE,
     UNKNOWN_FIELD,
@@ -95,17 +113,26 @@ pub const ALL: &[&str] = &[
 
 /// Where the prose for `code` lives, for `Diagnostic.codeDescription`.
 ///
-/// Points into this repository rather than at a documentation site, so the link
-/// is true the day it ships and keeps working for anyone reading a tagged
-/// release. A `codeDescription` pointing at a 404 renders as a dead hyperlink in
-/// VS Code, which is worse than none: `every_code_is_documented` is what keeps
-/// it honest.
+/// Points into this repository at **this build's own tag**, not at `master`.
+/// `master` is the branch that moves: a link to it would drift away from the
+/// binary the user is running, which is the opposite of what a stable code is
+/// for. Every published build (crates.io, npm, the release binaries) comes from
+/// a `v<version>` tag, so the link resolves for anything anyone installs.
+///
+/// The one case it does not resolve is a build from a working tree whose
+/// version has not been tagged yet, which is a state only this repository's own
+/// developers are ever in.
+///
+/// A `codeDescription` pointing at a 404 renders as a dead hyperlink in VS Code,
+/// which is worse than none: `every_code_is_documented` is what keeps the anchor
+/// half honest.
 pub fn description(code: &str) -> Option<ls_types::CodeDescription> {
     if !ALL.contains(&code) {
         return None;
     }
     let href: ls_types::Uri = format!(
-        "https://github.com/surrealdb/surrealql-language-server/blob/master/docs/diagnostics.md#{code}"
+        "https://github.com/surrealdb/surrealql-language-server/blob/v{}/docs/diagnostics.md#{code}",
+        env!("CARGO_PKG_VERSION")
     )
     .parse()
     .ok()?;
