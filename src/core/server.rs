@@ -258,6 +258,36 @@ where
         let workspace_folders = resolve_workspace_folders(&params);
         let client = ClientProfile::from_capabilities(&params.capabilities);
 
+        // Every conformant client supports UTF-16 (the specification requires
+        // it, and `positionEncoding` echoes it), so this is effectively
+        // unreachable. But "effectively unreachable" and "silently wrong" look
+        // identical from the outside, and a client that offers only UTF-8 would
+        // otherwise receive ranges counted the other way with nothing said.
+        if let Some(encodings) = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|general| general.position_encodings.as_ref())
+            && !encodings.is_empty()
+            && !encodings.contains(&PositionEncodingKind::UTF16)
+        {
+            self.notifier
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "SurrealQL: this client offers only {} position encoding, and the \
+                         server counts UTF-16. Ranges may be misplaced on lines holding \
+                         non-ASCII characters.",
+                        encodings
+                            .iter()
+                            .map(|encoding| encoding.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    ),
+                )
+                .await;
+        }
+
         // Which client, and which version. Free, and it turns an
         // editor-specific bug report into something reproducible.
         if let Some(info) = &params.client_info {

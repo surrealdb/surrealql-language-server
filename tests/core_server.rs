@@ -4144,3 +4144,63 @@ async fn validate_text_returns_the_same_diagnostics_the_server_publishes() {
         "a one-shot check must carry the documentation link too"
     );
 }
+
+/// The server counts UTF-16 and says so. A client that cannot take UTF-16 is
+/// told, because "effectively unreachable" and "silently wrong" look identical
+/// from the outside: such a client would otherwise get ranges counted the other
+/// way with nothing said.
+#[tokio::test]
+async fn a_client_that_cannot_take_utf16_is_warned() {
+    use tower_lsp_server::ls_types::PositionEncodingKind;
+
+    let utf8_only = InitializeParams {
+        capabilities: tower_lsp_server::ls_types::ClientCapabilities {
+            general: Some(tower_lsp_server::ls_types::GeneralClientCapabilities {
+                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..InitializeParams::default()
+    };
+
+    let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+    core.initialize(utf8_only).await;
+    assert!(
+        notifier
+            .logs()
+            .iter()
+            .any(|(_, message)| message.contains("position encoding")),
+        "a client offering only utf-8 must be told the server counts utf-16"
+    );
+
+    // A client that offers utf-16 (or says nothing, which is every client
+    // today) hears nothing about it.
+    for capabilities in [
+        tower_lsp_server::ls_types::ClientCapabilities {
+            general: Some(tower_lsp_server::ls_types::GeneralClientCapabilities {
+                position_encodings: Some(vec![
+                    PositionEncodingKind::UTF8,
+                    PositionEncodingKind::UTF16,
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        tower_lsp_server::ls_types::ClientCapabilities::default(),
+    ] {
+        let (core, notifier, _) = common::core_with(Default::default(), Default::default());
+        core.initialize(InitializeParams {
+            capabilities,
+            ..InitializeParams::default()
+        })
+        .await;
+        assert!(
+            !notifier
+                .logs()
+                .iter()
+                .any(|(_, message)| message.contains("position encoding")),
+            "a capable client must not be warned"
+        );
+    }
+}

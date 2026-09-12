@@ -162,8 +162,7 @@ are the same speed, so this profile change is where essentially all of the
 one-shot improvement comes from; the 0.7 code changes cost nothing measurable. That is a larger win than
 anything left in `docs/perf-plan.md`. The default belongs to the common case,
 which is the native binary; `scripts/build-wasm.sh` opts the browser module back
-into size, where a download is a real cost. The native binary grows to about
-9.3 MB.
+into size, where a download is a real cost. The native binary grows to 9.5 MB.
 
 The benchmark inherited `'z'` too, so every number in `docs/perf-baseline.md`
 described a binary no user of the `surrealql-language-server` executable ever

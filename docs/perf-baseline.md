@@ -243,7 +243,7 @@ change being the optimisation level:
 Larger than anything left in `docs/perf-plan.md`, for a one-line change. The
 default now optimises for speed; `scripts/build-wasm.sh` sets
 `CARGO_PROFILE_RELEASE_OPT_LEVEL=z` for the browser module, where a download is
-a real cost. The native binary grows to about 9.3 MB.
+a real cost. The native binary grows to 9.5 MB.
 
 ## Incremental parse
 
