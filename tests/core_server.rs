@@ -1790,6 +1790,48 @@ async fn a_stale_change_does_not_overwrite_a_newer_one() {
     );
 }
 
+/// Reopening a file must not freeze its diagnostics.
+///
+/// `document_versions` recorded a high-water mark per URI and `did_close`
+/// removed the document but not its version. A client that restarts versioning
+/// on reopen (VS Code does), then sent `didChange` at version 2 against a
+/// remembered 57, and `upsert_open_document` dropped it as stale. Every edit
+/// after that was dropped too, so the buffer showed the diagnostics it had when
+/// it was opened and never updated again.
+#[tokio::test]
+async fn reopening_a_file_does_not_freeze_its_diagnostics() {
+    let (core, _notifier, _) = common::core_with(Default::default(), Default::default());
+    core.apply_settings(settings_with_debounce(0)).await;
+
+    // Edit it up to a high version, the way a real session does.
+    open(&core, "reopen.surql", "DEFINE TABLE t1 SCHEMAFULL;").await;
+    core.did_change(change("reopen.surql", 57, "DEFINE TABLE t57 SCHEMAFULL;"))
+        .await;
+    assert_eq!(
+        defined_table(&core, "reopen.surql").await.as_deref(),
+        Some("TABLE t57"),
+    );
+
+    core.did_close(DidCloseTextDocumentParams {
+        text_document: TextDocumentIdentifier {
+            uri: uri("reopen.surql"),
+        },
+    })
+    .await;
+
+    // The client reopens and starts counting again from 1.
+    open(&core, "reopen.surql", "DEFINE TABLE fresh1 SCHEMAFULL;").await;
+    core.did_change(change("reopen.surql", 2, "DEFINE TABLE fresh2 SCHEMAFULL;"))
+        .await;
+
+    assert_eq!(
+        defined_table(&core, "reopen.surql").await.as_deref(),
+        Some("TABLE fresh2"),
+        "the edit after reopening was dropped as stale against the version the \
+         file had before it was closed"
+    );
+}
+
 /// `didOpen` is never delayed. The file just appeared and the user is waiting to
 /// see what is wrong with it.
 #[tokio::test]

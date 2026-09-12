@@ -35,8 +35,11 @@ pub struct ServerState {
     /// running the analysis off the reactor would let an older version finish
     /// last and overwrite a newer one.
     ///
-    /// `didOpen` does not record a version: it is never delayed, so there is
-    /// nothing to supersede.
+    /// `didOpen` *replaces* the entry rather than comparing against it (the
+    /// client is declaring where this buffer's versioning now starts), and
+    /// `didClose` removes it. Leaving a closed document's high-water mark behind
+    /// froze diagnostics on reopen, because a client that restarts its counter
+    /// then looked stale forever.
     pub document_versions: HashMap<Uri, i32>,
     pub live_metadata: Arc<LiveMetadataSnapshot>,
     pub model: Arc<MergedSemanticModel>,

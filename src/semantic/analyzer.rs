@@ -6,6 +6,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::grammar::language;
 use crate::semantic::codes;
+use crate::semantic::limits;
 use crate::semantic::node_kind as k;
 use crate::semantic::text::{LineIndex, compact_preview};
 use crate::semantic::type_expr::TypeExpr;
@@ -38,8 +39,28 @@ pub fn analyze_document_with_limit(
     let owned_text: String = text.into();
     let text: &str = &owned_text;
 
+    // Checked before the parser runs, because the tree-depth guard further down
+    // is too late for the very worst input: tree-sitter frees a tree by
+    // recursing through it, so a document deep enough overflows the stack in
+    // tree-sitter's own `Drop`: after every walk of ours has correctly
+    // declined it. Counting brackets in the text is one linear pass and lets
+    // such a document be refused without ever building the tree.
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
+
+    if limits::too_deep(limits::max_bracket_depth(text)) {
+        // Parse an empty document instead of this one. The analysis still needs
+        // a `Tree` (request handlers read it unconditionally), and an empty one
+        // is a single node that costs nothing to build or to free.
+        let tree = parser.parse("", None)?;
+        let line_index = LineIndex::new(text);
+        let mut analysis = blank_analysis(uri, tree);
+        analysis.syntax_diagnostics = vec![too_deeply_nested_text_diagnostic(&line_index)];
+        analysis.line_index = line_index;
+        analysis.text = owned_text;
+        return Some(analysis);
+    }
+
     let tree = parser.parse(text, None)?;
     let root = tree.root_node();
 
@@ -77,7 +98,28 @@ pub fn analyze_document_with_limit(
         document_symbols: Vec::with_capacity(statement_hint),
     };
 
-    collect_statements(root, text, &line_index, &uri, origin, &mut analysis);
+    // Bound the whole analysis in one place rather than guarding each of the
+    // forty-odd recursive walks that read this tree.
+    //
+    // Tree-sitter's parser is iterative, so it builds a tree as deep as the text
+    // asks for; almost everything that *reads* that tree descends it by
+    // recursion, and `panic = 'abort'` turns the first walk to run out of stack
+    // into a dead process that takes every open document with it. Measured on
+    // the real binary before this guard: a `didOpen` carrying `RETURN` and six
+    // thousand nested parentheses (a 12 KB file) aborted a worker thread.
+    //
+    // Rejecting once, here, is what makes every walk below provably bounded. A
+    // document this deep is not one SurrealDB would run either, so the honest
+    // answer is a syntax error and no extracted facts. See `semantic::limits`
+    // for where the number comes from.
+    if limits::too_deep(limits::tree_depth(root, limits::MAX_NODE_DEPTH)) {
+        analysis.syntax_diagnostics = vec![too_deeply_nested_diagnostic(text, &line_index, root)];
+        analysis.line_index = line_index;
+        analysis.text = owned_text;
+        return Some(analysis);
+    }
+
+    collect_statements(root, text, &line_index, &uri, origin, 0, &mut analysis);
     // One sweep over the whole tree rather than per-statement calls: a
     // `fn::` call can appear anywhere (a LET value, a RETURN expression,
     // an IF condition), and collecting per-statement both missed those
@@ -143,16 +185,14 @@ pub fn collect_syntax_diagnostics_at(
     let mut diagnostics = Vec::new();
     // One slot per line, marked as `parse` diagnostics are pushed.
     let mut parse_rows = vec![false; lines.line_count()];
-    collect_node_diagnostics(
+    let walk = DiagnosticWalk {
         uri,
         source,
         lines,
-        node,
         known_names,
         limit,
-        &mut parse_rows,
-        &mut diagnostics,
-    );
+    };
+    collect_node_diagnostics(&walk, node, 0, &mut parse_rows, &mut diagnostics);
     diagnostics
 }
 
@@ -162,8 +202,17 @@ fn collect_statements(
     lines: &LineIndex,
     uri: &Uri,
     origin: SymbolOrigin,
+    depth: u32,
     analysis: &mut DocumentAnalysis,
 ) {
+    // The extraction walk descends every container, so a document nested past
+    // anything SurrealDB would parse can run the stack out here. Stopping costs
+    // the definitions inside that subtree; the syntax pass still reports the
+    // nesting itself. See `semantic::limits`.
+    if limits::too_deep(depth) {
+        return;
+    }
+
     let kind = node.kind();
 
     if kind == k::DEFINE_STATEMENT {
@@ -187,7 +236,7 @@ fn collect_statements(
         if define_form(node, source).as_deref() == Some("function")
             && let Some(body) = k::find_child(node, k::BLOCK)
         {
-            collect_statements(body, source, lines, uri, origin, analysis);
+            collect_statements(body, source, lines, uri, origin, depth + 1, analysis);
         }
         return;
     }
@@ -245,7 +294,7 @@ fn collect_statements(
     // Descend into containers (SurrealQL root, Block, SubQuery, etc.).
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_statements(child, source, lines, uri, origin, analysis);
+        collect_statements(child, source, lines, uri, origin, depth + 1, analysis);
     }
 }
 
@@ -1806,28 +1855,47 @@ pub fn syntax_diagnostic_limit(configured: usize) -> usize {
     }
 }
 
-// Nine parameters, five of them shared with its mutually recursive partner.
-// The fix is a walk-context struct holding `uri`/`source`/`lines`/`known_names`,
-// which is also what lets the pair share one depth counter: done together with
-// the recursion guard rather than as a signature change on its own.
-#[allow(clippy::too_many_arguments)]
-fn collect_node_diagnostics(
-    uri: Option<&Uri>,
-    source: &str,
-    lines: &LineIndex,
-    node: Node<'_>,
-    known_names: &std::collections::HashSet<String>,
+/// The parts of the syntax-diagnostic walk that do not change as it descends.
+///
+/// Hoisting them out of the parameter list is what lets the two mutually
+/// recursive halves of the walk ([`collect_node_diagnostics`] and
+/// [`descend_into_error`]) share **one** depth counter. A guard that each half
+/// incremented separately would not bound the stack, because the pair alternates
+/// on malformed input: an ERROR node's children are walked by one and its nested
+/// errors by the other.
+struct DiagnosticWalk<'a> {
+    uri: Option<&'a Uri>,
+    source: &'a str,
+    lines: &'a LineIndex,
+    known_names: &'a std::collections::HashSet<String>,
     limit: usize,
+}
+
+fn collect_node_diagnostics(
+    walk: &DiagnosticWalk<'_>,
+    node: Node<'_>,
+    depth: u32,
     parse_rows: &mut [bool],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if diagnostics.len() >= limit {
+    if diagnostics.len() >= walk.limit {
+        return;
+    }
+
+    // Deeper than any query SurrealDB would run. Stop rather than overflow the
+    // stack: see `semantic::limits`.
+    if limits::too_deep(depth) {
+        push_parse_diagnostic(
+            too_deeply_nested_diagnostic(walk.source, walk.lines, node),
+            parse_rows,
+            diagnostics,
+        );
         return;
     }
 
     if node.is_missing() {
         push_parse_diagnostic(
-            missing_node_diagnostic(source, lines, node),
+            missing_node_diagnostic(walk.source, walk.lines, node),
             parse_rows,
             diagnostics,
         );
@@ -1836,7 +1904,7 @@ fn collect_node_diagnostics(
 
     if node.is_error() {
         push_parse_diagnostic(
-            error_node_diagnostic(uri, source, lines, node, known_names),
+            error_node_diagnostic(walk.uri, walk.source, walk.lines, node, walk.known_names),
             parse_rows,
             diagnostics,
         );
@@ -1845,13 +1913,10 @@ fn collect_node_diagnostics(
         // nested MISSING/ERROR nodes — surface those too instead of
         // hiding them behind one giant squiggle.
         descend_into_error(
-            uri,
-            source,
-            lines,
+            walk,
             node,
-            known_names,
             node.start_position().row,
-            limit,
+            depth + 1,
             parse_rows,
             diagnostics,
         );
@@ -1864,7 +1929,7 @@ fn collect_node_diagnostics(
     // report must not disappear when `enable_type_checking` is off.
     if node.kind() == k::TYPE_NAME
         && !parse_failure_on_line(parse_rows, node)
-        && let Some(diagnostic) = unknown_type_diagnostic(source, lines, node)
+        && let Some(diagnostic) = unknown_type_diagnostic(walk.source, walk.lines, node)
     {
         diagnostics.push(diagnostic);
         return;
@@ -1878,16 +1943,85 @@ fn collect_node_diagnostics(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_node_diagnostics(
-            uri,
-            source,
-            lines,
-            child,
-            known_names,
-            limit,
-            parse_rows,
-            diagnostics,
-        );
+        collect_node_diagnostics(walk, child, depth + 1, parse_rows, diagnostics);
+    }
+}
+
+/// Reported once where a walk stopped because the tree nests deeper than
+/// [`limits::MAX_NODE_DEPTH`].
+///
+/// It is deliberately a `parse` error rather than a new code. SurrealDB refuses
+/// to parse a query this deep too (its `expr_recursion_limit` and
+/// `object_recursion_limit` are far lower), so "this does not parse" is the
+/// truthful thing to say, and an agent keying on `parse` already knows to fix
+/// the query rather than the schema.
+/// A `DocumentAnalysis` holding nothing but the URI and a tree.
+///
+/// Used by the refusal paths, which have a document to account for but no facts
+/// to report about it.
+fn blank_analysis(uri: Uri, tree: tree_sitter::Tree) -> DocumentAnalysis {
+    DocumentAnalysis {
+        uri,
+        text: String::new(),
+        tree,
+        line_index: LineIndex::default(),
+        tables: Vec::new(),
+        events: Vec::new(),
+        indexes: Vec::new(),
+        fields: Vec::new(),
+        functions: Vec::new(),
+        params: Vec::new(),
+        accesses: Vec::new(),
+        analyzers: Vec::new(),
+        query_facts: Vec::new(),
+        edge_observations: Vec::new(),
+        references: Vec::new(),
+        syntax_diagnostics: Vec::new(),
+        document_symbols: Vec::new(),
+    }
+}
+
+/// The same report as [`too_deeply_nested_diagnostic`], for the pre-parse
+/// bracket check, which has no tree and therefore no node to point at.
+///
+/// Anchored at the start of the document: there is no meaningful narrower range
+/// when the whole file is one runaway nest.
+fn too_deeply_nested_text_diagnostic(lines: &LineIndex) -> Diagnostic {
+    Diagnostic {
+        range: lines.range("", 0, 0),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: codes::as_code(codes::PARSE),
+        source: Some("surreal-language-server".to_string()),
+        message: format!(
+            "Brackets nest more than {} levels deep. SurrealDB will not parse \
+             this either, and the analyzer does not attempt it.",
+            limits::MAX_NODE_DEPTH
+        ),
+        ..Diagnostic::default()
+    }
+}
+
+fn too_deeply_nested_diagnostic(source: &str, lines: &LineIndex, node: Node<'_>) -> Diagnostic {
+    // The node's own first line, the same clamping every other parse diagnostic
+    // uses: a range spanning the whole nest would underline most of the file.
+    let start = node.start_byte();
+    let end = source
+        .get(start..node.end_byte())
+        .and_then(|region| region.find('\n'))
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| node.end_byte());
+
+    Diagnostic {
+        range: lines.range(source, start, end),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: codes::as_code(codes::PARSE),
+        source: Some("surreal-language-server".to_string()),
+        message: format!(
+            "Expression nests more than {} levels deep. SurrealDB will not parse \
+             it either, and the analyzer stops descending here.",
+            limits::MAX_NODE_DEPTH
+        ),
+        ..Diagnostic::default()
     }
 }
 
@@ -2085,30 +2219,32 @@ fn has_error_ancestor(node: Node<'_>) -> bool {
 /// the same underline, so they're descended through without their own
 /// diagnostic; errors on later lines get reported (the parent's range
 /// was clamped to its first line).
-// Nine parameters, five of them shared with its mutually recursive partner.
-// The fix is a walk-context struct holding `uri`/`source`/`lines`/`known_names`,
-// which is also what lets the pair share one depth counter: done together with
-// the recursion guard rather than as a signature change on its own.
-#[allow(clippy::too_many_arguments)]
 fn descend_into_error(
-    uri: Option<&Uri>,
-    source: &str,
-    lines: &LineIndex,
+    walk: &DiagnosticWalk<'_>,
     node: Node<'_>,
-    known_names: &std::collections::HashSet<String>,
     reported_row: usize,
-    limit: usize,
+    depth: u32,
     parse_rows: &mut [bool],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Shares the counter with `collect_node_diagnostics`; see `DiagnosticWalk`.
+    if limits::too_deep(depth) {
+        push_parse_diagnostic(
+            too_deeply_nested_diagnostic(walk.source, walk.lines, node),
+            parse_rows,
+            diagnostics,
+        );
+        return;
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if diagnostics.len() >= limit {
+        if diagnostics.len() >= walk.limit {
             return;
         }
         if child.is_missing() {
             push_parse_diagnostic(
-                missing_node_diagnostic(source, lines, child),
+                missing_node_diagnostic(walk.source, walk.lines, child),
                 parse_rows,
                 diagnostics,
             );
@@ -2117,46 +2253,37 @@ fn descend_into_error(
         if child.is_error() {
             if child.start_position().row == reported_row {
                 descend_into_error(
-                    uri,
-                    source,
-                    lines,
+                    walk,
                     child,
-                    known_names,
                     reported_row,
-                    limit,
+                    depth + 1,
                     parse_rows,
                     diagnostics,
                 );
             } else {
                 push_parse_diagnostic(
-                    error_node_diagnostic(uri, source, lines, child, known_names),
+                    error_node_diagnostic(
+                        walk.uri,
+                        walk.source,
+                        walk.lines,
+                        child,
+                        walk.known_names,
+                    ),
                     parse_rows,
                     diagnostics,
                 );
                 descend_into_error(
-                    uri,
-                    source,
-                    lines,
+                    walk,
                     child,
-                    known_names,
                     child.start_position().row,
-                    limit,
+                    depth + 1,
                     parse_rows,
                     diagnostics,
                 );
             }
             continue;
         }
-        collect_node_diagnostics(
-            uri,
-            source,
-            lines,
-            child,
-            known_names,
-            limit,
-            parse_rows,
-            diagnostics,
-        );
+        collect_node_diagnostics(walk, child, depth + 1, parse_rows, diagnostics);
     }
 }
 

@@ -4,6 +4,33 @@
 
 ### Fixed
 
+**Deeply nested input no longer kills the server.** A `didOpen` carrying
+`RETURN` and six thousand nested parentheses (a 12 KB file) aborted the
+process with `thread 'tokio-rt-worker' has overflowed its stack`. Around forty
+functions walk the tree by recursion, tree-sitter's parser is iterative so it
+builds whatever depth the text asks for, and `panic = 'abort'` turns the first
+walk to run out of stack into a dead process that loses every open document.
+
+Bounded in one place rather than forty: `analyze_document` measures the tree
+once, iteratively, and refuses a document deeper than 1,024 levels with a single
+`parse` diagnostic. A cheaper bracket count runs before the parser, because
+tree-sitter frees a tree by recursing through it, so a deep enough document
+overflowed in tree-sitter's own `Drop`, after every walk of ours had correctly
+declined it.
+
+The cap is measured, not guessed: across SurrealDB's 1,897 test queries, 1,893
+parse to fewer than 30 levels, and the one outlier at 204 is a file that exists
+to prove the *engine* rejects it (SurrealDB's own defaults are
+`expr_recursion_limit: 128`, `object_recursion_limit: 100`). The benchmark is
+unchanged: `analyze_document` measures 45.7 ms against 46.4 ms before.
+
+**Reopening a file no longer freezes its diagnostics.** `did_close` removed the
+document but not its version high-water mark, so a client that restarts
+versioning on reopen (VS Code does) had every subsequent edit dropped as
+stale, and the buffer showed whatever it looked like when it was opened. The
+mark is now removed on close and replaced on open, which the LSP says is
+authoritative.
+
 **Every documented false positive is gone.** The grammar pin moved from
 `cb2e6b5` (which was an unmerged pull-request branch, not a revision on
 `master`) to `373e7cd`. That revision parses all seven shapes of valid

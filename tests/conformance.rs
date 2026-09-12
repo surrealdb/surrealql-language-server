@@ -380,6 +380,70 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
 ];
 
+/// Reports the deepest tree the corpus produces, which is how
+/// `semantic::limits::MAX_NODE_DEPTH` was sized.
+///
+/// The analyzer descends the tree recursively in about thirty places, and the
+/// guard that keeps a hostile document from overflowing the stack has to sit
+/// far enough above real SurrealQL to never fire on it. Guessing that number
+/// would either leave the crash reachable or silently truncate analysis of
+/// legitimately deep expressions, so it is measured. Kept as a test rather than
+/// a one-off script so the next person can re-run it after a grammar bump.
+///
+/// ```text
+/// cargo test --test conformance -- --ignored measure_corpus_tree_depth --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement, not an assertion; run it when sizing the depth cap"]
+fn measure_corpus_tree_depth() {
+    fn depth_of(node: tree_sitter::Node<'_>) -> usize {
+        let mut deepest = 0;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            deepest = deepest.max(depth_of(child));
+        }
+        deepest + 1
+    }
+
+    let Some(corpus) = corpus_dir() else {
+        eprintln!("skipping: no SurrealDB checkout. Set SURREALDB_DIR to run this.");
+        return;
+    };
+    let mut files = Vec::new();
+    surql_files(&corpus, &mut files);
+    files.sort();
+
+    let mut deepest = 0usize;
+    let mut worst = String::new();
+    let mut histogram = [0usize; 8];
+    for file in &files {
+        let Ok(source) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let Some(analysis) = analyze_document(uri("depth.surql"), &source, SymbolOrigin::Local)
+        else {
+            continue;
+        };
+        let depth = depth_of(analysis.tree.root_node());
+        histogram[(depth / 10).min(7)] += 1;
+        if depth > deepest {
+            deepest = depth;
+            worst = file.display().to_string();
+        }
+    }
+
+    println!("files: {}", files.len());
+    for (bucket, count) in histogram.iter().enumerate() {
+        let label = if bucket == 7 {
+            "70+".to_string()
+        } else {
+            format!("{}-{}", bucket * 10, bucket * 10 + 9)
+        };
+        println!("  depth {label:>6}: {count}");
+    }
+    println!("deepest: {deepest} ({worst})");
+}
+
 /// The exhaustive oracle. Ignored by default because it re-analyses ~1,900
 /// documents and takes about two minutes, which does not belong in a suite that
 /// otherwise finishes in under a second.

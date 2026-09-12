@@ -380,7 +380,7 @@ where
 
     pub async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.upsert_open_document(document.uri, document.text, Edit::Opened)
+        self.upsert_open_document(document.uri, document.text, Edit::Opened(document.version))
             .await;
     }
 
@@ -417,6 +417,12 @@ where
         {
             let mut state = self.state.write().await;
             state.open_documents.remove(&uri);
+            // The version high-water mark has to go with the document. A client
+            // that reopens a file starts counting from 1 again (VS Code does),
+            // and a remembered 57 would make `upsert_open_document` drop every
+            // edit until the counter climbed back past it: diagnostics frozen
+            // at whatever the file looked like when it was opened.
+            state.document_versions.remove(&uri);
         }
         self.sync_saved_document_from_disk(&uri).await;
         self.recompute_model().await;
@@ -1136,17 +1142,25 @@ where
 
         // Record the version first, so a later edit can tell that this one is
         // superseded even while this call is still waiting or analysing.
-        if let Edit::Changed(version) = edit {
-            let mut state = self.state.write().await;
-            if state
-                .document_versions
-                .get(&uri)
-                .is_some_and(|newest| *newest > version)
-            {
-                // A newer edit already arrived. Its own call does the work.
-                return;
+        match edit {
+            Edit::Changed(version) => {
+                let mut state = self.state.write().await;
+                if state
+                    .document_versions
+                    .get(&uri)
+                    .is_some_and(|newest| *newest > version)
+                {
+                    // A newer edit already arrived. Its own call does the work.
+                    return;
+                }
+                state.document_versions.insert(uri.clone(), version);
             }
-            state.document_versions.insert(uri.clone(), version);
+            // An open replaces the mark rather than comparing against it: the
+            // client is telling us where this buffer's versioning now starts.
+            Edit::Opened(version) => {
+                let mut state = self.state.write().await;
+                state.document_versions.insert(uri.clone(), version);
+            }
         }
 
         // Let a burst of keystrokes settle. `didOpen` skips this entirely.
@@ -1605,7 +1619,13 @@ fn builtin_signature_information(
 /// version of the same document in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Edit {
-    Opened,
+    /// `didOpen`, carrying the version the client says the buffer is at.
+    ///
+    /// Per LSP that version is authoritative for the newly-opened document, so
+    /// it *replaces* whatever high-water mark the URI had. A client that
+    /// reopens without closing first (and any client whose counter restarts)
+    /// is covered by this as well as by the removal in `did_close`.
+    Opened(i32),
     Changed(i32),
 }
 
