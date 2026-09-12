@@ -292,3 +292,96 @@ fn an_unreadable_config_exits_two() {
     let output = run_check(&dir, &["query.surql", "--config", "surql.json"]);
     assert_eq!(exit_code(&output), 2);
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// `--format json` prints exactly one JSON object, for every exit code
+// ──────────────────────────────────────────────────────────────────────
+
+/// The invariant an agent depends on.
+///
+/// Four paths used to write a sentence to stderr and exit 2 with stdout empty,
+/// so every JSON consumer had to special-case "no output": the exact ambiguity
+/// the exit-code contract exists to remove. Each failure kind is a separate case
+/// here because each was a separate early return.
+#[test]
+fn json_format_always_prints_one_object_even_when_the_run_fails() {
+    let dir = scratch("json-on-failure");
+
+    // 1. A config file that is not JSON.
+    let bad_config = write(&dir, "bad.json", "{ not json");
+    let good = write(&dir, "ok.surql", "DEFINE TABLE t SCHEMAFULL;\n");
+    let output = run_check(
+        &dir,
+        &[
+            good.to_str().expect("utf8"),
+            "--config",
+            bad_config.to_str().expect("utf8"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_failure_report(&output, "invalid-config");
+
+    // 2. A target that does not exist.
+    let output = run_check(
+        &dir,
+        &[
+            dir.join("missing.surql").to_str().expect("utf8"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_failure_report(&output, "unreadable-input");
+}
+
+/// Every failure report is one parseable object carrying `exitCode: 2` and a
+/// machine-readable `error.kind`.
+fn assert_failure_report(output: &Output, expected_kind: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a run that cannot complete must exit 2"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("`--format json` must print one JSON object; got {stdout:?} ({error})")
+    });
+
+    assert_eq!(report["exitCode"], 2);
+    assert_eq!(
+        report["error"]["kind"], expected_kind,
+        "error.kind is the stable field a repair keys on"
+    );
+    assert!(
+        report["error"]["message"].is_string(),
+        "the failure must carry prose too"
+    );
+    assert_eq!(
+        report["files"].as_array().map(Vec::len),
+        Some(0),
+        "a failed run must not claim to have checked anything"
+    );
+
+    // The human still gets the message.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("error:"),
+        "the message must reach stderr as well"
+    );
+}
+
+/// A clean run must keep serialising exactly as it always has: no `error` key.
+#[test]
+fn a_successful_report_carries_no_error_field() {
+    let dir = scratch("json-clean");
+    let file = write(&dir, "clean.surql", "DEFINE TABLE t SCHEMAFULL;\n");
+    let output = run_check(&dir, &[file.to_str().expect("utf8"), "--format", "json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON object");
+    assert!(
+        report.get("error").is_none(),
+        "a clean report gained an `error` key: {report}"
+    );
+}

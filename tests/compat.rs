@@ -353,6 +353,7 @@ fn check_json_report_shape_golden() {
         scan: ScanReport::default(),
         config_warnings: vec![],
         exit_code: 0,
+        error: None,
     };
     let value: serde_json::Value =
         serde_json::from_str(&render_json(&report)).expect("render_json emits one JSON object");

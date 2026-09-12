@@ -31,6 +31,16 @@ stale, and the buffer showed whatever it looked like when it was opened. The
 mark is now removed on close and replaced on open, which the LSP says is
 authoritative.
 
+**`check --format json` now prints exactly one JSON object for every exit
+code.** Four failure paths (an unreadable or malformed `--config`, an
+unreadable target, a document that could not be analyzed) wrote a sentence to
+stderr and exited 2 with stdout empty, so every JSON consumer had to
+special-case "no output", which is the ambiguity the exit-code contract exists
+to remove. A failed run now carries `error: { kind, message }`, where `kind` is
+the stable field to key a repair on (`usage`, `invalid-config`,
+`unreadable-input`, `analysis-failed`). A clean report is unchanged and carries
+no `error` key.
+
 **A partial `didChangeConfiguration` no longer resets the settings it does not
 mention.** The merge that carries settings across a configuration reload listed
 the fields to keep by hand, and was missing `connection.access` and the entire

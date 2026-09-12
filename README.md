@@ -252,6 +252,15 @@ surrealql-language-server check queries/ --format json --fail-on warning
 | 1 | Ran to completion; diagnostics at or above the threshold. |
 | 2 | Usage error, unreadable input, or a skipped target file. |
 
+`--format json` prints exactly one JSON object on stdout for **every** exit
+code. An exit-2 report carries an `error` object naming the kind, so a consumer
+never has to treat empty output as a result:
+
+```jsonc
+{ "files": [], "summary": { … }, "exitCode": 2,
+  "error": { "kind": "unreadable-input", "message": "cannot read `q.surql`: …" } }
+```
+
 `--format json` prints one object whose diagnostics are LSP wire objects
 verbatim (stable codes, 0-based UTF-16 ranges, structured `data` hints),
 plus a `summary`, the `scan` losses, and the `exitCode`:

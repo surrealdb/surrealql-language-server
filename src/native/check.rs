@@ -206,6 +206,18 @@ pub struct ScanReport {
     pub file_cap_hit: bool,
 }
 
+/// Why a run could not produce diagnostics.
+///
+/// `kind` is the stable machine field; `message` is prose that may be reworded.
+/// Present only on an exit-2 report, and omitted entirely otherwise, so the
+/// golden for a successful run is unchanged.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckError {
+    pub kind: &'static str,
+    pub message: String,
+}
+
 /// The complete machine-readable result. Field names and shape are a
 /// compatibility surface pinned by `tests/compat.rs` — additive changes only.
 #[derive(Debug, Serialize)]
@@ -217,6 +229,31 @@ pub struct CheckReport {
     pub scan: ScanReport,
     pub config_warnings: Vec<String>,
     pub exit_code: u8,
+    /// Set only when the run could not complete. Skipped when absent so a
+    /// clean report serialises exactly as it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<CheckError>,
+}
+
+impl CheckReport {
+    /// The report for a run that could not produce diagnostics.
+    ///
+    /// `--format json` prints exactly one JSON object on stdout for every exit
+    /// code, including this one. Four paths used to write a plain sentence to
+    /// stderr and exit 2 with stdout empty, which made every JSON consumer
+    /// special-case "no output": the exact ambiguity the exit-code contract
+    /// exists to remove.
+    pub fn failed(kind: &'static str, message: String) -> Self {
+        Self {
+            version: build_version(),
+            files: Vec::new(),
+            summary: Summary::default(),
+            scan: ScanReport::default(),
+            config_warnings: Vec::new(),
+            exit_code: 2,
+            error: Some(CheckError { kind, message }),
+        }
+    }
 }
 
 /// Render the report as the single JSON object `--format json` prints.
@@ -312,6 +349,22 @@ struct Targets {
 /// Run `check` to completion. Every early return is exit code 2 with the
 /// reason on stderr; a completed run prints its report and derives the exit
 /// code from the diagnostics.
+/// Report a run that could not complete, in whatever format the caller asked
+/// for, and exit 2.
+///
+/// The message goes to stderr either way (a human running `--format json` in a
+/// terminal should still see it), and, under `--format json`, stdout carries the
+/// one object the contract promises: exactly one JSON object for every exit
+/// code, so a consumer never has to special-case empty output.
+fn fail(options: &CheckOptions, kind: &'static str, message: String) -> ExitCode {
+    eprintln!("error: {message}");
+    let report = CheckReport::failed(kind, message);
+    if matches!(options.format, OutputFormat::Json) {
+        print!("{}", render_json(&report));
+    }
+    ExitCode::from(report.exit_code)
+}
+
 pub async fn run(options: CheckOptions) -> ExitCode {
     // Settings come from the same parser the LSP path uses, so a config file
     // an editor accepts is accepted here, warnings included.
@@ -320,13 +373,19 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(value) => Some(value),
                 Err(error) => {
-                    eprintln!("error: `{}` is not valid JSON: {error}", path.display());
-                    return ExitCode::from(2);
+                    return fail(
+                        &options,
+                        "invalid-config",
+                        format!("`{}` is not valid JSON: {error}", path.display()),
+                    );
                 }
             },
             Err(error) => {
-                eprintln!("error: cannot read `{}`: {error}", path.display());
-                return ExitCode::from(2);
+                return fail(
+                    &options,
+                    "unreadable-input",
+                    format!("cannot read `{}`: {error}", path.display()),
+                );
             }
         },
         None => None,
@@ -348,8 +407,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     let collected = match collect_targets(&options) {
         Ok(collected) => collected,
         Err(message) => {
-            eprintln!("error: {message}");
-            return ExitCode::from(2);
+            return fail(&options, "unreadable-input", message);
         }
     };
 
@@ -365,8 +423,11 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             SymbolOrigin::Local,
             settings.analysis.max_syntax_diagnostics,
         ) else {
-            eprintln!("error: cannot analyze `{}`", target.display);
-            return ExitCode::from(2);
+            return fail(
+                &options,
+                "analysis-failed",
+                format!("cannot analyze `{}`", target.display),
+            );
         };
         let analysis = Arc::new(analysis);
         // A target shadows the same-uri context entry, exactly like an open
@@ -434,6 +495,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
         },
         config_warnings,
         exit_code,
+        error: None,
     };
 
     for warning in &report.config_warnings {
@@ -747,6 +809,7 @@ mod tests {
             },
             config_warnings: vec![],
             exit_code: 1,
+            error: None,
         }
     }
 

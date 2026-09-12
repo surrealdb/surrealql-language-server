@@ -80,6 +80,12 @@ Facts a machine consumer must know:
 - **`--param <name>` declares a variable your caller binds at runtime**
   (`db.query(sql).bind(("id", id))`), suppressing `undefined-variable` for
   it. `--config file.json` accepts the same JSON an editor sends the LSP.
+- **`--format json` prints exactly one JSON object on stdout, for every exit
+  code.** A run that could not complete (exit 2) prints a report whose `files`
+  is empty and whose `error` names the kind (`usage`, `invalid-config`,
+  `unreadable-input` or `analysis-failed`) alongside prose in `message`. Key
+  repairs on `error.kind`; it is stable, the message is not. A clean run carries
+  no `error` key at all. Never treat empty stdout as a result.
 - **`check` never connects to a database.** `SURREALDB_ENDPOINT` has no
   effect on it.
 
