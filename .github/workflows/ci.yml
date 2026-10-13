@@ -49,6 +49,24 @@ jobs:
             # where a SurrealDB layout change shows up first.
             - name: Run generator tests
               run: cargo test -p xtask
+            # `scripts/package.sh` otherwise runs only in Publish LSP, so a
+            # change that breaks it would surface part-way through a release.
+            # The debug `surreal-lsp` that `cargo test` built stands in for a
+            # release one; the script asserts the archive's member and mode.
+            - name: Check the release packaging
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version=$(cargo metadata --format-version 1 --no-deps \
+                    | jq -r '.packages[] | select(.name == "surrealql-language-server") | .version')
+                  for platform in linux-amd64 windows-amd64; do
+                    scripts/package.sh surreal-lsp target/debug/surreal-lsp "${version}" "${platform}" staging
+                  done
+                  ls -l staging
+                  test -f "staging/surreal-lsp-v${version}.linux-amd64.tgz"
+                  test -f "staging/surreal-lsp-v${version}.linux-amd64.txt"
+                  test -f "staging/surreal-lsp-v${version}.windows-amd64.exe"
+                  test -f "staging/surreal-lsp-v${version}.windows-amd64.txt"
 
     release:
         if: startsWith(github.ref, 'refs/tags/v')

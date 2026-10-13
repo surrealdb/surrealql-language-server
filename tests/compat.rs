@@ -402,7 +402,7 @@ fn check_json_report_shape_golden() {
 fn check_exit_codes_and_flags_are_stable() {
     use std::process::Command;
 
-    let binary = env!("CARGO_BIN_EXE_surrealql-language-server");
+    let binary = env!("CARGO_BIN_EXE_surreal-lsp");
     let dir = std::env::temp_dir().join(format!("surql-compat-check-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("schema")).expect("scratch dir");

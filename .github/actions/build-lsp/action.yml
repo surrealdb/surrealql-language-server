@@ -1,0 +1,150 @@
+name: 'Build surreal-lsp'
+description: 'Build, smoke-test and package one surreal-lsp release for one target'
+
+# A copy-and-adapt of surrealdb/surrealctl's `build-cloud`. One action for all
+# five targets, `shell: bash` throughout: present on GitHub's Windows runners
+# too.
+#
+# Packaged by `scripts/package.sh`, the only implementation of the layout here,
+# documented in its header and in `docs/publishing.md`:
+#
+#   surreal-lsp-<name>.<os>-<arch>.tgz   holding one member, `surreal-lsp`, at
+#                                        the archive root, mode 0755
+#   surreal-lsp-<name>.<os>-<arch>.exe   on Windows, a bare executable
+#   surreal-lsp-<name>.<os>-<arch>.txt   64 lowercase hex, the asset's SHA-256
+
+inputs:
+    target:
+        description: 'Rust target triple'
+        required: true
+    os:
+        description: 'Asset OS component: linux, darwin or windows'
+        required: true
+    arch:
+        description: 'Asset architecture component: amd64 or arm64'
+        required: true
+    version:
+        description: 'Version being released, without a leading v'
+        required: true
+    name:
+        description: 'Release name used in file names, e.g. v0.7.0'
+        required: true
+
+runs:
+    using: composite
+    steps:
+        # The pinned revision lives in the script, so the release and a local
+        # build agree on it.
+        - name: Check out the tree-sitter grammar
+          shell: bash
+          run: bash scripts/setup-grammar.sh
+
+        - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+          with:
+              toolchain: 1.94.0
+              targets: ${{ inputs.target }}
+
+        # No `Swatinem/rust-cache`. A poisoned or cross-contaminated cache in
+        # the one job whose output users execute is not a trade worth minutes.
+        - name: Build
+          shell: bash
+          env:
+              # `aws-lc-sys` (reached through rustls) compiles C and assembly
+              # for every target. On MSVC it needs NASM; the crate ships
+              # pregenerated assembly so this avoids installing it.
+              AWS_LC_SYS_PREBUILT_NASM: ${{ inputs.os == 'windows' && '1' || '' }}
+              # Windows only: `cl.exe` links the C objects against the dynamic
+              # CRT by default, so a bare `.exe` fetched from a well-known URL
+              # would fail to start on a clean Windows box with no VC++
+              # redistributable. The `cc` crate reads this and switches to
+              # `/MT`, so the grammar and the Rust stay consistent.
+              #
+              # Must NOT be set for linux-gnu, where it attempts a static glibc
+              # and breaks `getaddrinfo` and NSS at runtime.
+              RUSTFLAGS: ${{ inputs.os == 'windows' && '-C target-feature=+crt-static' || '' }}
+          run: |
+              set -euo pipefail
+              cargo build --locked --release --target "${{ inputs.target }}" --bin surreal-lsp
+
+        # The only place that proves a release-profile binary for this target
+        # starts, answers the launcher's probe, and serves. CI builds debug and
+        # never cross-compiles, so `lto`, `panic = "abort"`, `+crt-static` and
+        # the cross-compiled target are exercised nowhere else.
+        - name: Smoke test
+          shell: bash
+          env:
+              EXE: ${{ inputs.os == 'windows' && '.exe' || '' }}
+              VERSION: ${{ inputs.version }}
+          run: |
+              set -euo pipefail
+              binary="target/${{ inputs.target }}/release/surreal-lsp${EXE}"
+
+              # The launcher checks an install by the first version in
+              # `--version`, and refuses one that is not the release it asked for.
+              version=$("${binary}" --version)
+              echo "${version}"
+              case "${version}" in
+                "surreal-lsp ${VERSION} ("*) ;;
+                *) echo "::error::--version should begin \`surreal-lsp ${VERSION} (\`, got: ${version}"; exit 1 ;;
+              esac
+
+              # One session over stdio, as an editor runs it: stdout must hold
+              # the protocol and stderr nothing at all. `initialize` gets time
+              # to be answered before `exit`, which would otherwise cancel it;
+              # a slow runner fails this rather than passing it.
+              frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+              {
+                frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}'
+                sleep 5
+                frame '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+                frame '{"jsonrpc":"2.0","id":2,"method":"shutdown"}'
+                frame '{"jsonrpc":"2.0","method":"exit"}'
+              } | "${binary}" > session.out 2> session.err
+              if [ -s session.err ]; then
+                echo "::error::the server wrote to stderr during a session:"
+                cat session.err
+                exit 1
+              fi
+              if ! grep -q '"serverInfo"' session.out || ! head -c 16 session.out | grep -q '^Content-Length: '; then
+                echo "::error::the server did not answer initialize with a framed reply:"
+                cat session.out
+                exit 1
+              fi
+              echo "ok  serves one session, silent on stderr"
+              rm -f session.out session.err
+
+        # The glibc floor, checked rather than assumed. Debian 12 is glibc
+        # 2.36, one step above the ubuntu-22.04 build floor of 2.35. The loader
+        # resolves glibc symbols before `main`, so starting at all is the test.
+        - name: Check the glibc floor
+          if: ${{ inputs.os == 'linux' }}
+          shell: bash
+          run: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$PWD/target/${{ inputs.target }}/release/surreal-lsp:/probe:ro" \
+                debian:12 /probe --version >/dev/null
+              echo "ok  surreal-lsp starts on debian:12"
+
+        - name: Package
+          shell: bash
+          env:
+              EXE: ${{ inputs.os == 'windows' && '.exe' || '' }}
+          run: |
+              set -euo pipefail
+              scripts/package.sh surreal-lsp \
+                "target/${{ inputs.target }}/release/surreal-lsp${EXE}" \
+                "${{ inputs.version }}" "${{ inputs.os }}-${{ inputs.arch }}" \
+                staging/surreal-lsp
+              echo "Packaged:"
+              ls -lR staging/
+
+        # Named exactly like the asset stem, so the publish job downloads it by
+        # an exact prefix.
+        - name: Upload
+          uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+          with:
+              name: surreal-lsp-${{ inputs.name }}.${{ inputs.os }}-${{ inputs.arch }}
+              path: staging/surreal-lsp/
+              if-no-files-found: error
+              retention-days: 7

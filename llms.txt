@@ -20,4 +20,4 @@
 
 ## Binaries
 
-- [Latest release](https://github.com/surrealdb/surrealql-language-server/releases/latest): native binaries for Linux, macOS and Windows; `surrealql-language-server check <paths>` exits 0 (clean), 1 (diagnostics), 2 (could not check)
+- [Latest release](https://github.com/surrealdb/surrealql-language-server/releases/latest): native binaries for Linux, macOS and Windows; `surreal-lsp check <paths>` (also `surreal lsp check`, or the older `surrealql-language-server check`) exits 0 (clean), 1 (diagnostics), 2 (could not check)

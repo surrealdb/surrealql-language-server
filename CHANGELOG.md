@@ -95,6 +95,20 @@ Also:
 
 ### Added
 
+- **`surreal-lsp`, run as `surreal lsp` by the `surreal` CLI.** The server's
+  executable is now `surreal-lsp`, and `publish-lsp.yml` publishes it to
+  download.surrealdb.com under `cli/lsp/`, in the launcher's layout, for
+  `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64` and, for the
+  first time, `darwin-amd64` (Intel macOS). `surrealql-language-server` is
+  still built, as the same program under the old name, and the GitHub release
+  assets keep their names, so editor extensions find the server as before.
+  Serving over stdio writes only the protocol under either name: no banner,
+  notice or deprecation line on stdout or stderr. See
+  [`docs/publishing.md`](docs/publishing.md).
+- **The command line is parsed with clap**, as in every other component of
+  the `surreal` CLI. `--help` names the command the way it was typed: `surreal
+  lsp check` when started by the launcher (`SURREAL_INVOKED_AS`).
+
 - **Closures are typed, and calls through them are checked.**
   `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`
   instead of `unknown`. The parameters come from the closure as written; the
@@ -231,6 +245,11 @@ Also:
   having no effect.)* Recorded as a defect in `docs/pain-points.md`.
 
 ### Compatibility
+
+- `--version` now prints the executable's name first: `surreal-lsp 0.7.0
+  (…)`, where it printed `0.7.0 (…)`. `initialize`'s `serverInfo.version` is
+  unchanged. `check`'s flags, exit codes and JSON report are unchanged; its
+  usage errors are worded by clap and still exit 2.
 
 - LSP wire: no new or renamed diagnostic codes. `unknown-type`
   diagnostics gain an additive `data.table` key naming the `DEFINE FIELD`

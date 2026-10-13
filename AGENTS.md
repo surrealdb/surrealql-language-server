@@ -11,7 +11,7 @@ A Language Server Protocol implementation for
 [SurrealQL](https://surrealdb.com/docs/surrealql), with two headless
 surfaces built for machines:
 
-- **`surrealql-language-server check`** — one-shot diagnostics for files,
+- **`surreal-lsp check`** — one-shot diagnostics for files,
   directories, or stdin. The generate → check → repair loop.
 - **[`builtins.json`](builtins.json)** — every builtin function SurrealDB
   accepts (signatures, return types, arity, renames, method receivers),
@@ -40,11 +40,15 @@ Run `check` after every `.surql` edit, exactly as you would run `cargo check`
 after a Rust edit:
 
 ```bash
-surrealql-language-server check queries/            # a directory
-surrealql-language-server check --stdin --stdin-filename src/feed.surql \
+surreal-lsp check queries/                          # a directory
+surreal-lsp check --stdin --stdin-filename src/feed.surql \
     --workspace schema/                             # an unsaved buffer
-surrealql-language-server check queries/ --format json --fail-on warning
+surreal-lsp check queries/ --format json --fail-on warning
 ```
+
+`surreal lsp check` (through the `surreal` CLI) and
+`surrealql-language-server check` (the older name, kept for the editor
+extensions) are the same command.
 
 | Exit | Meaning |
 | --- | --- |
@@ -125,8 +129,14 @@ query bugs. Everything else `parse` reports is a real syntax error.
   reviewed decision.
 - **No new shared dependencies.** The `[dependencies]` section of
   `Cargo.toml` is also the WASM dependency graph. Native-only crates go
-  under `cfg(not(target_arch = "wasm32"))`; prefer zero new dependencies
-  (the arg parsers here are hand-rolled on purpose).
+  under `cfg(not(target_arch = "wasm32"))`; prefer zero new dependencies.
+  The command line is the exception, native-only and deliberate: it is
+  parsed with clap, as every component of the `surreal` CLI parses its own
+  (`src/native/cli.rs`). `xtask`'s parser stays hand-rolled.
+- **Serving writes only the protocol.** stdout is the JSON-RPC channel and
+  editors parse stderr, so the stdio server writes no banner, notice or
+  deprecation line on either stream, under either executable name.
+  [`tests/stdio.rs`](tests/stdio.rs) pins this byte for byte.
 - **Never hand-edit a generated file.** `src/grammar_generated.rs` and
   `builtins.json` come from `make builtins`; CI fails if they drift.
 - **Small, focused pull requests**, one concern each, with tests in the

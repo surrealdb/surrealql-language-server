@@ -1,6 +1,6 @@
 //! Headless `check` subcommand: one-shot diagnostics with no LSP lifecycle.
 //!
-//! `surrealql-language-server check [paths…]` runs the same pipeline the
+//! `surreal-lsp check [paths…]` runs the same pipeline the
 //! editor path publishes from — analyze, merge the workspace model, then
 //! [`MergedSemanticModel::document_diagnostics`] — and renders the result as
 //! human-readable text or as one JSON object. Coding agents, CI jobs and
@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::{Args, ValueEnum};
 use ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Uri};
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -39,139 +41,76 @@ use crate::semantic::types::{
     DocumentAnalysis, LiveMetadataSnapshot, MergedSemanticModel, SymbolOrigin,
 };
 
-/// Usage text for `check`, shared with the `--help` paths in `main`.
-pub const USAGE: &str = "\
-Usage: surrealql-language-server check [OPTIONS] [PATHS...]
-
-Check .surql files and report diagnostics.
-
-Arguments:
-  [PATHS...]                 Files or directories to check. Directories are
-                             walked with the same skip rules as the LSP
-                             workspace scan (.surql/.surrealql only).
-
-Options:
-      --stdin                Read the single target document from stdin.
-                             Positional paths are not accepted with --stdin.
-      --stdin-filename <p>   The path the stdin content represents. The
-                             content shadows the on-disk file of that path.
-      --workspace <dir>      Directory analyzed for schema context only;
-                             never reported on. Repeatable.
-      --format <text|json>   Output format (default: text).
-      --config <file.json>   Settings file; same shape as the LSP settings
-                             (a `surrealql` key or the keys at the root).
-      --param <name>         Declare a variable your caller binds at runtime;
-                             suppresses undefined-variable for it. Repeatable.
-      --fail-on <severity>   Lowest severity that fails the run: error,
-                             warning, info, or hint (default: error).
-  -h, --help                 Print this help.
-
-Exit codes:
-  0  ran to completion, nothing at or above --fail-on
-  1  ran to completion, diagnostics at or above --fail-on
-  2  usage error, unreadable input, or a skipped target file";
-
 /// How `check` renders the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Text,
     Json,
 }
 
-/// Parsed command line for `check`.
-#[derive(Debug, PartialEq, Eq)]
+/// The command line for `check`, parsed by clap as a subcommand of
+/// [`crate::native::cli::Cli`].
+///
+/// Every flag here is part of the contract `tests/compat.rs` pins: rename
+/// one and a caller breaks.
+#[derive(Debug, PartialEq, Eq, Args)]
 pub struct CheckOptions {
+    /// Files or directories to check. Directories are walked with the same
+    /// skip rules as the LSP workspace scan (.surql/.surrealql only).
+    #[arg(value_name = "PATHS", required_unless_present = "stdin")]
     pub paths: Vec<PathBuf>,
+
+    /// Read the single target document from stdin. Positional paths are not
+    /// accepted with --stdin; pass schema context via --workspace.
+    #[arg(long, conflicts_with = "paths")]
     pub stdin: bool,
+
+    /// The path the stdin content represents. The content shadows the
+    /// on-disk file of that path. Needs --stdin.
+    #[arg(long, value_name = "PATH")]
     pub stdin_filename: Option<PathBuf>,
+
+    /// Directory analyzed for schema context only; never reported on.
+    /// Repeatable.
+    #[arg(long = "workspace", value_name = "DIR")]
     pub workspace_dirs: Vec<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+
+    /// Settings file; same shape as the LSP settings (a `surrealql` key or
+    /// the keys at the root).
+    #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+
+    /// Declare a variable your caller binds at runtime; suppresses
+    /// undefined-variable for it. Repeatable.
+    #[arg(long = "param", value_name = "NAME")]
     pub params: Vec<String>,
-    /// Severity rank (1 = error … 4 = hint) at or above which the run
-    /// exits 1. Stored as the rank so the comparison is a single `<=`.
+
+    // Stored as the severity's rank (1 = error … 4 = hint), so the
+    // comparison against a diagnostic is a single `<=`.
+    /// Lowest severity that fails the run.
+    #[arg(
+        long,
+        value_name = "SEVERITY",
+        default_value = "error",
+        value_parser = PossibleValuesParser::new(["error", "warning", "info", "hint"])
+            .map(|severity| fail_on_rank(&severity)),
+    )]
     pub fail_on: u8,
 }
 
-/// Outcome of [`parse_args`]: a run, or an explicit help request.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Parsed {
-    Run(CheckOptions),
-    Help,
-}
-
-/// Hand-rolled argument parser, following the `xtask` precedent — no
-/// dependency enters the graph for a fixed flag set this small.
-pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
-    let mut options = CheckOptions {
-        paths: Vec::new(),
-        stdin: false,
-        stdin_filename: None,
-        workspace_dirs: Vec::new(),
-        format: OutputFormat::Text,
-        config: None,
-        params: Vec::new(),
-        fail_on: 1,
-    };
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        let value_for = |flag: &str, args: &mut std::iter::Peekable<_>| match args.next() {
-            Some(value) => Ok(value),
-            None => Err(format!("`{flag}` needs a value")),
-        };
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(Parsed::Help),
-            "--stdin" => options.stdin = true,
-            "--stdin-filename" => {
-                options.stdin_filename = Some(PathBuf::from(value_for(&arg, &mut args)?));
-            }
-            "--workspace" => {
-                options
-                    .workspace_dirs
-                    .push(PathBuf::from(value_for(&arg, &mut args)?));
-            }
-            "--format" => {
-                options.format = match value_for(&arg, &mut args)?.as_str() {
-                    "text" => OutputFormat::Text,
-                    "json" => OutputFormat::Json,
-                    other => return Err(format!("unknown format `{other}` (text or json)")),
-                };
-            }
-            "--config" => {
-                options.config = Some(PathBuf::from(value_for(&arg, &mut args)?));
-            }
-            "--param" => options.params.push(value_for(&arg, &mut args)?),
-            "--fail-on" => {
-                options.fail_on = match value_for(&arg, &mut args)?.as_str() {
-                    "error" => 1,
-                    "warning" => 2,
-                    "info" => 3,
-                    "hint" => 4,
-                    other => {
-                        return Err(format!(
-                            "unknown severity `{other}` (error, warning, info or hint)"
-                        ));
-                    }
-                };
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown argument `{other}`"));
-            }
-            path => options.paths.push(PathBuf::from(path)),
-        }
+/// The rank of a `--fail-on` severity. Only reached with one of the four
+/// values the parser accepts.
+fn fail_on_rank(severity: &str) -> u8 {
+    match severity {
+        "warning" => 2,
+        "info" => 3,
+        "hint" => 4,
+        _ => 1,
     }
-    if options.stdin && !options.paths.is_empty() {
-        return Err("positional paths are not accepted with --stdin; \
-                    pass schema context via --workspace"
-            .to_string());
-    }
-    if options.stdin_filename.is_some() && !options.stdin {
-        return Err("`--stdin-filename` needs `--stdin`".to_string());
-    }
-    if !options.stdin && options.paths.is_empty() {
-        return Err("no input files (pass paths, or --stdin)".to_string());
-    }
-    Ok(Parsed::Run(options))
 }
 
 /// One checked file in the JSON report. `diagnostics` is the LSP wire
@@ -626,91 +565,6 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use ls_types::{Position, Range};
-
-    fn parse(args: &[&str]) -> Result<Parsed, String> {
-        parse_args(args.iter().map(|arg| arg.to_string()))
-    }
-
-    fn parsed_options(args: &[&str]) -> CheckOptions {
-        match parse(args).expect("parse") {
-            Parsed::Run(options) => options,
-            Parsed::Help => panic!("expected a run"),
-        }
-    }
-
-    #[test]
-    fn defaults_are_text_format_and_fail_on_error() {
-        let options = parsed_options(&["queries.surql"]);
-        assert_eq!(options.format, OutputFormat::Text);
-        assert_eq!(options.fail_on, 1);
-        assert_eq!(options.paths, vec![PathBuf::from("queries.surql")]);
-    }
-
-    #[test]
-    fn every_flag_parses() {
-        let options = parsed_options(&[
-            "--stdin",
-            "--stdin-filename",
-            "buffer.surql",
-            "--workspace",
-            "schema",
-            "--workspace",
-            "more",
-            "--format",
-            "json",
-            "--config",
-            "surql.json",
-            "--param",
-            "id",
-            "--param",
-            "limit",
-            "--fail-on",
-            "warning",
-        ]);
-        assert!(options.stdin);
-        assert_eq!(options.stdin_filename, Some(PathBuf::from("buffer.surql")));
-        assert_eq!(
-            options.workspace_dirs,
-            vec![PathBuf::from("schema"), PathBuf::from("more")]
-        );
-        assert_eq!(options.format, OutputFormat::Json);
-        assert_eq!(options.config, Some(PathBuf::from("surql.json")));
-        assert_eq!(options.params, vec!["id", "limit"]);
-        assert_eq!(options.fail_on, 2);
-    }
-
-    #[test]
-    fn help_is_not_a_usage_error() {
-        assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
-        assert_eq!(parse(&["-h"]), Ok(Parsed::Help));
-    }
-
-    #[test]
-    fn usage_errors_name_the_fault() {
-        assert!(parse(&[]).unwrap_err().contains("no input files"));
-        assert!(
-            parse(&["--stdin", "a.surql"])
-                .unwrap_err()
-                .contains("--stdin")
-        );
-        assert!(
-            parse(&["--stdin-filename", "a.surql", "a.surql"])
-                .unwrap_err()
-                .contains("--stdin")
-        );
-        assert!(parse(&["--nope"]).unwrap_err().contains("--nope"));
-        assert!(parse(&["--format"]).unwrap_err().contains("needs a value"));
-        assert!(
-            parse(&["--format", "yaml", "a.surql"])
-                .unwrap_err()
-                .contains("yaml")
-        );
-        assert!(
-            parse(&["--fail-on", "fatal", "a.surql"])
-                .unwrap_err()
-                .contains("fatal")
-        );
-    }
 
     fn sample_report() -> CheckReport {
         let diagnostic = Diagnostic {

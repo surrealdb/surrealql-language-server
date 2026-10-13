@@ -1,7 +1,7 @@
 //! Native (non-wasm) front-end for the language server core.
 //!
-//! Hosts the tower-lsp-server adapter ([`backend::Backend`]) plus the
-//! three target-specific trait impls:
+//! Hosts the tower-lsp-server adapter ([`backend::Backend`]), the command
+//! line ([`cli`]), plus the three target-specific trait impls:
 //!
 //! * [`notifier::TowerNotifier`] — outbound diagnostics / log /
 //!   configuration via tower-lsp's [`tower_lsp_server::Client`].
@@ -12,6 +12,7 @@
 
 pub mod backend;
 pub mod check;
+pub mod cli;
 pub mod metadata_db;
 pub mod notifier;
 pub mod workspace_fs;

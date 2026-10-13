@@ -1,0 +1,248 @@
+name: Publish LSP
+
+# Publishes `surreal-lsp` to download.surrealdb.com under `cli/lsp/`, where the
+# `surreal` launcher installs it from (`surreal install lsp`). See
+# docs/publishing.md for what this does, what the inputs mean, and the bucket
+# layout it writes.
+#
+# A copy-and-adapt of surrealdb/surrealctl's `publish-cloud.yml`, the house
+# pipeline for a component of the `surreal` CLI. It runs beside the existing
+# release, not instead of it: publishing a GitHub release still builds the
+# assets the editor extensions download, the crate and the npm package, from
+# ci.yml. This workflow adds the launcher's copy of the same release.
+#
+# `workflow_dispatch` only. A tag push cannot express `publish: false`, and the
+# rehearsal is the main safety feature here: with `publish: false` every build
+# runs, every validation runs, and nothing uploads.
+
+run-name: "Publish surreal-lsp from ${{ github.ref_name }} (publish: ${{ inputs.publish }}, latest: ${{ inputs.latest }})"
+
+on:
+    workflow_dispatch:
+        inputs:
+            publish:
+                required: true
+                type: boolean
+                description: 'Publish: upload binaries to download.surrealdb.com'
+                default: false
+            latest:
+                required: true
+                type: boolean
+                description: 'Release: mark as the latest stable release'
+                default: false
+
+permissions:
+    contents: read
+
+# The sidecar probe below refuses a *sequential* republish but cannot see a
+# *concurrent* one. `cancel-in-progress: false` because cancelling part-way
+# through the ordered uploads is strictly worse than queueing behind them.
+concurrency:
+    group: publish-lsp
+    cancel-in-progress: false
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+
+jobs:
+    prepare-vars:
+        name: Resolve the release
+        runs-on: ubuntu-22.04
+        outputs:
+            version: ${{ steps.vars.outputs.version }}
+            name: ${{ steps.vars.outputs.name }}
+            channel: ${{ steps.vars.outputs.channel }}
+            pre-release: ${{ steps.vars.outputs.pre-release }}
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Resolve the version and channel
+              id: vars
+              shell: bash
+              env:
+                  PUBLISH: ${{ inputs.publish }}
+                  LATEST: ${{ inputs.latest }}
+              run: |
+                  set -euo pipefail
+
+                  # Found by the binary it builds rather than by the package's
+                  # name, so this cannot pick up the `xtask` workspace member.
+                  version=$(cargo metadata --format-version 1 --no-deps \
+                    | jq -r --arg bin "surreal-lsp" \
+                      '.packages[] | select(any(.targets[]; .name == $bin and (.kind | index("bin")))) | .version')
+                  if [ -z "${version}" ] || [ "$(printf '%s\n' "${version}" | wc -l)" -ne 1 ]; then
+                    echo "::error::expected exactly one package in the workspace with a binary named surreal-lsp"
+                    exit 1
+                  fi
+
+                  if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+                    echo "::error::\`${version}\` is not a version number (X.Y.Z[-prerelease])"
+                    exit 1
+                  fi
+
+                  # A real publish runs from the release's own tag, so the
+                  # launcher's copy is built from exactly the commit the GitHub
+                  # release, the crate and the npm package came from, and so the
+                  # `release` environment can refuse its credentials to any other
+                  # ref. A rehearsal runs from anywhere.
+                  if [ "${PUBLISH}" = "true" ] && [ "${GITHUB_REF}" != "refs/tags/v${version}" ]; then
+                    echo "::error::publish from the release's tag, v${version}: dispatch this workflow on that tag, not on ${GITHUB_REF}"
+                    exit 1
+                  fi
+
+                  # The channel rule the launcher reads by: no `-` is stable; an
+                  # `alpha` first identifier is alpha; anything else with a `-`
+                  # collapses onto beta, so an unrecognised identifier never gets
+                  # a channel nobody polls. Compared exactly, not as a glob:
+                  # `alpha*` would also match `1.0.0-alphabet`, which is beta.
+                  if [[ "${version}" != *-* ]]; then
+                    channel="latest"
+                    pre_release="false"
+                  elif [ "$(printf '%s' "${version#*-}" | cut -d. -f1)" = "alpha" ]; then
+                    channel="alpha"
+                    pre_release="true"
+                  else
+                    channel="beta"
+                    pre_release="true"
+                  fi
+
+                  if [ "${pre_release}" = "true" ] && [ "${LATEST}" = "true" ]; then
+                    echo "::warning::\`latest\` is ignored for a pre-release; every stable pointer step is gated on pre-release too."
+                  fi
+
+                  {
+                    echo "version=${version}"
+                    echo "name=v${version}"
+                    echo "channel=${channel}"
+                    echo "pre-release=${pre_release}"
+                  } >> "$GITHUB_OUTPUT"
+
+                  echo "Releasing surreal-lsp v${version} under cli/lsp/ on the ${channel} channel (pre-release: ${pre_release})"
+
+            # Republish protection: refuse if any of the version's five SHA-256
+            # sidecars already answers. The layout has no completion marker, so
+            # the sidecars stand in for one: the publish uploads every asset
+            # before any sidecar, and a client checks an asset against its
+            # sidecar before using it, so a sidecar that answers is a download
+            # somebody can already complete. Overwriting it would change the
+            # hash under them.
+            #
+            # Not the prefix: the CDN answers a prefix URL with 403 whether or
+            # not anything lives under it, so a prefix check could only pass.
+            - name: Validate the version is unpublished
+              if: ${{ inputs.publish }}
+              shell: bash
+              env:
+                  VERSION: ${{ steps.vars.outputs.version }}
+                  PREFIX: cli/lsp
+                  EXECUTABLE: surreal-lsp
+              run: |
+                  set -euo pipefail
+                  for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
+                    url="https://download.surrealdb.com/${PREFIX}/v${VERSION}/${EXECUTABLE}-v${VERSION}.${platform}.txt"
+                    code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)
+                    case "$code" in
+                      200)
+                        echo "::error::${EXECUTABLE} v${VERSION} has already been published (${url}). Bump the version."
+                        exit 1
+                        ;;
+                      403|404)
+                        echo "OK: nothing at ${url} (HTTP ${code})."
+                        ;;
+                      *)
+                        # Neither "published" nor "absent". Guessing wrong in one
+                        # direction overwrites a live release.
+                        echo "::error::Could not determine whether ${EXECUTABLE} v${VERSION} is published: ${url} returned HTTP ${code}."
+                        exit 1
+                        ;;
+                    esac
+                  done
+
+    build:
+        name: Build ${{ matrix.os }}-${{ matrix.arch }}
+        needs: prepare-vars
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            # A real publish must not half-populate a release; a rehearsal
+            # exists to report every broken platform in one go.
+            fail-fast: ${{ inputs.publish }}
+            matrix:
+                include:
+                    # Runner images are pinned, not `-latest`. `ubuntu-22.04`
+                    # gives the widest glibc floor still available (2.35).
+                    #
+                    # Native runners throughout. x86_64 macOS is the one cross
+                    # build, because Xcode's clang is a working cross compiler
+                    # for the grammar's C and for `aws-lc-sys`. GitHub releases
+                    # have never had an Intel macOS build; this is the first.
+                    - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, os: linux, arch: amd64 }
+                    - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, os: linux, arch: arm64 }
+                    - { target: aarch64-apple-darwin, runner: macos-15, os: darwin, arch: arm64 }
+                    - { target: x86_64-apple-darwin, runner: macos-15, os: darwin, arch: amd64 }
+                    - { target: x86_64-pc-windows-msvc, runner: windows-2022, os: windows, arch: amd64 }
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - uses: ./.github/actions/build-lsp
+              with:
+                  version: ${{ needs.prepare-vars.outputs.version }}
+                  name: ${{ needs.prepare-vars.outputs.name }}
+                  target: ${{ matrix.target }}
+                  os: ${{ matrix.os }}
+                  arch: ${{ matrix.arch }}
+
+    # The only job that holds the bucket's credentials, and it runs no
+    # compiler: the builds above run `build.rs` for the whole dependency graph,
+    # which is arbitrary code from crates.io. The `release` environment holds
+    # the credentials, so they reach this job and nothing else; see
+    # docs/publishing.md for how it must be configured.
+    #
+    # Propagation is a step here rather than a job of its own, as it is in
+    # surrealctl: a second job in the environment would ask for a second
+    # approval after the release is already live, and an approver who walked
+    # away would leave the regions without it.
+    publish:
+        name: Publish to download.surrealdb.com
+        if: ${{ inputs.publish }}
+        needs: [prepare-vars, build]
+        runs-on: ubuntu-22.04
+        environment: release
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - uses: ./.github/actions/publish-lsp
+              with:
+                  name: ${{ needs.prepare-vars.outputs.name }}
+                  version: ${{ needs.prepare-vars.outputs.version }}
+                  channel: ${{ needs.prepare-vars.outputs.channel }}
+                  pre-release: ${{ needs.prepare-vars.outputs.pre-release }}
+                  latest: ${{ inputs.latest }}
+                  publish: 'true'
+                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
+                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+
+            - uses: ./.github/actions/propagate-lsp
+              with:
+                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
+                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+
+    # Split from `publish` rather than gated inside it, so a rehearsal runs
+    # every validation with no credential passed at all and without asking
+    # the `release` environment's reviewers.
+    rehearse:
+        name: Rehearse the publish
+        if: ${{ !inputs.publish }}
+        needs: [prepare-vars, build]
+        runs-on: ubuntu-22.04
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - uses: ./.github/actions/publish-lsp
+              with:
+                  name: ${{ needs.prepare-vars.outputs.name }}
+                  version: ${{ needs.prepare-vars.outputs.version }}
+                  channel: ${{ needs.prepare-vars.outputs.channel }}
+                  pre-release: ${{ needs.prepare-vars.outputs.pre-release }}
+                  latest: ${{ inputs.latest }}
+                  publish: 'false'

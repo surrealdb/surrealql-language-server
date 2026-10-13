@@ -1,8 +1,8 @@
 //! SurrealQL Language Server.
 //!
 //! The crate is organised so the same business logic feeds both the
-//! native LSP binary (this crate's `[[bin]]` target, see
-//! [`crate::native::Backend`]) and a `wasm-bindgen` browser package
+//! native LSP binary (this crate's `surreal-lsp` executable, see
+//! [`crate::native::cli`] and [`crate::native::Backend`]) and a `wasm-bindgen` browser package
 //! (built with `scripts/build-wasm.sh`, see
 //! [`crate::wasm::WasmLanguageServer`]).
 //!

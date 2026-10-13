@@ -1,6 +1,6 @@
 //! End-to-end tests for the `check` subcommand, driving the real binary.
 //!
-//! These spawn `surrealql-language-server check …` the way an agent, a CI
+//! These spawn `surreal-lsp check …` the way an agent, a CI
 //! job, or a pre-commit hook does, and assert on the observable contract:
 //! exit codes, output formats, and the flag surface. The JSON *shape* is
 //! pinned separately in `tests/compat.rs`; this file covers behavior.
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_surrealql-language-server")
+    env!("CARGO_BIN_EXE_surreal-lsp")
 }
 
 /// A unique per-test scratch directory. Tests run concurrently in one

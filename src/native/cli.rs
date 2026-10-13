@@ -1,0 +1,319 @@
+//! The command line: `surreal-lsp`, which the `surreal` launcher runs as
+//! `surreal lsp`.
+//!
+//! With no command (or `--stdio`, which LSP clients commonly append) this
+//! serves the Language Server Protocol over stdio, and editors depend on
+//! that default. `check` runs the one-shot diagnostics mode from
+//! [`crate::native::check`]. Anything else is a usage error on stderr with
+//! exit code 2, so a typo cannot silently start a server that eats the
+//! terminal's stdin.
+//!
+//! Serving writes nothing of its own on either stream, under either name:
+//! stdout is the JSON-RPC channel, and editors show every stderr line as a
+//! server message or treat it as a failure. No banner, no notice, no
+//! deprecation line. `tests/stdio.rs` holds the server to that byte for byte.
+//!
+//! Parsed with clap, the same way as the other components of the `surreal`
+//! CLI: `--version` and `--help` are clap's, and help names the command the
+//! way the launcher says it was typed ([`INVOKED_AS_VAR`]).
+
+use std::process::ExitCode;
+
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+
+use crate::native::check::{self, CheckOptions};
+
+const ABOUT: &str = "The SurrealQL language server, for editors";
+
+/// `0.6.0`, what `-V` prints and the launcher checks an install against.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `0.6.0 (master-v0.6.0-3-gabc1234, grammar cb2e6b5)`, what `--version`
+/// prints: the release, and which source and grammar it was built from.
+///
+/// The same string as [`crate::core::server::build_version`], built with
+/// `concat!` so it is a `&'static str` clap can take directly.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SURREALQL_LS_BUILD"),
+    ")"
+);
+
+/// What `check --help` adds below the flags: the exit codes agents key on.
+const CHECK_EXIT_CODES: &str = "\
+Exit codes:
+  0  ran to completion, nothing at or above --fail-on
+  1  ran to completion, diagnostics at or above --fail-on
+  2  usage error, unreadable input, or a skipped target file";
+
+#[derive(Parser, Debug)]
+#[command(name = "surreal-lsp", bin_name = "surreal-lsp")]
+#[command(about = ABOUT, long_about = None)]
+#[command(version = VERSION, long_version = LONG_VERSION)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct Cli {
+    /// Serve over stdio. This is the default and the only transport; the
+    /// flag is accepted because LSP clients append it.
+    #[arg(long)]
+    pub stdio: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Check .surql files and report diagnostics.
+    #[command(after_help = CHECK_EXIT_CODES)]
+    Check(CheckOptions),
+}
+
+impl Cli {
+    /// Parse the process's arguments, naming the program `name` in help and
+    /// `--version` unless the launcher says how it was reached.
+    ///
+    /// Not `Cli::parse`: the name differs between the two executables, and
+    /// the launcher's name has to be applied to the built command before it
+    /// parses anything.
+    pub fn from_env(name: &'static str) -> Self {
+        let mut command = Self::command().name(name).bin_name(name);
+        if let Some(invoked) = invoked_as(std::env::var(INVOKED_AS_VAR).ok().as_deref()) {
+            command = command.bin_name(invoked);
+        }
+        Self::parse_with(command, std::env::args_os()).unwrap_or_else(|err| err.exit())
+    }
+
+    /// Parse `args` against `command`, with the one rule clap cannot state.
+    ///
+    /// `--stdin-filename` needs `--stdin`, but clap counts a flag's implicit
+    /// `false` as present, so `requires = "stdin"` never fires. Checked here
+    /// instead, and reported as clap reports any other usage error: on
+    /// stderr, with the usage line, exit code 2.
+    fn parse_with(
+        mut command: clap::Command,
+        args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
+    ) -> Result<Self, clap::Error> {
+        let cli = Self::from_arg_matches(&command.try_get_matches_from_mut(args)?)?;
+        if let Some(Command::Check(options)) = &cli.command
+            && options.stdin_filename.is_some()
+            && !options.stdin
+        {
+            let check = command
+                .find_subcommand_mut("check")
+                .expect("`check` is a subcommand");
+            return Err(check.error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "`--stdin-filename` needs `--stdin`",
+            ));
+        }
+        Ok(cli)
+    }
+}
+
+/// The variable the `surreal` launcher sets on the component it runs, naming
+/// how the user reached it: `surreal lsp`.
+///
+/// Read so `--help` says `Usage: surreal lsp check` to somebody who typed
+/// exactly that.
+pub const INVOKED_AS_VAR: &str = "SURREAL_INVOKED_AS";
+
+/// The name to show in help, when the launcher supplied a usable one.
+///
+/// Absent, empty or odd values keep the executable's own name. The value
+/// lands in help text on stdout, so it is held to what a command name can
+/// plausibly contain rather than trusted with control characters.
+fn invoked_as(raw: Option<&str>) -> Option<String> {
+    let name = raw?.trim();
+    let plausible = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'));
+    plausible.then(|| name.to_owned())
+}
+
+/// Run the program under `name`: the executable's own name, which help and
+/// the panic line use when the launcher does not supply one.
+pub async fn run(name: &'static str) -> ExitCode {
+    // The release profile aborts on panic, so this hook is the only trace a
+    // crash leaves. It must write to stderr: stdout carries the LSP wire (or
+    // the check report) and editors surface stderr in their output panel.
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("{name} panicked: {info}");
+    }));
+
+    match Cli::from_env(name).command {
+        None => {
+            serve().await;
+            ExitCode::SUCCESS
+        }
+        Some(Command::Check(options)) => check::run(options).await,
+    }
+}
+
+/// Serve the Language Server Protocol over stdio until the client exits.
+async fn serve() {
+    use tower_lsp_server::{LspService, Server};
+
+    use crate::native::Backend;
+
+    let (service, socket) = LspService::new(Backend::new);
+    Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
+        .serve(service)
+        .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::native::check::OutputFormat;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let argv = std::iter::once("surreal-lsp").chain(args.iter().copied());
+        Cli::parse_with(Cli::command(), argv)
+    }
+
+    fn check_options(args: &[&str]) -> CheckOptions {
+        let mut argv = vec!["check"];
+        argv.extend_from_slice(args);
+        match parse(&argv).expect("parse").command {
+            Some(Command::Check(options)) => options,
+            None => panic!("expected check"),
+        }
+    }
+
+    /// Catches duplicate argument ids, conflicting shorts and bad
+    /// relationships between arguments in one assertion.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// Editors start the bare executable, or append `--stdio`. Both serve.
+    #[test]
+    fn no_command_and_stdio_both_serve() {
+        assert!(parse(&[]).expect("bare").command.is_none());
+        let cli = parse(&["--stdio"]).expect("--stdio");
+        assert!(cli.stdio);
+        assert!(cli.command.is_none());
+    }
+
+    /// A typo must be refused rather than start a server that waits on the
+    /// terminal's stdin.
+    #[test]
+    fn an_unknown_argument_is_a_usage_error() {
+        let err = parse(&["--frobnicate"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert_eq!(err.exit_code(), 2);
+        let err = parse(&["serve"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn check_defaults_are_text_format_and_fail_on_error() {
+        let options = check_options(&["queries.surql"]);
+        assert_eq!(options.format, OutputFormat::Text);
+        assert_eq!(options.fail_on, 1);
+        assert_eq!(options.paths, vec![PathBuf::from("queries.surql")]);
+    }
+
+    #[test]
+    fn every_check_flag_parses() {
+        let options = check_options(&[
+            "--stdin",
+            "--stdin-filename",
+            "buffer.surql",
+            "--workspace",
+            "schema",
+            "--workspace",
+            "more",
+            "--format",
+            "json",
+            "--config",
+            "surql.json",
+            "--param",
+            "id",
+            "--param",
+            "limit",
+            "--fail-on",
+            "warning",
+        ]);
+        assert!(options.stdin);
+        assert_eq!(options.stdin_filename, Some(PathBuf::from("buffer.surql")));
+        assert_eq!(
+            options.workspace_dirs,
+            vec![PathBuf::from("schema"), PathBuf::from("more")]
+        );
+        assert_eq!(options.format, OutputFormat::Json);
+        assert_eq!(options.config, Some(PathBuf::from("surql.json")));
+        assert_eq!(options.params, vec!["id", "limit"]);
+        assert_eq!(options.fail_on, 2);
+    }
+
+    #[test]
+    fn every_fail_on_severity_has_its_rank() {
+        for (word, rank) in [("error", 1), ("warning", 2), ("info", 3), ("hint", 4)] {
+            assert_eq!(check_options(&["a.surql", "--fail-on", word]).fail_on, rank);
+        }
+    }
+
+    /// Exit code 2 is the `check` contract for a usage error, and clap's
+    /// own exit code for one, so every refusal below exits 2.
+    #[test]
+    fn check_usage_errors_name_the_fault_and_exit_two() {
+        let fault = |args: &[&str]| {
+            let mut argv = vec!["check"];
+            argv.extend_from_slice(args);
+            let err = parse(&argv).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{args:?}");
+            err.to_string()
+        };
+        assert!(fault(&[]).contains("PATHS"));
+        assert!(fault(&["--stdin", "a.surql"]).contains("--stdin"));
+        assert!(fault(&["--stdin-filename", "a.surql", "a.surql"]).contains("--stdin"));
+        assert!(fault(&["--nope", "a.surql"]).contains("--nope"));
+        assert!(fault(&["--format"]).contains("--format"));
+        assert!(fault(&["--format", "yaml", "a.surql"]).contains("yaml"));
+        assert!(fault(&["--fail-on", "fatal", "a.surql"]).contains("fatal"));
+    }
+
+    #[test]
+    fn help_is_not_a_usage_error() {
+        for args in [
+            &["--help"][..],
+            &["-h"],
+            &["check", "--help"],
+            &["check", "-h"],
+        ] {
+            let err = parse(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert_eq!(err.exit_code(), 0);
+        }
+    }
+
+    /// The launcher finds a release's version as the first semver token
+    /// `--version` prints, and refuses an install whose version disagrees
+    /// with the one it asked for.
+    #[test]
+    fn the_version_line_leads_with_the_release() {
+        assert!(LONG_VERSION.starts_with(&format!("{VERSION} (")));
+        assert_eq!(LONG_VERSION, crate::core::server::build_version());
+    }
+
+    #[test]
+    fn a_launcher_name_is_used_only_when_it_is_plausible() {
+        assert_eq!(invoked_as(Some("surreal lsp")), Some("surreal lsp".into()));
+        assert_eq!(
+            invoked_as(Some("  surreal lsp ")),
+            Some("surreal lsp".into())
+        );
+        assert_eq!(invoked_as(None), None);
+        assert_eq!(invoked_as(Some("")), None);
+        assert_eq!(invoked_as(Some("surreal\nlsp")), None);
+        assert_eq!(invoked_as(Some("surreal \x1b[31mlsp")), None);
+        assert_eq!(invoked_as(Some(&"x".repeat(65))), None);
+    }
+}
