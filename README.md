@@ -51,8 +51,26 @@ change. Known grammar parse gaps (and the tests that track them) are listed in
 
 ```bash
 cargo build --release
-# binary at: target/release/surrealql-language-server
+# binary at: target/release/surreal-lsp
 ```
+
+The build also produces `target/release/surrealql-language-server`, the same
+program under the name the editor extensions look for. Both serve the LSP over
+stdio when run with no arguments (or `--stdio`), and both write nothing but
+the protocol while they do.
+
+### With the `surreal` CLI
+
+The [`surreal`](https://github.com/surrealdb/surrealdb-cli) command installs
+and runs the server as its `lsp` component, from download.surrealdb.com:
+
+```bash
+surreal install lsp
+surreal lsp            # what an editor starts; stdio, nothing else written
+surreal lsp check queries/
+```
+
+See [`docs/publishing.md`](docs/publishing.md) for how it gets there.
 
 ### Browser WASM package
 
@@ -220,10 +238,13 @@ The same analysis the editor shows is available headless, so coding agents,
 CI jobs and pre-commit hooks can run the generate → check → repair loop:
 
 ```bash
-surrealql-language-server check queries/
-surrealql-language-server check --stdin --stdin-filename src/feed.surql --workspace schema/
-surrealql-language-server check queries/ --format json --fail-on warning
+surreal-lsp check queries/
+surreal-lsp check --stdin --stdin-filename src/feed.surql --workspace schema/
+surreal-lsp check queries/ --format json --fail-on warning
 ```
+
+`surreal lsp check`, through the `surreal` CLI, and `surrealql-language-server
+check`, under the older name, are the same command.
 
 | Exit | Meaning |
 | --- | --- |
@@ -253,9 +274,9 @@ Recipes:
 
 - **CI**: run `check` over your `.surql` directories with
   `--fail-on warning`; exit codes 1 and 2 fail the job.
-- **pre-commit**: `surrealql-language-server check $(git diff --cached --name-only -- '*.surql')`
+- **pre-commit**: `surreal-lsp check $(git diff --cached --name-only -- '*.surql')`
   (skip when the list is empty).
-- **Claude Code**: add "Run `surrealql-language-server check <file>` after
+- **Claude Code**: add "Run `surreal-lsp check <file>` after
   every `.surql` edit" to `CLAUDE.md`, or point it at [`AGENTS.md`](AGENTS.md).
 - **Cursor**: the same instruction in `.cursor/rules`.
 - **Zed**: the extension already ships this server for editing; use `check`
@@ -306,7 +327,7 @@ This boots an in-memory engine, calls every function with synthesised arguments,
 
 ## CI
 
-GitHub Actions runs `cargo fmt --check`, `cargo test` and `cargo test -p xtask` on every push and pull request. The grammar and SurrealDB sibling repos are cloned automatically, both pinned, so the catalogue freshness check runs in CI.
+GitHub Actions runs `cargo fmt --check`, `cargo test` and `cargo test -p xtask` on every push and pull request, and checks that `scripts/package.sh` still packages `surreal-lsp` in the launcher's layout. The grammar and SurrealDB sibling repos are cloned automatically, both pinned, so the catalogue freshness check runs in CI.
 
 ## Releases
 
@@ -325,6 +346,17 @@ Release checklist:
 3. Confirm the `wasm` CI job succeeds and the package appears on npm.
 4. Confirm the release assets include the platform binaries, the npm `.tgz`,
    and `builtins.json`.
+5. Publish the same tag to download.surrealdb.com for the `surreal` CLI:
+   dispatch **Publish LSP** on the tag, first as a rehearsal, then for real.
+   [`docs/publishing.md`](docs/publishing.md) has the steps.
+
+### download.surrealdb.com, for the `surreal` CLI
+
+`publish-lsp.yml` publishes `surreal-lsp` under `cli/lsp/` in the layout the
+`surreal` launcher installs from, on five platforms including Intel macOS.
+It is dispatched by hand from the release tag and needs the `release`
+environment's approval; [`docs/publishing.md`](docs/publishing.md) describes
+the layout, the safety checks and the one-time setup.
 
 npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC from GitHub Actions). Before the first publish, an `@surrealdb` org admin must configure a trusted publisher on the package's npm **Access** page ([`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server)) with:
 

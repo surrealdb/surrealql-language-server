@@ -15,6 +15,24 @@ authors = ['Chiru Boggavarapu <chiru@foretag.co>', 'Tobie Morgan Hitchcock <tobi
 license-file = 'LICENSE'
 description = 'Language Server Protocol implementation for SurrealQL'
 keywords = ['surrealdb', 'language-server']
+# The binaries are declared below, so nothing is discovered by accident.
+autobins = false
+
+# `surreal-lsp` is the executable: the `surreal` launcher runs it as
+# `surreal lsp`, and it is what download.surrealdb.com publishes.
+#
+# `surrealql-language-server` is the same program under the name the editor
+# extensions have always looked for — on PATH, from `cargo install`, and as
+# the GitHub release assets they download. It stays until every extension
+# has moved, and it says nothing about the rename: an editor shows every
+# stderr line, and stdout is the JSON-RPC channel.
+[[bin]]
+name = 'surreal-lsp'
+path = 'src/main.rs'
+
+[[bin]]
+name = 'surrealql-language-server'
+path = 'src/bin/surrealql-language-server.rs'
 
 # `cdylib` is required so `scripts/build-wasm.sh` can produce the
 # browser-loadable wasm module; `rlib` keeps `cargo build`/`cargo test`
@@ -36,8 +54,11 @@ tree-sitter = '0.26.6'
 
 # Native (binary + library) dependencies. Pulls in the multi-threaded
 # tokio runtime, the tower-lsp-server stdio framework, the SurrealDB
-# Rust SDK for live metadata, and walkdir for workspace ingestion.
+# Rust SDK for live metadata, walkdir for workspace ingestion, and clap
+# for the command line, parsed the way every other component of the
+# `surreal` CLI parses its own.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = '4.6.1', features = ['derive', 'wrap_help'] }
 surrealdb = { version = '3.0.5', default-features = false, features = ['protocol-http', 'protocol-ws', 'rustls'] }
 tokio = { version = '1.48.0', features = ['io-std', 'macros', 'rt-multi-thread', 'sync', 'time'] }
 tower-lsp-server = '0.23.0'
