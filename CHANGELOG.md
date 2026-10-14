@@ -108,6 +108,11 @@ Also:
 - **The command line is parsed with clap**, as in every other component of
   the `surreal` CLI. `--help` names the command the way it was typed: `surreal
   lsp check` when started by the launcher (`SURREAL_INVOKED_AS`).
+- **`surreal-lsp version`**, as every component of the `surreal` CLI has.
+  It prints what `--version` prints; `version --json` (or `-j`) prints one
+  object with the `version`, and the `commit`, `target`, `build` and `grammar`
+  the binary was built from, `null` where the build could not tell.
+  `-V`/`--version` are unchanged.
 
 - **Closures are typed, and calls through them are checked.**
   `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`

@@ -1,8 +1,9 @@
 //! The command line: `surreal-lsp`, which the `surreal` launcher runs as
 //! `surreal lsp`.
 //!
-//! `stdio` serves the Language Server Protocol over stdio, and `check` runs
-//! the one-shot diagnostics mode from [`crate::native::check`]. Anything else
+//! `stdio` serves the Language Server Protocol over stdio, `check` runs the
+//! one-shot diagnostics mode from [`crate::native::check`], and `version`
+//! says which release and build this is. Anything else
 //! is a usage error on stderr with exit code 2, so a typo cannot silently
 //! start a server that eats the terminal's stdin.
 //!
@@ -47,6 +48,10 @@ pub const LONG_VERSION: &str = concat!(
     ")"
 );
 
+/// The help text of `--json`, the same in every component of the `surreal`
+/// CLI.
+pub const JSON_HELP: &str = "Emit machine-readable JSON on stdout";
+
 /// What `check --help` adds below the flags: the exit codes agents key on.
 const CHECK_EXIT_CODES: &str = "\
 Exit codes:
@@ -78,6 +83,9 @@ pub enum Command {
     /// Check .surql files and report diagnostics.
     #[command(after_help = CHECK_EXIT_CODES)]
     Check(CheckOptions),
+
+    /// Print the version, and the source and grammar it was built from.
+    Version(VersionOptions),
 }
 
 /// `stdio` takes no options of its own.
@@ -87,6 +95,56 @@ pub struct StdioOptions {
     /// they are configured with, which here is already `stdio`.
     #[arg(long = "stdio", hide = true)]
     pub stdio: bool,
+}
+
+/// The options of `version`.
+#[derive(clap::Args, Debug)]
+pub struct VersionOptions {
+    #[arg(long, short = 'j', help = JSON_HELP)]
+    pub json: bool,
+}
+
+/// What `version --json` prints: the release, then what the build recorded
+/// about itself. A part the build could not find out is `null`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VersionReport {
+    /// The release, `X.Y.Z`: what `-V` prints.
+    pub version: &'static str,
+    /// The short revision of this repository the binary was built from.
+    pub commit: Option<&'static str>,
+    /// The Rust target triple, such as `aarch64-apple-darwin`.
+    pub target: Option<&'static str>,
+    /// `git describe` of the source, with the branch: what `--version`
+    /// shows in brackets before the grammar.
+    pub build: Option<&'static str>,
+    /// The short revision of the tree-sitter grammar compiled in.
+    pub grammar: Option<&'static str>,
+}
+
+impl VersionReport {
+    /// This binary's report, from what `build.rs` recorded.
+    pub fn current() -> Self {
+        let known = |value: &'static str| (value != "unknown").then_some(value);
+        Self {
+            version: VERSION,
+            commit: known(env!("SURREALQL_LS_COMMIT")),
+            target: known(env!("SURREALQL_LS_TARGET")),
+            build: known(env!("SURREALQL_LS_SOURCE")),
+            grammar: known(env!("SURREALQL_LS_GRAMMAR")),
+        }
+    }
+}
+
+/// Print the version: as `--version` prints it, `name` first, or as one JSON
+/// object.
+fn version(name: &str, options: &VersionOptions) {
+    if options.json {
+        let report = serde_json::to_string_pretty(&VersionReport::current())
+            .expect("the version report serializes");
+        println!("{report}");
+    } else {
+        println!("{name} {LONG_VERSION}");
+    }
 }
 
 impl Cli {
@@ -204,6 +262,10 @@ pub async fn run(name: &'static str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Command::Check(options)) => check::run(options).await,
+        Some(Command::Version(options)) => {
+            version(name, &options);
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -409,6 +471,44 @@ mod tests {
     fn the_version_line_leads_with_the_release() {
         assert!(LONG_VERSION.starts_with(&format!("{VERSION} (")));
         assert_eq!(LONG_VERSION, crate::core::server::build_version());
+    }
+
+    #[test]
+    fn the_version_command_takes_json_long_and_short() {
+        for (args, json) in [
+            (&["version"][..], false),
+            (&["version", "--json"], true),
+            (&["version", "-j"], true),
+        ] {
+            match parse(args).expect("version").command {
+                Some(Command::Version(options)) => assert_eq!(options.json, json, "{args:?}"),
+                other => panic!("expected version, got {other:?}"),
+            }
+        }
+    }
+
+    /// The JSON leads with the release `-V` prints, and carries the same
+    /// build and grammar `--version` shows in brackets.
+    #[test]
+    fn the_version_report_agrees_with_the_version_flag() {
+        let report = VersionReport::current();
+        assert_eq!(report.version, VERSION);
+        let build = report.build.unwrap_or("unknown");
+        let grammar = report.grammar.unwrap_or("unknown");
+        assert_eq!(
+            LONG_VERSION,
+            format!("{VERSION} ({build}, grammar {grammar})")
+        );
+        let value = serde_json::to_value(&report).expect("serializes");
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in ["version", "commit", "target", "build", "grammar"] {
+            assert!(keys.contains(&key), "{key} missing from {keys:?}");
+        }
     }
 
     #[test]

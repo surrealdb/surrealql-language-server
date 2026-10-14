@@ -105,10 +105,20 @@ fn locate_wasm_clang() -> Option<PathBuf> {
 ///
 /// Both lookups are best-effort: a source tarball with no `.git`, or no
 /// `git` on PATH, simply yields `unknown` rather than failing the build.
+///
+/// The parts are also recorded one by one, for `version --json`:
+/// `SURREALQL_LS_SOURCE` (the `git describe` above), `SURREALQL_LS_COMMIT`,
+/// `SURREALQL_LS_GRAMMAR` and `SURREALQL_LS_TARGET`.
 fn emit_build_provenance(manifest_dir: &Path, grammar_dir: &Path) {
     let source = git_describe(manifest_dir).unwrap_or_else(|| "unknown".to_string());
+    let commit = git_short_revision(manifest_dir).unwrap_or_else(|| "unknown".to_string());
     let grammar = git_short_revision(grammar_dir).unwrap_or_else(|| "unknown".to_string());
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=SURREALQL_LS_BUILD={source}, grammar {grammar}");
+    println!("cargo:rustc-env=SURREALQL_LS_SOURCE={source}");
+    println!("cargo:rustc-env=SURREALQL_LS_COMMIT={commit}");
+    println!("cargo:rustc-env=SURREALQL_LS_GRAMMAR={grammar}");
+    println!("cargo:rustc-env=SURREALQL_LS_TARGET={target}");
 
     // A new commit (or a newly dirty tree) must re-stamp the binary.
     let head = manifest_dir.join(".git/HEAD");
