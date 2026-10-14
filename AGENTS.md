@@ -61,6 +61,14 @@ Facts a machine consumer must know:
 - **`--json` prints one JSON object on stdout.** It is the documented
   spelling of `--format json`, which is still accepted and prints the same
   bytes.
+- **Under `--json`, a failure is the JSON error envelope on stderr** and
+  stdout is empty: a usage error (`"kind": "usage"`, exit 2, `command` naming
+  the failing command's `--help`), or a run that could not start, such as a
+  missing file (`"kind": "not_found"`) or an invalid `--config`
+  (`"kind": "invalid"`), still exit 2. Every key is present, `null` when
+  unknown: `kind`, `message`, `status`, `code`, `request_id`, `hint`,
+  `command`, `docs`, `retry_after_secs`, `exit_code`. A completed run (exit 0
+  or 1, or 2 for a skipped target) prints the report on stdout instead.
 - **JSON diagnostics are LSP wire objects verbatim**: 0-based lines, UTF-16
   columns, camelCase keys, integer severity (1 error, 2 warning), string
   `code`. Text output is 1-based in both line and column.

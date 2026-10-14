@@ -116,6 +116,13 @@ Also:
 - **`check --json`** (or `-j`), the flag every component of the `surreal` CLI
   shares, is the documented spelling of `check --format json` and prints the
   same bytes. `--format` is still accepted, and hidden from help.
+- **The JSON error envelope.** With `--json` (or `-j`) among the arguments, a
+  usage error, clap's included, is one JSON object on stderr instead of clap's
+  text, as in every other component of the `surreal` CLI: `kind` `"usage"`,
+  clap's message, and the failing command's `--help` as `command`, exit 2.
+  `check --json` reports a run that cannot start (a missing file, an invalid
+  `--config`) the same way, with nothing on stdout; the exit code stays 2.
+  Without `--json`, errors read as before.
 
 - **Closures are typed, and calls through them are checked.**
   `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`

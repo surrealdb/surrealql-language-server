@@ -101,6 +101,49 @@ fn a_missing_file_exits_two() {
     );
 }
 
+/// Under `--json` a run that cannot start is the JSON error envelope on
+/// stderr, with nothing on stdout. The exit code stays the `check` contract's
+/// 2; the envelope's `kind` says which failure it was.
+#[test]
+fn a_missing_file_under_json_is_the_error_envelope() {
+    let dir = scratch("missing-json");
+    for args in [
+        &["not-there.surql", "--json"][..],
+        &["not-there.surql", "--format", "json"],
+    ] {
+        let output = run_check(&dir, args);
+        assert_eq!(exit_code(&output), 2, "{args:?}");
+        assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("stderr is one JSON object");
+        assert_eq!(value["kind"], "not_found");
+        assert!(
+            value["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("cannot read `not-there.surql`")),
+            "{value}"
+        );
+        assert_eq!(value["exit_code"], 2);
+        for key in ["status", "code", "request_id", "hint", "command", "docs"] {
+            assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
+        }
+    }
+}
+
+#[test]
+fn an_invalid_config_under_json_is_the_error_envelope() {
+    let dir = scratch("config-bad-json");
+    write(&dir, "query.surql", "RETURN 1;\n");
+    write(&dir, "surql.json", "{ not json ");
+    let output = run_check(&dir, &["query.surql", "--config", "surql.json", "--json"]);
+    assert_eq!(exit_code(&output), 2);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("stderr is one JSON object");
+    assert_eq!(value["kind"], "invalid");
+    assert_eq!(value["exit_code"], 2);
+}
+
 #[test]
 fn an_unknown_flag_exits_two() {
     let dir = scratch("unknown-flag");

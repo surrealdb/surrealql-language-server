@@ -23,13 +23,16 @@
 //!
 //! Parsed with clap, the same way as the other components of the `surreal`
 //! CLI: `--version` and `--help` are clap's, and help names the command the
-//! way the launcher says it was typed ([`INVOKED_AS_VAR`]).
+//! way the launcher says it was typed ([`INVOKED_AS_VAR`]). A usage error
+//! from a caller that asked for `--json` is the JSON error envelope from
+//! [`crate::native::error`] instead of clap's text.
 
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::native::check::{self, CheckOptions};
+use crate::native::error::{self, Envelope};
 
 const ABOUT: &str = "The SurrealQL language server, for editors";
 
@@ -162,7 +165,13 @@ impl Cli {
         if launched(std::env::var_os(LAUNCHER_VAR).as_deref()) {
             command = launcher_flow(command);
         }
-        Self::parse_with(command, std::env::args_os()).unwrap_or_else(|err| err.exit())
+        let program = command
+            .get_bin_name()
+            .unwrap_or_else(|| command.get_name())
+            .to_owned();
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        Self::parse_with(command, argv.iter().cloned())
+            .unwrap_or_else(|err| parse_failure(&err, &argv, &program))
     }
 
     /// Parse `args` against `command`, with the one rule clap cannot state.
@@ -190,6 +199,22 @@ impl Cli {
         }
         Ok(cli)
     }
+}
+
+/// Leave after a parse that did not produce a [`Cli`].
+///
+/// Help and `--version` are clap's, on stdout with exit code 0, whatever else
+/// was passed. A usage error is exit code 2. Under `--json` (or `-j`, up to a
+/// `--`) it is the JSON error envelope on stderr instead of clap's text, as in
+/// every other component of the `surreal` CLI: a script that asked for JSON
+/// reads stderr as JSON, and clap's prose there is a second failure.
+fn parse_failure(err: &clap::Error, argv: &[std::ffi::OsString], program: &str) -> ! {
+    if err.use_stderr() && error::asks_for_json(argv) {
+        let envelope = Envelope::usage(err, program);
+        envelope.eprint();
+        std::process::exit(i32::from(envelope.exit_code));
+    }
+    err.exit()
 }
 
 /// The variable the `surreal` launcher sets on the component it runs, naming
