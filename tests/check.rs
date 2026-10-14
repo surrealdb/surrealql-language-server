@@ -148,6 +148,28 @@ fn json_format_is_one_parseable_object() {
     );
 }
 
+/// `--json` is the documented spelling of `--format json`: the same bytes on
+/// stdout and the same exit code, so a script can switch without a diff.
+#[test]
+fn json_is_byte_identical_to_format_json() {
+    let dir = scratch("json-flag");
+    write(&dir, "broken.surql", "SELEC * FRM person\n");
+    write(
+        &dir,
+        "queries/clean.surql",
+        "DEFINE TABLE person SCHEMALESS;\n",
+    );
+    for target in ["broken.surql", "queries"] {
+        let format = run_check(&dir, &[target, "--format", "json"]);
+        for flag in ["--json", "-j"] {
+            let json = run_check(&dir, &[target, flag]);
+            assert_eq!(exit_code(&json), exit_code(&format), "{target} {flag}");
+            assert_eq!(json.stdout, format.stdout, "{target} {flag}");
+            assert_eq!(json.stderr, format.stderr, "{target} {flag}");
+        }
+    }
+}
+
 #[test]
 fn a_directory_target_walks_only_surql_files() {
     let dir = scratch("dir-walk");

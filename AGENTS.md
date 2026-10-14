@@ -43,7 +43,7 @@ after a Rust edit:
 surreal-lsp check queries/                          # a directory
 surreal-lsp check --stdin --stdin-filename src/feed.surql \
     --workspace schema/                             # an unsaved buffer
-surreal-lsp check queries/ --format json --fail-on warning
+surreal-lsp check queries/ --json --fail-on warning
 ```
 
 `surreal lsp check` (through the `surreal` CLI) and
@@ -58,6 +58,9 @@ extensions) are the same command.
 
 Facts a machine consumer must know:
 
+- **`--json` prints one JSON object on stdout.** It is the documented
+  spelling of `--format json`, which is still accepted and prints the same
+  bytes.
 - **JSON diagnostics are LSP wire objects verbatim**: 0-based lines, UTF-16
   columns, camelCase keys, integer severity (1 error, 2 warning), string
   `code`. Text output is 1-based in both line and column.

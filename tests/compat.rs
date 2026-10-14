@@ -309,7 +309,7 @@ fn default_settings_are_stable() {
 // The `check` subcommand surface (machine-readable output, exit codes, flags)
 // ---------------------------------------------------------------------------
 
-/// Exact-equality golden for the `--format json` report shape. The
+/// Exact-equality golden for the `--json` (`--format json`) report shape. The
 /// diagnostics inside are LSP wire objects verbatim (0-based lines, UTF-16
 /// columns, camelCase keys, integer severity, string code) — agents key
 /// repairs on these fields, so changes must be additive and deliberate.
@@ -456,4 +456,7 @@ fn check_exit_codes_and_flags_are_stable() {
         0,
         "the documented flag surface"
     );
+    // `--json` is the documented spelling of `--format json`; both stay.
+    assert_eq!(run(&["clean.surql", "--json"]), 0, "--json");
+    assert_eq!(run(&["clean.surql", "-j"]), 0, "-j");
 }

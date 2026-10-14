@@ -75,8 +75,13 @@ pub struct CheckOptions {
     #[arg(long = "workspace", value_name = "DIR")]
     pub workspace_dirs: Vec<PathBuf>,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(long, short = 'j', help = crate::native::cli::JSON_HELP, conflicts_with = "format")]
+    pub json: bool,
+
+    /// Output format. Hidden: `--json` is the documented spelling of
+    /// `--format json`, and the flag every component of the `surreal` CLI
+    /// shares. Still accepted, because scripts already pass it.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, hide = true)]
     pub format: OutputFormat,
 
     /// Settings file; same shape as the LSP settings (a `surrealql` key or
@@ -100,6 +105,17 @@ pub struct CheckOptions {
             .map(|severity| fail_on_rank(&severity)),
     )]
     pub fail_on: u8,
+}
+
+impl CheckOptions {
+    /// The format to render: `--json` is `--format json`.
+    pub fn output_format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.format
+        }
+    }
 }
 
 /// The rank of a `--fail-on` severity. Only reached with one of the four
@@ -158,7 +174,7 @@ pub struct CheckReport {
     pub exit_code: u8,
 }
 
-/// Render the report as the single JSON object `--format json` prints.
+/// Render the report as the single JSON object `--json` prints.
 pub fn render_json(report: &CheckReport) -> String {
     let mut out = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
     out.push('\n');
@@ -380,7 +396,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     }
     report_scan_losses(&report.scan, collected.target_skipped);
 
-    match options.format {
+    match options.output_format() {
         OutputFormat::Text => print!("{}", render_text(&report)),
         OutputFormat::Json => print!("{}", render_json(&report)),
     }

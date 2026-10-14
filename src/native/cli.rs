@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn check_defaults_are_text_format_and_fail_on_error() {
         let options = check_options(&["queries.surql"]);
-        assert_eq!(options.format, OutputFormat::Text);
+        assert_eq!(options.output_format(), OutputFormat::Text);
         assert_eq!(options.fail_on, 1);
         assert_eq!(options.paths, vec![PathBuf::from("queries.surql")]);
     }
@@ -417,10 +417,40 @@ mod tests {
             options.workspace_dirs,
             vec![PathBuf::from("schema"), PathBuf::from("more")]
         );
-        assert_eq!(options.format, OutputFormat::Json);
+        assert_eq!(options.output_format(), OutputFormat::Json);
         assert_eq!(options.config, Some(PathBuf::from("surql.json")));
         assert_eq!(options.params, vec!["id", "limit"]);
         assert_eq!(options.fail_on, 2);
+    }
+
+    /// `--json` is the documented spelling of `--format json`, which stays
+    /// accepted for the scripts that already pass it.
+    #[test]
+    fn check_json_is_format_json() {
+        for flag in ["--json", "-j"] {
+            let options = check_options(&["a.surql", flag]);
+            assert_eq!(options.output_format(), OutputFormat::Json, "{flag}");
+        }
+        let options = check_options(&["a.surql", "--format", "json"]);
+        assert_eq!(options.output_format(), OutputFormat::Json);
+        let options = check_options(&["a.surql", "--format", "text"]);
+        assert_eq!(options.output_format(), OutputFormat::Text);
+        // Asking for both is a contradiction, not a precedence rule.
+        let err = parse(&["check", "a.surql", "--json", "--format", "text"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Help documents `--json`, worded as in every other component, and not
+    /// `--format`.
+    #[test]
+    fn check_help_offers_json_and_hides_format() {
+        let err = parse(&["check", "--help"]).unwrap_err();
+        let help = err.to_string();
+        assert!(
+            help.contains("-j, --json") && help.contains(JSON_HELP),
+            "{help}"
+        );
+        assert!(!help.contains("--format"), "{help}");
     }
 
     #[test]

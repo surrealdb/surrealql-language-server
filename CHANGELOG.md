@@ -113,6 +113,9 @@ Also:
   object with the `version`, and the `commit`, `target`, `build` and `grammar`
   the binary was built from, `null` where the build could not tell.
   `-V`/`--version` are unchanged.
+- **`check --json`** (or `-j`), the flag every component of the `surreal` CLI
+  shares, is the documented spelling of `check --format json` and prints the
+  same bytes. `--format` is still accepted, and hidden from help.
 
 - **Closures are typed, and calls through them are checked.**
   `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`
