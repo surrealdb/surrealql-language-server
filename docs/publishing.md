@@ -9,7 +9,7 @@ publishes every copy of it:
 |---|---|
 | GitHub release | The editor extensions (`surrealql-language-server-<platform>` assets), `builtins.json`, the npm `.tgz` |
 | crates.io, npm | `cargo install`, the browser WASM package |
-| `download.surrealdb.com/cli/lsp/` | The `surreal` launcher: `surreal install lsp`, then `surreal lsp` |
+| `download.surrealdb.com/cli/lsp/` | The `surreal` launcher: `surreal install lsp`, then `surreal lsp stdio` |
 
 Each target is compiled once, and that build yields both the GitHub release
 asset and the launcher's archive, so the two copies cannot drift. Nothing is

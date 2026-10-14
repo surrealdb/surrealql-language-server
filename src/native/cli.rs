@@ -1,12 +1,19 @@
 //! The command line: `surreal-lsp`, which the `surreal` launcher runs as
 //! `surreal lsp`.
 //!
-//! With no command (or `--stdio`, which LSP clients commonly append) this
-//! serves the Language Server Protocol over stdio, and editors depend on
-//! that default. `check` runs the one-shot diagnostics mode from
-//! [`crate::native::check`]. Anything else is a usage error on stderr with
-//! exit code 2, so a typo cannot silently start a server that eats the
-//! terminal's stdin.
+//! `stdio` serves the Language Server Protocol over stdio, and `check` runs
+//! the one-shot diagnostics mode from [`crate::native::check`]. Anything else
+//! is a usage error on stderr with exit code 2, so a typo cannot silently
+//! start a server that eats the terminal's stdin.
+//!
+//! What no command at all does depends on who started the program:
+//!
+//! - **Through the `surreal` launcher** ([`LAUNCHER_VAR`] set and not empty),
+//!   it prints help, as every other component of the `surreal` CLI does.
+//!   `surreal lsp stdio` is how an editor starts the server.
+//! - **Otherwise**, the legacy flow: no command, or `--stdio`, serves over
+//!   stdio. The editor extensions start the bare executable and depend on
+//!   it, so it stays for as long as anything does.
 //!
 //! Serving writes nothing of its own on either stream, under either name:
 //! stdout is the JSON-RPC channel, and editors show every stderr line as a
@@ -25,10 +32,10 @@ use crate::native::check::{self, CheckOptions};
 
 const ABOUT: &str = "The SurrealQL language server, for editors";
 
-/// `0.6.1`, what `-V` prints and the launcher checks an install against.
+/// `X.Y.Z`, what `-V` prints and the launcher checks an install against.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `0.6.1`, what `--version`
+/// `X.Y.Z (master-vX.Y.Z-3-gabc1234, grammar cb2e6b5)`, what `--version`
 /// prints: the release, and which source and grammar it was built from.
 ///
 /// The same string as [`crate::core::server::build_version`], built with
@@ -53,9 +60,10 @@ Exit codes:
 #[command(version = VERSION, long_version = LONG_VERSION)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
-    /// Serve over stdio. This is the default and the only transport; the
-    /// flag is accepted because LSP clients append it.
-    #[arg(long)]
+    /// Legacy: serve over stdio, as no command does outside the launcher.
+    /// Hidden, because `stdio` is the command to document; accepted because
+    /// LSP clients append it to whatever they start.
+    #[arg(long, hide = true)]
     pub stdio: bool,
 
     #[command(subcommand)]
@@ -64,9 +72,21 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Serve the Language Server Protocol over stdio, for an editor.
+    Stdio(StdioOptions),
+
     /// Check .surql files and report diagnostics.
     #[command(after_help = CHECK_EXIT_CODES)]
     Check(CheckOptions),
+}
+
+/// `stdio` takes no options of its own.
+#[derive(clap::Args, Debug)]
+pub struct StdioOptions {
+    /// Accepted and ignored: LSP clients append `--stdio` to whatever command
+    /// they are configured with, which here is already `stdio`.
+    #[arg(long = "stdio", hide = true)]
+    pub stdio: bool,
 }
 
 impl Cli {
@@ -80,6 +100,9 @@ impl Cli {
         let mut command = Self::command().name(name).bin_name(name);
         if let Some(invoked) = invoked_as(std::env::var(INVOKED_AS_VAR).ok().as_deref()) {
             command = command.bin_name(invoked);
+        }
+        if launched(std::env::var_os(LAUNCHER_VAR).as_deref()) {
+            command = launcher_flow(command);
         }
         Self::parse_with(command, std::env::args_os()).unwrap_or_else(|err| err.exit())
     }
@@ -118,6 +141,36 @@ impl Cli {
 /// exactly that.
 pub const INVOKED_AS_VAR: &str = "SURREAL_INVOKED_AS";
 
+/// The variable the `surreal` launcher sets on every component it runs: the
+/// launcher's own path.
+///
+/// Its presence switches no command from serving to printing help. Only the
+/// launcher sets it, so an editor that starts the executable directly keeps
+/// the legacy flow it depends on.
+pub const LAUNCHER_VAR: &str = "SURREAL_CLI_LAUNCHER";
+
+/// Whether the `surreal` launcher started this process: [`LAUNCHER_VAR`] set
+/// and not empty.
+fn launched(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.is_some_and(|value| !value.is_empty())
+}
+
+/// The standard flow, as the launcher runs it: no command prints help.
+///
+/// Through clap's own rule, so it reads like every other component of the
+/// `surreal` CLI: the full help on stderr, exit code 2. The usage line is
+/// spelled out because clap's would also offer the bare command, which here
+/// only prints this help.
+fn launcher_flow(command: clap::Command) -> clap::Command {
+    let bin = command
+        .get_bin_name()
+        .unwrap_or_else(|| command.get_name())
+        .to_owned();
+    command
+        .arg_required_else_help(true)
+        .override_usage(format!("{bin} <COMMAND>"))
+}
+
 /// The name to show in help, when the launcher supplied a usable one.
 ///
 /// Absent, empty or odd values keep the executable's own name. The value
@@ -144,7 +197,9 @@ pub async fn run(name: &'static str) -> ExitCode {
     }));
 
     match Cli::from_env(name).command {
-        None => {
+        // `None` is the legacy flow; under the launcher it never gets here,
+        // because no command prints help.
+        None | Some(Command::Stdio(_)) => {
             serve().await;
             ExitCode::SUCCESS
         }
@@ -176,12 +231,18 @@ mod tests {
         Cli::parse_with(Cli::command(), argv)
     }
 
+    /// Parse as the `surreal` launcher runs the program.
+    fn parse_launched(args: &[&str]) -> Result<Cli, clap::Error> {
+        let argv = std::iter::once("surreal-lsp").chain(args.iter().copied());
+        Cli::parse_with(launcher_flow(Cli::command()), argv)
+    }
+
     fn check_options(args: &[&str]) -> CheckOptions {
         let mut argv = vec!["check"];
         argv.extend_from_slice(args);
         match parse(&argv).expect("parse").command {
             Some(Command::Check(options)) => options,
-            None => panic!("expected check"),
+            other => panic!("expected check, got {other:?}"),
         }
     }
 
@@ -192,13 +253,60 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// Editors start the bare executable, or append `--stdio`. Both serve.
+    /// The legacy flow: editors start the bare executable, or append
+    /// `--stdio`. Both serve.
     #[test]
     fn no_command_and_stdio_both_serve() {
         assert!(parse(&[]).expect("bare").command.is_none());
         let cli = parse(&["--stdio"]).expect("--stdio");
         assert!(cli.stdio);
         assert!(cli.command.is_none());
+    }
+
+    /// The standard flow: `stdio` serves, with or without the `--stdio` an
+    /// LSP client appends, under the launcher and outside it.
+    #[test]
+    fn the_stdio_command_serves() {
+        for parse in [parse, parse_launched] {
+            for args in [&["stdio"][..], &["stdio", "--stdio"]] {
+                let cli = parse(args).expect("stdio");
+                assert!(matches!(cli.command, Some(Command::Stdio(_))), "{args:?}");
+            }
+        }
+    }
+
+    /// Under the launcher no command is a request for help, not a server
+    /// waiting on the terminal's stdin.
+    #[test]
+    fn under_the_launcher_no_command_prints_help() {
+        let err = parse_launched(&[]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        let help = err.to_string();
+        assert!(help.contains("stdio"), "{help}");
+        assert!(help.contains("check"), "{help}");
+        assert!(help.contains("Usage: surreal-lsp <COMMAND>\n"), "{help}");
+        // The legacy flag stays out of the help it prints.
+        assert!(!help.contains("--stdio"), "{help}");
+    }
+
+    /// The legacy flag still serves under the launcher, so an editor set up
+    /// with `surreal lsp --stdio` keeps working.
+    #[test]
+    fn under_the_launcher_the_legacy_flag_still_serves() {
+        let cli = parse_launched(&["--stdio"]).expect("--stdio");
+        assert!(cli.stdio);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn only_a_non_empty_launcher_variable_counts() {
+        use std::ffi::OsStr;
+        assert!(launched(Some(OsStr::new("/usr/local/bin/surreal"))));
+        assert!(!launched(Some(OsStr::new(""))));
+        assert!(!launched(None));
     }
 
     /// A typo must be refused rather than start a server that waits on the

@@ -56,8 +56,9 @@ cargo build --release
 
 The build also produces `target/release/surrealql-language-server`, the same
 program under the name the editor extensions look for. Both serve the LSP over
-stdio when run with no arguments (or `--stdio`), and both write nothing but
-the protocol while they do.
+stdio with `stdio`, and both write nothing but the protocol while they do.
+Run directly, no arguments (or `--stdio`) also serves, the legacy behaviour
+the editor extensions rely on.
 
 ### With the `surreal` CLI
 
@@ -66,9 +67,14 @@ and runs the server as its `lsp` component, from download.surrealdb.com:
 
 ```bash
 surreal install lsp
-surreal lsp            # what an editor starts; stdio, nothing else written
+surreal lsp            # prints help
+surreal lsp stdio      # what an editor starts; stdio, nothing else written
 surreal lsp check queries/
 ```
+
+Through the launcher, which sets `SURREAL_CLI_LAUNCHER`, no command prints
+help instead of serving, as with every other `surreal` component. Configure
+editors with `surreal lsp stdio`; `surreal lsp --stdio` still works.
 
 See [`docs/publishing.md`](docs/publishing.md) for how it gets there.
 
