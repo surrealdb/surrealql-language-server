@@ -170,6 +170,13 @@ Also:
 
 ### Changed
 
+- **`surreal lsp` prints help; `surreal lsp stdio` serves.** Under the
+  `surreal` launcher (`SURREAL_CLI_LAUNCHER` set and not empty), running with
+  no command now prints help and exits 2, as every other `surreal` component
+  does, instead of silently waiting on stdin for an editor. The new `stdio`
+  command serves the LSP, and accepts the `--stdio` that LSP clients append.
+  Started any other way, the executable keeps the legacy behaviour: no command,
+  or `--stdio`, serves, so the editor extensions are unaffected.
 - **`DEFINE INDEX … FULLTEXT`, `COUNT` and `DISKANN` no longer report a false
   syntax error.** `DEFINE INDEX OVERWRITE article_body_search ON article FIELDS
   body FULLTEXT ANALYZER english BM25;` reported ``Invalid SurrealQL syntax

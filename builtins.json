@@ -1,7 +1,7 @@
 {
   "meta": {
     "schemaVersion": 1,
-    "languageServerVersion": "0.6.1",
+    "languageServerVersion": "0.6.2",
     "surrealdbRevision": "9d9a5b069",
     "generatedBy": "cargo xtask generate-builtins"
   },

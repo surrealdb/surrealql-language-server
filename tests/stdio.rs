@@ -171,15 +171,67 @@ fn the_old_name_serves_only_the_protocol() {
     assert_only_the_protocol(&serve(binary, &["--stdio"], &[]));
 }
 
-/// What the `surreal` launcher sets on a component it runs. Neither changes
-/// what the server writes.
+/// The `stdio` command, the standard way to start the server, under both
+/// names, with and without the `--stdio` an LSP client appends.
+#[test]
+fn the_stdio_command_serves_only_the_protocol() {
+    for binary in [
+        env!("CARGO_BIN_EXE_surreal-lsp"),
+        env!("CARGO_BIN_EXE_surrealql-language-server"),
+    ] {
+        assert_only_the_protocol(&serve(binary, &["stdio"], &[]));
+        assert_only_the_protocol(&serve(binary, &["stdio", "--stdio"], &[]));
+    }
+}
+
+/// What the `surreal` launcher sets on a component it runs.
+const LAUNCHER_ENV: [(&str, &str); 2] = [
+    ("SURREAL_INVOKED_AS", "surreal lsp"),
+    ("SURREAL_CLI_LAUNCHER", "/usr/local/bin/surreal"),
+];
+
+/// Under the launcher, `stdio` and the legacy `--stdio` both serve, and
+/// neither variable changes what the server writes.
 #[test]
 fn started_by_the_launcher_it_serves_only_the_protocol() {
-    let env = [
-        ("SURREAL_INVOKED_AS", "surreal lsp"),
-        ("SURREAL_CLI_LAUNCHER", "/usr/local/bin/surreal"),
-    ];
-    let output = serve(env!("CARGO_BIN_EXE_surreal-lsp"), &["--stdio"], &env);
+    let binary = env!("CARGO_BIN_EXE_surreal-lsp");
+    assert_only_the_protocol(&serve(binary, &["stdio"], &LAUNCHER_ENV));
+    assert_only_the_protocol(&serve(binary, &["--stdio"], &LAUNCHER_ENV));
+}
+
+/// Run `binary` with no arguments and no stdin, as somebody typing the bare
+/// command would, and return what it wrote.
+fn run_bare(binary: &str, env: &[(&str, &str)]) -> Output {
+    Command::new(binary)
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the binary")
+}
+
+/// Under the launcher no command prints help, naming the command the way the
+/// user typed it, instead of serving.
+#[test]
+fn started_by_the_launcher_with_no_command_it_prints_help() {
+    let output = run_bare(env!("CARGO_BIN_EXE_surreal-lsp"), &LAUNCHER_ENV);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let help = String::from_utf8(output.stderr).expect("utf-8 help");
+    assert!(help.contains("Usage: surreal lsp <COMMAND>\n"), "{help}");
+    assert!(help.contains("stdio"), "{help}");
+    assert!(help.contains("check"), "{help}");
+}
+
+/// An empty launcher variable is not the launcher: no command keeps the
+/// legacy flow and serves, so it answers on stdout and prints no help.
+#[test]
+fn an_empty_launcher_variable_keeps_the_legacy_flow() {
+    let output = serve(
+        env!("CARGO_BIN_EXE_surreal-lsp"),
+        &[],
+        &[("SURREAL_CLI_LAUNCHER", "")],
+    );
     assert_only_the_protocol(&output);
 }
 
