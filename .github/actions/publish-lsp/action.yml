@@ -12,8 +12,8 @@ description: 'Stage, verify and publish one surreal-lsp release to download.surr
 #     names, the same `v<version>/<executable>-v<version>.<platform>.tgz` assets
 #     and `.txt` SHA-256 sidecars, and nothing else beside them. One reader in
 #     the launcher fetches every component.
-#   - The staging and verification steps run on a rehearsal too, which is the
-#     valuable half of a dry run.
+#   - Every asset is staged and re-verified against its sidecar before the
+#     first upload, so a malformed release fails with nothing written.
 
 inputs:
     name:
@@ -29,19 +29,17 @@ inputs:
         description: 'Whether this version is a pre-release'
         required: true
     latest:
-        description: 'Whether to move the stable pointer to this version'
+        description: 'Whether to move latest.txt to this version'
         required: true
-    publish:
-        description: 'Whether to upload anything at all'
+    major:
+        description: 'Whether to move v<major>.txt to this version'
         required: true
     aws-access-key-id:
         description: 'AWS access key ID'
-        required: false
-        default: ''
+        required: true
     aws-secret-access-key:
         description: 'AWS secret access key'
-        required: false
-        default: ''
+        required: true
 
 runs:
     using: composite
@@ -55,8 +53,6 @@ runs:
               pattern: 'surreal-lsp-${{ inputs.name }}.*'
               path: artifacts/surreal-lsp
 
-        # Runs on a rehearsal as well as a real publish, so `publish: false`
-        # proves the release is well-formed rather than only that it compiled.
         - name: Stage and verify
           shell: bash
           env:
@@ -127,7 +123,6 @@ runs:
               echo "every archive holds exactly one member named ${EXECUTABLE}"
 
         - name: Configure AWS
-          if: ${{ inputs.publish == 'true' }}
           uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
           with:
               aws-region: us-east-2
@@ -140,7 +135,6 @@ runs:
         # a sidecar is what the republish check probes: one being present has
         # to mean its asset is too.
         - name: Publish artifacts
-          if: ${{ inputs.publish == 'true' }}
           shell: bash
           env:
               PREFIX: cli/lsp
@@ -158,7 +152,7 @@ runs:
         # Every mutable key gets `no-store`, because a cached pointer is a
         # release nobody is offered.
         - name: Set the latest stable pointer
-          if: ${{ inputs.publish == 'true' && inputs.pre-release != 'true' && inputs.latest == 'true' }}
+          if: ${{ inputs.latest == 'true' }}
           shell: bash
           env:
               PREFIX: cli/lsp
@@ -170,7 +164,7 @@ runs:
                 "s3://download.surrealdb.com/${PREFIX}/latest.txt"
 
         - name: Set the major-version pointer
-          if: ${{ inputs.publish == 'true' && inputs.pre-release != 'true' }}
+          if: ${{ inputs.major == 'true' }}
           shell: bash
           env:
               PREFIX: cli/lsp
@@ -183,7 +177,7 @@ runs:
                 "s3://download.surrealdb.com/${PREFIX}/v${major}.txt"
 
         - name: Set the pre-release channel pointer
-          if: ${{ inputs.publish == 'true' && inputs.pre-release == 'true' }}
+          if: ${{ inputs.pre-release == 'true' }}
           shell: bash
           env:
               PREFIX: cli/lsp
@@ -194,42 +188,3 @@ runs:
               echo "v${VERSION}" > "${CHANNEL}.txt"
               aws s3 cp --cache-control 'no-store' "${CHANNEL}.txt" \
                 "s3://download.surrealdb.com/${PREFIX}/${CHANNEL}.txt"
-
-        - name: Report the rehearsal
-          if: ${{ inputs.publish != 'true' }}
-          shell: bash
-          env:
-              PREFIX: cli/lsp
-              EXECUTABLE: surreal-lsp
-              NAME: ${{ inputs.name }}
-              VERSION: ${{ inputs.version }}
-              CHANNEL: ${{ inputs.channel }}
-              PRE_RELEASE: ${{ inputs.pre-release }}
-              LATEST: ${{ inputs.latest }}
-          run: |
-              set -euo pipefail
-              prefix="s3://download.surrealdb.com/${PREFIX}"
-              echo "Rehearsal only. Nothing was uploaded, and no credential was passed"
-              echo "to this job. These are the keys a real publish would write, in order:"
-              echo
-              for f in "staging/${EXECUTABLE}"/*; do
-                case "$f" in *.txt) ;; *) echo "  ${prefix}/${NAME}/$(basename "$f")" ;; esac
-              done
-              for f in "staging/${EXECUTABLE}"/*.txt; do
-                echo "  ${prefix}/${NAME}/$(basename "$f")"
-              done
-
-              if [ "${PRE_RELEASE}" != "true" ] && [ "${LATEST}" = "true" ]; then
-                echo "  ${prefix}/latest.txt                     (no-store) -> v${VERSION}"
-              else
-                echo "  (held back) ${prefix}/latest.txt         pre-release=${PRE_RELEASE} latest=${LATEST}"
-              fi
-
-              if [ "${PRE_RELEASE}" != "true" ]; then
-                echo "  ${prefix}/v${VERSION%%.*}.txt                        (no-store) -> v${VERSION}"
-              else
-                echo "  (held back) ${prefix}/v${VERSION%%.*}.txt            this is a pre-release"
-                echo "  ${prefix}/${CHANNEL}.txt                       (no-store) -> v${VERSION}"
-              fi
-              echo
-              echo "Then cli/lsp/ is synced to each regional bucket, s3://download.<region>.surrealdb.com/cli/lsp/."

@@ -2,15 +2,22 @@
 
 How a release reaches its users, and what each copy promises.
 
-A release is published twice, from the same tag:
+Publishing a GitHub release runs `publish.yml` on its tag, and that one run
+publishes every copy of it:
 
-| Where | Built by | What it is for |
-|---|---|---|
-| GitHub release, crates.io, npm | `ci.yml`, on the `v<version>` tag | The editor extensions (`surrealql-language-server-<platform>` assets), `cargo install`, the browser WASM package, `builtins.json` |
-| `download.surrealdb.com/cli/lsp/` | `publish-lsp.yml`, dispatched by hand | The `surreal` launcher: `surreal install lsp`, then `surreal lsp` |
+| Where | What it is for |
+|---|---|
+| GitHub release | The editor extensions (`surrealql-language-server-<platform>` assets), `builtins.json`, the npm `.tgz` |
+| crates.io, npm | `cargo install`, the browser WASM package |
+| `download.surrealdb.com/cli/lsp/` | The `surreal` launcher: `surreal install lsp`, then `surreal lsp` |
 
-The first is unchanged by the second. The extensions keep finding the server
-exactly as they do today; moving them to the launcher is a separate decision.
+Each target is compiled once, and that build yields both the GitHub release
+asset and the launcher's archive, so the two copies cannot drift. Nothing is
+published until `check.yml`, the same formatting, tests and packaging check
+every push gets, has passed on the tagged commit.
+
+The extensions keep finding the server exactly as they always have; moving
+them to the launcher is a separate decision.
 
 ## The executables
 
@@ -33,43 +40,35 @@ checks it again on every target.
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows,
    and merge.
-2. Release `v<version>` as the README's release checklist describes. `ci.yml`
-   builds the GitHub assets, the crate and the npm package from the tag, and
-   `notify-consumers.yml` tells the extensions.
-3. Dispatch **Publish LSP** on the tag `v<version>` with **`publish: false`**.
-   This is a full rehearsal: all five targets build, each binary is checked for
-   its `--version` line and serves one silent session, the Linux builds start
-   inside `debian:12`, every asset is re-verified against its sidecar, and the
-   exact list of keys a real publish would write is printed. No credential
-   reaches that run.
-4. Read the key list against the layout below.
-5. Dispatch again on the same tag with **`publish: true`**, and `latest: true`
-   when this version should become what `surreal install lsp` installs. A
-   reviewer of the `release` environment approves the publish job.
+2. Publish a GitHub release whose tag is `v<version>`, as the README's release
+   checklist describes. Tick *Set as latest release* when this version should
+   become what `surreal install lsp` installs; for a backport, leave it off.
+3. `publish.yml` runs on the tag. A reviewer of the `release` environment
+   approves its *Publish to download.surrealdb.com* job once the builds are
+   green; everything else proceeds without approval.
+4. `notify-consumers.yml` tells the extensions once the four GitHub assets are
+   on the release.
 
-```bash
-gh workflow run publish-lsp.yml --ref v0.7.0 -f publish=false -f latest=false
-gh workflow run publish-lsp.yml --ref v0.7.0 -f publish=true -f latest=true
-```
+The run refuses to publish anything if the tag is not `v<version>`, where
+`<version>` is what `Cargo.toml` says at that tag, so every copy of a release
+is built from the commit it names.
 
-A real publish refuses to run from anything but the tag `v<version>`, where
-`<version>` is what `Cargo.toml` says at that tag, so the launcher's copy is
-always built from the commit the GitHub release came from.
+### Which pointers move
 
-### Inputs
+There are no inputs. The pointers under `cli/lsp/` follow the release:
 
-| Input | Default | What it does |
-|---|---|---|
-| `publish` | `false` | Upload anything at all. `false` is the rehearsal. |
-| `latest` | `false` | Move `latest.txt` to this version. Ignored for a pre-release. |
+| Pointer | Moved when |
+|---|---|
+| `latest.txt` | Stable, and GitHub marks this release as the latest |
+| `v<major>.txt` | Stable, and newer than the version it names now (or it does not exist) |
+| `beta.txt` / `alpha.txt` | A pre-release, on the version's channel |
 
-`latest` is a separate decision from `publish`: writing the stable pointer *is*
-offering the release to every launcher, so a build can be published and sat on
-before it becomes what a new install gets.
+`latest.txt` follows GitHub's own flag because writing it *is* offering the
+release to every launcher: a backport published without *Set as latest
+release* leaves new installs on the newer line.
 
-There is no `version` input. The version is `Cargo.toml`'s, which is also what
-the binary reports, and the launcher refuses an install whose `--version` names
-a different release than the pointer did.
+The channel is derived from the version: no `-` is stable, an `alpha` first
+pre-release identifier is alpha, and anything else with a `-` is beta.
 
 ---
 
@@ -101,27 +100,17 @@ download.surrealdb.com/cli/lsp/
   special case in it.
 
 `scripts/package.sh` is the only implementation of the archive and sidecar
-layout here, and a copy of the launcher repository's. CI runs it on every push.
+layout here, and a copy of the launcher repository's. `check.yml` runs it on
+every push.
 
 **Order matters:** assets, then sidecars, then pointers. A client that reads a
 pointer must find the files it names already in place. Every mutable key gets
 `Cache-Control: no-store`; the versioned keys are immutable and get none.
 
-### Pointer gates
-
-| Pointer | Written when |
-|---|---|
-| `latest.txt` | `publish && !pre-release && latest` |
-| `v<major>.txt` | `publish && !pre-release` |
-| `beta.txt` / `alpha.txt` | `publish && pre-release`, the version's channel |
-
-The channel is derived from the version: no `-` is stable, an `alpha` first
-pre-release identifier is alpha, and anything else with a `-` is beta.
-
 ### Republish protection
 
-A version is published at most once. Before anything builds, the workflow asks
-for the version's five `.txt` sidecars and refuses if any answers 200 (`403`
+A version is published at most once. Before uploading anything, the publish
+job asks for the version's five `.txt` sidecars and refuses if any answers 200 (`403`
 and `404` both mean absent; anything else fails the run rather than guess). The
 sidecars are uploaded after every asset, so one that answers is a download
 somebody can already complete.
@@ -150,14 +139,17 @@ below.
 | `x86_64-apple-darwin` | `macos-15` (cross) | `darwin-amd64` |
 | `x86_64-pc-windows-msvc` | `windows-2022` | `windows-amd64` |
 
-`darwin-amd64` is new: the GitHub release has never had an Intel macOS build.
+Every leg but `darwin-amd64` also uploads `surrealql-language-server` as the
+GitHub release asset for its platform (`linux-amd64`, `linux-arm64`,
+`macos-arm64`, `windows-amd64.exe`). The GitHub release has never had an Intel
+macOS build; only the launcher gets one.
 
 `ubuntu-22.04` sets the glibc floor at 2.35, and the Linux builds are started
 inside `debian:12` (2.36) to prove it. Windows links the C runtime statically,
 so the bare `.exe` starts on a machine without the VC++ redistributable.
 
-The grammar revision comes from `scripts/setup-grammar.sh`. `ci.yml` pins the
-same revision separately; bump both together.
+The grammar revision comes from `scripts/setup-grammar.sh`, which every
+workflow calls.
 
 ---
 
@@ -167,10 +159,10 @@ The repository is public, so the bucket's credentials live in a GitHub
 **environment**, not in repository or organisation secrets, and only the one
 job that uploads names that environment. That job runs no compiler: the builds
 run `build.rs` for the whole dependency graph, which is arbitrary code from
-crates.io, and hold no credential. A rehearsal passes no credential at all.
+crates.io, and hold no credential.
 
 Before the first publish, a repository admin has to set up the following.
-None of it can be checked by a rehearsal.
+None of it can be checked short of a real release.
 
 1. **An environment named `release`**, exactly. A misspelt environment in a
    workflow is created empty rather than refused.
@@ -194,7 +186,7 @@ None of it can be checked by a rehearsal.
      `s3:ListBucket` on each regional bucket conditioned on the same prefix,
      for each of the eleven regions in `propagate-lsp`.
 
-A rehearsal cannot detect a policy that is too narrow; the first real publish
+Nothing short of a release detects a policy that is too narrow; the first one
 will, part-way through its uploads, and leaves the version needing its partial
 keys deleted (see republish protection above).
 

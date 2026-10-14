@@ -1,5 +1,5 @@
 name: 'Build surreal-lsp'
-description: 'Build, smoke-test and package one surreal-lsp release for one target'
+description: 'Build, smoke-test and package one release of the server for one target'
 
 # A copy-and-adapt of surrealdb/surrealctl's `build-cloud`. One action for all
 # five targets, `shell: bash` throughout: present on GitHub's Windows runners
@@ -12,6 +12,10 @@ description: 'Build, smoke-test and package one surreal-lsp release for one targ
 #                                        the archive root, mode 0755
 #   surreal-lsp-<name>.<os>-<arch>.exe   on Windows, a bare executable
 #   surreal-lsp-<name>.<os>-<arch>.txt   64 lowercase hex, the asset's SHA-256
+#
+# The same build also yields `surrealql-language-server`, the GitHub release
+# asset the editor extensions download, when `release-asset` names it. One
+# compile serves both, so the two copies of a release cannot drift.
 
 inputs:
     target:
@@ -29,6 +33,10 @@ inputs:
     name:
         description: 'Release name used in file names, e.g. v0.7.0'
         required: true
+    release-asset:
+        description: 'GitHub release asset name for surrealql-language-server; empty for none'
+        required: false
+        default: ''
 
 runs:
     using: composite
@@ -64,7 +72,8 @@ runs:
               RUSTFLAGS: ${{ inputs.os == 'windows' && '-C target-feature=+crt-static' || '' }}
           run: |
               set -euo pipefail
-              cargo build --locked --release --target "${{ inputs.target }}" --bin surreal-lsp
+              cargo build --locked --release --target "${{ inputs.target }}" \
+                --bin surreal-lsp --bin surrealql-language-server
 
         # The only place that proves a release-profile binary for this target
         # starts, answers the launcher's probe, and serves. CI builds debug and
@@ -146,5 +155,26 @@ runs:
           with:
               name: surreal-lsp-${{ inputs.name }}.${{ inputs.os }}-${{ inputs.arch }}
               path: staging/surreal-lsp/
+              if-no-files-found: error
+              retention-days: 7
+
+        - name: Stage the GitHub release asset
+          if: ${{ inputs.release-asset != '' }}
+          shell: bash
+          env:
+              EXE: ${{ inputs.os == 'windows' && '.exe' || '' }}
+              ASSET: ${{ inputs.release-asset }}
+          run: |
+              set -euo pipefail
+              mkdir -p staging/github
+              cp "target/${{ inputs.target }}/release/surrealql-language-server${EXE}" "staging/github/${ASSET}"
+              ls -l staging/github/
+
+        - name: Upload the GitHub release asset
+          if: ${{ inputs.release-asset != '' }}
+          uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+          with:
+              name: github-release-${{ inputs.release-asset }}
+              path: staging/github/
               if-no-files-found: error
               retention-days: 7

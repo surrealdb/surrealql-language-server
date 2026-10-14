@@ -1,0 +1,420 @@
+name: Publish
+
+# Publishes a release everywhere it goes, from the release's own tag:
+#
+#   - the GitHub release: the `surrealql-language-server-<platform>` binaries
+#     the editor extensions download, `builtins.json` and the npm `.tgz`;
+#   - crates.io and npm (the browser WASM package);
+#   - download.surrealdb.com under `cli/lsp/`, where the `surreal` launcher
+#     installs `surreal-lsp` from (`surreal install lsp`).
+#
+# See docs/publishing.md for the release steps, the bucket layout and the
+# one-time setup.
+#
+# The npm trusted publisher is pinned to this file's name. Renaming it breaks
+# npm publishing until the package's trusted publisher is updated to match.
+
+run-name: 'Publish ${{ github.ref_name }}'
+
+on:
+    release:
+        types: [published]
+
+permissions:
+    contents: read
+
+# The S3 sidecar probe below refuses a *sequential* republish but cannot see a
+# *concurrent* one. `cancel-in-progress: false` because cancelling part-way
+# through the ordered uploads is strictly worse than queueing behind them.
+concurrency:
+    group: publish
+    cancel-in-progress: false
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+
+jobs:
+    # Formatting, tests and the packaging check, exactly as on every push.
+    # Every publishing job waits on it.
+    check:
+        uses: ./.github/workflows/check.yml
+
+    prepare:
+        name: Resolve the release
+        runs-on: ubuntu-22.04
+        outputs:
+            version: ${{ steps.vars.outputs.version }}
+            name: ${{ steps.vars.outputs.name }}
+            channel: ${{ steps.vars.outputs.channel }}
+            pre-release: ${{ steps.vars.outputs.pre-release }}
+            latest: ${{ steps.pointers.outputs.latest }}
+            major: ${{ steps.pointers.outputs.major }}
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Resolve the version and channel
+              id: vars
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  # Found by the binary it builds rather than by the package's
+                  # name, so this cannot pick up the `xtask` workspace member.
+                  version=$(cargo metadata --format-version 1 --no-deps \
+                    | jq -r --arg bin "surreal-lsp" \
+                      '.packages[] | select(any(.targets[]; .name == $bin and (.kind | index("bin")))) | .version')
+                  if [ -z "${version}" ] || [ "$(printf '%s\n' "${version}" | wc -l)" -ne 1 ]; then
+                    echo "::error::expected exactly one package in the workspace with a binary named surreal-lsp"
+                    exit 1
+                  fi
+
+                  if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+                    echo "::error::\`${version}\` is not a version number (X.Y.Z[-prerelease])"
+                    exit 1
+                  fi
+
+                  # Every copy of the release is built from this commit, and the
+                  # binaries, the crate and the npm package all carry this
+                  # version, so the tag has to name it.
+                  if [ "${GITHUB_REF}" != "refs/tags/v${version}" ]; then
+                    echo "::error::Cargo.toml says ${version}, so the release tag must be v${version}, not ${GITHUB_REF_NAME}. Bump the version or retag."
+                    exit 1
+                  fi
+
+                  # The channel rule the launcher reads by: no `-` is stable; an
+                  # `alpha` first identifier is alpha; anything else with a `-`
+                  # collapses onto beta, so an unrecognised identifier never gets
+                  # a channel nobody polls. Compared exactly, not as a glob:
+                  # `alpha*` would also match `1.0.0-alphabet`, which is beta.
+                  if [[ "${version}" != *-* ]]; then
+                    channel="latest"
+                    pre_release="false"
+                  elif [ "$(printf '%s' "${version#*-}" | cut -d. -f1)" = "alpha" ]; then
+                    channel="alpha"
+                    pre_release="true"
+                  else
+                    channel="beta"
+                    pre_release="true"
+                  fi
+
+                  {
+                    echo "version=${version}"
+                    echo "name=v${version}"
+                    echo "channel=${channel}"
+                    echo "pre-release=${pre_release}"
+                  } >> "$GITHUB_OUTPUT"
+
+                  echo "Releasing v${version} on the ${channel} channel (pre-release: ${pre_release})"
+
+            # Which stable pointers under `cli/lsp/` this release moves.
+            #
+            # `latest.txt` follows GitHub's own "latest release" flag, the
+            # checkbox on the release form, so publishing a backport that is
+            # not marked latest leaves the launcher's default install alone.
+            # `v<major>.txt` only ever moves forward within its major.
+            - name: Decide the pointers
+              id: pointers
+              shell: bash
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  VERSION: ${{ steps.vars.outputs.version }}
+                  PRE_RELEASE: ${{ steps.vars.outputs.pre-release }}
+              run: |
+                  set -euo pipefail
+
+                  if [ "${PRE_RELEASE}" = "true" ]; then
+                    echo "latest=false" >> "$GITHUB_OUTPUT"
+                    echo "major=false" >> "$GITHUB_OUTPUT"
+                    echo "A pre-release moves only its channel pointer."
+                    exit 0
+                  fi
+
+                  github_latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+                  if [ "${github_latest}" = "v${VERSION}" ]; then
+                    latest="true"
+                  else
+                    latest="false"
+                    echo "::notice::GitHub's latest release is ${github_latest}, so cli/lsp/latest.txt stays where it is."
+                  fi
+
+                  major="${VERSION%%.*}"
+                  url="https://download.surrealdb.com/cli/lsp/v${major}.txt"
+                  code=$(curl -s -o current.txt -w '%{http_code}' "${url}" || true)
+                  case "${code}" in
+                    200)
+                      current=$(tr -d '[:space:]' < current.txt)
+                      newest=$(printf '%s\n%s\n' "${current#v}" "${VERSION}" | sort -V | tail -n1)
+                      if [ "${newest}" = "${VERSION}" ]; then
+                        move_major="true"
+                      else
+                        move_major="false"
+                        echo "::notice::v${major}.txt already names ${current}, newer than v${VERSION}; it stays."
+                      fi
+                      ;;
+                    403|404)
+                      move_major="true"
+                      ;;
+                    *)
+                      echo "::error::Could not read ${url}: HTTP ${code}."
+                      exit 1
+                      ;;
+                  esac
+
+                  echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+                  echo "major=${move_major}" >> "$GITHUB_OUTPUT"
+                  echo "latest.txt: ${latest}, v${major}.txt: ${move_major}"
+
+    # One build per target serves both copies of the release: the
+    # `surrealql-language-server` asset for the GitHub release and the
+    # packaged `surreal-lsp` for download.surrealdb.com. No job here holds a
+    # credential or write access: the builds run `build.rs` for the whole
+    # dependency graph, which is arbitrary code from crates.io.
+    build:
+        name: Build ${{ matrix.os }}-${{ matrix.arch }}
+        needs: [check, prepare]
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            # A release must not be half-populated.
+            fail-fast: true
+            matrix:
+                include:
+                    # Runner images are pinned, not `-latest`. `ubuntu-22.04`
+                    # gives the widest glibc floor still available (2.35).
+                    #
+                    # Native runners throughout. x86_64 macOS is the one cross
+                    # build, because Xcode's clang is a working cross compiler
+                    # for the grammar's C and for `aws-lc-sys`. The GitHub
+                    # release has no Intel macOS asset; only the CLI ships one.
+                    - target: x86_64-unknown-linux-gnu
+                      runner: ubuntu-22.04
+                      os: linux
+                      arch: amd64
+                      release-asset: surrealql-language-server-linux-amd64
+                    - target: aarch64-unknown-linux-gnu
+                      runner: ubuntu-22.04-arm
+                      os: linux
+                      arch: arm64
+                      release-asset: surrealql-language-server-linux-arm64
+                    - target: aarch64-apple-darwin
+                      runner: macos-15
+                      os: darwin
+                      arch: arm64
+                      release-asset: surrealql-language-server-macos-arm64
+                    - target: x86_64-apple-darwin
+                      runner: macos-15
+                      os: darwin
+                      arch: amd64
+                      release-asset: ''
+                    - target: x86_64-pc-windows-msvc
+                      runner: windows-2022
+                      os: windows
+                      arch: amd64
+                      release-asset: surrealql-language-server-windows-amd64.exe
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - uses: ./.github/actions/build-lsp
+              with:
+                  version: ${{ needs.prepare.outputs.version }}
+                  name: ${{ needs.prepare.outputs.name }}
+                  target: ${{ matrix.target }}
+                  os: ${{ matrix.os }}
+                  arch: ${{ matrix.arch }}
+                  release-asset: ${{ matrix.release-asset }}
+
+    # The one job that writes the binaries to the GitHub release, so four
+    # build legs never race to update it.
+    github-release:
+        name: Upload to the GitHub release
+        needs: [prepare, build]
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Download the release assets
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              with:
+                  pattern: 'github-release-*'
+                  path: dist
+                  merge-multiple: true
+
+            # The four names the editor extensions and notify-consumers.yml
+            # look for. A missing one must fail here, not in their hands.
+            - name: Verify the assets
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  ls -l dist
+                  for asset in \
+                    surrealql-language-server-linux-amd64 \
+                    surrealql-language-server-linux-arm64 \
+                    surrealql-language-server-macos-arm64 \
+                    surrealql-language-server-windows-amd64.exe; do
+                    test -f "dist/${asset}" || { echo "::error::missing ${asset}"; exit 1; }
+                  done
+
+            - name: Upload release assets
+              uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+              with:
+                  files: dist/*
+                  fail_on_unmatched_files: true
+
+    # builtins.json is committed and freshness-checked on every push, so this
+    # job only attaches the already-correct file to the release. It is kept
+    # apart from the builds and from npm so the data artifact never shares
+    # their fate.
+    builtins:
+        name: Upload builtins.json
+        needs: [check, prepare]
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Upload builtins.json to the GitHub release
+              uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+              with:
+                  files: builtins.json
+                  fail_on_unmatched_files: true
+
+    crate:
+        name: Publish to crates.io
+        needs: [check, prepare]
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Check out tree-sitter grammar
+              run: bash scripts/setup-grammar.sh
+            - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.94.0
+            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+              name: Cache Rust Artifacts
+            - name: Publish to crates.io
+              run: cargo publish
+              env:
+                  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+                  TREE_SITTER_SURREALQL_DIR: ${{ github.workspace }}/../surrealql-tree-sitter
+
+    npm:
+        name: Publish to npm
+        needs: [check, prepare]
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            id-token: write
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Check out tree-sitter grammar
+              run: bash scripts/setup-grammar.sh
+            - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.94.0
+                  targets: wasm32-unknown-unknown
+            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+              name: Cache Rust Artifacts
+            - name: Install wasm-bindgen-cli
+              run: command -v wasm-bindgen && wasm-bindgen --version | grep -q 0.2.108 || cargo install -f wasm-bindgen-cli --version 0.2.108
+            - name: Install wasm-opt
+              run: command -v wasm-opt || cargo install wasm-opt
+            - name: Build wasm package
+              run: bash scripts/build-wasm.sh
+            # Do not set registry-url here — it writes an .npmrc that forces
+            # NODE_AUTH_TOKEN auth and breaks npm OIDC trusted publishing.
+            - name: Set up Node.js
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              with:
+                  node-version: '24'
+            - name: Ensure npm supports OIDC trusted publishing
+              run: npm install -g npm@latest && npm --version
+            - name: Align npm package version with the release
+              working-directory: pkg
+              env:
+                  VERSION: ${{ needs.prepare.outputs.version }}
+              run: npm pkg set "version=${VERSION}"
+            - name: Pack npm tarball
+              working-directory: pkg
+              run: npm pack
+            - name: Dry run publish to npm
+              working-directory: pkg
+              run: npm publish --dry-run --access public
+            - name: Publish to npm
+              working-directory: pkg
+              run: npm publish --access public
+            - name: Upload to the GitHub release
+              uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+              with:
+                  files: pkg/*.tgz
+                  fail_on_unmatched_files: true
+
+    # The only job that holds the bucket's credentials, and it runs no
+    # compiler. The `release` environment holds them, so they reach this job
+    # and nothing else, after one of its reviewers approves; see
+    # docs/publishing.md for how it must be configured.
+    #
+    # Propagation is a step here rather than a job of its own: a second job in
+    # the environment would ask for a second approval after the release is
+    # already live, and an approver who walked away would leave the regions
+    # without it.
+    cli:
+        name: Publish to download.surrealdb.com
+        needs: [prepare, build]
+        runs-on: ubuntu-22.04
+        environment: release
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            # Republish protection: refuse if any of the version's five SHA-256
+            # sidecars already answers. The layout has no completion marker, so
+            # the sidecars stand in for one: the publish uploads every asset
+            # before any sidecar, and a client checks an asset against its
+            # sidecar before using it, so a sidecar that answers is a download
+            # somebody can already complete. Overwriting it would change the
+            # hash under them.
+            #
+            # Not the prefix: the CDN answers a prefix URL with 403 whether or
+            # not anything lives under it, so a prefix check could only pass.
+            - name: Validate the version is unpublished
+              shell: bash
+              env:
+                  VERSION: ${{ needs.prepare.outputs.version }}
+                  PREFIX: cli/lsp
+                  EXECUTABLE: surreal-lsp
+              run: |
+                  set -euo pipefail
+                  for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
+                    url="https://download.surrealdb.com/${PREFIX}/v${VERSION}/${EXECUTABLE}-v${VERSION}.${platform}.txt"
+                    code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)
+                    case "$code" in
+                      200)
+                        echo "::error::${EXECUTABLE} v${VERSION} has already been published (${url}). Bump the version."
+                        exit 1
+                        ;;
+                      403|404)
+                        echo "OK: nothing at ${url} (HTTP ${code})."
+                        ;;
+                      *)
+                        # Neither "published" nor "absent". Guessing wrong in one
+                        # direction overwrites a live release.
+                        echo "::error::Could not determine whether ${EXECUTABLE} v${VERSION} is published: ${url} returned HTTP ${code}."
+                        exit 1
+                        ;;
+                    esac
+                  done
+
+            - uses: ./.github/actions/publish-lsp
+              with:
+                  name: ${{ needs.prepare.outputs.name }}
+                  version: ${{ needs.prepare.outputs.version }}
+                  channel: ${{ needs.prepare.outputs.channel }}
+                  pre-release: ${{ needs.prepare.outputs.pre-release }}
+                  latest: ${{ needs.prepare.outputs.latest }}
+                  major: ${{ needs.prepare.outputs.major }}
+                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
+                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+
+            - uses: ./.github/actions/propagate-lsp
+              with:
+                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
+                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}

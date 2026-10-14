@@ -327,43 +327,41 @@ This boots an in-memory engine, calls every function with synthesised arguments,
 
 ## CI
 
-GitHub Actions runs `cargo fmt --check`, `cargo test` and `cargo test -p xtask` on every push and pull request, and checks that `scripts/package.sh` still packages `surreal-lsp` in the launcher's layout. The grammar and SurrealDB sibling repos are cloned automatically, both pinned, so the catalogue freshness check runs in CI.
+`check.yml` runs `cargo fmt --check`, `cargo test` and `cargo test -p xtask` on every push and pull request, and checks that `scripts/package.sh` still packages `surreal-lsp` in the launcher's layout. The grammar and SurrealDB sibling repos are cloned automatically, both pinned, so the catalogue freshness check runs in CI. `publish.yml` runs the same checks before it publishes anything.
 
 ## Releases
 
-### Native binaries and crates.io
+Publishing a GitHub release runs `publish.yml` on its tag, which checks the
+commit, then publishes it everywhere at once:
 
-Push a `v*` tag (e.g. `v0.1.5`). CI builds platform binaries, uploads them to the GitHub Release, and publishes the Rust crate to [crates.io](https://crates.io).
-
-### Browser WASM npm package
-
-The scoped package [`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server) is built with `scripts/build-wasm.sh` (`cargo` → `wasm-bindgen` → `wasm-opt`) and published to npm on the same `v*` tag. A `.tgz` is also attached to the GitHub Release.
+- **GitHub release**: the platform binaries the editor extensions download,
+  `builtins.json`, and the npm `.tgz`.
+- **[crates.io](https://crates.io)**: the Rust crate.
+- **npm**: the scoped browser WASM package
+  [`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server),
+  built with `scripts/build-wasm.sh` (`cargo` → `wasm-bindgen` → `wasm-opt`).
+- **download.surrealdb.com**: `surreal-lsp` under `cli/lsp/`, in the layout
+  the `surreal` launcher installs from, on five platforms including Intel
+  macOS. This job waits for approval in the `release` environment.
 
 Release checklist:
 
-1. Bump `version` in [`Cargo.toml`](Cargo.toml) and [`pkg/package.json`](pkg/package.json).
-2. Push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. Confirm the `wasm` CI job succeeds and the package appears on npm.
-4. Confirm the release assets include the platform binaries, the npm `.tgz`,
-   and `builtins.json`.
-5. Publish the same tag to download.surrealdb.com for the `surreal` CLI:
-   dispatch **Publish LSP** on the tag, first as a rehearsal, then for real.
-   [`docs/publishing.md`](docs/publishing.md) has the steps.
+1. Bump `version` in [`Cargo.toml`](Cargo.toml) and [`pkg/package.json`](pkg/package.json), and merge.
+2. Publish a GitHub release with the tag `vX.Y.Z`. Tick *Set as latest
+   release* if `surreal install lsp` should install it.
+3. Approve the *Publish to download.surrealdb.com* job when it asks.
+4. Confirm the run succeeds, the package appears on npm, and the release
+   assets include the platform binaries, the npm `.tgz`, and `builtins.json`.
 
-### download.surrealdb.com, for the `surreal` CLI
-
-`publish-lsp.yml` publishes `surreal-lsp` under `cli/lsp/` in the layout the
-`surreal` launcher installs from, on five platforms including Intel macOS.
-It is dispatched by hand from the release tag and needs the `release`
-environment's approval; [`docs/publishing.md`](docs/publishing.md) describes
-the layout, the safety checks and the one-time setup.
+[`docs/publishing.md`](docs/publishing.md) describes the bucket layout, which
+pointers a release moves, the safety checks and the one-time setup.
 
 npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC from GitHub Actions). Before the first publish, an `@surrealdb` org admin must configure a trusted publisher on the package's npm **Access** page ([`@surrealdb/surrealql-language-server`](https://www.npmjs.com/package/@surrealdb/surrealql-language-server)) with:
 
 - Repository owner: `surrealdb`
 - Repository name: `surrealql-language-server`
-- Workflow filename: `ci.yml` (exact match, case-sensitive)
+- Workflow filename: `publish.yml` (exact match, case-sensitive)
 
-The CI workflow intentionally does **not** set `registry-url` on `actions/setup-node` — that option writes an `.npmrc` which forces token auth and breaks OIDC ([npm/cli#8730](https://github.com/npm/cli/issues/8730)). Do not add a `NODE_AUTH_TOKEN` secret for this job.
+The publish workflow intentionally does **not** set `registry-url` on `actions/setup-node` — that option writes an `.npmrc` which forces token auth and breaks OIDC ([npm/cli#8730](https://github.com/npm/cli/issues/8730)). Do not add a `NODE_AUTH_TOKEN` secret for this job.
 
-If the first CI publish still fails with a misleading `404`, an org admin can bootstrap the package once locally (`bash scripts/build-wasm.sh && npm publish --access public` from `pkg/`), then configure the trusted publisher for subsequent tag releases.
+If the first publish still fails with a misleading `404`, an org admin can bootstrap the package once locally (`bash scripts/build-wasm.sh && npm publish --access public` from `pkg/`), then configure the trusted publisher for subsequent releases.

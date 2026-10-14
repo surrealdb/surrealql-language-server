@@ -2,8 +2,8 @@
 
 The language server compiles against the tree-sitter SurrealQL grammar
 pinned to commit `cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b`
-(`GRAMMAR_REF` in [`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh)
-and the checkout steps in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
+(`GRAMMAR_REF` in [`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh),
+which CI and the release workflow both call).
 The analysis layer in [`src/semantic/node_kind.rs`](../src/semantic/node_kind.rs)
 is coupled to that revision's node kinds — bump the pin and the
 constants together.
