@@ -25,10 +25,10 @@ use crate::native::check::{self, CheckOptions};
 
 const ABOUT: &str = "The SurrealQL language server, for editors";
 
-/// `0.6.0`, what `-V` prints and the launcher checks an install against.
+/// `0.6.1`, what `-V` prints and the launcher checks an install against.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `0.6.0 (master-v0.6.0-3-gabc1234, grammar cb2e6b5)`, what `--version`
+/// `0.6.1`, what `--version`
 /// prints: the release, and which source and grammar it was built from.
 ///
 /// The same string as [`crate::core::server::build_version`], built with

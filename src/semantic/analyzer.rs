@@ -1786,10 +1786,6 @@ fn location(uri: &Uri, source: &str, lines: &LineIndex, node: Node<'_>) -> Locat
 /// document may be. It also covers the syntax pass only — `parse` and
 /// `unknown-type`. Semantic and type diagnostics are bounded by the query
 /// facts and definitions they are derived from, so they need no cap.
-///
-/// Overridable per client through `analysis.maxSyntaxDiagnostics`; raised from
-/// 100 in 0.6.0, because a large schema file mid-edit legitimately exceeds a
-/// hundred parse errors and the truncation read as "the server stopped working".
 pub const DEFAULT_MAX_SYNTAX_DIAGNOSTICS: usize = 2000;
 
 /// `0` in the setting means "report every one". Kept as a saturating sentinel
