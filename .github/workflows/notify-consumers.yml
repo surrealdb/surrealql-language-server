@@ -1,14 +1,14 @@
 # Tell the editor-extension repos about a new LSP release, so each opens a
 # pull request that bumps its pinned LSP version.
 #
-# Deliberately a separate file from ci.yml: the npm trusted publisher is
-# pinned to that file name, so ci.yml must not be renamed or restructured.
+# A separate workflow from publish.yml so an announcement can be re-sent by
+# hand without re-running a publish.
 #
 # Why this waits for assets instead of trusting the `published` event: a
 # release here is published by a person in the GitHub UI, which creates the
-# tag, and only then does CI build the binaries. Measured on v0.5.2, the last
+# tag, and only then does publish.yml build the binaries. Measured on v0.5.2, the last
 # asset landed 17m32s after publish. The event fires on an EMPTY release.
-# And the CI run's conclusion is not a usable gate either — the v0.5.2 run
+# And the publish run's conclusion is not a usable gate either — the v0.5.2 run
 # concluded `failure` (an npm step) while all four binaries landed fine. The
 # only reliable signal is the four asset names being present.
 name: Notify consumers
@@ -51,7 +51,7 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
                   TAG: ${{ steps.tag.outputs.tag }}
               run: |
-                  # The four binaries ci.yml uploads. Do NOT add the npm .tgz
+                  # The four binaries publish.yml uploads. Do NOT add the npm .tgz
                   # here: it has never landed on any release, and waiting for
                   # it would time out on every real release.
                   expected=(

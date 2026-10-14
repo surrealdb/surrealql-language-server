@@ -96,7 +96,7 @@ Also:
 ### Added
 
 - **`surreal-lsp`, run as `surreal lsp` by the `surreal` CLI.** The server's
-  executable is now `surreal-lsp`, and `publish-lsp.yml` publishes it to
+  executable is now `surreal-lsp`, and every release publishes it to
   download.surrealdb.com under `cli/lsp/`, in the launcher's layout, for
   `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64` and, for the
   first time, `darwin-amd64` (Intel macOS). `surrealql-language-server` is

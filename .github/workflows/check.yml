@@ -1,0 +1,72 @@
+name: Check
+
+# Formatting, tests and the release packaging, on every push and pull request.
+# `publish.yml` calls this too, so nothing is released from a red commit.
+
+on:
+    push:
+        branches:
+            - '**'
+    pull_request:
+    workflow_dispatch:
+    workflow_call:
+
+permissions:
+    contents: read
+
+jobs:
+    rust:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            # The pinned revision lives in the script, so CI, the release and a
+            # local build agree on it.
+            - name: Check out tree-sitter grammar
+              run: bash scripts/setup-grammar.sh
+            # The revision `src/grammar_generated.rs` was generated from, in full
+            # so a shallow fetch can ask for it by name. Its 9-character
+            # abbreviation `9d9a5b069` is what the catalogue header records.
+            #
+            # Without this checkout the catalogue freshness test skips, and it
+            # skipped for the whole life of the generator: the return types and
+            # argument types could drift from the engine with nothing failing.
+            - name: Check out SurrealDB
+              run: |
+                  git init ../surrealdb
+                  git -C ../surrealdb remote add origin https://github.com/surrealdb/surrealdb
+                  git -C ../surrealdb fetch --depth 1 origin 9d9a5b0693e499e0d030cac6b618062ec02cd2bc
+                  git -C ../surrealdb checkout FETCH_HEAD
+            - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.94.0
+                  components: rustfmt
+            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+              name: Cache Rust Artifacts
+            - name: Check formatting
+              run: cargo fmt --check
+            - name: Run tests
+              run: cargo test
+            # `cargo test` acts on the root package alone, so the generator's own
+            # tests need naming. They cover the engine-source parsers, which is
+            # where a SurrealDB layout change shows up first.
+            - name: Run generator tests
+              run: cargo test -p xtask
+            # `scripts/package.sh` otherwise runs only when a release is
+            # published, so a change that breaks it would surface part-way
+            # through one. The debug `surreal-lsp` that `cargo test` built
+            # stands in for a release one; the script asserts the archive's
+            # member and mode.
+            - name: Check the release packaging
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version=$(cargo metadata --format-version 1 --no-deps \
+                    | jq -r '.packages[] | select(.name == "surrealql-language-server") | .version')
+                  for platform in linux-amd64 windows-amd64; do
+                    scripts/package.sh surreal-lsp target/debug/surreal-lsp "${version}" "${platform}" staging
+                  done
+                  ls -l staging
+                  test -f "staging/surreal-lsp-v${version}.linux-amd64.tgz"
+                  test -f "staging/surreal-lsp-v${version}.linux-amd64.txt"
+                  test -f "staging/surreal-lsp-v${version}.windows-amd64.exe"
+                  test -f "staging/surreal-lsp-v${version}.windows-amd64.txt"
