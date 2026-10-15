@@ -110,7 +110,8 @@ Also:
   lsp check` when started by the launcher (`SURREAL_INVOKED_AS`).
 - **`surreal-lsp version`**, as every component of the `surreal` CLI has.
   It prints what `--version` prints; `version --json` (or `-j`) prints one
-  object with the `version`, and the `commit`, `target`, `build` and `grammar`
+  object with the `version`, and the `commit`, `build_date` (UTC
+  `YYYY-MM-DD`, from `SOURCE_DATE_EPOCH` when set), `target` and `grammar`
   the binary was built from, `null` where the build could not tell.
   `-V`/`--version` are unchanged.
 - **`check --json`** (or `-j`), the flag every component of the `surreal` CLI

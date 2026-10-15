@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "build/date.rs"]
+mod date;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
@@ -104,27 +108,59 @@ fn locate_wasm_clang() -> Option<PathBuf> {
 /// `initialize`'s `serverInfo.version`.
 ///
 /// Both lookups are best-effort: a source tarball with no `.git`, or no
-/// `git` on PATH, simply yields `unknown` rather than failing the build.
+/// `git` on PATH, simply yields `unknown` in that string rather than failing
+/// the build.
 ///
-/// The parts are also recorded one by one, for `version --json`:
-/// `SURREALQL_LS_SOURCE` (the `git describe` above), `SURREALQL_LS_COMMIT`,
-/// `SURREALQL_LS_GRAMMAR` and `SURREALQL_LS_TARGET`.
+/// The parts `version --json` reports are also recorded one by one:
+/// `SURREALQL_LS_COMMIT`, `SURREALQL_LS_BUILD_DATE`, `SURREALQL_LS_TARGET`
+/// and `SURREALQL_LS_GRAMMAR`. Each is always set, and empty when the build
+/// could not tell, so the crate decides in one place what an unknown part
+/// reads as, and a variable of the same name in the environment cannot leak
+/// in.
 fn emit_build_provenance(manifest_dir: &Path, grammar_dir: &Path) {
-    let source = git_describe(manifest_dir).unwrap_or_else(|| "unknown".to_string());
-    let commit = git_short_revision(manifest_dir).unwrap_or_else(|| "unknown".to_string());
-    let grammar = git_short_revision(grammar_dir).unwrap_or_else(|| "unknown".to_string());
-    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-    println!("cargo:rustc-env=SURREALQL_LS_BUILD={source}, grammar {grammar}");
-    println!("cargo:rustc-env=SURREALQL_LS_SOURCE={source}");
-    println!("cargo:rustc-env=SURREALQL_LS_COMMIT={commit}");
-    println!("cargo:rustc-env=SURREALQL_LS_GRAMMAR={grammar}");
-    println!("cargo:rustc-env=SURREALQL_LS_TARGET={target}");
+    let source = git_describe(manifest_dir);
+    let commit = git_short_revision(manifest_dir);
+    let grammar = git_short_revision(grammar_dir);
+    let target = env::var("TARGET").ok();
+    let build_date = build_date();
+    println!(
+        "cargo:rustc-env=SURREALQL_LS_BUILD={}, grammar {}",
+        source.as_deref().unwrap_or("unknown"),
+        grammar.as_deref().unwrap_or("unknown"),
+    );
+    for (name, value) in [
+        ("SURREALQL_LS_COMMIT", commit),
+        ("SURREALQL_LS_BUILD_DATE", build_date),
+        ("SURREALQL_LS_TARGET", target),
+        ("SURREALQL_LS_GRAMMAR", grammar),
+    ] {
+        println!("cargo:rustc-env={name}={}", value.unwrap_or_default());
+    }
 
     // A new commit (or a newly dirty tree) must re-stamp the binary.
     let head = manifest_dir.join(".git/HEAD");
     if head.exists() {
         println!("cargo:rerun-if-changed={}", head.display());
     }
+}
+
+/// The UTC date of the build, `YYYY-MM-DD`: `SOURCE_DATE_EPOCH` when it is
+/// set, so a reproducible build stamps the date it was asked to, and the
+/// clock otherwise. `None` when `SOURCE_DATE_EPOCH` is not a whole number of
+/// seconds, or the clock reads before 1970.
+///
+/// It is the date this script last ran, which is the date of the build that
+/// compiled the crate after any change that reruns it.
+fn build_date() -> Option<String> {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let seconds = match env::var_os("SOURCE_DATE_EPOCH") {
+        Some(epoch) => epoch.to_str()?.trim().parse::<i64>().ok()?,
+        None => {
+            let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+            i64::try_from(elapsed.as_secs()).ok()?
+        }
+    };
+    Some(date::utc_date(seconds))
 }
 
 fn git_describe(dir: &Path) -> Option<String> {

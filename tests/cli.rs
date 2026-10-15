@@ -8,6 +8,9 @@
 
 use std::process::{Command, Output};
 
+#[path = "../build/date.rs"]
+mod date;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_surreal-lsp")
 }
@@ -70,7 +73,7 @@ fn version_json_is_one_object_that_leads_with_the_release() {
             serde_json::from_str(&stdout(&output)).expect("stdout is one JSON object");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         // Every key is present, `null` when the build could not tell.
-        for key in ["commit", "target", "build", "grammar"] {
+        for key in ["commit", "build_date", "target", "grammar"] {
             assert!(value.get(key).is_some(), "{key} missing: {value}");
         }
         // The release is what `-V` prints after the name.
@@ -175,6 +178,25 @@ fn json_with_format_conflicts_only_with_format_text() {
         value["message"],
         "the argument '--json' cannot be used with '--format text'"
     );
+}
+
+/// The build date's arithmetic, checked here because a build script's own
+/// tests never run.
+#[test]
+fn the_build_date_is_the_utc_calendar_date_of_the_epoch() {
+    for (seconds, expected) in [
+        (0, "1970-01-01"),
+        (86_399, "1970-01-01"),
+        (86_400, "1970-01-02"),
+        (951_782_400, "2000-02-29"),
+        (1_709_164_800, "2024-02-29"),
+        (1_735_689_599, "2024-12-31"),
+        (1_735_689_600, "2025-01-01"),
+        (4_102_444_800, "2100-01-01"),
+        (-1, "1969-12-31"),
+    ] {
+        assert_eq!(date::utc_date(seconds), expected, "{seconds}");
+    }
 }
 
 /// The rule clap cannot state, `--stdin-filename` without `--stdin`, reads

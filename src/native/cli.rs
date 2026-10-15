@@ -109,30 +109,34 @@ pub struct VersionOptions {
 
 /// What `version --json` prints: the release, then what the build recorded
 /// about itself. A part the build could not find out is `null`.
+///
+/// The keys are a contract shared with every component of the `surreal`
+/// CLI, pinned in `tests/compat.rs`: added to, never renamed or removed.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct VersionReport {
     /// The release, `X.Y.Z`: what `-V` prints.
     pub version: &'static str,
     /// The short revision of this repository the binary was built from.
     pub commit: Option<&'static str>,
+    /// The UTC date of the build, `YYYY-MM-DD` (`SOURCE_DATE_EPOCH`'s, when
+    /// the build set it).
+    pub build_date: Option<&'static str>,
     /// The Rust target triple, such as `aarch64-apple-darwin`.
     pub target: Option<&'static str>,
-    /// `git describe` of the source, with the branch: what `--version`
-    /// shows in brackets before the grammar.
-    pub build: Option<&'static str>,
     /// The short revision of the tree-sitter grammar compiled in.
     pub grammar: Option<&'static str>,
 }
 
 impl VersionReport {
-    /// This binary's report, from what `build.rs` recorded.
+    /// This binary's report, from what `build.rs` recorded: an empty value
+    /// is a part it could not find out.
     pub fn current() -> Self {
-        let known = |value: &'static str| (value != "unknown").then_some(value);
+        let known = |value: &'static str| (!value.is_empty()).then_some(value);
         Self {
             version: VERSION,
             commit: known(env!("SURREALQL_LS_COMMIT")),
+            build_date: known(env!("SURREALQL_LS_BUILD_DATE")),
             target: known(env!("SURREALQL_LS_TARGET")),
-            build: known(env!("SURREALQL_LS_SOURCE")),
             grammar: known(env!("SURREALQL_LS_GRAMMAR")),
         }
     }
@@ -580,27 +584,37 @@ mod tests {
     }
 
     /// The JSON leads with the release `-V` prints, and carries the same
-    /// build and grammar `--version` shows in brackets.
+    /// grammar `--version` shows in brackets.
     #[test]
     fn the_version_report_agrees_with_the_version_flag() {
         let report = VersionReport::current();
         assert_eq!(report.version, VERSION);
-        let build = report.build.unwrap_or("unknown");
         let grammar = report.grammar.unwrap_or("unknown");
-        assert_eq!(
-            LONG_VERSION,
-            format!("{VERSION} ({build}, grammar {grammar})")
+        assert!(
+            LONG_VERSION.ends_with(&format!(", grammar {grammar})")),
+            "{LONG_VERSION}"
         );
-        let value = serde_json::to_value(&report).expect("serializes");
-        let keys: Vec<&str> = value
-            .as_object()
-            .expect("an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        for key in ["version", "commit", "target", "build", "grammar"] {
-            assert!(keys.contains(&key), "{key} missing from {keys:?}");
-        }
+    }
+
+    /// The build date is a calendar date or nothing at all.
+    #[test]
+    fn the_build_date_is_a_utc_calendar_date_when_known() {
+        let Some(date) = VersionReport::current().build_date else {
+            return;
+        };
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.len(), 3, "{date}");
+        assert_eq!(
+            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            [4, 2, 2],
+            "{date}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.bytes().all(|b| b.is_ascii_digit())),
+            "{date}"
+        );
     }
 
     #[test]
