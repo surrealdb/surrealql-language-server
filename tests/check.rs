@@ -357,3 +357,23 @@ fn an_unreadable_config_exits_two() {
     let output = run_check(&dir, &["query.surql", "--config", "surql.json"]);
     assert_eq!(exit_code(&output), 2);
 }
+
+/// A config file that is not there reads as a missing target does: the same
+/// message, `kind` `not_found`.
+#[test]
+fn a_missing_config_under_json_is_the_error_envelope() {
+    let dir = scratch("config-missing-json");
+    write(&dir, "query.surql", "RETURN 1;\n");
+    let output = run_check(&dir, &["query.surql", "--config", "absent.json", "--json"]);
+    assert_eq!(exit_code(&output), 2);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("stderr is one JSON object");
+    assert_eq!(value["kind"], "not_found");
+    assert!(
+        value["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("cannot read `absent.json`: ")),
+        "{value}"
+    );
+}

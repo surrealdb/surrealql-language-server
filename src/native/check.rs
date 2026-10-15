@@ -278,13 +278,10 @@ pub async fn run(options: CheckOptions) -> ExitCode {
                 Ok(value) => Some(value),
                 Err(error) => {
                     let message = format!("`{}` is not valid JSON: {error}", path.display());
-                    return fail(&options, failure(error::INVALID, message));
+                    return cannot_check(&options, Failure::new(error::INVALID, message));
                 }
             },
-            Err(error) => {
-                let message = format!("cannot read `{}`: {error}", path.display());
-                return fail(&options, failure(io_kind(&error), message));
-            }
+            Err(error) => return cannot_check(&options, Failure::unreadable(path, &error)),
         },
         None => None,
     };
@@ -304,7 +301,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
 
     let collected = match collect_targets(&options) {
         Ok(collected) => collected,
-        Err(failure) => return fail(&options, failure),
+        Err(failure) => return cannot_check(&options, failure),
     };
 
     // Analyze targets at the configured syntax cap (the context walk uses the
@@ -320,7 +317,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             settings.analysis.max_syntax_diagnostics,
         ) else {
             let message = format!("cannot analyze `{}`", target.display);
-            return fail(&options, failure(error::UNKNOWN, message));
+            return cannot_check(&options, Failure::new(error::UNKNOWN, message));
         };
         let analysis = Arc::new(analysis);
         // A target shadows the same-uri context entry, exactly like an open
@@ -413,10 +410,18 @@ struct Failure {
     message: String,
 }
 
-fn failure(kind: &'static str, message: impl Into<String>) -> Failure {
-    Failure {
-        kind,
-        message: message.into(),
+impl Failure {
+    fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// `path` could not be read: `not_found` when it is missing.
+    fn unreadable(path: &Path, error: &std::io::Error) -> Self {
+        let message = format!("cannot read `{}`: {error}", path.display());
+        Self::new(io_kind(error), message)
     }
 }
 
@@ -433,7 +438,7 @@ fn io_kind(error: &std::io::Error) -> &'static str {
 /// Nothing has been written to stdout yet, and nothing will be. Under
 /// `--json` the reason is the JSON error envelope on stderr; otherwise it is
 /// one `error:` line there.
-fn fail(options: &CheckOptions, failure: Failure) -> ExitCode {
+fn cannot_check(options: &CheckOptions, failure: Failure) -> ExitCode {
     match options.output_format() {
         OutputFormat::Json => Envelope::new(failure.kind, failure.message, CANNOT_CHECK).eprint(),
         OutputFormat::Text => eprintln!("error: {}", failure.message),
@@ -484,23 +489,25 @@ fn collect_targets(options: &CheckOptions) -> Result<Targets, Failure> {
         use std::io::Read;
         std::io::stdin()
             .read_to_string(&mut text)
-            .map_err(|error| failure(io_kind(&error), format!("cannot read stdin: {error}")))?;
+            .map_err(|error| {
+                Failure::new(io_kind(&error), format!("cannot read stdin: {error}"))
+            })?;
         let (uri, display) = match &options.stdin_filename {
             Some(path) => {
                 let absolute = std::path::absolute(path).map_err(|error| {
                     let message = format!("cannot resolve `{}`: {error}", path.display());
-                    failure(io_kind(&error), message)
+                    Failure::new(io_kind(&error), message)
                 })?;
                 let uri = Uri::from_file_path(&absolute).ok_or_else(|| {
                     let message = format!("cannot make a URI for `{}`", absolute.display());
-                    failure(error::INVALID, message)
+                    Failure::new(error::INVALID, message)
                 })?;
                 (uri, display_path(path))
             }
             None => (
                 "untitled:stdin"
                     .parse::<Uri>()
-                    .map_err(|_| failure(error::UNKNOWN, "cannot make the stdin URI"))?,
+                    .map_err(|_| Failure::new(error::UNKNOWN, "cannot make the stdin URI"))?,
                 "<stdin>".to_string(),
             ),
         };
@@ -509,10 +516,7 @@ fn collect_targets(options: &CheckOptions) -> Result<Targets, Failure> {
     }
 
     for path in &options.paths {
-        let metadata = fs::metadata(path).map_err(|error| {
-            let message = format!("cannot read `{}`: {error}", path.display());
-            failure(io_kind(&error), message)
-        })?;
+        let metadata = fs::metadata(path).map_err(|error| Failure::unreadable(path, &error))?;
         if metadata.is_dir() {
             walk_target_dir(path, &mut collected, &mut seen);
         } else {
@@ -525,15 +529,13 @@ fn collect_targets(options: &CheckOptions) -> Result<Targets, Failure> {
                     path.display(),
                     MAX_FILE_SIZE_BYTES / (1024 * 1024)
                 );
-                return Err(failure(error::INVALID, message));
+                return Err(Failure::new(error::INVALID, message));
             }
-            let text = fs::read_to_string(path).map_err(|error| {
-                let message = format!("cannot read `{}`: {error}", path.display());
-                failure(io_kind(&error), message)
-            })?;
+            let text =
+                fs::read_to_string(path).map_err(|error| Failure::unreadable(path, &error))?;
             push_target(path, text, &mut collected, &mut seen).map_err(|()| {
                 let message = format!("cannot make a URI for `{}`", path.display());
-                failure(error::INVALID, message)
+                Failure::new(error::INVALID, message)
             })?;
         }
     }
