@@ -31,7 +31,7 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use crate::native::check::{self, CheckOptions};
+use crate::native::check::{self, CheckOptions, OutputFormat};
 use crate::native::error::{self, Envelope};
 
 const ABOUT: &str = "The SurrealQL language server, for editors";
@@ -170,32 +170,47 @@ impl Cli {
             .unwrap_or_else(|| command.get_name())
             .to_owned();
         let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        Self::parse_with(command, argv.iter().cloned())
-            .unwrap_or_else(|err| parse_failure(&err, &argv, &program))
+        Self::parse_with(&mut command, argv.iter().cloned())
+            .unwrap_or_else(|err| parse_failure(&err, &command, &argv, &program))
     }
 
-    /// Parse `args` against `command`, with the one rule clap cannot state.
+    /// Parse `args` against `command`, with the rules clap cannot state.
     ///
-    /// `--stdin-filename` needs `--stdin`, but clap counts a flag's implicit
-    /// `false` as present, so `requires = "stdin"` never fires. Checked here
-    /// instead, and reported as clap reports any other usage error: on
-    /// stderr, with the usage line, exit code 2.
+    /// - `--stdin-filename` needs `--stdin`, but clap counts a flag's
+    ///   implicit `false` as present, so `requires = "stdin"` never fires.
+    /// - `--json` conflicts with `--format text` only: `--format json` says
+    ///   the same thing, and clap's `conflicts_with` cannot tell the values
+    ///   apart.
+    ///
+    /// Both are reported as clap reports any other usage error: on stderr,
+    /// with the usage line, exit code 2.
     fn parse_with(
-        mut command: clap::Command,
+        command: &mut clap::Command,
         args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
     ) -> Result<Self, clap::Error> {
+        use clap::error::ErrorKind;
+
         let cli = Self::from_arg_matches(&command.try_get_matches_from_mut(args)?)?;
-        if let Some(Command::Check(options)) = &cli.command
-            && options.stdin_filename.is_some()
-            && !options.stdin
-        {
-            let check = command
-                .find_subcommand_mut("check")
-                .expect("`check` is a subcommand");
-            return Err(check.error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "`--stdin-filename` needs `--stdin`",
-            ));
+        if let Some(Command::Check(options)) = &cli.command {
+            let refusal = if options.stdin_filename.is_some() && !options.stdin {
+                Some((
+                    ErrorKind::MissingRequiredArgument,
+                    "`--stdin-filename` needs `--stdin`",
+                ))
+            } else if options.json && options.format == Some(OutputFormat::Text) {
+                Some((
+                    ErrorKind::ArgumentConflict,
+                    "the argument '--json' cannot be used with '--format text'",
+                ))
+            } else {
+                None
+            };
+            if let Some((kind, message)) = refusal {
+                let check = command
+                    .find_subcommand_mut("check")
+                    .expect("`check` is a subcommand");
+                return Err(check.error(kind, message));
+            }
         }
         Ok(cli)
     }
@@ -204,12 +219,18 @@ impl Cli {
 /// Leave after a parse that did not produce a [`Cli`].
 ///
 /// Help and `--version` are clap's, on stdout with exit code 0, whatever else
-/// was passed. A usage error is exit code 2. Under `--json` (or `-j`, up to a
-/// `--`) it is the JSON error envelope on stderr instead of clap's text, as in
-/// every other component of the `surreal` CLI: a script that asked for JSON
-/// reads stderr as JSON, and clap's prose there is a second failure.
-fn parse_failure(err: &clap::Error, argv: &[std::ffi::OsString], program: &str) -> ! {
-    if err.use_stderr() && error::asks_for_json(argv) {
+/// was passed. A usage error is exit code 2. Under `--json`, `-j` or
+/// `--format json` (up to a `--`; see [`error::asks_for_json`]) it is the
+/// JSON error envelope on stderr instead of clap's text, as in every other
+/// component of the `surreal` CLI: a script that asked for JSON reads stderr
+/// as JSON, and clap's prose there is a second failure.
+fn parse_failure(
+    err: &clap::Error,
+    command: &clap::Command,
+    argv: &[std::ffi::OsString],
+    program: &str,
+) -> ! {
+    if err.use_stderr() && error::asks_for_json(command, argv) {
         let envelope = Envelope::usage(err, program);
         envelope.eprint();
         std::process::exit(i32::from(envelope.exit_code));
@@ -311,17 +332,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::native::check::OutputFormat;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let argv = std::iter::once("surreal-lsp").chain(args.iter().copied());
-        Cli::parse_with(Cli::command(), argv)
+        Cli::parse_with(&mut Cli::command(), argv)
     }
 
     /// Parse as the `surreal` launcher runs the program.
     fn parse_launched(args: &[&str]) -> Result<Cli, clap::Error> {
         let argv = std::iter::once("surreal-lsp").chain(args.iter().copied());
-        Cli::parse_with(launcher_flow(Cli::command()), argv)
+        Cli::parse_with(&mut launcher_flow(Cli::command()), argv)
     }
 
     fn check_options(args: &[&str]) -> CheckOptions {
@@ -463,6 +483,23 @@ mod tests {
         // Asking for both is a contradiction, not a precedence rule.
         let err = parse(&["check", "a.surql", "--json", "--format", "text"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// Saying JSON twice is redundant, not a contradiction.
+    #[test]
+    fn check_json_with_format_json_is_json() {
+        for args in [
+            &["a.surql", "--json", "--format", "json"][..],
+            &["a.surql", "--format", "json", "-j"],
+            &["a.surql", "--format=json", "--json"],
+        ] {
+            assert_eq!(
+                check_options(args).output_format(),
+                OutputFormat::Json,
+                "{args:?}"
+            );
+        }
     }
 
     /// Help documents `--json`, worded as in every other component, and not

@@ -109,6 +109,38 @@ fn a_usage_error_under_json_is_the_error_envelope() {
     }
 }
 
+/// `--format json` is the older spelling of `--json`, so a usage error
+/// under it is the same envelope, in either form.
+#[test]
+fn a_usage_error_under_format_json_is_the_error_envelope() {
+    let json = run_launched(&["check", "--json", "--bogus", "a.surql"]);
+    for args in [
+        &["check", "--format", "json", "--bogus", "a.surql"][..],
+        &["check", "--format=json", "--bogus", "a.surql"],
+    ] {
+        let output = run_launched(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+        assert_eq!(output.stderr, json.stderr, "{args:?}");
+    }
+}
+
+/// A `-j` in a cluster of short flags asks for JSON as a lone one does.
+/// (`check` has no other short flag but `-h`, which prints help, so the
+/// cluster here is the usage error itself.)
+#[test]
+fn a_usage_error_under_a_cluster_with_j_is_the_error_envelope() {
+    let output = run(&["check", "-jj", "a.surql"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value = envelope(&output);
+    assert_eq!(value["kind"], "usage");
+    assert_eq!(
+        value["message"],
+        "the argument '--json' cannot be used multiple times"
+    );
+}
+
 /// The envelope keeps what clap says under its first line: here, which
 /// arguments are missing.
 #[test]
@@ -123,6 +155,26 @@ fn a_missing_argument_under_json_names_the_argument() {
         "the following required arguments were not provided: <PATHS>..."
     );
     assert_eq!(value["command"], "surreal-lsp check --help");
+}
+
+/// `--json` beside `--format json` is said twice, not contradicted; beside
+/// `--format text` it is a usage error, and the envelope says so.
+#[test]
+fn json_with_format_conflicts_only_with_format_text() {
+    let output = run(&["check", "--json", "--format", "json", "--bogus"]);
+    assert_eq!(
+        envelope(&output)["message"],
+        "unexpected argument '--bogus' found"
+    );
+    let output = run(&["check", "--json", "--format", "text", "a.surql"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value = envelope(&output);
+    assert_eq!(value["kind"], "usage");
+    assert_eq!(
+        value["message"],
+        "the argument '--json' cannot be used with '--format text'"
+    );
 }
 
 /// The rule clap cannot state, `--stdin-filename` without `--stdin`, reads

@@ -76,14 +76,15 @@ pub struct CheckOptions {
     #[arg(long = "workspace", value_name = "DIR")]
     pub workspace_dirs: Vec<PathBuf>,
 
-    #[arg(long, short = 'j', help = crate::native::cli::JSON_HELP, conflicts_with = "format")]
+    #[arg(long, short = 'j', help = crate::native::cli::JSON_HELP)]
     pub json: bool,
 
-    /// Output format. Hidden: `--json` is the documented spelling of
-    /// `--format json`, and the flag every component of the `surreal` CLI
-    /// shares. Still accepted, because scripts already pass it.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text, hide = true)]
-    pub format: OutputFormat,
+    /// Output format, text when absent. Hidden: `--json` is the documented
+    /// spelling of `--format json`, and the flag every component of the
+    /// `surreal` CLI shares. Still accepted, because scripts already pass it.
+    /// `--format text` beside `--json` is refused by the parser.
+    #[arg(long, value_enum, hide = true)]
+    pub format: Option<OutputFormat>,
 
     /// Settings file; same shape as the LSP settings (a `surrealql` key or
     /// the keys at the root).
@@ -109,12 +110,13 @@ pub struct CheckOptions {
 }
 
 impl CheckOptions {
-    /// The format to render: `--json` is `--format json`.
+    /// The format to render: `--json` is `--format json`, and neither is
+    /// text.
     pub fn output_format(&self) -> OutputFormat {
         if self.json {
             OutputFormat::Json
         } else {
-            self.format
+            self.format.unwrap_or(OutputFormat::Text)
         }
     }
 }

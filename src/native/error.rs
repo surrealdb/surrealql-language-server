@@ -136,16 +136,53 @@ fn first_paragraph(rendered: &str) -> String {
         .join(" ")
 }
 
-/// Whether the caller asked for JSON: `--json` or `-j` among the raw
-/// arguments, up to a `--`.
+/// Whether the caller asked for JSON, read off the raw arguments up to a
+/// `--`: `--json`, `-j` alone or in a cluster of short flags (`-xj`), or
+/// `--format json` / `--format=json`, which `check` still accepts as the
+/// older spelling of `--json`.
 ///
 /// Read off the raw arguments because the parse that would have decided it
-/// is the one that failed.
-pub fn asks_for_json(argv: &[std::ffi::OsString]) -> bool {
-    argv.iter()
+/// is the one that failed. `command` says which short flags take a value:
+/// in a cluster, the letters after one of those are its value, not flags.
+pub fn asks_for_json(command: &clap::Command, argv: &[std::ffi::OsString]) -> bool {
+    let mut value_shorts = Vec::new();
+    shorts_taking_values(command, &mut value_shorts);
+    let args: Vec<Option<&str>> = argv
+        .iter()
         .skip(1)
         .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--json" || arg == "-j")
+        .map(|arg| arg.to_str())
+        .collect();
+    args.iter().enumerate().any(|(at, arg)| match *arg {
+        Some("--json" | "--format=json") => true,
+        Some("--format") => args.get(at + 1) == Some(&Some("json")),
+        Some(arg) => arg
+            .strip_prefix('-')
+            .filter(|cluster| {
+                !cluster.is_empty() && cluster.bytes().all(|b| b.is_ascii_alphabetic())
+            })
+            .is_some_and(|cluster| {
+                cluster
+                    .chars()
+                    .take_while(|short| !value_shorts.contains(short))
+                    .any(|short| short == 'j')
+            }),
+        None => false,
+    })
+}
+
+/// Every short flag in `command`'s tree that takes a value.
+fn shorts_taking_values(command: &clap::Command, into: &mut Vec<char>) {
+    for arg in command.get_arguments() {
+        if arg.get_action().takes_values()
+            && let Some(shorts) = arg.get_short_and_visible_aliases()
+        {
+            into.extend(shorts);
+        }
+    }
+    for subcommand in command.get_subcommands() {
+        shorts_taking_values(subcommand, into);
+    }
 }
 
 #[cfg(test)]
@@ -195,13 +232,62 @@ mod tests {
         assert!(rendered.ends_with("}\n"), "{rendered}");
     }
 
+    /// A command with a value-taking short (`-o`) beside the flags, which
+    /// the real one does not have yet.
+    fn command() -> clap::Command {
+        use clap::{Arg, ArgAction, Command};
+        Command::new("surreal-lsp").subcommand(
+            Command::new("check")
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .short('j')
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(Arg::new("quiet").short('q').action(ArgAction::SetTrue))
+                .arg(Arg::new("output").short('o').action(ArgAction::Set))
+                .arg(Arg::new("format").long("format"))
+                .arg(Arg::new("paths").num_args(0..)),
+        )
+    }
+
+    fn asks(args: &[&str]) -> bool {
+        asks_for_json(&command(), &argv(args))
+    }
+
     #[test]
     fn json_is_asked_for_only_before_a_double_dash() {
-        assert!(asks_for_json(&argv(&["check", "--json", "a.surql"])));
-        assert!(asks_for_json(&argv(&["check", "a.surql", "-j"])));
-        assert!(!asks_for_json(&argv(&["check", "a.surql"])));
-        assert!(!asks_for_json(&argv(&["check", "--", "--json"])));
-        assert!(!asks_for_json(&argv(&["check", "--jsonx"])));
+        assert!(asks(&["check", "--json", "a.surql"]));
+        assert!(asks(&["check", "a.surql", "-j"]));
+        assert!(!asks(&["check", "a.surql"]));
+        assert!(!asks(&["check", "--", "--json"]));
+        assert!(!asks(&["check", "--", "--format", "json"]));
+        assert!(!asks(&["check", "--jsonx"]));
+    }
+
+    /// `--format json` is the older spelling of `--json`, so it asks for the
+    /// envelope too, in either form; any other format does not.
+    #[test]
+    fn format_json_asks_for_json_like_the_flag() {
+        assert!(asks(&["check", "--format", "json", "--bogus"]));
+        assert!(asks(&["check", "--format=json", "--bogus"]));
+        assert!(!asks(&["check", "--format", "text", "--bogus"]));
+        assert!(!asks(&["check", "--format=text", "--bogus"]));
+        assert!(!asks(&["check", "--format"]));
+        assert!(!asks(&["check", "json"]));
+    }
+
+    /// In a cluster of shorts, `j` counts until a short that takes a value:
+    /// the rest of the cluster is that value.
+    #[test]
+    fn j_in_a_cluster_of_short_flags_asks_for_json() {
+        assert!(asks(&["check", "-qj", "a.surql"]));
+        assert!(asks(&["check", "-jq", "a.surql"]));
+        assert!(asks(&["check", "-jo", "out"]));
+        assert!(!asks(&["check", "-oj", "a.surql"]));
+        assert!(!asks(&["check", "-qoj", "a.surql"]));
+        assert!(!asks(&["check", "-", "a.surql"]));
+        assert!(!asks(&["check", "-j1"]));
     }
 
     #[test]
