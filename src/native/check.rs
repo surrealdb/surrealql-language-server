@@ -33,6 +33,7 @@ use walkdir::WalkDir;
 use crate::config::ServerSettings;
 use crate::core::client::WorkspaceLoader;
 use crate::core::server::build_version;
+use crate::native::error::{self, Envelope};
 use crate::native::workspace_fs::{
     FilesystemWorkspaceLoader, MAX_FILE_SIZE_BYTES, MAX_WORKSPACE_FILES, should_descend,
 };
@@ -75,9 +76,15 @@ pub struct CheckOptions {
     #[arg(long = "workspace", value_name = "DIR")]
     pub workspace_dirs: Vec<PathBuf>,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    pub format: OutputFormat,
+    #[arg(long, short = 'j', help = crate::native::cli::JSON_HELP)]
+    pub json: bool,
+
+    /// Output format, text when absent. Hidden: `--json` is the documented
+    /// spelling of `--format json`, and the flag every component of the
+    /// `surreal` CLI shares. Still accepted, because scripts already pass it.
+    /// `--format text` beside `--json` is refused by the parser.
+    #[arg(long, value_enum, hide = true)]
+    pub format: Option<OutputFormat>,
 
     /// Settings file; same shape as the LSP settings (a `surrealql` key or
     /// the keys at the root).
@@ -100,6 +107,18 @@ pub struct CheckOptions {
             .map(|severity| fail_on_rank(&severity)),
     )]
     pub fail_on: u8,
+}
+
+impl CheckOptions {
+    /// The format to render: `--json` is `--format json`, and neither is
+    /// text.
+    pub fn output_format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.format.unwrap_or(OutputFormat::Text)
+        }
+    }
 }
 
 /// The rank of a `--fail-on` severity. Only reached with one of the four
@@ -158,7 +177,7 @@ pub struct CheckReport {
     pub exit_code: u8,
 }
 
-/// Render the report as the single JSON object `--format json` prints.
+/// Render the report as the single JSON object `--json` prints.
 pub fn render_json(report: &CheckReport) -> String {
     let mut out = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
     out.push('\n');
@@ -249,8 +268,9 @@ struct Targets {
 }
 
 /// Run `check` to completion. Every early return is exit code 2 with the
-/// reason on stderr; a completed run prints its report and derives the exit
-/// code from the diagnostics.
+/// reason on stderr, as the JSON error envelope under `--json`, and nothing
+/// on stdout; a completed run prints its report and derives the exit code
+/// from the diagnostics.
 pub async fn run(options: CheckOptions) -> ExitCode {
     // Settings come from the same parser the LSP path uses, so a config file
     // an editor accepts is accepted here, warnings included.
@@ -259,14 +279,11 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(value) => Some(value),
                 Err(error) => {
-                    eprintln!("error: `{}` is not valid JSON: {error}", path.display());
-                    return ExitCode::from(2);
+                    let message = format!("`{}` is not valid JSON: {error}", path.display());
+                    return cannot_check(&options, Failure::new(error::INVALID, message));
                 }
             },
-            Err(error) => {
-                eprintln!("error: cannot read `{}`: {error}", path.display());
-                return ExitCode::from(2);
-            }
+            Err(error) => return cannot_check(&options, Failure::unreadable(path, &error)),
         },
         None => None,
     };
@@ -286,10 +303,7 @@ pub async fn run(options: CheckOptions) -> ExitCode {
 
     let collected = match collect_targets(&options) {
         Ok(collected) => collected,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return ExitCode::from(2);
-        }
+        Err(failure) => return cannot_check(&options, failure),
     };
 
     // Analyze targets at the configured syntax cap (the context walk uses the
@@ -304,8 +318,8 @@ pub async fn run(options: CheckOptions) -> ExitCode {
             SymbolOrigin::Local,
             settings.analysis.max_syntax_diagnostics,
         ) else {
-            eprintln!("error: cannot analyze `{}`", target.display);
-            return ExitCode::from(2);
+            let message = format!("cannot analyze `{}`", target.display);
+            return cannot_check(&options, Failure::new(error::UNKNOWN, message));
         };
         let analysis = Arc::new(analysis);
         // A target shadows the same-uri context entry, exactly like an open
@@ -380,11 +394,58 @@ pub async fn run(options: CheckOptions) -> ExitCode {
     }
     report_scan_losses(&report.scan, collected.target_skipped);
 
-    match options.format {
+    match options.output_format() {
         OutputFormat::Text => print!("{}", render_text(&report)),
         OutputFormat::Json => print!("{}", render_json(&report)),
     }
     ExitCode::from(exit_code)
+}
+
+/// The exit code of a run that could not do what was asked: a missing or
+/// unreadable input. 2, as the `check` contract has always said, under
+/// `--json` too; the envelope's `kind` says which failure it was.
+const CANNOT_CHECK: u8 = 2;
+
+/// Why a run could not start: the error envelope's `kind`, and the message.
+struct Failure {
+    kind: &'static str,
+    message: String,
+}
+
+impl Failure {
+    fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// `path` could not be read: `not_found` when it is missing.
+    fn unreadable(path: &Path, error: &std::io::Error) -> Self {
+        let message = format!("cannot read `{}`: {error}", path.display());
+        Self::new(io_kind(error), message)
+    }
+}
+
+/// The envelope `kind` of a failed read: a missing path is `not_found`.
+fn io_kind(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => error::NOT_FOUND,
+        _ => error::UNKNOWN,
+    }
+}
+
+/// Report a failure before the report and leave with its exit code.
+///
+/// Nothing has been written to stdout yet, and nothing will be. Under
+/// `--json` the reason is the JSON error envelope on stderr; otherwise it is
+/// one `error:` line there.
+fn cannot_check(options: &CheckOptions, failure: Failure) -> ExitCode {
+    match options.output_format() {
+        OutputFormat::Json => Envelope::new(failure.kind, failure.message, CANNOT_CHECK).eprint(),
+        OutputFormat::Text => eprintln!("error: {}", failure.message),
+    }
+    ExitCode::from(CANNOT_CHECK)
 }
 
 fn code_of(diagnostic: &Diagnostic) -> String {
@@ -417,7 +478,7 @@ fn report_scan_losses(scan: &ScanReport, target_skipped: bool) {
 /// Gather the target documents: explicit files verbatim (an unreadable one is
 /// an immediate error), directories through the same walk rules as the LSP
 /// scan, or stdin. Duplicate URIs keep the first occurrence.
-fn collect_targets(options: &CheckOptions) -> Result<Targets, String> {
+fn collect_targets(options: &CheckOptions) -> Result<Targets, Failure> {
     let mut collected = Targets {
         targets: Vec::new(),
         scan: ScanReport::default(),
@@ -430,19 +491,25 @@ fn collect_targets(options: &CheckOptions) -> Result<Targets, String> {
         use std::io::Read;
         std::io::stdin()
             .read_to_string(&mut text)
-            .map_err(|error| format!("cannot read stdin: {error}"))?;
+            .map_err(|error| {
+                Failure::new(io_kind(&error), format!("cannot read stdin: {error}"))
+            })?;
         let (uri, display) = match &options.stdin_filename {
             Some(path) => {
-                let absolute = std::path::absolute(path)
-                    .map_err(|error| format!("cannot resolve `{}`: {error}", path.display()))?;
-                let uri = Uri::from_file_path(&absolute)
-                    .ok_or_else(|| format!("cannot make a URI for `{}`", absolute.display()))?;
+                let absolute = std::path::absolute(path).map_err(|error| {
+                    let message = format!("cannot resolve `{}`: {error}", path.display());
+                    Failure::new(io_kind(&error), message)
+                })?;
+                let uri = Uri::from_file_path(&absolute).ok_or_else(|| {
+                    let message = format!("cannot make a URI for `{}`", absolute.display());
+                    Failure::new(error::INVALID, message)
+                })?;
                 (uri, display_path(path))
             }
             None => (
                 "untitled:stdin"
                     .parse::<Uri>()
-                    .map_err(|_| "cannot make the stdin URI".to_string())?,
+                    .map_err(|_| Failure::new(error::UNKNOWN, "cannot make the stdin URI"))?,
                 "<stdin>".to_string(),
             ),
         };
@@ -451,8 +518,7 @@ fn collect_targets(options: &CheckOptions) -> Result<Targets, String> {
     }
 
     for path in &options.paths {
-        let metadata = fs::metadata(path)
-            .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
+        let metadata = fs::metadata(path).map_err(|error| Failure::unreadable(path, &error))?;
         if metadata.is_dir() {
             walk_target_dir(path, &mut collected, &mut seen);
         } else {
@@ -460,16 +526,19 @@ fn collect_targets(options: &CheckOptions) -> Result<Targets, String> {
             // but the size ceiling still holds: past it the parse is the
             // risk, and silently skipping a named file would be a lie.
             if metadata.len() > MAX_FILE_SIZE_BYTES {
-                return Err(format!(
+                let message = format!(
                     "`{}` is over the {} MB limit",
                     path.display(),
                     MAX_FILE_SIZE_BYTES / (1024 * 1024)
-                ));
+                );
+                return Err(Failure::new(error::INVALID, message));
             }
-            let text = fs::read_to_string(path)
-                .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
-            push_target(path, text, &mut collected, &mut seen)
-                .map_err(|()| format!("cannot make a URI for `{}`", path.display()))?;
+            let text =
+                fs::read_to_string(path).map_err(|error| Failure::unreadable(path, &error))?;
+            push_target(path, text, &mut collected, &mut seen).map_err(|()| {
+                let message = format!("cannot make a URI for `{}`", path.display());
+                Failure::new(error::INVALID, message)
+            })?;
         }
     }
     Ok(collected)

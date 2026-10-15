@@ -246,7 +246,7 @@ CI jobs and pre-commit hooks can run the generate → check → repair loop:
 ```bash
 surreal-lsp check queries/
 surreal-lsp check --stdin --stdin-filename src/feed.surql --workspace schema/
-surreal-lsp check queries/ --format json --fail-on warning
+surreal-lsp check queries/ --json --fail-on warning
 ```
 
 `surreal lsp check`, through the `surreal` CLI, and `surrealql-language-server
@@ -258,9 +258,10 @@ check`, under the older name, are the same command.
 | 1 | Ran to completion; diagnostics at or above the threshold. |
 | 2 | Usage error, unreadable input, or a skipped target file. |
 
-`--format json` prints one object whose diagnostics are LSP wire objects
+`--json` (or `-j`) prints one object whose diagnostics are LSP wire objects
 verbatim (stable codes, 0-based UTF-16 ranges, structured `data` hints),
-plus a `summary`, the `scan` losses, and the `exitCode`:
+plus a `summary`, the `scan` losses, and the `exitCode`. `--format json`,
+the older spelling, still works and prints the same bytes.
 
 ```jsonc
 {

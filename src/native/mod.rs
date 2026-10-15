@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod check;
 pub mod cli;
+pub mod error;
 pub mod metadata_db;
 pub mod notifier;
 pub mod workspace_fs;

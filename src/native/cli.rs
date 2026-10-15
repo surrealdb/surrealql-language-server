@@ -2,9 +2,10 @@
 //! `surreal lsp`.
 //!
 //! `stdio` serves the Language Server Protocol over stdio, and `check` runs
-//! the one-shot diagnostics mode from [`crate::native::check`]. Anything else
-//! is a usage error on stderr with exit code 2, so a typo cannot silently
-//! start a server that eats the terminal's stdin.
+//! the one-shot diagnostics mode from [`crate::native::check`]. `--version`
+//! (`-v`) says which release this is. Anything else is a usage error on
+//! stderr with exit code 2, so a typo cannot silently start a server that
+//! eats the terminal's stdin.
 //!
 //! What no command at all does depends on who started the program:
 //!
@@ -21,31 +22,33 @@
 //! deprecation line. `tests/stdio.rs` holds the server to that byte for byte.
 //!
 //! Parsed with clap, the same way as the other components of the `surreal`
-//! CLI: `--version` and `--help` are clap's, and help names the command the
-//! way the launcher says it was typed ([`INVOKED_AS_VAR`]).
+//! CLI: `--help` is clap's, and help names the command the way the launcher
+//! says it was typed ([`INVOKED_AS_VAR`]). `--version` is not clap's, which
+//! would put the program's name in front of the line; it prints the line
+//! every component of the `surreal` CLI prints ([`version_line`]). A usage error
+//! from a caller that asked for `--json` is the JSON error envelope from
+//! [`crate::native::error`] instead of clap's text.
 
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use crate::native::check::{self, CheckOptions};
+use crate::native::check::{self, CheckOptions, OutputFormat};
+use crate::native::error::{self, Envelope};
 
 const ABOUT: &str = "The SurrealQL language server, for editors";
 
-/// `X.Y.Z`, what `-V` prints and the launcher checks an install against.
+/// `X.Y.Z`, the release: the first word `--version` prints, which the
+/// launcher checks an install against.
+///
+/// Which source and grammar a binary was built from is
+/// [`crate::core::server::build_version`], reported by `initialize`'s
+/// `serverInfo` and `check --json`, not by `--version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `X.Y.Z (master-vX.Y.Z-3-gabc1234, grammar cb2e6b5)`, what `--version`
-/// prints: the release, and which source and grammar it was built from.
-///
-/// The same string as [`crate::core::server::build_version`], built with
-/// `concat!` so it is a `&'static str` clap can take directly.
-pub const LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("SURREALQL_LS_BUILD"),
-    ")"
-);
+/// The help text of `--json`, the same in every component of the `surreal`
+/// CLI.
+pub const JSON_HELP: &str = "Emit machine-readable JSON on stdout";
 
 /// What `check --help` adds below the flags: the exit codes agents key on.
 const CHECK_EXIT_CODES: &str = "\
@@ -57,9 +60,20 @@ Exit codes:
 #[derive(Parser, Debug)]
 #[command(name = "surreal-lsp", bin_name = "surreal-lsp")]
 #[command(about = ABOUT, long_about = None)]
-#[command(version = VERSION, long_version = LONG_VERSION)]
+#[command(disable_version_flag = true)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
+    /// Print the version: `X.Y.Z for <os> on <arch>`. `-V`, clap's old
+    /// spelling, still works and is hidden.
+    #[arg(long, short = 'v', short_alias = 'V', help = "Print version")]
+    pub version: bool,
+
+    /// With `--version`: print it as one JSON object. Accepted only there,
+    /// because `check --json` is the flag to document, and a lone `--json`
+    /// must not start the legacy stdio server.
+    #[arg(long, short = 'j', hide = true, requires = "version", help = JSON_HELP)]
+    pub json: bool,
+
     /// Legacy: serve over stdio, as no command does outside the launcher.
     /// Hidden, because `stdio` is the command to document; accepted because
     /// LSP clients append it to whatever they start.
@@ -89,9 +103,52 @@ pub struct StdioOptions {
     pub stdio: bool,
 }
 
+/// What `--version --json` prints: the release and the platform it runs on.
+///
+/// The keys and their order are the ones every component of the `surreal`
+/// CLI prints, pinned in `tests/compat.rs`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VersionReport {
+    /// [`std::env::consts::ARCH`], such as `aarch64`.
+    pub arch: &'static str,
+    /// [`std::env::consts::OS`], such as `macos`.
+    pub os: &'static str,
+    /// The release, `X.Y.Z`.
+    pub version: &'static str,
+}
+
+impl VersionReport {
+    /// This binary's report.
+    pub fn current() -> Self {
+        Self {
+            arch: std::env::consts::ARCH,
+            os: std::env::consts::OS,
+            version: VERSION,
+        }
+    }
+}
+
+/// `X.Y.Z for <os> on <arch>`: what `--version` prints, the release first.
+pub fn version_line() -> String {
+    let VersionReport { arch, os, version } = VersionReport::current();
+    format!("{version} for {os} on {arch}")
+}
+
+/// Print the version, as one line or, under `--json`, as one JSON object
+/// written the way `check --json` writes its report.
+fn print_version(json: bool) {
+    if json {
+        let report = serde_json::to_string_pretty(&VersionReport::current())
+            .expect("the version report serializes");
+        println!("{report}");
+    } else {
+        println!("{}", version_line());
+    }
+}
+
 impl Cli {
-    /// Parse the process's arguments, naming the program `name` in help and
-    /// `--version` unless the launcher says how it was reached.
+    /// Parse the process's arguments, naming the program `name` in help
+    /// unless the launcher says how it was reached.
     ///
     /// Not `Cli::parse`: the name differs between the two executables, and
     /// the launcher's name has to be applied to the built command before it
@@ -104,34 +161,77 @@ impl Cli {
         if launched(std::env::var_os(LAUNCHER_VAR).as_deref()) {
             command = launcher_flow(command);
         }
-        Self::parse_with(command, std::env::args_os()).unwrap_or_else(|err| err.exit())
+        let program = command
+            .get_bin_name()
+            .unwrap_or_else(|| command.get_name())
+            .to_owned();
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        Self::parse_with(&mut command, argv.iter().cloned())
+            .unwrap_or_else(|err| parse_failure(&err, &command, &argv, &program))
     }
 
-    /// Parse `args` against `command`, with the one rule clap cannot state.
+    /// Parse `args` against `command`, with the rules clap cannot state.
     ///
-    /// `--stdin-filename` needs `--stdin`, but clap counts a flag's implicit
-    /// `false` as present, so `requires = "stdin"` never fires. Checked here
-    /// instead, and reported as clap reports any other usage error: on
-    /// stderr, with the usage line, exit code 2.
+    /// - `--stdin-filename` needs `--stdin`, but clap counts a flag's
+    ///   implicit `false` as present, so `requires = "stdin"` never fires.
+    /// - `--json` conflicts with `--format text` only: `--format json` says
+    ///   the same thing, and clap's `conflicts_with` cannot tell the values
+    ///   apart.
+    ///
+    /// Both are reported as clap reports any other usage error: on stderr,
+    /// with the usage line, exit code 2.
     fn parse_with(
-        mut command: clap::Command,
+        command: &mut clap::Command,
         args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
     ) -> Result<Self, clap::Error> {
+        use clap::error::ErrorKind;
+
         let cli = Self::from_arg_matches(&command.try_get_matches_from_mut(args)?)?;
-        if let Some(Command::Check(options)) = &cli.command
-            && options.stdin_filename.is_some()
-            && !options.stdin
-        {
-            let check = command
-                .find_subcommand_mut("check")
-                .expect("`check` is a subcommand");
-            return Err(check.error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "`--stdin-filename` needs `--stdin`",
-            ));
+        if let Some(Command::Check(options)) = &cli.command {
+            let refusal = if options.stdin_filename.is_some() && !options.stdin {
+                Some((
+                    ErrorKind::MissingRequiredArgument,
+                    "`--stdin-filename` needs `--stdin`",
+                ))
+            } else if options.json && options.format == Some(OutputFormat::Text) {
+                Some((
+                    ErrorKind::ArgumentConflict,
+                    "the argument '--json' cannot be used with '--format text'",
+                ))
+            } else {
+                None
+            };
+            if let Some((kind, message)) = refusal {
+                let check = command
+                    .find_subcommand_mut("check")
+                    .expect("`check` is a subcommand");
+                return Err(check.error(kind, message));
+            }
         }
         Ok(cli)
     }
+}
+
+/// Leave after a parse that did not produce a [`Cli`].
+///
+/// Help is clap's, on stdout with exit code 0, whatever else was passed. A
+/// usage error is exit code 2. Under `--json`, `-j` or
+/// `--format json` (up to a `--`; see [`error::asks_for_json`]) it is the
+/// JSON error envelope on stderr instead of clap's text, as in every other
+/// component of the `surreal` CLI: a script that asked for JSON reads stderr
+/// as JSON, and clap's prose there is a second failure.
+fn parse_failure(
+    err: &clap::Error,
+    command: &clap::Command,
+    argv: &[std::ffi::OsString],
+    program: &str,
+) -> ! {
+    if err.use_stderr() && error::asks_for_json(command, argv) {
+        let envelope = Envelope::usage(err, program);
+        envelope.eprint();
+        std::process::exit(i32::from(envelope.exit_code));
+    }
+    err.exit()
 }
 
 /// The variable the `surreal` launcher sets on the component it runs, naming
@@ -196,7 +296,12 @@ pub async fn run(name: &'static str) -> ExitCode {
         eprintln!("{name} panicked: {info}");
     }));
 
-    match Cli::from_env(name).command {
+    let cli = Cli::from_env(name);
+    if cli.version {
+        print_version(cli.json);
+        return ExitCode::SUCCESS;
+    }
+    match cli.command {
         // `None` is the legacy flow; under the launcher it never gets here,
         // because no command prints help.
         None | Some(Command::Stdio(_)) => {
@@ -224,17 +329,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::native::check::OutputFormat;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let argv = std::iter::once("surreal-lsp").chain(args.iter().copied());
-        Cli::parse_with(Cli::command(), argv)
+        Cli::parse_with(&mut Cli::command(), argv)
     }
 
     /// Parse as the `surreal` launcher runs the program.
     fn parse_launched(args: &[&str]) -> Result<Cli, clap::Error> {
         let argv = std::iter::once("surreal-lsp").chain(args.iter().copied());
-        Cli::parse_with(launcher_flow(Cli::command()), argv)
+        Cli::parse_with(&mut launcher_flow(Cli::command()), argv)
     }
 
     fn check_options(args: &[&str]) -> CheckOptions {
@@ -323,7 +427,7 @@ mod tests {
     #[test]
     fn check_defaults_are_text_format_and_fail_on_error() {
         let options = check_options(&["queries.surql"]);
-        assert_eq!(options.format, OutputFormat::Text);
+        assert_eq!(options.output_format(), OutputFormat::Text);
         assert_eq!(options.fail_on, 1);
         assert_eq!(options.paths, vec![PathBuf::from("queries.surql")]);
     }
@@ -355,10 +459,57 @@ mod tests {
             options.workspace_dirs,
             vec![PathBuf::from("schema"), PathBuf::from("more")]
         );
-        assert_eq!(options.format, OutputFormat::Json);
+        assert_eq!(options.output_format(), OutputFormat::Json);
         assert_eq!(options.config, Some(PathBuf::from("surql.json")));
         assert_eq!(options.params, vec!["id", "limit"]);
         assert_eq!(options.fail_on, 2);
+    }
+
+    /// `--json` is the documented spelling of `--format json`, which stays
+    /// accepted for the scripts that already pass it.
+    #[test]
+    fn check_json_is_format_json() {
+        for flag in ["--json", "-j"] {
+            let options = check_options(&["a.surql", flag]);
+            assert_eq!(options.output_format(), OutputFormat::Json, "{flag}");
+        }
+        let options = check_options(&["a.surql", "--format", "json"]);
+        assert_eq!(options.output_format(), OutputFormat::Json);
+        let options = check_options(&["a.surql", "--format", "text"]);
+        assert_eq!(options.output_format(), OutputFormat::Text);
+        // Asking for both is a contradiction, not a precedence rule.
+        let err = parse(&["check", "a.surql", "--json", "--format", "text"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// Saying JSON twice is redundant, not a contradiction.
+    #[test]
+    fn check_json_with_format_json_is_json() {
+        for args in [
+            &["a.surql", "--json", "--format", "json"][..],
+            &["a.surql", "--format", "json", "-j"],
+            &["a.surql", "--format=json", "--json"],
+        ] {
+            assert_eq!(
+                check_options(args).output_format(),
+                OutputFormat::Json,
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Help documents `--json`, worded as in every other component, and not
+    /// `--format`.
+    #[test]
+    fn check_help_offers_json_and_hides_format() {
+        let err = parse(&["check", "--help"]).unwrap_err();
+        let help = err.to_string();
+        assert!(
+            help.contains("-j, --json") && help.contains(JSON_HELP),
+            "{help}"
+        );
+        assert!(!help.contains("--format"), "{help}");
     }
 
     #[test]
@@ -404,11 +555,74 @@ mod tests {
 
     /// The launcher finds a release's version as the first semver token
     /// `--version` prints, and refuses an install whose version disagrees
-    /// with the one it asked for.
+    /// with the one it asked for. Nothing follows the platform.
     #[test]
     fn the_version_line_leads_with_the_release() {
-        assert!(LONG_VERSION.starts_with(&format!("{VERSION} (")));
-        assert_eq!(LONG_VERSION, crate::core::server::build_version());
+        assert_eq!(
+            version_line(),
+            format!(
+                "{VERSION} for {} on {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        );
+    }
+
+    /// `-v` and `--version`, and clap's old `-V`, are one flag, and `--json`
+    /// or `-j` goes with it in either order.
+    #[test]
+    fn the_version_flag_takes_json_in_either_order() {
+        for (args, json) in [
+            (&["--version"][..], false),
+            (&["-v"], false),
+            (&["-V"], false),
+            (&["--version", "--json"], true),
+            (&["--json", "--version"], true),
+            (&["-v", "-j"], true),
+            (&["-j", "-v"], true),
+            (&["-vj"], true),
+            (&["-V", "--json"], true),
+        ] {
+            for parse in [parse, parse_launched] {
+                let cli = parse(args).expect("version");
+                assert!(cli.version, "{args:?}");
+                assert_eq!(cli.json, json, "{args:?}");
+                assert!(cli.command.is_none(), "{args:?}");
+            }
+        }
+    }
+
+    /// A top-level `--json` without `--version` is a usage error, not a
+    /// request to serve over stdio.
+    #[test]
+    fn a_top_level_json_needs_the_version_flag() {
+        for args in [&["--json"][..], &["-j"]] {
+            let err = parse(args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}"
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    /// `version` is not a command: the flag is the one way to ask.
+    #[test]
+    fn version_is_not_a_command() {
+        let err = parse(&["version"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// Help lists `-v, --version`, and neither the hidden `-V` nor the
+    /// top-level `--json`.
+    #[test]
+    fn help_lists_the_version_flag_only() {
+        let help = parse(&["--help"]).unwrap_err().to_string();
+        assert!(help.contains("-v, --version"), "{help}");
+        assert!(!help.contains("-V"), "{help}");
+        assert!(!help.contains("--json"), "{help}");
+        assert!(!help.contains("  version"), "{help}");
     }
 
     #[test]

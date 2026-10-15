@@ -309,7 +309,7 @@ fn default_settings_are_stable() {
 // The `check` subcommand surface (machine-readable output, exit codes, flags)
 // ---------------------------------------------------------------------------
 
-/// Exact-equality golden for the `--format json` report shape. The
+/// Exact-equality golden for the `--json` (`--format json`) report shape. The
 /// diagnostics inside are LSP wire objects verbatim (0-based lines, UTF-16
 /// columns, camelCase keys, integer severity, string code) — agents key
 /// repairs on these fields, so changes must be additive and deliberate.
@@ -456,4 +456,107 @@ fn check_exit_codes_and_flags_are_stable() {
         0,
         "the documented flag surface"
     );
+    // `--json` is the documented spelling of `--format json`; both stay.
+    assert_eq!(run(&["clean.surql", "--json"]), 0, "--json");
+    assert_eq!(run(&["clean.surql", "-j"]), 0, "-j");
+}
+
+// ---------------------------------------------------------------------------
+// The surface every component of the `surreal` CLI shares
+// ---------------------------------------------------------------------------
+
+/// The top-level keys of `rendered`, in the order they are written: what a
+/// reader of the text sees, and what `serde_json::Value` would sort.
+fn keys_in_order(rendered: &str) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_str(rendered).expect("one JSON object");
+    let mut keys: Vec<(usize, String)> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(|key| {
+            let at = rendered
+                .find(&format!("\n  \"{key}\":"))
+                .unwrap_or_else(|| panic!("{key} is not a top-level key: {rendered}"));
+            (at, key.clone())
+        })
+        .collect();
+    keys.sort();
+    keys.into_iter().map(|(_, key)| key).collect()
+}
+
+/// The JSON error envelope's keys, in order, every one present: the shape
+/// every component of the `surreal` CLI writes on stderr under `--json`, so
+/// a script reads `surreal lsp`'s failures as it reads `surreal cloud`'s.
+/// Keys may be added only in step with the other components.
+#[test]
+fn error_envelope_keys_are_stable() {
+    use std::process::Command;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surreal-lsp"))
+        .args(["check", "--json", "surql-compat-absent.surql"])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("spawn check");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let rendered = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert_eq!(
+        keys_in_order(&rendered),
+        [
+            "kind",
+            "message",
+            "status",
+            "code",
+            "request_id",
+            "hint",
+            "command",
+            "docs",
+            "retry_after_secs",
+            "exit_code",
+        ],
+        "the error envelope changed shape — update this golden only for a deliberate, reviewed change shared with every component"
+    );
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("one JSON object");
+    assert_eq!(value["kind"], "not_found");
+    assert_eq!(value["exit_code"], 2);
+}
+
+/// `--version`'s line and `--version --json`'s keys, in order: what every
+/// component of the `surreal` CLI prints, so a script reads `surreal lsp`'s
+/// version as it reads `surreal cloud`'s. The launcher reads the release as
+/// the first version on the line. Change only in step with the other
+/// components.
+#[test]
+fn version_flag_output_is_stable() {
+    use std::process::Command;
+
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_surreal-lsp"))
+            .args(args)
+            .output()
+            .expect("spawn --version");
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        String::from_utf8(output.stdout).expect("utf-8 stdout")
+    };
+
+    assert_eq!(
+        run(&["--version"]),
+        format!(
+            "{} for {} on {}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+        "the version line changed shape — update this golden only for a deliberate, reviewed change shared with every component"
+    );
+    for args in [&["--version", "--json"][..], &["--json", "--version"]] {
+        let rendered = run(args);
+        assert_eq!(
+            keys_in_order(&rendered),
+            ["arch", "os", "version"],
+            "the version object changed shape — update this golden only for a deliberate, reviewed change shared with every component"
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("one JSON object");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
 }

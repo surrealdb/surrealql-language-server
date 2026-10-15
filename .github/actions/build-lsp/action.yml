@@ -93,8 +93,8 @@ runs:
               version=$("${binary}" --version)
               echo "${version}"
               case "${version}" in
-                "surreal-lsp ${VERSION} ("*) ;;
-                *) echo "::error::--version should begin \`surreal-lsp ${VERSION} (\`, got: ${version}"; exit 1 ;;
+                "${VERSION} for "*) ;;
+                *) echo "::error::--version should begin \`${VERSION} for \`, got: ${version}"; exit 1 ;;
               esac
 
               # One session over stdio, as an editor runs it: stdout must hold

@@ -101,6 +101,49 @@ fn a_missing_file_exits_two() {
     );
 }
 
+/// Under `--json` a run that cannot start is the JSON error envelope on
+/// stderr, with nothing on stdout. The exit code stays the `check` contract's
+/// 2; the envelope's `kind` says which failure it was.
+#[test]
+fn a_missing_file_under_json_is_the_error_envelope() {
+    let dir = scratch("missing-json");
+    for args in [
+        &["not-there.surql", "--json"][..],
+        &["not-there.surql", "--format", "json"],
+    ] {
+        let output = run_check(&dir, args);
+        assert_eq!(exit_code(&output), 2, "{args:?}");
+        assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("stderr is one JSON object");
+        assert_eq!(value["kind"], "not_found");
+        assert!(
+            value["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("cannot read `not-there.surql`")),
+            "{value}"
+        );
+        assert_eq!(value["exit_code"], 2);
+        for key in ["status", "code", "request_id", "hint", "command", "docs"] {
+            assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
+        }
+    }
+}
+
+#[test]
+fn an_invalid_config_under_json_is_the_error_envelope() {
+    let dir = scratch("config-bad-json");
+    write(&dir, "query.surql", "RETURN 1;\n");
+    write(&dir, "surql.json", "{ not json ");
+    let output = run_check(&dir, &["query.surql", "--config", "surql.json", "--json"]);
+    assert_eq!(exit_code(&output), 2);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("stderr is one JSON object");
+    assert_eq!(value["kind"], "invalid");
+    assert_eq!(value["exit_code"], 2);
+}
+
 #[test]
 fn an_unknown_flag_exits_two() {
     let dir = scratch("unknown-flag");
@@ -146,6 +189,28 @@ fn json_format_is_one_parseable_object() {
         value["files"][0]["diagnostics"][0]["range"]["start"]["line"],
         0
     );
+}
+
+/// `--json` is the documented spelling of `--format json`: the same bytes on
+/// stdout and the same exit code, so a script can switch without a diff.
+#[test]
+fn json_is_byte_identical_to_format_json() {
+    let dir = scratch("json-flag");
+    write(&dir, "broken.surql", "SELEC * FRM person\n");
+    write(
+        &dir,
+        "queries/clean.surql",
+        "DEFINE TABLE person SCHEMALESS;\n",
+    );
+    for target in ["broken.surql", "queries"] {
+        let format = run_check(&dir, &[target, "--format", "json"]);
+        for flag in ["--json", "-j"] {
+            let json = run_check(&dir, &[target, flag]);
+            assert_eq!(exit_code(&json), exit_code(&format), "{target} {flag}");
+            assert_eq!(json.stdout, format.stdout, "{target} {flag}");
+            assert_eq!(json.stderr, format.stderr, "{target} {flag}");
+        }
+    }
 }
 
 #[test]
@@ -291,4 +356,24 @@ fn an_unreadable_config_exits_two() {
     write(&dir, "surql.json", "{ not json ");
     let output = run_check(&dir, &["query.surql", "--config", "surql.json"]);
     assert_eq!(exit_code(&output), 2);
+}
+
+/// A config file that is not there reads as a missing target does: the same
+/// message, `kind` `not_found`.
+#[test]
+fn a_missing_config_under_json_is_the_error_envelope() {
+    let dir = scratch("config-missing-json");
+    write(&dir, "query.surql", "RETURN 1;\n");
+    let output = run_check(&dir, &["query.surql", "--config", "absent.json", "--json"]);
+    assert_eq!(exit_code(&output), 2);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("stderr is one JSON object");
+    assert_eq!(value["kind"], "not_found");
+    assert!(
+        value["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("cannot read `absent.json`: ")),
+        "{value}"
+    );
 }

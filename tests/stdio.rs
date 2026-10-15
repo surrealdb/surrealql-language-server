@@ -264,14 +264,19 @@ fn help_names_the_launcher_invocation_when_it_is_given_one() {
 
 /// The launcher smoke-tests an install by running `--version` and taking
 /// the first version-shaped word, which must be the release it asked for.
+/// Both executables print the same line, the release first, with no name in
+/// front of it.
 #[test]
-fn version_names_the_executable_and_the_release() {
-    for (binary, name) in [
-        (env!("CARGO_BIN_EXE_surreal-lsp"), "surreal-lsp"),
-        (
-            env!("CARGO_BIN_EXE_surrealql-language-server"),
-            "surrealql-language-server",
-        ),
+fn version_leads_with_the_release_under_either_name() {
+    let expected = format!(
+        "{} for {} on {}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    for binary in [
+        env!("CARGO_BIN_EXE_surreal-lsp"),
+        env!("CARGO_BIN_EXE_surrealql-language-server"),
     ] {
         let output = Command::new(binary)
             .arg("--version")
@@ -280,7 +285,6 @@ fn version_names_the_executable_and_the_release() {
             .expect("spawn");
         assert_eq!(output.status.code(), Some(0));
         let line = String::from_utf8(output.stdout).expect("utf-8");
-        let expected = format!("{name} {} (", env!("CARGO_PKG_VERSION"));
-        assert!(line.starts_with(&expected), "got {line:?}");
+        assert_eq!(line, expected, "{binary}");
     }
 }
