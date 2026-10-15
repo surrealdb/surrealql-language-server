@@ -460,3 +460,82 @@ fn check_exit_codes_and_flags_are_stable() {
     assert_eq!(run(&["clean.surql", "--json"]), 0, "--json");
     assert_eq!(run(&["clean.surql", "-j"]), 0, "-j");
 }
+
+// ---------------------------------------------------------------------------
+// The surface every component of the `surreal` CLI shares
+// ---------------------------------------------------------------------------
+
+/// The top-level keys of `rendered`, in the order they are written: what a
+/// reader of the text sees, and what `serde_json::Value` would sort.
+fn keys_in_order(rendered: &str) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_str(rendered).expect("one JSON object");
+    let mut keys: Vec<(usize, String)> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(|key| {
+            let at = rendered
+                .find(&format!("\n  \"{key}\":"))
+                .unwrap_or_else(|| panic!("{key} is not a top-level key: {rendered}"));
+            (at, key.clone())
+        })
+        .collect();
+    keys.sort();
+    keys.into_iter().map(|(_, key)| key).collect()
+}
+
+/// The JSON error envelope's keys, in order, every one present: the shape
+/// every component of the `surreal` CLI writes on stderr under `--json`, so
+/// a script reads `surreal lsp`'s failures as it reads `surreal cloud`'s.
+/// Keys may be added only in step with the other components.
+#[test]
+fn error_envelope_keys_are_stable() {
+    use std::process::Command;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surreal-lsp"))
+        .args(["check", "--json", "surql-compat-absent.surql"])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("spawn check");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let rendered = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert_eq!(
+        keys_in_order(&rendered),
+        [
+            "kind",
+            "message",
+            "status",
+            "code",
+            "request_id",
+            "hint",
+            "command",
+            "docs",
+            "retry_after_secs",
+            "exit_code",
+        ],
+        "the error envelope changed shape — update this golden only for a deliberate, reviewed change shared with every component"
+    );
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("one JSON object");
+    assert_eq!(value["kind"], "not_found");
+    assert_eq!(value["exit_code"], 2);
+}
+
+/// `version --json`'s keys. Additive only: a key is never renamed or
+/// removed, and one the build could not find out is `null`, not absent.
+#[test]
+fn version_json_keys_are_stable() {
+    use std::process::Command;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_surreal-lsp"))
+        .args(["version", "--json"])
+        .output()
+        .expect("spawn version");
+    assert_eq!(output.status.code(), Some(0));
+    let rendered = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        keys_in_order(&rendered),
+        ["version", "commit", "build_date", "target", "grammar"],
+        "the version report changed shape — update this golden only for a deliberate, reviewed addition"
+    );
+}
