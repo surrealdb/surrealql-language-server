@@ -63,11 +63,13 @@ impl Envelope {
 
     /// clap's usage error as an envelope.
     ///
-    /// The message is clap's first line without its `error: `. The command is
-    /// the failing command's own `--help`, read off clap's usage line, so
-    /// `surreal lsp check --bogus` points at `surreal lsp check --help`
-    /// rather than the root's. `fallback` is the program's name, for an error
-    /// that carries no usage line.
+    /// The message is clap's error without its `error: `: the first line,
+    /// with the indented lines clap sets under it (the missing arguments, the
+    /// possible values) joined on, and without the usage block and the tip
+    /// that follow. The command is the failing command's own `--help`, read
+    /// off clap's usage line, so `surreal lsp check --bogus` points at
+    /// `surreal lsp check --help` rather than the root's. `fallback` is the
+    /// program's name, for an error that carries no usage line.
     pub fn usage(err: &clap::Error, fallback: &str) -> Self {
         use clap::error::ErrorKind;
 
@@ -92,13 +94,7 @@ impl Envelope {
                     None => String::from("a command is required"),
                 }
             }
-            _ => {
-                let first = rendered
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("");
-                first.strip_prefix("error: ").unwrap_or(first).to_owned()
-            }
+            _ => first_paragraph(&rendered),
         };
         let exit_code = u8::try_from(err.exit_code()).unwrap_or(2);
         Self {
@@ -122,6 +118,22 @@ impl Envelope {
         use std::io::Write as _;
         let _ = std::io::stderr().write_all(self.render().as_bytes());
     }
+}
+
+/// clap's error text up to its first blank line, as one line: the first
+/// line without its `error: `, then each indented line under it, trimmed.
+fn first_paragraph(rendered: &str) -> String {
+    let mut lines = rendered.lines().skip_while(|line| line.trim().is_empty());
+    let first = lines.next().unwrap_or("");
+    let first = first.strip_prefix("error: ").unwrap_or(first);
+    std::iter::once(first)
+        .chain(
+            lines
+                .take_while(|line| line.starts_with([' ', '\t']) && !line.trim().is_empty())
+                .map(str::trim),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether the caller asked for JSON: `--json` or `-j` among the raw
@@ -210,5 +222,48 @@ mod tests {
             Some("surreal lsp check --help")
         );
         assert_eq!(envelope.exit_code, 2);
+    }
+
+    /// clap's detail under its first line is the point of the message: which
+    /// arguments are missing, which values are possible. The usage block and
+    /// the tip are not.
+    #[test]
+    fn a_usage_message_keeps_the_lines_clap_sets_under_it() {
+        use clap::{Arg, Command};
+        let mut command = Command::new("surreal-lsp").subcommand(
+            Command::new("check")
+                .arg(
+                    Arg::new("paths")
+                        .value_name("PATHS")
+                        .num_args(1..)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .value_parser(["text", "json"]),
+                ),
+        );
+        let missing = command
+            .try_get_matches_from_mut(["surreal-lsp", "check"])
+            .unwrap_err();
+        assert_eq!(
+            Envelope::usage(&missing, "surreal-lsp").message,
+            "the following required arguments were not provided: <PATHS>..."
+        );
+        let invalid = command
+            .try_get_matches_from_mut(["surreal-lsp", "check", "a", "--format", "yaml"])
+            .unwrap_err();
+        assert_eq!(
+            Envelope::usage(&invalid, "surreal-lsp").message,
+            "invalid value 'yaml' for '--format <format>' [possible values: text, json]"
+        );
+        let unknown = command
+            .try_get_matches_from_mut(["surreal-lsp", "check", "a", "--bogus"])
+            .unwrap_err();
+        assert_eq!(
+            Envelope::usage(&unknown, "surreal-lsp").message,
+            "unexpected argument '--bogus' found"
+        );
     }
 }

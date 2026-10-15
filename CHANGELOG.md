@@ -119,7 +119,8 @@ Also:
 - **The JSON error envelope.** With `--json` (or `-j`) among the arguments, a
   usage error, clap's included, is one JSON object on stderr instead of clap's
   text, as in every other component of the `surreal` CLI: `kind` `"usage"`,
-  clap's message, and the failing command's `--help` as `command`, exit 2.
+  clap's message (with the lines it sets under it, such as the missing
+  arguments), and the failing command's `--help` as `command`, exit 2.
   `check --json` reports a run that cannot start (a missing file, an invalid
   `--config`) the same way, with nothing on stdout; the exit code stays 2.
   Without `--json`, errors read as before.

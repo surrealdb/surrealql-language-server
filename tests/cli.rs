@@ -109,6 +109,22 @@ fn a_usage_error_under_json_is_the_error_envelope() {
     }
 }
 
+/// The envelope keeps what clap says under its first line: here, which
+/// arguments are missing.
+#[test]
+fn a_missing_argument_under_json_names_the_argument() {
+    let output = run(&["check", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let value = envelope(&output);
+    assert_eq!(value["kind"], "usage");
+    assert_eq!(
+        value["message"],
+        "the following required arguments were not provided: <PATHS>..."
+    );
+    assert_eq!(value["command"], "surreal-lsp check --help");
+}
+
 /// The rule clap cannot state, `--stdin-filename` without `--stdin`, reads
 /// the same as clap's own refusals.
 #[test]
