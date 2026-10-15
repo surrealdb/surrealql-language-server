@@ -1,15 +1,12 @@
 //! End-to-end tests for the command line's shared surface, driving the real
-//! binary: `version`, and how a usage error reads to a caller that asked for
-//! JSON.
+//! binary: `--version`, and how a usage error reads to a caller that asked
+//! for JSON.
 //!
 //! These are the rules every component of the `surreal` CLI follows, so a
 //! script can treat `surreal lsp` the way it treats `surreal cloud`. `check`
 //! itself is covered by `tests/check.rs`.
 
 use std::process::{Command, Output};
-
-#[path = "../build/date.rs"]
-mod date;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_surreal-lsp")
@@ -54,35 +51,80 @@ fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("utf-8 stdout")
 }
 
-#[test]
-fn version_prints_what_the_version_flag_prints() {
-    let flag = run(&["--version"]);
-    let command = run(&["version"]);
-    assert_eq!(command.status.code(), Some(0));
-    assert_eq!(stdout(&command), stdout(&flag));
-    assert!(command.stderr.is_empty(), "stderr: {:?}", command.stderr);
+/// `<release> for <os> on <arch>`: the line every component of the
+/// `surreal` CLI prints.
+fn expected_version_line() -> String {
+    format!(
+        "{} for {} on {}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
 }
 
+/// `--version`, `-v` and clap's old `-V` print one line, the release first
+/// (the launcher reads the first version on it), and nothing else: no
+/// program name, no build or grammar.
 #[test]
-fn version_json_is_one_object_that_leads_with_the_release() {
-    for flag in ["--json", "-j"] {
-        let output = run(&["version", flag]);
-        assert_eq!(output.status.code(), Some(0));
-        assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
-        let value: serde_json::Value =
-            serde_json::from_str(&stdout(&output)).expect("stdout is one JSON object");
-        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
-        // Every key is present, `null` when the build could not tell.
-        for key in ["commit", "build_date", "target", "grammar"] {
-            assert!(value.get(key).is_some(), "{key} missing: {value}");
+fn the_version_flag_prints_the_release_and_platform() {
+    for args in [&["--version"][..], &["-v"], &["-V"]] {
+        for output in [run(args), run_launched(args)] {
+            assert_eq!(output.status.code(), Some(0), "{args:?}");
+            assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+            assert_eq!(stdout(&output), expected_version_line(), "{args:?}");
         }
-        // The release is what `-V` prints after the name.
-        let short = stdout(&run(&["-V"]));
-        assert_eq!(
-            short.split_whitespace().nth(1),
-            value["version"].as_str(),
-            "{short}"
-        );
+    }
+}
+
+/// `--json` (or `-j`) with the version flag, before it or after it, prints
+/// one object with `arch`, `os` and `version`, in that order.
+#[test]
+fn the_version_flag_with_json_prints_one_object() {
+    let expected = format!(
+        "{{\n  \"arch\": \"{}\",\n  \"os\": \"{}\",\n  \"version\": \"{}\"\n}}\n",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        env!("CARGO_PKG_VERSION"),
+    );
+    for args in [
+        &["--version", "--json"][..],
+        &["--json", "--version"],
+        &["-v", "-j"],
+        &["-j", "-v"],
+        &["-vj"],
+        &["-V", "-j"],
+    ] {
+        for output in [run(args), run_launched(args)] {
+            assert_eq!(output.status.code(), Some(0), "{args:?}");
+            assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+    }
+}
+
+/// `version` is no longer a command: it is a usage error like any other
+/// unknown word, and never starts the stdio server.
+#[test]
+fn version_is_not_a_command() {
+    for args in [&["version"][..], &["version", "--json"]] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    }
+}
+
+/// A top-level `--json` asks only for the version as JSON. On its own it is
+/// a usage error, reported as the envelope, rather than the legacy flow
+/// serving over stdio.
+#[test]
+fn a_top_level_json_without_the_version_flag_is_a_usage_error() {
+    for flag in ["--json", "-j"] {
+        let output = run(&[flag]);
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+        let value = envelope(&output);
+        assert_eq!(value["kind"], "usage");
+        assert_eq!(value["command"], "surreal-lsp --help");
     }
 }
 
@@ -180,25 +222,6 @@ fn json_with_format_conflicts_only_with_format_text() {
     );
 }
 
-/// The build date's arithmetic, checked here because a build script's own
-/// tests never run.
-#[test]
-fn the_build_date_is_the_utc_calendar_date_of_the_epoch() {
-    for (seconds, expected) in [
-        (0, "1970-01-01"),
-        (86_399, "1970-01-01"),
-        (86_400, "1970-01-02"),
-        (951_782_400, "2000-02-29"),
-        (1_709_164_800, "2024-02-29"),
-        (1_735_689_599, "2024-12-31"),
-        (1_735_689_600, "2025-01-01"),
-        (4_102_444_800, "2100-01-01"),
-        (-1, "1969-12-31"),
-    ] {
-        assert_eq!(date::utc_date(seconds), expected, "{seconds}");
-    }
-}
-
 /// The rule clap cannot state, `--stdin-filename` without `--stdin`, reads
 /// the same as clap's own refusals.
 #[test]
@@ -232,16 +255,14 @@ fn a_usage_error_without_json_is_clap_text() {
     }
 }
 
-/// Help and `--version` are never errors: clap's text on stdout, exit 0,
-/// whatever `--json` comes with them. (`--json` is not a top-level flag, so
-/// it has to follow `--version` there, as any unknown flag would.)
+/// Help is never an error: clap's text on stdout, exit 0, whatever `--json`
+/// comes with it.
 #[test]
-fn help_and_version_ignore_json() {
+fn help_ignores_json() {
     for args in [
         &["check", "--json", "--help"][..],
-        &["version", "-j", "--help"],
-        &["--version", "--json"],
-        &["-V", "-j"],
+        &["--json", "--help"],
+        &["--version", "-j", "--help"],
     ] {
         let output = run_launched(args);
         assert_eq!(output.status.code(), Some(0), "{args:?}");

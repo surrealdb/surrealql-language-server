@@ -521,21 +521,42 @@ fn error_envelope_keys_are_stable() {
     assert_eq!(value["exit_code"], 2);
 }
 
-/// `version --json`'s keys. Additive only: a key is never renamed or
-/// removed, and one the build could not find out is `null`, not absent.
+/// `--version`'s line and `--version --json`'s keys, in order: what every
+/// component of the `surreal` CLI prints, so a script reads `surreal lsp`'s
+/// version as it reads `surreal cloud`'s. The launcher reads the release as
+/// the first version on the line. Change only in step with the other
+/// components.
 #[test]
-fn version_json_keys_are_stable() {
+fn version_flag_output_is_stable() {
     use std::process::Command;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_surreal-lsp"))
-        .args(["version", "--json"])
-        .output()
-        .expect("spawn version");
-    assert_eq!(output.status.code(), Some(0));
-    let rendered = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_surreal-lsp"))
+            .args(args)
+            .output()
+            .expect("spawn --version");
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        String::from_utf8(output.stdout).expect("utf-8 stdout")
+    };
+
     assert_eq!(
-        keys_in_order(&rendered),
-        ["version", "commit", "build_date", "target", "grammar"],
-        "the version report changed shape — update this golden only for a deliberate, reviewed addition"
+        run(&["--version"]),
+        format!(
+            "{} for {} on {}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+        "the version line changed shape — update this golden only for a deliberate, reviewed change shared with every component"
     );
+    for args in [&["--version", "--json"][..], &["--json", "--version"]] {
+        let rendered = run(args);
+        assert_eq!(
+            keys_in_order(&rendered),
+            ["arch", "os", "version"],
+            "the version object changed shape — update this golden only for a deliberate, reviewed change shared with every component"
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("one JSON object");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
 }

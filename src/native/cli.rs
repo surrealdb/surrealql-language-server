@@ -1,11 +1,11 @@
 //! The command line: `surreal-lsp`, which the `surreal` launcher runs as
 //! `surreal lsp`.
 //!
-//! `stdio` serves the Language Server Protocol over stdio, `check` runs the
-//! one-shot diagnostics mode from [`crate::native::check`], and `version`
-//! says which release and build this is. Anything else
-//! is a usage error on stderr with exit code 2, so a typo cannot silently
-//! start a server that eats the terminal's stdin.
+//! `stdio` serves the Language Server Protocol over stdio, and `check` runs
+//! the one-shot diagnostics mode from [`crate::native::check`]. `--version`
+//! (`-v`) says which release this is. Anything else is a usage error on
+//! stderr with exit code 2, so a typo cannot silently start a server that
+//! eats the terminal's stdin.
 //!
 //! What no command at all does depends on who started the program:
 //!
@@ -22,8 +22,10 @@
 //! deprecation line. `tests/stdio.rs` holds the server to that byte for byte.
 //!
 //! Parsed with clap, the same way as the other components of the `surreal`
-//! CLI: `--version` and `--help` are clap's, and help names the command the
-//! way the launcher says it was typed ([`INVOKED_AS_VAR`]). A usage error
+//! CLI: `--help` is clap's, and help names the command the way the launcher
+//! says it was typed ([`INVOKED_AS_VAR`]). `--version` is not clap's, which
+//! would put the program's name in front of the line; it prints the line
+//! every component of the `surreal` CLI prints ([`version_line`]). A usage error
 //! from a caller that asked for `--json` is the JSON error envelope from
 //! [`crate::native::error`] instead of clap's text.
 
@@ -36,20 +38,13 @@ use crate::native::error::{self, Envelope};
 
 const ABOUT: &str = "The SurrealQL language server, for editors";
 
-/// `X.Y.Z`, what `-V` prints and the launcher checks an install against.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// `X.Y.Z (master-vX.Y.Z-3-gabc1234, grammar cb2e6b5)`, what `--version`
-/// prints: the release, and which source and grammar it was built from.
+/// `X.Y.Z`, the release: the first word `--version` prints, which the
+/// launcher checks an install against.
 ///
-/// The same string as [`crate::core::server::build_version`], built with
-/// `concat!` so it is a `&'static str` clap can take directly.
-pub const LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("SURREALQL_LS_BUILD"),
-    ")"
-);
+/// Which source and grammar a binary was built from is
+/// [`crate::core::server::build_version`], reported by `initialize`'s
+/// `serverInfo` and `check --json`, not by `--version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The help text of `--json`, the same in every component of the `surreal`
 /// CLI.
@@ -65,9 +60,20 @@ Exit codes:
 #[derive(Parser, Debug)]
 #[command(name = "surreal-lsp", bin_name = "surreal-lsp")]
 #[command(about = ABOUT, long_about = None)]
-#[command(version = VERSION, long_version = LONG_VERSION)]
+#[command(disable_version_flag = true)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
+    /// Print the version: `X.Y.Z for <os> on <arch>`. `-V`, clap's old
+    /// spelling, still works and is hidden.
+    #[arg(long, short = 'v', short_alias = 'V', help = "Print version")]
+    pub version: bool,
+
+    /// With `--version`: print it as one JSON object. Accepted only there,
+    /// because `check --json` is the flag to document, and a lone `--json`
+    /// must not start the legacy stdio server.
+    #[arg(long, short = 'j', hide = true, requires = "version", help = JSON_HELP)]
+    pub json: bool,
+
     /// Legacy: serve over stdio, as no command does outside the launcher.
     /// Hidden, because `stdio` is the command to document; accepted because
     /// LSP clients append it to whatever they start.
@@ -86,9 +92,6 @@ pub enum Command {
     /// Check .surql files and report diagnostics.
     #[command(after_help = CHECK_EXIT_CODES)]
     Check(CheckOptions),
-
-    /// Print the version, and the source and grammar it was built from.
-    Version(VersionOptions),
 }
 
 /// `stdio` takes no options of its own.
@@ -100,63 +103,52 @@ pub struct StdioOptions {
     pub stdio: bool,
 }
 
-/// The options of `version`.
-#[derive(clap::Args, Debug)]
-pub struct VersionOptions {
-    #[arg(long, short = 'j', help = JSON_HELP)]
-    pub json: bool,
-}
-
-/// What `version --json` prints: the release, then what the build recorded
-/// about itself. A part the build could not find out is `null`.
+/// What `--version --json` prints: the release and the platform it runs on.
 ///
-/// The keys are a contract shared with every component of the `surreal`
-/// CLI, pinned in `tests/compat.rs`: added to, never renamed or removed.
+/// The keys and their order are the ones every component of the `surreal`
+/// CLI prints, pinned in `tests/compat.rs`.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct VersionReport {
-    /// The release, `X.Y.Z`: what `-V` prints.
+    /// [`std::env::consts::ARCH`], such as `aarch64`.
+    pub arch: &'static str,
+    /// [`std::env::consts::OS`], such as `macos`.
+    pub os: &'static str,
+    /// The release, `X.Y.Z`.
     pub version: &'static str,
-    /// The short revision of this repository the binary was built from.
-    pub commit: Option<&'static str>,
-    /// The UTC date of the build, `YYYY-MM-DD` (`SOURCE_DATE_EPOCH`'s, when
-    /// the build set it).
-    pub build_date: Option<&'static str>,
-    /// The Rust target triple, such as `aarch64-apple-darwin`.
-    pub target: Option<&'static str>,
-    /// The short revision of the tree-sitter grammar compiled in.
-    pub grammar: Option<&'static str>,
 }
 
 impl VersionReport {
-    /// This binary's report, from what `build.rs` recorded: an empty value
-    /// is a part it could not find out.
+    /// This binary's report.
     pub fn current() -> Self {
-        let known = |value: &'static str| (!value.is_empty()).then_some(value);
         Self {
+            arch: std::env::consts::ARCH,
+            os: std::env::consts::OS,
             version: VERSION,
-            commit: known(env!("SURREALQL_LS_COMMIT")),
-            build_date: known(env!("SURREALQL_LS_BUILD_DATE")),
-            target: known(env!("SURREALQL_LS_TARGET")),
-            grammar: known(env!("SURREALQL_LS_GRAMMAR")),
         }
     }
 }
 
-/// Print the version: as `--version` prints it, `name` first, or as one JSON
-/// object.
-fn version(name: &str, options: &VersionOptions) {
-    if options.json {
+/// `X.Y.Z for <os> on <arch>`: what `--version` prints, the release first.
+pub fn version_line() -> String {
+    let VersionReport { arch, os, version } = VersionReport::current();
+    format!("{version} for {os} on {arch}")
+}
+
+/// Print the version, as one line or, under `--json`, as one JSON object
+/// written the way `check --json` writes its report.
+fn print_version(json: bool) {
+    if json {
         let report = serde_json::to_string_pretty(&VersionReport::current())
             .expect("the version report serializes");
         println!("{report}");
     } else {
-        println!("{name} {LONG_VERSION}");
+        println!("{}", version_line());
     }
 }
 
 impl Cli {
-    /// Parse the process's arguments, naming the program `name` in help and
-    /// `--version` unless the launcher says how it was reached.
+    /// Parse the process's arguments, naming the program `name` in help
+    /// unless the launcher says how it was reached.
     ///
     /// Not `Cli::parse`: the name differs between the two executables, and
     /// the launcher's name has to be applied to the built command before it
@@ -222,8 +214,8 @@ impl Cli {
 
 /// Leave after a parse that did not produce a [`Cli`].
 ///
-/// Help and `--version` are clap's, on stdout with exit code 0, whatever else
-/// was passed. A usage error is exit code 2. Under `--json`, `-j` or
+/// Help is clap's, on stdout with exit code 0, whatever else was passed. A
+/// usage error is exit code 2. Under `--json`, `-j` or
 /// `--format json` (up to a `--`; see [`error::asks_for_json`]) it is the
 /// JSON error envelope on stderr instead of clap's text, as in every other
 /// component of the `surreal` CLI: a script that asked for JSON reads stderr
@@ -304,7 +296,12 @@ pub async fn run(name: &'static str) -> ExitCode {
         eprintln!("{name} panicked: {info}");
     }));
 
-    match Cli::from_env(name).command {
+    let cli = Cli::from_env(name);
+    if cli.version {
+        print_version(cli.json);
+        return ExitCode::SUCCESS;
+    }
+    match cli.command {
         // `None` is the legacy flow; under the launcher it never gets here,
         // because no command prints help.
         None | Some(Command::Stdio(_)) => {
@@ -312,10 +309,6 @@ pub async fn run(name: &'static str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Command::Check(options)) => check::run(options).await,
-        Some(Command::Version(options)) => {
-            version(name, &options);
-            ExitCode::SUCCESS
-        }
     }
 }
 
@@ -562,59 +555,74 @@ mod tests {
 
     /// The launcher finds a release's version as the first semver token
     /// `--version` prints, and refuses an install whose version disagrees
-    /// with the one it asked for.
+    /// with the one it asked for. Nothing follows the platform.
     #[test]
     fn the_version_line_leads_with_the_release() {
-        assert!(LONG_VERSION.starts_with(&format!("{VERSION} (")));
-        assert_eq!(LONG_VERSION, crate::core::server::build_version());
+        assert_eq!(
+            version_line(),
+            format!(
+                "{VERSION} for {} on {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        );
     }
 
+    /// `-v` and `--version`, and clap's old `-V`, are one flag, and `--json`
+    /// or `-j` goes with it in either order.
     #[test]
-    fn the_version_command_takes_json_long_and_short() {
+    fn the_version_flag_takes_json_in_either_order() {
         for (args, json) in [
-            (&["version"][..], false),
-            (&["version", "--json"], true),
-            (&["version", "-j"], true),
+            (&["--version"][..], false),
+            (&["-v"], false),
+            (&["-V"], false),
+            (&["--version", "--json"], true),
+            (&["--json", "--version"], true),
+            (&["-v", "-j"], true),
+            (&["-j", "-v"], true),
+            (&["-vj"], true),
+            (&["-V", "--json"], true),
         ] {
-            match parse(args).expect("version").command {
-                Some(Command::Version(options)) => assert_eq!(options.json, json, "{args:?}"),
-                other => panic!("expected version, got {other:?}"),
+            for parse in [parse, parse_launched] {
+                let cli = parse(args).expect("version");
+                assert!(cli.version, "{args:?}");
+                assert_eq!(cli.json, json, "{args:?}");
+                assert!(cli.command.is_none(), "{args:?}");
             }
         }
     }
 
-    /// The JSON leads with the release `-V` prints, and carries the same
-    /// grammar `--version` shows in brackets.
+    /// A top-level `--json` without `--version` is a usage error, not a
+    /// request to serve over stdio.
     #[test]
-    fn the_version_report_agrees_with_the_version_flag() {
-        let report = VersionReport::current();
-        assert_eq!(report.version, VERSION);
-        let grammar = report.grammar.unwrap_or("unknown");
-        assert!(
-            LONG_VERSION.ends_with(&format!(", grammar {grammar})")),
-            "{LONG_VERSION}"
-        );
+    fn a_top_level_json_needs_the_version_flag() {
+        for args in [&["--json"][..], &["-j"]] {
+            let err = parse(args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}"
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
     }
 
-    /// The build date is a calendar date or nothing at all.
+    /// `version` is not a command: the flag is the one way to ask.
     #[test]
-    fn the_build_date_is_a_utc_calendar_date_when_known() {
-        let Some(date) = VersionReport::current().build_date else {
-            return;
-        };
-        let parts: Vec<&str> = date.split('-').collect();
-        assert_eq!(parts.len(), 3, "{date}");
-        assert_eq!(
-            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
-            [4, 2, 2],
-            "{date}"
-        );
-        assert!(
-            parts
-                .iter()
-                .all(|part| part.bytes().all(|b| b.is_ascii_digit())),
-            "{date}"
-        );
+    fn version_is_not_a_command() {
+        let err = parse(&["version"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// Help lists `-v, --version`, and neither the hidden `-V` nor the
+    /// top-level `--json`.
+    #[test]
+    fn help_lists_the_version_flag_only() {
+        let help = parse(&["--help"]).unwrap_err().to_string();
+        assert!(help.contains("-v, --version"), "{help}");
+        assert!(!help.contains("-V"), "{help}");
+        assert!(!help.contains("--json"), "{help}");
+        assert!(!help.contains("  version"), "{help}");
     }
 
     #[test]
