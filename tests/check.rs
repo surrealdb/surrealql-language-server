@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! End-to-end tests for the `check` subcommand, driving the real binary.
 //!
 //! These spawn `surreal-lsp check …` the way an agent, a CI

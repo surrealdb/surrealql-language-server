@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! Backwards-compatibility tripwires. Every assertion here pins an
 //! observable surface (LSP wire shape, config parsing, diagnostic
 //! identity) — a failure means a change is client-visible and must be

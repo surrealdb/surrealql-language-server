@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! JSON-RPC wire tests against the transport-agnostic dispatcher —
 //! the exact behavior the WASM `handleMessage` shim returns to
 //! Surrealist, exercised natively.
