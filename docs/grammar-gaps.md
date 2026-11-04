@@ -1,12 +1,49 @@
 # Grammar Gaps
 
 The language server compiles against the tree-sitter SurrealQL grammar
-pinned to commit `cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b`
+pinned to commit `329dcec0a057e4bc25d71e2c97e16c391573ecb0`
 (`GRAMMAR_REF` in [`scripts/setup-grammar.sh`](../scripts/setup-grammar.sh),
 which CI and the release workflow both call).
 The analysis layer in [`src/semantic/node_kind.rs`](../src/semantic/node_kind.rs)
 is coupled to that revision's node kinds — bump the pin and the
 constants together.
+
+## Fixed by the `329dcec` pin
+
+The pin moved from `cb2e6b5` to `329dcec` (upstream `master`, ten commits:
+#16–#23). Those commits converge the grammar on the engine's parser — seven
+shapes the engine accepts (#16, #17), `EXPLAIN` (#18), `DELETE FROM`, `WITH`,
+`SEQUENCE` and `NS`/`DB` (#19), `DEFINE ACCESS` and `DEFINE USER` (#20), bare
+constants, `not()` and s-strings (#21), `ACCESS`, `INFO`, `REMOVE` and
+`IF … { } ELSE { }` bodies (#22), and the remaining language-test
+inconsistencies (#23). For this server that means:
+
+- **A block `IF` as an expression.** `PERMISSIONS FOR create WHERE (IF kind =
+  'a' { true } ELSE { false })` and `RETURN { acc: IF $skip { 1 } ELSE { 2 } }`
+  each reported a `parse` error at `cb2e6b5`.
+- **`SYSTEM`, `RETRY` and `MAXDEPTH`** are grammar keywords, so they leave
+  `OFFERS_THE_GRAMMAR_CANNOT_PARSE` in
+  [`src/core/statement_shape.rs`](../src/core/statement_shape.rs); the two
+  `GRAPHQL_*` words remain.
+
+No node the analysis reads was renamed, so `node_kind.rs` needed no change.
+One analyzer test fed `PERMISSIONS FOR select FULL, create WHERE …`, which
+SurrealDB 3.3.5 and 4.0.0 both reject (`surreal validate`); `cb2e6b5`'s error
+recovery happened to keep the table, `329dcec`'s does not. The test now uses
+the form the engine accepts, `FOR select FULL, FOR create WHERE …`.
+
+Two tests depended on the old gaps. `ALTER FIELD`, which both engines accept,
+now parses, so `stays_silent_on_a_line_the_parser_already_failed_on` asserts
+it parses cleanly; its original failed-line path needs a new fixture. A legacy
+`IF … THEN … END` branch now parses with its `RETURN` inside a `Legacy` node,
+which exposed that return-type inference never implemented the refusal
+`node_kind::LEGACY` documents: `{ IF $c THEN RETURN 1 END; RETURN 'a'; }`
+inferred `string`. `body_return_type` now refuses such a body.
+
+Across an 83-file production schema written for SurrealDB 3.3, the move
+reduced files with a `parse` error from 45 (230 diagnostics) to 2 (2
+diagnostics), and regressed none. Guard tests: `tests/lsp.rs` (the *Grammar
+pin `329dcec`* section).
 
 ## Fixed by the `cb2e6b5` pin
 

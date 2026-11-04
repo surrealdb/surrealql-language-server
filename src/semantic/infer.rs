@@ -2027,6 +2027,12 @@ fn body_tail<'tree>(body: Node<'tree>) -> Option<Node<'tree>> {
 /// The only recursion left is into a closure nested inside this one, which the
 /// tree bounds.
 fn body_return_type(body: Node<'_>, ctx: &TypeCtx<'_>) -> Option<TypeExpr> {
+    // A legacy `IF … THEN … END` branch can hold a `RETURN` the walk below does
+    // not collect, and a missed `RETURN` infers a type narrower than the truth.
+    // Refuse instead, as `k::LEGACY` documents.
+    if hides_returns(body) {
+        return None;
+    }
     let results = body_results(body);
     // A body with no result at all — `{}` — says nothing.
     if results.is_empty() {
@@ -2072,6 +2078,14 @@ fn collect_function_returns<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>
             collect_function_returns(child, out);
         }
     }
+}
+
+/// True when a legacy `IF … THEN … END` branch sits on a return path of `node`,
+/// reached through the same constructs [`collect_function_returns`] walks.
+fn hides_returns(node: Node<'_>) -> bool {
+    k::named_children(node).into_iter().any(|child| {
+        child.kind() == k::LEGACY || (propagates_return(child.kind()) && hides_returns(child))
+    })
 }
 
 /// True when a `RETURN` inside this construct returns from the enclosing
