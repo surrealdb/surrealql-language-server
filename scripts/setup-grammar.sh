@@ -9,7 +9,7 @@ TARGET="$(dirname "$PWD")/surrealql-tree-sitter"
 # node kinds, so an unpinned `master` can silently break analysis when the
 # grammar changes shape. Bump this deliberately alongside any node_kind.rs
 # update. Override with GRAMMAR_REF for local grammar development.
-GRAMMAR_REF="${GRAMMAR_REF:-cb2e6b5f77de5de4e59aa4e1a72ccac7606d7d3b}"
+GRAMMAR_REF="${GRAMMAR_REF:-329dcec0a057e4bc25d71e2c97e16c391573ecb0}"
 
 if [ -d "$TARGET" ]; then
     # Never disturb an existing checkout — a grammar developer may have

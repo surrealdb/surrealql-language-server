@@ -203,9 +203,6 @@ const PERMISSIONS_HEADS: &[&str] = &["NONE", "FULL", "FOR"];
 pub const OFFERS_THE_GRAMMAR_CANNOT_PARSE: &[&str] = &[
     "GRAPHQL_ALIAS",
     "GRAPHQL_DEPRECATED",
-    "SYSTEM",
-    "RETRY",
-    "MAXDEPTH",
 ];
 
 struct HeadRule {
