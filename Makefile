@@ -42,6 +42,10 @@ release: ## Build the native binary + library (release)
 wasm: ## Build the browser WASM module and refresh pkg/
 	bash scripts/build-wasm.sh
 
+.PHONY: wasm-test
+wasm-test: wasm ## Build the WASM module and stress it under Node
+	node tests/wasm/stress.mjs
+
 .PHONY: wasm-setup
 wasm-setup: ## Install the WASM toolchain prerequisites (target, CLIs, clang)
 	rustup target add $(WASM_TARGET)

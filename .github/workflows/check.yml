@@ -70,3 +70,29 @@ jobs:
                   test -f "staging/surreal-lsp-v${version}.linux-amd64.txt"
                   test -f "staging/surreal-lsp-v${version}.windows-amd64.exe"
                   test -f "staging/surreal-lsp-v${version}.windows-amd64.txt"
+    # The wasm build has faults the native suite cannot see: the C allocator
+    # tree-sitter links on wasm32, and a 1 MiB stack. `tests/wasm/stress.mjs`
+    # drives the built package with wide and deep schemas.
+    wasm:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+            - name: Check out tree-sitter grammar
+              run: bash scripts/setup-grammar.sh
+            - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.94.0
+                  targets: wasm32-unknown-unknown
+            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+              name: Cache Rust Artifacts
+            - name: Install wasm-bindgen-cli
+              run: command -v wasm-bindgen && wasm-bindgen --version | grep -q 0.2.108 || cargo install -f wasm-bindgen-cli --version 0.2.108
+            - name: Install wasm-opt
+              run: command -v wasm-opt || cargo install wasm-opt
+            - name: Build wasm package
+              run: bash scripts/build-wasm.sh
+            - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              with:
+                  node-version: '24'
+            - name: Stress the wasm package
+              run: node tests/wasm/stress.mjs

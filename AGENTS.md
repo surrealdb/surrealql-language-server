@@ -109,6 +109,7 @@ added. Key repairs on the code, not the message text.
 | `renamed-function` | warning | A builtin called by a name SurrealDB has renamed; `data` carries the new name. |
 | `not-callable` | warning | A name the parser accepts but no implementation backs in call form. |
 | `field-type` | error | A `DEFINE FIELD` whose `DEFAULT`/`VALUE`/`COMPUTED` cannot satisfy the declared type. |
+| `too-deep` | warning | A statement nested more than 256 levels deep, left out of the analysis. Nothing in it was checked. |
 
 Several diagnostics carry structured hints in `data` — for example
 `unknown-table` includes `{"table": …, "suggestion": …}`. Prefer the hint
