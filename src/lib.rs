@@ -26,7 +26,7 @@ pub mod grammar_generated;
 pub mod runtime;
 pub mod semantic;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "server"))]
 pub mod native;
 
 #[cfg(target_arch = "wasm32")]

@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! End-to-end tests for the command line's shared surface, driving the real
 //! binary: `--version`, and how a usage error reads to a caller that asked
 //! for JSON.

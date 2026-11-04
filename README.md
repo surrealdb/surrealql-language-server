@@ -54,6 +54,19 @@ cargo build --release
 # binary at: target/release/surreal-lsp
 ```
 
+The `server` feature is on by default. It is the language-server program, the
+SurrealDB Rust SDK used for live metadata, and the workspace walk. A crate
+that only needs `semantic::analyzer::analyze_document` leaves that SDK out:
+
+```bash
+cargo add surrealql-language-server --no-default-features
+```
+
+`tokio` stays in that build: the portable core uses it. `surrealdb`, `clap`,
+`tower-lsp-server` and `walkdir` do not. Building the binaries without
+`server` produces a program that exits immediately and says the feature is
+required.
+
 The build also produces `target/release/surrealql-language-server`, the same
 program under the name the editor extensions look for. Both serve the LSP over
 stdio with `stdio`, and both write nothing but the protocol while they do.
