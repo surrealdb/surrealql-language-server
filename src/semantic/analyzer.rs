@@ -40,7 +40,7 @@ pub fn analyze_document_with_limit(
 
     let mut parser = Parser::new();
     parser.set_language(&language()).ok()?;
-    let tree = parser.parse(text, None)?;
+    let (tree, too_deep) = parse_bounded(&mut parser, text)?;
     let root = tree.root_node();
 
     // Built once, before the walk. Every range the walk records goes through
@@ -106,9 +106,108 @@ pub fn analyze_document_with_limit(
         &known_names,
         syntax_diagnostic_limit(limit),
     );
+    analysis.syntax_diagnostics.extend(
+        too_deep
+            .into_iter()
+            .map(|span| too_deep_diagnostic(text, &line_index, span)),
+    );
     analysis.line_index = line_index;
     analysis.text = owned_text;
     Some(analysis)
+}
+
+/// The deepest parse tree the semantic walks are given. They recurse once per
+/// level, and on wasm32 the whole program shares a 1 MiB stack: nested
+/// parentheses overflowed it at about 1,070 levels, and an overflow there is a
+/// trap, not a panic. Real schemas sit well under 50.
+pub const MAX_TREE_DEPTH: usize = 256;
+
+/// Parse `text`, blanking out any top-level statement whose subtree is deeper
+/// than [`MAX_TREE_DEPTH`] and parsing again. Blanking keeps every byte offset
+/// and line, so the rest of the document is analysed as written. Returns the
+/// byte spans that were skipped.
+fn parse_bounded(
+    parser: &mut Parser,
+    text: &str,
+) -> Option<(tree_sitter::Tree, Vec<std::ops::Range<usize>>)> {
+    let tree = parser.parse(text, None)?;
+    let root = tree.root_node();
+    let too_deep: Vec<_> = root
+        .children(&mut root.walk())
+        .filter(|statement| tree_depth(*statement) >= MAX_TREE_DEPTH)
+        .map(|statement| statement.byte_range())
+        .collect();
+    if too_deep.is_empty() {
+        return Some((tree, too_deep));
+    }
+
+    let mut masked = text.as_bytes().to_vec();
+    for span in &too_deep {
+        for byte in &mut masked[span.clone()] {
+            if !matches!(byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    // Spans start and end on node boundaries, which are character boundaries,
+    // and every byte inside was replaced whole.
+    let masked = String::from_utf8(masked).ok()?;
+    let tree = parser.parse(&masked, None)?;
+    if tree_depth(tree.root_node()) > MAX_TREE_DEPTH {
+        // Error recovery joined what was left into something deep again.
+        return Some((
+            parser.parse("", None)?,
+            std::iter::once(0..text.len()).collect(),
+        ));
+    }
+    Some((tree, too_deep))
+}
+
+/// Levels from `node` down to its deepest descendant, counting `node` as one.
+/// Iterative, since it is what keeps the recursive walks safe.
+pub fn tree_depth(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    let mut depth = 1;
+    let mut deepest = 1;
+    loop {
+        if cursor.goto_first_child() {
+            depth += 1;
+            deepest = deepest.max(depth);
+            continue;
+        }
+        loop {
+            if depth == 1 {
+                return deepest;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            cursor.goto_parent();
+            depth -= 1;
+        }
+    }
+}
+
+fn too_deep_diagnostic(
+    source: &str,
+    lines: &LineIndex,
+    span: std::ops::Range<usize>,
+) -> Diagnostic {
+    // First line only, like a clamped parse error: the statement may run on
+    // for pages.
+    let end = source[span.clone()]
+        .find('\n')
+        .map_or(span.end, |offset| span.start + offset);
+    Diagnostic {
+        range: lines.range(source, span.start, end),
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: codes::as_code(codes::TOO_DEEP),
+        source: Some("surreal-language-server".to_string()),
+        message: format!(
+            "Nested more than {MAX_TREE_DEPTH} levels deep, so this statement is not analysed."
+        ),
+        ..Diagnostic::default()
+    }
 }
 
 pub fn collect_syntax_diagnostics(source: &str, node: Node<'_>) -> Vec<Diagnostic> {
