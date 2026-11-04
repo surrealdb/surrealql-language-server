@@ -15,9 +15,16 @@
 //!    by `INFO FOR DB` / `INFO FOR TABLE`) — pushed via
 //!    [`server::WasmLanguageServer::set_live_metadata`].
 
+mod alloc;
 pub mod dispatch;
 pub mod host_data;
 pub mod notifier;
 pub mod server;
 
 pub use server::WasmLanguageServer;
+
+/// Runs once when the host instantiates the module, before any export.
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+fn start() {
+    alloc::install();
+}

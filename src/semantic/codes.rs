@@ -65,6 +65,11 @@ pub const FIELD_TYPE: &str = "field-type";
 /// therefore reported from the syntax pass and is not gated by
 /// `analysis.enable_type_checking` — see [`crate::semantic::type_name`].
 pub const UNKNOWN_TYPE: &str = "unknown-type";
+/// A statement whose parse tree is deeper than
+/// [`crate::semantic::analyzer::MAX_TREE_DEPTH`], so it is left out of the
+/// analysis rather than overflowing the stack. A fact about this server, not
+/// the query, hence a warning: `check` still says the statement went unchecked.
+pub const TOO_DEEP: &str = "too-deep";
 
 /// The codes whose behavior on a `SCHEMALESS` table the
 /// `analysis.schemalessDiagnostics` setting decides. Every other code is

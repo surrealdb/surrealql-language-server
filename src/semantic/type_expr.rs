@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+use crate::semantic::analyzer::MAX_TREE_DEPTH;
 use crate::semantic::node_kind as k;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,14 +54,25 @@ pub enum TypeExpr {
 }
 
 impl TypeExpr {
+    /// Parse a type from text. Hover and go-to-definition pass the raw word
+    /// under the cursor, which no parse tree has bounded, so text nested
+    /// deeper than [`MAX_TREE_DEPTH`] stays [`Self::Other`] rather than
+    /// recursing once per level.
     pub fn parse(input: &str) -> Self {
+        if bracket_depth(input) > MAX_TREE_DEPTH {
+            return Self::Other(input.trim().to_string());
+        }
+        Self::parse_bounded(input)
+    }
+
+    fn parse_bounded(input: &str) -> Self {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Self::Unknown;
         }
 
         if let Some(parts) = split_top_level(trimmed, '|') {
-            return Self::Union(parts.into_iter().map(Self::parse).collect());
+            return Self::Union(parts.into_iter().map(Self::parse_bounded).collect());
         }
 
         if let Some(inner) = unwrap_generic(trimmed, "record") {
@@ -87,7 +99,7 @@ impl TypeExpr {
             return Self::Record(tables);
         }
         if let Some(inner) = unwrap_generic(trimmed, "array") {
-            return Self::Array(Box::new(Self::parse(element_of(inner))));
+            return Self::Array(Box::new(Self::parse_bounded(element_of(inner))));
         }
         // `set<T>` reaches this path from the generated builtin catalogue and
         // from any declared type that arrives as text rather than as a grammar
@@ -95,10 +107,10 @@ impl TypeExpr {
         // checker treats exactly like `Unknown` — so a `set` parameter or field
         // silently checked nothing.
         if let Some(inner) = unwrap_generic(trimmed, "set") {
-            return Self::Set(Box::new(Self::parse(element_of(inner))));
+            return Self::Set(Box::new(Self::parse_bounded(element_of(inner))));
         }
         if let Some(inner) = unwrap_generic(trimmed, "option") {
-            return Self::Option(Box::new(Self::parse(inner)));
+            return Self::Option(Box::new(Self::parse_bounded(inner)));
         }
         if trimmed.eq_ignore_ascii_case("record") {
             return Self::Record(Vec::new());
@@ -394,6 +406,22 @@ fn unwrap_generic<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     }
 
     Some(&input[prefix.len()..input.len() - 1])
+}
+
+fn bracket_depth(input: &str) -> usize {
+    let mut depth = 0usize;
+    let mut deepest = 0;
+    for ch in input.chars() {
+        match ch {
+            '<' | '(' | '[' | '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 fn split_top_level(input: &str, delimiter: char) -> Option<Vec<&str>> {

@@ -52,13 +52,17 @@ pub fn collect(builtin_dir: &Path) -> Result<BTreeMap<String, String>, String> {
 }
 
 fn collect_dir(dir: &Path, found: &mut BTreeMap<String, String>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("cannot read a directory entry: {error}"))?
-            .path();
-
+    let mut paths = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read a directory entry: {error}"))?;
+    // `read_dir` order is the filesystem's, and a name declared twice keeps the
+    // last kind read: `array::distinct` is `-> Any` in `array.rs` but `array`
+    // as an aggregate in `aggregates/array.rs`. Subdirectories first, then
+    // files, each by name, so the scalar declarations win on every machine.
+    paths.sort_by_key(|path| (!path.is_dir(), path.clone()));
+    for path in paths {
         // `aggregates/` holds `count`, `math::sum` and the other reducers, one
         // file per namespace.
         if path.is_dir() {

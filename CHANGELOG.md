@@ -271,6 +271,25 @@ Also:
   *(Behavior change for anyone who set it `false` and worked around its
   having no effect.)* Recorded as a defect in `docs/pain-points.md`.
 
+### Fixed
+
+- **The wasm build faulted once about 20K characters of schema had been
+  parsed.** `setLiveMetadata` with 2000 `DEFINE TABLE` statements, or a
+  realistic 400-statement schema, trapped with `memory access out of bounds`
+  or `unreachable` (Electron on Linux turns that into a renderer `SIGSEGV`).
+  On `wasm32-unknown-unknown`, tree-sitter's C runtime allocated through
+  `tree-sitter-language`'s `stdlib.c`, a bump allocator meant for a wasmtime
+  store. Nothing set its heap, so it started at address 0 and grew through
+  the Rust stack and heap, then aborted at 4 MiB. The module now hands
+  tree-sitter Rust's allocator when it starts.
+- **A deeply nested statement overflowed the stack.** The semantic walks
+  recurse once per tree level, so a 2000-term `1 + 1 + …`, or about 1000
+  nested parentheses, trapped the wasm build and could overflow a native
+  thread. A top-level statement deeper than 256 levels is now left out of the
+  analysis with a `too-deep` warning; the rest of the document is analysed as
+  before. Hover and go-to-definition no longer recurse over a nested type
+  under the cursor either.
+
 ### Compatibility
 
 - `--version` now prints the executable's name first: `surreal-lsp 0.7.0
@@ -278,7 +297,8 @@ Also:
   unchanged. `check`'s flags, exit codes and JSON report are unchanged; its
   usage errors are worded by clap and still exit 2.
 
-- LSP wire: no new or renamed diagnostic codes. `unknown-type`
+- LSP wire: one new diagnostic code, `too-deep` (warning), and none renamed.
+  `unknown-type`
   diagnostics gain an additive `data.table` key naming the `DEFINE FIELD`
   target they belong to; `data.type` and `data.suggestion` are unchanged,
   so the existing quick fix is unaffected.
