@@ -362,6 +362,9 @@ jobs:
         needs: [prepare, build]
         runs-on: ubuntu-22.04
         environment: release
+        permissions:
+            contents: read
+            id-token: write
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
@@ -411,10 +414,8 @@ jobs:
                   pre-release: ${{ needs.prepare.outputs.pre-release }}
                   latest: ${{ needs.prepare.outputs.latest }}
                   major: ${{ needs.prepare.outputs.major }}
-                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
-                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+                  role-to-assume: arn:aws:iam::857808225976:role/gh-publish-surrealdb-surrealql-language-server
 
             - uses: ./.github/actions/propagate-lsp
               with:
-                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
-                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+                  role-to-assume: arn:aws:iam::857808225976:role/gh-publish-surrealdb-surrealql-language-server

@@ -155,42 +155,42 @@ workflow calls.
 
 ## Security and prerequisites
 
-The repository is public, so the bucket's credentials live in a GitHub
-**environment**, not in repository or organisation secrets, and only the one
-job that uploads names that environment. That job runs no compiler: the builds
-run `build.rs` for the whole dependency graph, which is arbitrary code from
-crates.io, and hold no credential.
+The bucket is reached through the IAM role
+`gh-publish-surrealdb-surrealql-language-server` in the legacy AWS account
+(857808225976), assumed through GitHub OIDC; no static credential exists. Only
+the one job that uploads binds the `release` environment and requests an OIDC
+token. That job runs no compiler: the builds run `build.rs` for the whole
+dependency graph, which is arbitrary code from crates.io, and hold no
+credential.
+
+The role trusts only `publish.yml` running on a `refs/tags/v*` ref in the
+`release` environment. It may, and only on the `cli/lsp/` prefix:
+
+- list, read and write `download.surrealdb.com/cli/lsp/*` (the read is the
+  sync's source);
+- list and write `download.<region>.surrealdb.com/cli/lsp/*` in each of the
+  eleven regions in `propagate-lsp`.
+
+It cannot delete. The role is defined in surrealdb/platform
+(`infra/pulumi/legacy`).
 
 Before the first publish, a repository admin has to set up the following.
 None of it can be checked short of a real release.
 
 1. **An environment named `release`**, exactly. A misspelt environment in a
-   workflow is created empty rather than refused.
+   workflow is created empty rather than refused, and the role trusts the
+   exact name.
    - *Required reviewers*: the people who may release. Turn on *Prevent
      self-review* if the team is large enough for it.
    - *Deployment branches and tags*: **selected tags only, `v*`**. The workflow
-     already refuses to publish from anything but the release's tag; this makes
-     the environment refuse its secrets to any other ref as well.
+     already refuses to publish from anything but the release's tag, and the
+     role trusts only `v*` tags; this makes the environment refuse other refs
+     as well.
    - Do not allow administrators to bypass the protection rules.
-2. **Two environment secrets in `release`**, `AMAZON_ACCESS_KEY` and
-   `AMAZON_SECRET_KEY`: the key pair of an IAM user (or role) dedicated to this
-   repository. Not the bucket-wide key the other release pipelines use: a key
-   kept in a public repository's settings should be able to write
-   `cli/lsp/*` and nothing else.
-3. **That identity's IAM policy**, allowing, and only on the `cli/lsp/` prefix:
-   - `s3:PutObject` on `download.surrealdb.com/cli/lsp/*`;
-   - `s3:GetObject` on `download.surrealdb.com/cli/lsp/*` and `s3:ListBucket`
-     on `download.surrealdb.com` conditioned on the `cli/lsp/` prefix, for the
-     sync's source;
-   - `s3:PutObject` on `download.<region>.surrealdb.com/cli/lsp/*` and
-     `s3:ListBucket` on each regional bucket conditioned on the same prefix,
-     for each of the eleven regions in `propagate-lsp`.
+2. **A tag ruleset on `refs/tags/v*`** restricting creation, update and
+   deletion to the people who may release. The role trusts any `v*` tag, so
+   the ruleset is what decides who can publish.
 
 Nothing short of a release detects a policy that is too narrow; the first one
 will, part-way through its uploads, and leaves the version needing its partial
 keys deleted (see republish protection above).
-
-Moving to OIDC, with the workflow assuming a role instead of holding a key,
-removes the long-lived secret altogether and is worth doing. It is left for the
-house's release pipelines to move together, as `surrealctl`'s own publishing
-notes record.
