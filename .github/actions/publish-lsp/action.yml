@@ -34,11 +34,8 @@ inputs:
     major:
         description: 'Whether to move v<major>.txt to this version'
         required: true
-    aws-access-key-id:
-        description: 'AWS access key ID'
-        required: true
-    aws-secret-access-key:
-        description: 'AWS secret access key'
+    role-to-assume:
+        description: 'ARN of the publish role, assumed through GitHub OIDC'
         required: true
 
 runs:
@@ -126,8 +123,9 @@ runs:
           uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
           with:
               aws-region: us-east-2
-              aws-access-key-id: ${{ inputs.aws-access-key-id }}
-              aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+              role-to-assume: ${{ inputs.role-to-assume }}
+              role-session-name: lsp-publish-${{ github.run_id }}
+              role-duration-seconds: 3600
 
         # Assets, then sidecars, then the pointers. A client that reads a
         # pointer must find the files it names already in place, so nothing is
