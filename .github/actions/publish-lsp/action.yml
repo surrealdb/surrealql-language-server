@@ -122,7 +122,9 @@ runs:
         - name: Configure AWS
           uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
           with:
-              aws-region: us-east-2
+              # download.surrealdb.com's region, so no request depends on S3's
+              # region redirect.
+              aws-region: eu-west-2
               role-to-assume: ${{ inputs.role-to-assume }}
               role-session-name: lsp-publish-${{ github.run_id }}
               role-duration-seconds: 3600
