@@ -23,7 +23,7 @@ on:
 permissions:
     contents: read
 
-# The S3 sidecar probe below refuses a *sequential* republish but cannot see a
+# The sidecar probe below (HTTPS, through the CDN) refuses a *sequential* republish but cannot see a
 # *concurrent* one. `cancel-in-progress: false` because cancelling part-way
 # through the ordered uploads is strictly worse than queueing behind them.
 concurrency:
@@ -348,10 +348,10 @@ jobs:
                   files: pkg/*.tgz
                   fail_on_unmatched_files: true
 
-    # The only job that holds the bucket's credentials, and it runs no
-    # compiler. The `release` environment holds them, so they reach this job
-    # and nothing else, after one of its reviewers approves; see
-    # docs/publishing.md for how it must be configured.
+    # The only job that can assume the publish role, and it runs no compiler:
+    # the role trusts publish.yml on a `v*` tag in the `release` environment,
+    # and only this job binds that environment with `id-token: write`. See
+    # docs/publishing.md for how the environment must be configured.
     #
     # Propagation is a step here rather than a job of its own: a second job in
     # the environment would ask for a second approval after the release is
@@ -362,8 +362,13 @@ jobs:
         needs: [prepare, build]
         runs-on: ubuntu-22.04
         environment: release
+        permissions:
+            contents: read
+            id-token: write
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+              with:
+                  persist-credentials: false
 
             # Republish protection: refuse if any of the version's five SHA-256
             # sidecars already answers. The layout has no completion marker, so
@@ -411,10 +416,8 @@ jobs:
                   pre-release: ${{ needs.prepare.outputs.pre-release }}
                   latest: ${{ needs.prepare.outputs.latest }}
                   major: ${{ needs.prepare.outputs.major }}
-                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
-                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+                  role-to-assume: arn:aws:iam::857808225976:role/gh-publish-surrealdb-surrealql-language-server
 
             - uses: ./.github/actions/propagate-lsp
               with:
-                  aws-access-key-id: ${{ secrets.AMAZON_ACCESS_KEY }}
-                  aws-secret-access-key: ${{ secrets.AMAZON_SECRET_KEY }}
+                  role-to-assume: arn:aws:iam::857808225976:role/gh-publish-surrealdb-surrealql-language-server
