@@ -6705,7 +6705,11 @@ fn a_block_if_in_a_permission_where_parses() {
     let source = "DEFINE TABLE note TYPE NORMAL SCHEMAFULL PERMISSIONS FOR select FULL, \
                   FOR create WHERE (IF kind = 'a' { true } ELSE { false });";
     let diagnostics = diagnostics_for(source);
-    assert!(diagnostics.is_empty(), "got {:?}", messages_of(&diagnostics));
+    assert!(
+        diagnostics.is_empty(),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
 }
 
 #[test]
@@ -6713,6 +6717,9 @@ fn a_block_if_as_an_object_value_parses() {
     let source = "DEFINE FUNCTION fn::step($skip: bool) -> object { \
                   RETURN { first: false, acc: IF $skip { 1 } ELSE { 2 } }; };";
     let diagnostics = diagnostics_for(source);
-    assert!(diagnostics.is_empty(), "got {:?}", messages_of(&diagnostics));
+    assert!(
+        diagnostics.is_empty(),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
 }
-
