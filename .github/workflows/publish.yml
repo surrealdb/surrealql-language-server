@@ -314,11 +314,12 @@ jobs:
                   targets: wasm32-unknown-unknown
             # No build cache in a publishing job: a cache entry written by any
             # other run, including the tools installed below, would feed the
-            # published package.
+            # published package. The tools are built fresh each release, pinned
+            # to exact versions and installed with their published lockfiles.
             - name: Install wasm-bindgen-cli
-              run: command -v wasm-bindgen && wasm-bindgen --version | grep -q 0.2.108 || cargo install -f wasm-bindgen-cli --version 0.2.108
+              run: cargo install --locked wasm-bindgen-cli --version 0.2.108
             - name: Install wasm-opt
-              run: command -v wasm-opt || cargo install wasm-opt
+              run: cargo install --locked wasm-opt --version 0.116.1
             - name: Build wasm package
               run: bash scripts/build-wasm.sh
             # Do not set registry-url here — it writes an .npmrc that forces
