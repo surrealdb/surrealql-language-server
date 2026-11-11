@@ -289,8 +289,8 @@ jobs:
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
                   toolchain: 1.94.0
-            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-              name: Cache Rust Artifacts
+            # No build cache in a publishing job: a cache entry written by any
+            # other run would feed the published output.
             - name: Publish to crates.io
               run: cargo publish
               env:
@@ -312,8 +312,9 @@ jobs:
               with:
                   toolchain: 1.94.0
                   targets: wasm32-unknown-unknown
-            - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-              name: Cache Rust Artifacts
+            # No build cache in a publishing job: a cache entry written by any
+            # other run, including the tools installed below, would feed the
+            # published package.
             - name: Install wasm-bindgen-cli
               run: command -v wasm-bindgen && wasm-bindgen --version | grep -q 0.2.108 || cargo install -f wasm-bindgen-cli --version 0.2.108
             - name: Install wasm-opt
@@ -323,7 +324,8 @@ jobs:
             # Do not set registry-url here — it writes an .npmrc that forces
             # NODE_AUTH_TOKEN auth and breaks npm OIDC trusted publishing.
             - name: Set up Node.js
-              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              # This pin is setup-node v4.4.0, which caches only when `cache:` is set.
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # zizmor: ignore[cache-poisoning]
               with:
                   node-version: '24'
             - name: Ensure npm supports OIDC trusted publishing
