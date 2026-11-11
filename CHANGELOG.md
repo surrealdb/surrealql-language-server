@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Grammar
+
+- The grammar pin moves from `cb2e6b5` to `329dcec`. A block `IF … { } ELSE
+  { }` in expression position, `SYSTEM`, `RETRY` and `MAXDEPTH` now parse; across an 83-file
+  production schema, files with a `parse` error fell from 45 to 2. See
+  `docs/grammar-gaps.md`.
+
 ### Performance
 
 Editor-facing latency, measured on a 3200-line (166 KB) file and a 200-document

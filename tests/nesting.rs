@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! Schemas that are wide (thousands of statements) or deep (one statement
 //! nested thousands of levels) load and answer every request.
 //!

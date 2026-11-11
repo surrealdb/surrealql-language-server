@@ -200,13 +200,7 @@ const PERMISSIONS_HEADS: &[&str] = &["NONE", "FULL", "FOR"];
 /// clause the server itself suggested. That is a pre-existing grammar gap, not
 /// one this table introduces — recorded here so a grammar bump can shorten the
 /// list, and asserted by `offers_outside_the_grammar_are_declared`.
-pub const OFFERS_THE_GRAMMAR_CANNOT_PARSE: &[&str] = &[
-    "GRAPHQL_ALIAS",
-    "GRAPHQL_DEPRECATED",
-    "SYSTEM",
-    "RETRY",
-    "MAXDEPTH",
-];
+pub const OFFERS_THE_GRAMMAR_CANNOT_PARSE: &[&str] = &["GRAPHQL_ALIAS", "GRAPHQL_DEPRECATED"];
 
 struct HeadRule {
     /// The words that must already be typed, in order. [`ANY`] matches one

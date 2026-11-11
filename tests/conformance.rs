@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! Conformance of the argument checks against SurrealDB itself.
 //!
 //! The unit tests prove the checks fire where they should. These prove the far

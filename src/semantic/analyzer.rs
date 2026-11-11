@@ -3286,7 +3286,7 @@ mod tests {
     fn extracts_indexes_events_and_table_permissions() {
         let uri = Uri::from_str("file:///workspace/schema.surql").expect("valid uri");
         let text = r#"
-        DEFINE TABLE person PERMISSIONS FOR select FULL, create WHERE $auth.roles CONTAINS 'admin';
+        DEFINE TABLE person PERMISSIONS FOR select FULL, FOR create WHERE $auth.roles CONTAINS 'admin';
         DEFINE EVENT audit_person ON TABLE person WHEN $before != $after THEN (CREATE event CONTENT { table: 'person' });
         DEFINE INDEX person_email ON TABLE person FIELDS email UNIQUE;
         "#;
