@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{Location, Position, Range, Uri};

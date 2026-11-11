@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! End-to-end tests driving [`LanguageServerCore`] through its public
 //! API with recording mocks — the same pipeline real clients exercise
 //! (didOpen → analysis → merged model → published diagnostics).

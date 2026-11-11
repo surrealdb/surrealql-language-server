@@ -1,3 +1,5 @@
+#![cfg(feature = "server")]
+
 //! Serving over stdio writes the protocol and nothing else.
 //!
 //! An editor starts the server and speaks JSON-RPC over its stdin and
