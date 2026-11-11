@@ -723,21 +723,22 @@ fn stays_silent_for_a_boolean_literal_type() {
 
 #[test]
 fn stays_silent_on_a_line_the_parser_already_failed_on() {
-    // Also caught by the corpus sweep. The grammar has no `ALTER FIELD` rule, so
-    // it leaves an ERROR for the head of the statement and then reads the tail as
-    // a `TypeCast` — `person` reaches the check as a `TypeName` with no ERROR
-    // ancestor at all. It is a table name in an unreadable statement, not a
-    // misspelled type.
+    // Also caught by the corpus sweep. Before grammar `329dcec` there was no
+    // `ALTER FIELD` rule: the head became an ERROR and the tail a `TypeCast`, so
+    // `person` reached the check as a `TypeName` with no ERROR ancestor. It is a
+    // table name, not a misspelled type, and must not be flagged.
     let source = "ALTER FIELD author ON comment TYPE record<person>;";
     assert!(
         unknown_type_messages(source).is_empty(),
-        "a name on a line the parser failed on is a guess: {:?}",
+        "a table name in `record<…>` is not a type: {:?}",
         syntax_diagnostics_for(source)
     );
-    // The parse diagnostic itself must still be reported.
+    // `329dcec` parses `ALTER FIELD` (SurrealDB 3.3.5 and 4.0.0 accept it), so
+    // the statement is no longer unreadable.
     assert!(
-        !syntax_diagnostics_for(source).is_empty(),
-        "the unreadable statement must still raise a parse diagnostic"
+        syntax_diagnostics_for(source).is_empty(),
+        "ALTER FIELD parses: {:?}",
+        syntax_diagnostics_for(source)
     );
 }
 
@@ -6689,4 +6690,36 @@ fn every_documented_index_form_parses() {
             messages_of(&diagnostics)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Grammar pin `329dcec` — block IF as an expression
+// ---------------------------------------------------------------------------
+//
+// At `cb2e6b5` a block `IF … { } ELSE { }` in expression position reported a
+// `parse` error, in a permission `WHERE` and as an object value alike. Both
+// statements below validate on SurrealDB 3.3.5 and 4.0.0.
+
+#[test]
+fn a_block_if_in_a_permission_where_parses() {
+    let source = "DEFINE TABLE note TYPE NORMAL SCHEMAFULL PERMISSIONS FOR select FULL, \
+                  FOR create WHERE (IF kind = 'a' { true } ELSE { false });";
+    let diagnostics = diagnostics_for(source);
+    assert!(
+        diagnostics.is_empty(),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
+}
+
+#[test]
+fn a_block_if_as_an_object_value_parses() {
+    let source = "DEFINE FUNCTION fn::step($skip: bool) -> object { \
+                  RETURN { first: false, acc: IF $skip { 1 } ELSE { 2 } }; };";
+    let diagnostics = diagnostics_for(source);
+    assert!(
+        diagnostics.is_empty(),
+        "got {:?}",
+        messages_of(&diagnostics)
+    );
 }
