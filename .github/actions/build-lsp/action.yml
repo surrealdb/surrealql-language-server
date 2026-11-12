@@ -70,9 +70,10 @@ runs:
               # Must NOT be set for linux-gnu, where it attempts a static glibc
               # and breaks `getaddrinfo` and NSS at runtime.
               RUSTFLAGS: ${{ inputs.os == 'windows' && '-C target-feature=+crt-static' || '' }}
+              LSP_TARGET: ${{ inputs.target }}
           run: |
               set -euo pipefail
-              cargo build --locked --release --target "${{ inputs.target }}" \
+              cargo build --locked --release --target "${LSP_TARGET}" \
                 --bin surreal-lsp --bin surrealql-language-server
 
         # The only place that proves a release-profile binary for this target
@@ -84,9 +85,10 @@ runs:
           env:
               EXE: ${{ inputs.os == 'windows' && '.exe' || '' }}
               VERSION: ${{ inputs.version }}
+              LSP_TARGET: ${{ inputs.target }}
           run: |
               set -euo pipefail
-              binary="target/${{ inputs.target }}/release/surreal-lsp${EXE}"
+              binary="target/${LSP_TARGET}/release/surreal-lsp${EXE}"
 
               # The launcher checks an install by the first version in
               # `--version`, and refuses one that is not the release it asked for.
@@ -128,10 +130,12 @@ runs:
         - name: Check the glibc floor
           if: ${{ inputs.os == 'linux' }}
           shell: bash
+          env:
+              LSP_TARGET: ${{ inputs.target }}
           run: |
               set -euo pipefail
               docker run --rm \
-                -v "$PWD/target/${{ inputs.target }}/release/surreal-lsp:/probe:ro" \
+                -v "$PWD/target/${LSP_TARGET}/release/surreal-lsp:/probe:ro" \
                 debian:12 /probe --version >/dev/null
               echo "ok  surreal-lsp starts on debian:12"
 
@@ -139,11 +143,14 @@ runs:
           shell: bash
           env:
               EXE: ${{ inputs.os == 'windows' && '.exe' || '' }}
+              LSP_TARGET: ${{ inputs.target }}
+              VERSION: ${{ inputs.version }}
+              PLATFORM: ${{ inputs.os }}-${{ inputs.arch }}
           run: |
               set -euo pipefail
               scripts/package.sh surreal-lsp \
-                "target/${{ inputs.target }}/release/surreal-lsp${EXE}" \
-                "${{ inputs.version }}" "${{ inputs.os }}-${{ inputs.arch }}" \
+                "target/${LSP_TARGET}/release/surreal-lsp${EXE}" \
+                "${VERSION}" "${PLATFORM}" \
                 staging/surreal-lsp
               echo "Packaged:"
               ls -lR staging/
@@ -164,10 +171,11 @@ runs:
           env:
               EXE: ${{ inputs.os == 'windows' && '.exe' || '' }}
               ASSET: ${{ inputs.release-asset }}
+              LSP_TARGET: ${{ inputs.target }}
           run: |
               set -euo pipefail
               mkdir -p staging/github
-              cp "target/${{ inputs.target }}/release/surrealql-language-server${EXE}" "staging/github/${ASSET}"
+              cp "target/${LSP_TARGET}/release/surrealql-language-server${EXE}" "staging/github/${ASSET}"
               ls -l staging/github/
 
         - name: Upload the GitHub release asset

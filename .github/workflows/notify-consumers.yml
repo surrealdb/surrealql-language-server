@@ -88,6 +88,8 @@ jobs:
                   private-key: ${{ secrets.LSP_BUMP_APP_PRIVATE_KEY }}
                   owner: surrealdb
                   repositories: surrealql-vsx,surrealql-jetbrains,surrealql-zed
+                  # `POST /repos/{owner}/{repo}/dispatches` needs contents: write.
+                  permission-contents: write
 
             - name: Dispatch to the consumer repos
               env:
