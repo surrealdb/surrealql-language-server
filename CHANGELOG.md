@@ -2,12 +2,217 @@
 
 ## Unreleased
 
+## 0.6.4 — 2026-11-17
+
 ### Grammar
 
 - The grammar pin moves from `cb2e6b5` to `329dcec`. A block `IF … { } ELSE
   { }` in expression position, `SYSTEM`, `RETRY` and `MAXDEPTH` now parse; across an 83-file
   production schema, files with a `parse` error fell from 45 to 2. See
   `docs/grammar-gaps.md`.
+- `ALTER FIELD` and a legacy `IF … THEN … END` branch now parse too. A
+  function body that can return from inside such a legacy branch is no
+  longer given an inferred return type: `{ IF $c THEN RETURN 1 END; RETURN
+  'a'; }` inferred `string`.
+
+### Added
+
+- **A `server` Cargo feature, on by default.** It is the language-server
+  program, the SurrealDB Rust SDK used for live metadata, and the workspace
+  walk. A crate that only calls `semantic::analyzer::analyze_document` can
+  leave it out (`cargo add surrealql-language-server --no-default-features`)
+  and then does not link `surrealdb`, `clap`, `tower-lsp-server` or
+  `walkdir`; `tokio` stays, because the portable core uses it. `cargo build`
+  and `cargo install` still produce `surreal-lsp`. Built without `server`,
+  the binaries exit immediately and say the feature is required.
+
+### Fixed
+
+- **The wasm build faulted once about 20K characters of schema had been
+  parsed.** `setLiveMetadata` with 2000 `DEFINE TABLE` statements, or a
+  realistic 400-statement schema, trapped with `memory access out of bounds`
+  or `unreachable` (Electron on Linux turns that into a renderer `SIGSEGV`).
+  On `wasm32-unknown-unknown`, tree-sitter's C runtime allocated through
+  `tree-sitter-language`'s `stdlib.c`, a bump allocator meant for a wasmtime
+  store. Nothing set its heap, so it started at address 0 and grew through
+  the Rust stack and heap, then aborted at 4 MiB. The module now hands
+  tree-sitter Rust's allocator when it starts.
+- **A deeply nested statement overflowed the stack.** The semantic walks
+  recurse once per tree level, so a 2000-term `1 + 1 + …`, or about 1000
+  nested parentheses, trapped the wasm build and could overflow a native
+  thread. A top-level statement deeper than 256 levels is now left out of the
+  analysis with a `too-deep` warning; the rest of the document is analysed as
+  before. Hover and go-to-definition no longer recurse over a nested type
+  under the cursor either.
+
+### Compatibility
+
+- LSP wire: one new diagnostic code, `too-deep` (warning), and none renamed.
+- Cargo: the `server` feature is new and on by default, so a default build
+  is unchanged.
+
+### Build and release
+
+- Publishing to download.surrealdb.com signs in through a GitHub OIDC role
+  instead of the organisation's shared AWS key pair. The role trusts only
+  `publish.yml` on a `v*` tag in the `release` environment, and can only
+  list, read and write `cli/lsp/`, with no deletes.
+  [`docs/publishing.md`](docs/publishing.md) describes the role and the
+  environment and tag ruleset it relies on.
+- The release workflows clear zizmor's high-severity findings: workflow
+  inputs reach scripts through step environment variables, no build cache
+  feeds a published artifact, and the notification App token asks only for
+  `contents: write`.
+- `rustls` 0.23.42 → 0.23.46 in `Cargo.lock`.
+
+## 0.6.3 — 2026-10-15
+
+### Added
+
+- **`--version` (or `-v`) prints `X.Y.Z for <os> on <arch>`**, the line
+  every component of the `surreal` CLI prints, such as `0.1.0 for macos on
+  aarch64`. It no longer starts with `surreal-lsp`, or names the source and
+  grammar the binary was built from: `initialize`'s `serverInfo.version` and
+  `check --json`'s `version` still do. `-V` still works, hidden from help.
+  With `--json` (or `-j`), before or after it, it prints `{"arch", "os",
+  "version"}` instead.
+- **`check --json`** (or `-j`), the flag every component of the `surreal` CLI
+  shares, is the documented spelling of `check --format json` and prints the
+  same bytes. `--format` is still accepted, and hidden from help; `--json`
+  beside `--format json` is redundant, beside `--format text` a usage error.
+- **The JSON error envelope.** With `--json` (or `-j`, alone or among other
+  short flags, or `--format json`) among the arguments, a usage error, clap's
+  included, is one JSON object on stderr instead of clap's text, as in every
+  other component of the `surreal` CLI: `kind` `"usage"`, clap's message
+  (with the lines it sets under it, such as the missing arguments), and the
+  failing command's `--help` as `command`, exit 2.
+  `check --json` reports a run that cannot start (a missing file, an invalid
+  `--config`) the same way, with nothing on stdout; the exit code stays 2.
+  Without `--json`, errors read as before.
+
+## 0.6.2 — 2026-10-14
+
+### Changed
+
+- **`surreal lsp` prints help; `surreal lsp stdio` serves.** Under the
+  `surreal` launcher (`SURREAL_CLI_LAUNCHER` set and not empty), running with
+  no command now prints help and exits 2, as every other `surreal` component
+  does, instead of silently waiting on stdin for an editor. The new `stdio`
+  command serves the LSP, and accepts the `--stdio` that LSP clients append.
+  Started any other way, the executable keeps the legacy behaviour: no command,
+  or `--stdio`, serves, so the editor extensions are unaffected.
+
+## 0.6.1 — 2026-10-14
+
+### Added
+
+- **`check`: diagnostics without an editor.** `surreal-lsp check [paths…]`
+  runs the parse and semantic diagnostics the editor shows, with no LSP
+  lifecycle, over files, directories or stdin (`--stdin`,
+  `--stdin-filename`), and exits 0, 1 or 2 (`--fail-on` sets the
+  threshold). `--workspace <dir>` supplies schema context, `--config` takes
+  the JSON an editor sends, and `--format json` prints the LSP wire
+  diagnostics verbatim. It never connects to a database. A skipped target
+  file is exit 2, so exit 0 never claims coverage the run did not have. See
+  [`AGENTS.md`](AGENTS.md).
+- **`surreal-lsp`, run as `surreal lsp` by the `surreal` CLI.** The server's
+  executable is now `surreal-lsp`, and every release publishes it to
+  download.surrealdb.com under `cli/lsp/`, in the launcher's layout, for
+  `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64` and, for the
+  first time, `darwin-amd64` (Intel macOS). `surrealql-language-server` is
+  still built, as the same program under the old name, and the GitHub release
+  assets keep their names, so editor extensions find the server as before.
+  Serving over stdio writes only the protocol under either name: no banner,
+  notice or deprecation line on stdout or stderr. See
+  [`docs/publishing.md`](docs/publishing.md).
+- **The command line is parsed with clap**, as in every other component of
+  the `surreal` CLI. `--help` names the command the way it was typed: `surreal
+  lsp check` when started by the launcher (`SURREAL_INVOKED_AS`).
+
+- **Closures are typed, and calls through them are checked.**
+  `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`
+  instead of `unknown`. The parameters come from the closure as written; the
+  result is the declared `-> T` when there is one, otherwise what the body was
+  read to produce — a `Block` body through its `RETURN`s and trailing
+  expression, a bare-expression body through the expression itself. Hover,
+  completion detail and signature help (`$double(`) all show it, and
+  `LET $y = $double(20)` binds `$y` to `int`.
+
+  A call through the variable is checked as the engine checks it
+  (`exec/physical_expr/function/closure.rs`): `$double("asdasd")` reports
+  ``Argument 1 of `$double` expects `int`, found `string`.`` (`argument-type`),
+  and `$double()` reports ``expects 1 argument, found 0`` (`argument-count`).
+  Two engine facts shape the count check: an unannotated parameter is `any`,
+  which may be omitted, and extra arguments are dropped rather than rejected,
+  so only the lower bound is ever reported. A closure declared `-> T` has its
+  result checked against `T` (`return-type`), as a `DEFINE FUNCTION` does.
+
+  The new type fits a parameter declared with the bare kind `function` — the
+  engine's own spelling for every closure, and what every closure-taking
+  builtin declares — and nothing else. A variable typed only as `function` is
+  never judged: its parameters are not visible.
+
+- **`builtins.json`**: every builtin function SurrealDB accepts, with
+  signatures, return types, arity, renames and method receivers, generated
+  from the engine's source by `cargo xtask generate-builtins` beside the Rust
+  catalogue and held fresh by the same test. It is committed at the
+  repository root, attached to every GitHub release, and shipped in the npm
+  package as `@surrealdb/surrealql-language-server/builtins.json`.
+
+### Changed
+
+- **`DEFINE INDEX … FULLTEXT`, `COUNT` and `DISKANN` no longer report a false
+  syntax error.** `DEFINE INDEX OVERWRITE article_body_search ON article FIELDS
+  body FULLTEXT ANALYZER english BM25;` reported ``Invalid SurrealQL syntax
+  near `FULLTEXT ANALYZER english BM25`.`` — the grammar's `IndexClause` knew
+  only the pre-3.0 `SEARCH ANALYZER` spelling. The grammar pin moves to
+  `cb2e6b5`, which parses every index kind SurrealDB 3 reads
+  (`syn/parser/stmt/define.rs`, `parse_define_index`): `FULLTEXT` with
+  `ANALYZER`, `BM25 [(k1, b)]` and `HIGHLIGHTS` in any order and none
+  required; `COUNT [WHERE …]`; `DISKANN` with `DIST`, `TYPE`, `DEGREE`,
+  `L_BUILD`, `ALPHA` and `HASHED_VECTOR`; `HASHED_VECTOR` on `HNSW`; the
+  `DISTANCE` spelling of `DIST`; the `F16`, `I8` and `U8` vector types; and
+  the `COSINE_NORMALIZED` and `INNER_PRODUCT` distances. The clauses appear
+  verbatim among the index's options in hover, as `HNSW` already did — and
+  `OVERWRITE` / `IF NOT EXISTS` no longer do, which they wrongly had. The
+  pre-3.0 `SEARCH ANALYZER` and `MTREE` forms still parse. Across SurrealDB's
+  own `language-tests/` corpus the move fixes the parse of 42 files and
+  regresses none; `DISKANN` leaves the list of completions the grammar cannot
+  parse. Recorded in `docs/grammar-gaps.md`.
+
+- **Grammar pin moved to `df12d94`** (upstream `master` of
+  `surrealql-tree-sitter`), from `826d0c2`. Four shapes the earlier revision
+  rejected or mis-nested on valid SurrealQL no longer produce a false `parse`
+  diagnostic: a closure with a bare-expression body (`|$x: int| $x * 2`),
+  `UNSET` with a field list (`UPDATE person:tobie UNSET name, email, age`),
+  `SHOW CHANGES FOR TABLE person SINCE 1` with a versionstamp, and mock
+  syntax (`|test:1..4|`). Binary operators now nest by the engine's
+  precedence. Across SurrealDB's own `language-tests/` corpus the move fixes
+  the parse of 91 files and regresses none. `docs/grammar-gaps.md` records
+  what the new revision still rejects.
+
+- **Arithmetic chains are flattened on both sides.** With operators nested
+  by precedence, `1 + "a" * 3` carries `"a" * 3` as the *right* operand of
+  `+`, and a chain nested there used to be typed with its diagnostics
+  discarded. `semantic::infer` now flattens a chain on either side before
+  regrouping it with the engine's binding powers, so every nested chain is
+  judged exactly once — and the regrouping now distinguishes every rank of the
+  engine's `BindingPower`, not only the arithmetic three. That matters for
+  what is *provable*: `$a AND $b = "x" + 1` groups as
+  `$a AND ($b = ("x" + 1))`, whose right side may never run, and is no longer
+  reported.
+
+### Compatibility
+
+- `--version` (or `-V`) is new, and prints the executable's name, the
+  release, and the source and grammar it was built from: `surreal-lsp 0.6.1
+  (…)`. `initialize`'s `serverInfo.version` is unchanged. 0.6.3 changes the
+  `--version` line.
+- `check`'s flags, exit codes and JSON report are pinned by
+  `tests/compat.rs` from this release on. Its usage errors are worded by clap
+  and exit 2.
+
+## 0.6.0 — 2026-08-17
 
 ### Performance
 
@@ -26,7 +231,6 @@ workspace, release profile:
 
 Every document operation is now linear in file size; the cost per line no longer
 grows. Details below.
-
 
 The editor-facing operations were quadratic in document size. One function was
 the cause: `offset_to_position` scanned the document from byte 0 to convert a
@@ -102,62 +306,23 @@ Also:
 
 ### Added
 
-- **`surreal-lsp`, run as `surreal lsp` by the `surreal` CLI.** The server's
-  executable is now `surreal-lsp`, and every release publishes it to
-  download.surrealdb.com under `cli/lsp/`, in the launcher's layout, for
-  `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64` and, for the
-  first time, `darwin-amd64` (Intel macOS). `surrealql-language-server` is
-  still built, as the same program under the old name, and the GitHub release
-  assets keep their names, so editor extensions find the server as before.
-  Serving over stdio writes only the protocol under either name: no banner,
-  notice or deprecation line on stdout or stderr. See
-  [`docs/publishing.md`](docs/publishing.md).
-- **The command line is parsed with clap**, as in every other component of
-  the `surreal` CLI. `--help` names the command the way it was typed: `surreal
-  lsp check` when started by the launcher (`SURREAL_INVOKED_AS`).
-- **`--version` (or `-v`) prints `X.Y.Z for <os> on <arch>`**, the line
-  every component of the `surreal` CLI prints, such as `0.1.0 for macos on
-  aarch64`. It no longer starts with `surreal-lsp`, or names the source and
-  grammar the binary was built from: `initialize`'s `serverInfo.version` and
-  `check --json`'s `version` still do. `-V` still works, hidden from help.
-  With `--json` (or `-j`), before or after it, it prints `{"arch", "os",
-  "version"}` instead.
-- **`check --json`** (or `-j`), the flag every component of the `surreal` CLI
-  shares, is the documented spelling of `check --format json` and prints the
-  same bytes. `--format` is still accepted, and hidden from help; `--json`
-  beside `--format json` is redundant, beside `--format text` a usage error.
-- **The JSON error envelope.** With `--json` (or `-j`, alone or among other
-  short flags, or `--format json`) among the arguments, a usage error, clap's
-  included, is one JSON object on stderr instead of clap's text, as in every
-  other component of the `surreal` CLI: `kind` `"usage"`, clap's message
-  (with the lines it sets under it, such as the missing arguments), and the
-  failing command's `--help` as `command`, exit 2.
-  `check --json` reports a run that cannot start (a missing file, an invalid
-  `--config`) the same way, with nothing on stdout; the exit code stays 2.
-  Without `--json`, errors read as before.
-
-- **Closures are typed, and calls through them are checked.**
-  `LET $double = |$x: int| $x * 2;` now binds `$double` to `|$x: int| -> int`
-  instead of `unknown`. The parameters come from the closure as written; the
-  result is the declared `-> T` when there is one, otherwise what the body was
-  read to produce — a `Block` body through its `RETURN`s and trailing
-  expression, a bare-expression body through the expression itself. Hover,
-  completion detail and signature help (`$double(`) all show it, and
-  `LET $y = $double(20)` binds `$y` to `int`.
-
-  A call through the variable is checked as the engine checks it
-  (`exec/physical_expr/function/closure.rs`): `$double("asdasd")` reports
-  ``Argument 1 of `$double` expects `int`, found `string`.`` (`argument-type`),
-  and `$double()` reports ``expects 1 argument, found 0`` (`argument-count`).
-  Two engine facts shape the count check: an unannotated parameter is `any`,
-  which may be omitted, and extra arguments are dropped rather than rejected,
-  so only the lower bound is ever reported. A closure declared `-> T` has its
-  result checked against `T` (`return-type`), as a `DEFINE FUNCTION` does.
-
-  The new type fits a parameter declared with the bare kind `function` — the
-  engine's own spelling for every closure, and what every closure-taking
-  builtin declares — and nothing else. A variable typed only as `function` is
-  never judged: its parameters are not visible.
+- **Graph traversals, columns and query results resolve.** A traversal, a
+  column after a comma, the column under the pointer and the value a query
+  produced all used to resolve to nothing.
+  - Edges are read from `DEFINE TABLE … TYPE RELATION IN a OUT b` and from
+    every `RELATE a->edge->b` in the workspace, so `->knows->person` from
+    `person` is `array<record<person>>`, and `FROM person->likes->product`
+    no longer reports the edge as an `unknown-table`.
+  - Column completion works after a comma and in a projection not yet
+    written (`SELECT  FROM person`), and offers `id` on every table and
+    `in`/`out` on an edge. Hovering a column describes it.
+  - A `SELECT` is typed from its projection and the schema, so a bound
+    query carries a shape instead of `unknown`; `ONLY` yields the row
+    rather than a list of one. A member is read off an object, off a record
+    through its table's schema, and off a list element-wise, and
+    `FOR $person IN $people` binds `$person` to an element of `$people`.
+  - Hover, go-to-definition and the completion prefix resolve the first
+    character of a word, and each name inside a `->`/`<-` traversal.
 
 - **`analysis.diagnosticDebounceMs`** (default `200`) waits for typing to settle
   before analysing an edited buffer. Every keystroke used to trigger a full
@@ -168,7 +333,6 @@ Also:
   Parsing and extraction now also run off the thread that serves requests, so a
   hover or completion arriving mid-keystroke is not queued behind a reparse, and
   a result the client has already superseded is dropped rather than published.
-
 
 - **`analysis.schemalessDiagnostics`** decides which diagnostics apply to
   a table declared `SCHEMALESS`. Three values:
@@ -197,54 +361,6 @@ Also:
 
 ### Changed
 
-- **`surreal lsp` prints help; `surreal lsp stdio` serves.** Under the
-  `surreal` launcher (`SURREAL_CLI_LAUNCHER` set and not empty), running with
-  no command now prints help and exits 2, as every other `surreal` component
-  does, instead of silently waiting on stdin for an editor. The new `stdio`
-  command serves the LSP, and accepts the `--stdio` that LSP clients append.
-  Started any other way, the executable keeps the legacy behaviour: no command,
-  or `--stdio`, serves, so the editor extensions are unaffected.
-- **`DEFINE INDEX … FULLTEXT`, `COUNT` and `DISKANN` no longer report a false
-  syntax error.** `DEFINE INDEX OVERWRITE article_body_search ON article FIELDS
-  body FULLTEXT ANALYZER english BM25;` reported ``Invalid SurrealQL syntax
-  near `FULLTEXT ANALYZER english BM25`.`` — the grammar's `IndexClause` knew
-  only the pre-3.0 `SEARCH ANALYZER` spelling. The grammar pin moves to
-  `cb2e6b5`, which parses every index kind SurrealDB 3 reads
-  (`syn/parser/stmt/define.rs`, `parse_define_index`): `FULLTEXT` with
-  `ANALYZER`, `BM25 [(k1, b)]` and `HIGHLIGHTS` in any order and none
-  required; `COUNT [WHERE …]`; `DISKANN` with `DIST`, `TYPE`, `DEGREE`,
-  `L_BUILD`, `ALPHA` and `HASHED_VECTOR`; `HASHED_VECTOR` on `HNSW`; the
-  `DISTANCE` spelling of `DIST`; the `F16`, `I8` and `U8` vector types; and
-  the `COSINE_NORMALIZED` and `INNER_PRODUCT` distances. The clauses appear
-  verbatim among the index's options in hover, as `HNSW` already did — and
-  `OVERWRITE` / `IF NOT EXISTS` no longer do, which they wrongly had. The
-  pre-3.0 `SEARCH ANALYZER` and `MTREE` forms still parse. Across SurrealDB's
-  own `language-tests/` corpus the move fixes the parse of 42 files and
-  regresses none; `DISKANN` leaves the list of completions the grammar cannot
-  parse. Recorded in `docs/grammar-gaps.md`.
-
-- **Grammar pin moved to `df12d94`** (upstream `master` of
-  `surrealql-tree-sitter`), from `826d0c2`. Four shapes the earlier revision
-  rejected or mis-nested on valid SurrealQL no longer produce a false `parse`
-  diagnostic: a closure with a bare-expression body (`|$x: int| $x * 2`),
-  `UNSET` with a field list (`UPDATE person:tobie UNSET name, email, age`),
-  `SHOW CHANGES FOR TABLE person SINCE 1` with a versionstamp, and mock
-  syntax (`|test:1..4|`). Binary operators now nest by the engine's
-  precedence. Across SurrealDB's own `language-tests/` corpus the move fixes
-  the parse of 91 files and regresses none. `docs/grammar-gaps.md` records
-  what the new revision still rejects.
-
-- **Arithmetic chains are flattened on both sides.** With operators nested
-  by precedence, `1 + "a" * 3` carries `"a" * 3` as the *right* operand of
-  `+`, and a chain nested there used to be typed with its diagnostics
-  discarded. `semantic::infer` now flattens a chain on either side before
-  regrouping it with the engine's binding powers, so every nested chain is
-  judged exactly once — and the regrouping now distinguishes every rank of the
-  engine's `BindingPower`, not only the arithmetic three. That matters for
-  what is *provable*: `$a AND $b = "x" + 1` groups as
-  `$a AND ($b = ("x" + 1))`, whose right side may never run, and is no longer
-  reported.
-
 - **A nested `SET` target is read whole.** `field_assignment_target` in
   `src/semantic/analyzer.rs` now accepts either grammar shape for the
   assigned-to side of a `FieldAssignment` — an `Ident` (pinned grammar
@@ -264,7 +380,7 @@ Also:
   codes ignored schema mode entirely. Under the new `quiet` default all
   five stand down on a declared `SCHEMALESS` table. *(Behavior change. Set
   `analysis.schemalessDiagnostics` to `errors` to keep the two faults the
-  engine raises, or to `strict` for the pre-0.5.3 behavior.)*
+  engine raises, or to `strict` for the pre-0.6.0 behavior.)*
 - **The syntax-diagnostic cap is 2000, was 100.** The cap counts
   diagnostics per document, not lines — nothing limits document length.
   100 was low enough that a large schema file mid-edit hit it and read as
@@ -278,37 +394,15 @@ Also:
   *(Behavior change for anyone who set it `false` and worked around its
   having no effect.)* Recorded as a defect in `docs/pain-points.md`.
 
-### Fixed
-
-- **The wasm build faulted once about 20K characters of schema had been
-  parsed.** `setLiveMetadata` with 2000 `DEFINE TABLE` statements, or a
-  realistic 400-statement schema, trapped with `memory access out of bounds`
-  or `unreachable` (Electron on Linux turns that into a renderer `SIGSEGV`).
-  On `wasm32-unknown-unknown`, tree-sitter's C runtime allocated through
-  `tree-sitter-language`'s `stdlib.c`, a bump allocator meant for a wasmtime
-  store. Nothing set its heap, so it started at address 0 and grew through
-  the Rust stack and heap, then aborted at 4 MiB. The module now hands
-  tree-sitter Rust's allocator when it starts.
-- **A deeply nested statement overflowed the stack.** The semantic walks
-  recurse once per tree level, so a 2000-term `1 + 1 + …`, or about 1000
-  nested parentheses, trapped the wasm build and could overflow a native
-  thread. A top-level statement deeper than 256 levels is now left out of the
-  analysis with a `too-deep` warning; the rest of the document is analysed as
-  before. Hover and go-to-definition no longer recurse over a nested type
-  under the cursor either.
-
 ### Compatibility
 
-- `--version` now prints the executable's name first: `surreal-lsp 0.7.0
-  (…)`, where it printed `0.7.0 (…)`. `initialize`'s `serverInfo.version` is
-  unchanged. `check`'s flags, exit codes and JSON report are unchanged; its
-  usage errors are worded by clap and still exit 2.
-
-- LSP wire: one new diagnostic code, `too-deep` (warning), and none renamed.
-  `unknown-type`
+- LSP wire: no new or renamed diagnostic codes. `unknown-type`
   diagnostics gain an additive `data.table` key naming the `DEFINE FIELD`
   target they belong to; `data.type` and `data.suggestion` are unchanged,
   so the existing quick fix is unaffected.
+- `>` joins the completion trigger characters, so `->` opens the list as
+  `<-` already did. Graph completion items carry an explicit `textEdit`
+  range and `filterText`.
 - `analysis.schemalessDiagnostics` and `analysis.maxSyntaxDiagnostics`
   accept both `camelCase` and `snake_case`, like every other setting.
 - Rust API: `collect_syntax_diagnostics_at` takes a trailing `limit`
@@ -324,7 +418,43 @@ Also:
   `insert_field` and `insert_table` keep their owned parameters, so callers
   that build a model by hand are unaffected. No LSP wire behaviour changes.
 
-## 0.5.0 — unreleased
+## 0.5.2 — 2026-08-05
+
+### Added
+
+- **`unknown-type`** (error). A type position holding a word SurrealQL's
+  kind grammar does not have, such as `LET $x: xxx = 2`, reported nothing;
+  the engine refuses to parse it. It is reported from the syntax pass, so
+  `analysis.enableTypeChecking` does not turn it off. An unknown name also
+  no longer silences later checks: `LET $x: strng = 1` typed `$x` as
+  `strng`, which hid every later fault on `$x`.
+- **Collection elements are checked against the declared type.**
+  `LET $ages: set<int> = { "20", "30" }` and `array<int> = ["20", 30]` were
+  silent. Each element is now judged, uniformly for `array` and `set` and by
+  position and length for a tuple, in `LET`, call arguments and declared
+  return types.
+- **`field-type`** (error). A `DEFINE FIELD … TYPE T` whose `DEFAULT`,
+  `VALUE` or `COMPUTED` cannot satisfy `T`, which the engine fails with
+  ``Couldn't coerce value for field …``. `ASSERT` is not compared: it is a
+  predicate over `$value`, not a value coerced to `T`.
+
+### Compatibility
+
+- LSP wire: two new diagnostic codes, `unknown-type` and `field-type`, both
+  errors, and none renamed.
+
+## 0.5.1 — 2026-08-03
+
+0.5.1 has no section of its own: its changes were written into the 0.5.0
+section below as they landed. They are *Builtin return types come from the
+engine* (with *The registry is unverified, so it is verified here*),
+*Undeclared function return types are inferred*, *Arithmetic operands are
+checked*, *Method calls resolve against the engine's own receiver tables*,
+*Completion offers every builtin, not just the curated 79*, *Three wrong
+answers this replaced* and *Methods reach the rest of the LSP*, and their
+entries under *Testing* and *Known gaps*.
+
+## 0.5.0 — 2026-07-30
 
 Engine-parity release. Two things the server claimed to do but did not:
 completion ignored where the cursor was, and the builtin functions were
@@ -894,7 +1024,7 @@ all 12 of `rand::` including `rand::uuid::v4`.
   feeds hover and completion in that case, which is the intent, but the work
   is still done.
 
-## 0.4.0 — unreleased
+## 0.4.0 — not tagged; shipped in 0.5.0
 
 Type-inference release. Parameter annotations were being discarded
 wholesale — `FunctionParam.type_expr` was *always* `None` — so nothing
@@ -979,7 +1109,7 @@ on it.
   `Diagnostic.data`, and no test covers that path, so it wants a
   deliberate decision rather than being folded into this release.
 
-## 0.3.0 — 2026-07-24
+## 0.3.0 — 2026-07-27
 
 Error-handling and diagnostics release. Everything the server used to
 swallow silently — connection failures, malformed configuration,
