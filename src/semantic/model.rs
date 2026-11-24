@@ -1886,21 +1886,27 @@ impl MergedSemanticModel {
                 title: format!("Add PERMISSIONS clause to table `{}`", table.name),
                 kind: Some(CodeActionKind::REFACTOR_REWRITE),
                 edit: Some(WorkspaceEdit {
-                    document_changes: Some(DocumentChanges::Operations(vec![ls_types::DocumentChangeOperation::Edit(
-                        TextDocumentEdit {
+                    document_changes: Some(DocumentChanges::Operations(vec![
+                        ls_types::DocumentChangeOperation::Edit(TextDocumentEdit {
                             text_document: OptionalVersionedTextDocumentIdentifier {
                                 uri: uri.clone(),
                                 version: None,
                             },
+                            // The statement node stops before its `;`, so the
+                            // clause lands inside the statement. Every group
+                            // needs its own `FOR`: `FOR select FULL, create
+                            // NONE` does not parse.
                             edits: vec![OneOf::Left(TextEdit {
                                 range: Range {
                                     start: table.location.range.end,
                                     end: table.location.range.end,
                                 },
-                                new_text: " PERMISSIONS FOR select FULL, create NONE, update NONE, delete NONE".to_string(),
+                                new_text:
+                                    " PERMISSIONS FOR select FULL, FOR create, update, delete NONE"
+                                        .to_string(),
                             })],
-                        },
-                    )])),
+                        }),
+                    ])),
                     ..WorkspaceEdit::default()
                 }),
                 ..CodeAction::default()

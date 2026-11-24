@@ -1663,6 +1663,103 @@ fn code_action_suggests_add_permissions_for_table_without_rules() {
     );
 }
 
+/// Applies the "Add PERMISSIONS clause" action for `table` to `source` and
+/// returns the edited text.
+fn apply_add_permissions_action(source: &str, table: &str) -> String {
+    use tower_lsp_server::ls_types::{
+        CodeActionOrCommand, DocumentChangeOperation, DocumentChanges, OneOf,
+    };
+
+    let u = uri("schema.surql");
+    let analysis = analyze_document(u.clone(), source, SymbolOrigin::Local).expect("analysis");
+    let model = MergedSemanticModel::default();
+    let title = format!("Add PERMISSIONS clause to table `{table}`");
+    let action = model
+        .code_actions(&u, &analysis, &[])
+        .into_iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) if action.title == title => Some(action),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no `{title}` action for {source:?}"));
+    let Some(DocumentChanges::Operations(operations)) =
+        action.edit.and_then(|edit| edit.document_changes)
+    else {
+        panic!("the action must carry document changes");
+    };
+    let [DocumentChangeOperation::Edit(document_edit)] = operations.as_slice() else {
+        panic!("the action must carry exactly one text document edit");
+    };
+    let [OneOf::Left(edit)] = document_edit.edits.as_slice() else {
+        panic!("the action must carry exactly one text edit");
+    };
+    let start =
+        surrealql_language_server::semantic::text::position_to_offset(source, edit.range.start);
+    let end = surrealql_language_server::semantic::text::position_to_offset(source, edit.range.end);
+    format!("{}{}{}", &source[..start], edit.new_text, &source[end..])
+}
+
+#[test]
+fn add_permissions_code_action_produces_valid_surrealql() {
+    const CLAUSE: &str = " PERMISSIONS FOR select FULL, FOR create, update, delete NONE";
+    let cases = [
+        (
+            "DEFINE TABLE widget SCHEMAFULL;",
+            "widget",
+            format!("DEFINE TABLE widget SCHEMAFULL{CLAUSE};"),
+        ),
+        (
+            "DEFINE TABLE widget",
+            "widget",
+            format!("DEFINE TABLE widget{CLAUSE}"),
+        ),
+        (
+            "DEFINE TABLE widget SCHEMAFULL COMMENT 'parts';\nDEFINE TABLE gadget;\n",
+            "widget",
+            format!(
+                "DEFINE TABLE widget SCHEMAFULL COMMENT 'parts'{CLAUSE};\nDEFINE TABLE gadget;\n"
+            ),
+        ),
+        (
+            "DEFINE TABLE widget;\nDEFINE TABLE gadget TYPE RELATION IN widget OUT widget ;\n",
+            "gadget",
+            format!(
+                "DEFINE TABLE widget;\nDEFINE TABLE gadget TYPE RELATION IN widget OUT widget{CLAUSE} ;\n"
+            ),
+        ),
+        (
+            "DEFINE TABLE widget;\nDEFINE TABLE total AS SELECT count() FROM widget GROUP ALL;",
+            "total",
+            format!(
+                "DEFINE TABLE widget;\nDEFINE TABLE total AS SELECT count() FROM widget GROUP ALL{CLAUSE};"
+            ),
+        ),
+    ];
+    for (source, table, expected) in cases {
+        let before =
+            analyze_document(uri("schema.surql"), source, SymbolOrigin::Local).expect("analysis");
+        assert!(
+            before.syntax_diagnostics.is_empty(),
+            "fixture must parse before the edit: {source:?}: {:?}",
+            before.syntax_diagnostics
+        );
+
+        let edited = apply_add_permissions_action(source, table);
+        assert_eq!(
+            edited, expected,
+            "the clause must land inside the statement, before its `;`"
+        );
+
+        let after =
+            analyze_document(uri("schema.surql"), &edited, SymbolOrigin::Local).expect("analysis");
+        assert!(
+            after.syntax_diagnostics.is_empty(),
+            "the edited document must parse: {edited:?}: {:?}",
+            after.syntax_diagnostics
+        );
+    }
+}
+
 #[test]
 fn full_analysis_pipeline_js_and_surql_mixed() {
     let u = uri("all.surql");
