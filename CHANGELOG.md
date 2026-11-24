@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Table and field `PERMISSIONS` clauses were ignored** (#67). `DEFINE
+  TABLE user SCHEMAFULL PERMISSIONS FULL; CREATE user …` reported
+  `permission-unknown` ("No explicit permission rule found"), and so did
+  `PERMISSIONS FOR select, create, update, delete FULL`. The analyzer read
+  the clause in the shape of an older grammar, so it found no actions and no
+  `FULL` or `NONE`. A SCHEMALESS table showed no warning only because the
+  default `analysis.schemalessDiagnostics` hides `permission-unknown` there.
+  Now `FULL` allows the write and a `WHERE` rule stays `permission-unknown`.
+  `PERMISSIONS NONE` now reports `permission-denied`, an error, where it
+  reported a `permission-unknown` warning. A table's hover shows `public` for
+  `PERMISSIONS FULL`, where it showed `gated`.
+
 ## 0.6.4 — 2026-11-17
 
 ### Grammar

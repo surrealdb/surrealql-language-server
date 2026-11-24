@@ -119,6 +119,9 @@ pub const ENFORCED_CLAUSE: &str = "EnforcedClause";
 
 pub const PERMISSIONS_FOR_CLAUSE: &str = "PermissionsForClause";
 pub const PERMISSIONS_BASIC_CLAUSE: &str = "PermissionsBasicClause";
+/// One `FOR <action>, … FULL | NONE | WHERE …` group inside a
+/// [`PERMISSIONS_FOR_CLAUSE`].
+pub const PERMISSION_GROUP: &str = "PermissionGroup";
 
 // ---- Values and expressions ----------------------------------------------
 

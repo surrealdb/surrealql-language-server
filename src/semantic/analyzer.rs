@@ -413,7 +413,9 @@ fn extract_table(
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
-            .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
+            .flat_map(|child| {
+                parse_permission_rules(*child, TABLE_ACTIONS, source, lines, origin, uri)
+            })
             .collect(),
         origin,
         explicit: true,
@@ -543,7 +545,9 @@ fn extract_field(
         permissions: children
             .iter()
             .filter(|child| child.kind() == k::PERMISSIONS_FOR_CLAUSE)
-            .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
+            .flat_map(|child| {
+                parse_permission_rules(*child, FIELD_ACTIONS, source, lines, origin, uri)
+            })
             .collect(),
         origin,
         explicit: true,
@@ -681,7 +685,9 @@ fn extract_function(
     let permissions = children
         .iter()
         .filter(|child| child.kind() == k::PERMISSIONS_BASIC_CLAUSE)
-        .map(|child| parse_permission_rule(*child, source, lines, origin, uri))
+        .flat_map(|child| {
+            parse_permission_rules(*child, &[QueryAction::Execute], source, lines, origin, uri)
+        })
         .collect::<Vec<_>>();
 
     let body_node = children
@@ -1326,20 +1332,62 @@ fn type_expr_of(node: Node<'_>, source: &str) -> Option<TypeExpr> {
     Some(TypeExpr::from_node(node, source))
 }
 
+/// The actions a bare table `PERMISSIONS FULL | NONE` covers.
+const TABLE_ACTIONS: &[QueryAction] = &[
+    QueryAction::Select,
+    QueryAction::Create,
+    QueryAction::Update,
+    QueryAction::Delete,
+];
+
+/// The actions a bare field `PERMISSIONS FULL | NONE` covers. The engine
+/// rejects `FOR delete` on a field.
+const FIELD_ACTIONS: &[QueryAction] = &[
+    QueryAction::Select,
+    QueryAction::Create,
+    QueryAction::Update,
+];
+
+/// One rule per `FOR …` group of a `PERMISSIONS` clause, or one rule for a
+/// bare `PERMISSIONS FULL | NONE | WHERE …`, which covers `bare_actions`.
+fn parse_permission_rules(
+    clause: Node<'_>,
+    bare_actions: &[QueryAction],
+    source: &str,
+    lines: &LineIndex,
+    origin: SymbolOrigin,
+    uri: &Uri,
+) -> Vec<PermissionRule> {
+    let groups: Vec<_> = k::named_children(clause)
+        .into_iter()
+        .filter(|child| child.kind() == k::PERMISSION_GROUP)
+        .collect();
+    let nodes = if groups.is_empty() {
+        vec![clause]
+    } else {
+        groups
+    };
+    nodes
+        .into_iter()
+        .map(|node| parse_permission_rule(node, bare_actions, source, lines, origin, uri))
+        .collect()
+}
+
 fn parse_permission_rule(
     node: Node<'_>,
+    bare_actions: &[QueryAction],
     source: &str,
     lines: &LineIndex,
     origin: SymbolOrigin,
     uri: &Uri,
 ) -> PermissionRule {
-    // `permissions_for_clause(keyword_permissions, keyword_for,
-    //   keyword_<action>+, where_clause | keyword_full | keyword_none)`
-    // `permissions_basic_clause(keyword_permissions, keyword_full |
-    //   keyword_none | where_clause)`
+    // `PermissionGroup(Keyword FOR, Keyword <action>+,
+    //   Literal | None | WhereClause)`
+    // `PermissionsForClause(Keyword PERMISSIONS, Literal | None)` (bare)
+    // `PermissionsBasicClause(Keyword PERMISSIONS,
+    //   Literal | None | WhereClause)`
     //
-    // Actions come from the dedicated `keyword_select/create/update/delete`
-    // nodes; the mode is FULL/NONE keywords or a `where_clause` expression.
+    // `FULL` is a `Literal` node and `NONE` a `None` node, not keywords.
     let scope = k::named_children(node);
 
     let mut actions = Vec::new();
@@ -1355,12 +1403,12 @@ fn parse_permission_rule(
         }
     }
     if actions.is_empty() {
-        actions.push(QueryAction::Execute);
+        actions = bare_actions.to_vec();
     }
 
-    let mode = if scope.iter().any(|child| k::is_kw(*child, source, "full")) {
+    let mode = if scope.iter().any(|child| child.kind() == k::LITERAL) {
         PermissionMode::Full
-    } else if scope.iter().any(|child| k::is_kw(*child, source, "none")) {
+    } else if scope.iter().any(|child| child.kind() == k::NONE) {
         PermissionMode::None
     } else {
         let expression = scope
@@ -3302,6 +3350,54 @@ mod tests {
         assert_eq!(analysis.indexes[0].fields, vec!["email".to_string()]);
         assert!(analysis.indexes[0].unique);
         assert!(analysis.indexes[0].options.is_empty());
+    }
+
+    /// A bare `PERMISSIONS FULL | NONE` covers every action the statement
+    /// has; a `FOR` group covers only its own (issue #67).
+    #[test]
+    fn reads_bare_and_grouped_permission_clauses() {
+        use crate::semantic::types::{PermissionMode, PermissionRule};
+        use QueryAction::{Create, Delete, Execute, Select, Update};
+
+        let analysis = analyze(
+            "DEFINE TABLE a PERMISSIONS FULL;
+             DEFINE TABLE b PERMISSIONS FOR select, create FULL, FOR delete WHERE $auth.id = id;
+             DEFINE FIELD f ON a PERMISSIONS NONE;
+             DEFINE FUNCTION fn::g() { 1 } PERMISSIONS FULL;",
+        );
+        let rules = |permissions: &[PermissionRule]| {
+            permissions
+                .iter()
+                .map(|rule| (rule.actions.clone(), rule.mode.clone()))
+                .collect::<Vec<_>>()
+        };
+        let table = |name: &str| {
+            let table = analysis.tables.iter().find(|table| table.name == name);
+            rules(&table.expect("table").permissions)
+        };
+
+        assert_eq!(
+            table("a"),
+            vec![(vec![Select, Create, Update, Delete], PermissionMode::Full)]
+        );
+        assert_eq!(
+            table("b"),
+            vec![
+                (vec![Select, Create], PermissionMode::Full),
+                (
+                    vec![Delete],
+                    PermissionMode::Expression("WHERE $auth.id = id".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            rules(&analysis.fields[0].permissions),
+            vec![(vec![Select, Create, Update], PermissionMode::None)]
+        );
+        assert_eq!(
+            rules(&analysis.functions[0].permissions),
+            vec![(vec![Execute], PermissionMode::Full)]
+        );
     }
 
     #[test]
