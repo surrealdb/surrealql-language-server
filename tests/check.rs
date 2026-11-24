@@ -379,3 +379,61 @@ fn a_missing_config_under_json_is_the_error_envelope() {
         "{value}"
     );
 }
+
+/// Table and field `PERMISSIONS FULL` allow the write, written bare or as
+/// `FOR` groups (issue #67). The SCHEMALESS case runs under `strict`, which
+/// does not hide `permission-unknown`.
+#[test]
+fn a_full_permission_clause_allows_the_write() {
+    let dir = scratch("permissions-full");
+    write(
+        &dir,
+        "strict.json",
+        r#"{ "analysis": { "schemalessDiagnostics": "strict" } }"#,
+    );
+    let field = "DEFINE FIELD name ON user TYPE string;\n";
+    let create = "CREATE user SET name = 'a';\n";
+    for schema in [
+        format!("DEFINE TABLE user SCHEMAFULL PERMISSIONS FULL;\n{field}"),
+        format!("DEFINE TABLE user SCHEMALESS PERMISSIONS FULL;\n{field}"),
+        format!(
+            "DEFINE TABLE user SCHEMAFULL PERMISSIONS FOR select, create, update, delete FULL;\n{field}"
+        ),
+        "DEFINE TABLE user SCHEMAFULL;\nDEFINE FIELD name ON user TYPE string PERMISSIONS FULL;\n"
+            .to_string(),
+    ] {
+        write(&dir, "query.surql", &format!("{schema}{create}"));
+        let output = run_check(&dir, &["query.surql", "--config", "strict.json"]);
+        assert_eq!(exit_code(&output), 0, "{schema}{}", stdout(&output));
+        assert!(
+            stdout(&output).contains("0 errors, 0 warnings"),
+            "{schema}{}",
+            stdout(&output)
+        );
+    }
+}
+
+/// `PERMISSIONS NONE` denies the write; a `WHERE` rule stays unknown.
+#[test]
+fn none_denies_and_where_stays_unknown() {
+    let dir = scratch("permissions-none-where");
+    write(
+        &dir,
+        "query.surql",
+        "DEFINE TABLE locked SCHEMAFULL PERMISSIONS NONE;\n\
+         DEFINE TABLE owned SCHEMAFULL PERMISSIONS FOR create WHERE $auth.id = id;\n\
+         CREATE locked;\n\
+         CREATE owned;\n",
+    );
+    let output = run_check(&dir, &["query.surql"]);
+    let text = stdout(&output);
+    assert_eq!(exit_code(&output), 1, "{text}");
+    assert!(
+        text.contains("query.surql:3:8 error[permission-denied]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("query.surql:4:8 warning[permission-unknown]: CREATE on `owned` depends on"),
+        "{text}"
+    );
+}
