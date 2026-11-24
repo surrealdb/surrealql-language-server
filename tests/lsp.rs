@@ -2574,6 +2574,9 @@ fn known_and_user_defined_calls_are_never_unknown_functions() {
         "RETURN mod::lib::f(1);",
         "RETURN silo::org::pkg::f(1);",
         "RETURN ml::model<1.0.0>(1);",
+        // The engine parses a middleware name as a free path, not against the
+        // builtin table.
+        "DEFINE CONFIG API MIDDLEWARE api::req::max_body('1mb') PERMISSIONS FULL;",
     ] {
         let codes = codes_of(&diagnostics_for_with(source, &ServerSettings::default()));
         assert!(

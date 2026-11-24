@@ -2076,12 +2076,20 @@ fn unknown_type_diagnostic(source: &str, lines: &LineIndex, node: Node<'_>) -> O
 ///
 /// Only paths in a namespace the catalogue knows are judged. `fn::`, `mod::`,
 /// `silo::` and `ml::` name user-defined code, and the catalogue cannot say
-/// whether those exist.
+/// whether those exist. A `MIDDLEWARE` name is not judged either: the engine
+/// parses it as a free path and resolves it when a request arrives, so
+/// `api::req::max_body` is valid there although the 3.3 table lacks it.
 fn unknown_function_diagnostic(
     source: &str,
     lines: &LineIndex,
     call: Node<'_>,
 ) -> Option<Diagnostic> {
+    if call
+        .parent()
+        .is_some_and(|parent| parent.kind() == k::MIDDLEWARE_CLAUSE)
+    {
+        return None;
+    }
     let name_node = k::find_child(call, k::FUNCTION_NAME)?;
     let name = k::text_of(source, name_node)?;
     let lower = name.to_ascii_lowercase();
