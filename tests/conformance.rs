@@ -44,8 +44,9 @@ fn uri(path: &str) -> Uri {
 
 /// Every diagnostic this sweep judges for one document.
 ///
-/// The semantic diagnostics, plus the one syntax diagnostic this crate reasons
-/// about rather than merely relays: `unknown-type`. The other syntax codes are
+/// The semantic diagnostics, plus the two syntax diagnostics this crate reasons
+/// about rather than merely relays: `unknown-type` and `unknown-function`. The
+/// other syntax codes are
 /// left out on purpose — `parse` reports whatever the tree-sitter grammar cannot
 /// read, including two shapes it rejects although SurrealDB accepts them
 /// (a union in a `ParamDefinition`, and `array<float, 10>`). Those are grammar
@@ -66,7 +67,8 @@ fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
             .syntax_diagnostics
             .iter()
             .filter(|diagnostic| {
-                diagnostic.code == Some(NumberOrString::String("unknown-type".to_string()))
+                matches!(&diagnostic.code, Some(NumberOrString::String(code))
+                    if code == "unknown-type" || code == "unknown-function")
             })
             .cloned(),
     );
@@ -92,6 +94,7 @@ fn argument_diagnostics(source: &str) -> Vec<(String, String)> {
                     || code == "operator-type"
                     || code == "unknown-method"
                     || code == "unknown-type"
+                    || code == "unknown-function"
                     || code == "field-type" =>
             {
                 Some((code.clone(), diagnostic.message.clone()))
@@ -308,6 +311,12 @@ const EXPECTED: &[(&str, &str)] = &[
     (
         "reproductions/value_clause_type_validation.surql",
         "field-type",
+    ),
+    // `string::slayce()`, declared as `parsing-error = "Invalid
+    // function/constant path, did you maybe mean `string::slice`"`.
+    (
+        "language/functions/path_hints/typo_hint.surql",
+        "unknown-function",
     ),
 ];
 

@@ -83,6 +83,9 @@ Facts a machine consumer must know:
   it. `--config file.json` accepts the same JSON an editor sends the LSP.
 - **`check` never connects to a database.** `SURREALDB_ENDPOINT` has no
   effect on it.
+- **Exit 0 is not proof that SurrealDB accepts the statement.** `check`
+  parses with the pinned grammar and does not run the query. The README
+  section "What `check` cannot detect" lists what it misses.
 
 ## Diagnostic codes
 
@@ -94,6 +97,7 @@ added. Key repairs on the code, not the message text.
 | --- | --- | --- |
 | `parse` | error | Tree-sitter could not parse the source (see the false-positive list below). |
 | `unknown-type` | error | A type position holds a word SurrealQL's kind grammar does not have. |
+| `unknown-function` | error | A call to a path in a builtin namespace SurrealDB does not have (`math::nope(1)`); `data` carries the suggestion. |
 | `unknown-table` | warning | A queried table reads as a typo of an explicitly defined one. |
 | `unknown-field` | warning | A field not defined on an explicit (closed-schema) table. |
 | `permission-denied` | error | Static permission evaluation proved the active auth context is denied. |

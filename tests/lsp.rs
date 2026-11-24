@@ -2539,6 +2539,77 @@ fn a_callable_function_is_never_reported_as_not_callable() {
 }
 
 #[test]
+fn an_unknown_builtin_is_reported_with_the_engines_suggestion() {
+    // The engine's own words: "Invalid function/constant path, did you maybe
+    // mean `math::mode`". It is a parse error there, so it must survive with
+    // type checking off.
+    let mut settings = ServerSettings::default();
+    settings.analysis.enable_type_checking = false;
+    let diagnostics = diagnostics_for_with("RETURN math::nope(1);", &settings);
+    let found: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| codes_of(std::slice::from_ref(d)) == ["unknown-function"])
+        .collect();
+    assert_eq!(found.len(), 1, "got {:?}", messages_of(&diagnostics));
+    assert_eq!(
+        found[0].severity,
+        Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR)
+    );
+    assert_eq!(
+        found[0].data,
+        Some(serde_json::json!({ "function": "math::nope", "suggestion": "math::mode" }))
+    );
+}
+
+#[test]
+fn known_and_user_defined_calls_are_never_unknown_functions() {
+    for source in [
+        "RETURN math::abs(-1);",
+        "RETURN MATH::ABS(-1);",
+        // Old spellings the engine still accepts.
+        "RETURN type::thing('person', 1);",
+        "RETURN string::is::alpha('a');",
+        // Namespaces the catalogue cannot judge.
+        "RETURN fn::missing(1);",
+        "RETURN mod::lib::f(1);",
+        "RETURN silo::org::pkg::f(1);",
+        "RETURN ml::model<1.0.0>(1);",
+        // The engine parses a middleware name as a free path, not against the
+        // builtin table.
+        "DEFINE CONFIG API MIDDLEWARE api::req::max_body('1mb') PERMISSIONS FULL;",
+    ] {
+        let codes = codes_of(&diagnostics_for_with(source, &ServerSettings::default()));
+        assert!(
+            !codes.contains(&"unknown-function".to_string()),
+            "{source} got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_builtin_inside_a_known_call_is_reported() {
+    let codes = codes_of(&diagnostics_for_with(
+        "RETURN math::abs(math::nope(1));",
+        &ServerSettings::default(),
+    ));
+    assert!(codes.contains(&"unknown-function".to_string()), "{codes:?}");
+}
+
+#[test]
+fn an_empty_where_is_a_parse_error() {
+    // The grammar makes the condition optional; the engine does not:
+    // "Unexpected token ';', expected an expression".
+    for source in [
+        "SELECT * FROM person WHERE;",
+        "DELETE person WHERE /* nothing */;",
+    ] {
+        let codes = codes_of(&syntax_diagnostics_for(source));
+        assert_eq!(codes, ["parse"], "{source}");
+    }
+    assert!(syntax_diagnostics_for("SELECT * FROM person WHERE age > 1;").is_empty());
+}
+
+#[test]
 fn a_function_whose_signature_was_not_read_is_never_flagged() {
     // The nine names the parser accepts and no dispatch arm implements. Their
     // signatures are unknown, so any count must stay silent.

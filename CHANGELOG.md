@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+
+- **`unknown-function`, a new diagnostic code (error).** A call to a path in a
+  builtin namespace that SurrealDB does not have, such as `math::nope(1)`, is
+  now reported, with the engine's own did-you-mean in the message and as
+  `{"function", "suggestion"}` in `data`. SurrealDB rejects such a call at
+  parse time, so the check runs in the syntax pass and type checking does not
+  turn it off. `fn::`, `mod::`, `silo::` and `ml::` calls are never judged.
+  ([#66](https://github.com/surrealdb/surrealql-language-server/issues/66))
+
+### Fixed
+
+- `SELECT * FROM person WHERE;` is now a `parse` error. The grammar accepts a
+  `WHERE` with no condition, but SurrealDB does not, so `check` exited 0 on a
+  statement that cannot run.
+  ([#66](https://github.com/surrealdb/surrealql-language-server/issues/66))
+
 ## 0.6.4 — 2026-11-17
 
 ### Grammar

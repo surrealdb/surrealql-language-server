@@ -285,6 +285,28 @@ the older spelling, still works and prints the same bytes.
 }
 ```
 
+### What `check` cannot detect
+
+`check` reads the source and does not run it. Exit code 0 means that `check`
+found no fault. It does not prove that SurrealDB accepts the statement.
+
+These faults are outside what `check` can see:
+
+- **Syntax that the grammar and the engine disagree on.** `check` parses with
+  the pinned tree-sitter grammar, not with the SurrealDB parser. Each accepts
+  some statements that the other rejects.
+  [`docs/grammar-gaps.md`](docs/grammar-gaps.md) lists the known differences.
+- **Faults that depend on data.** `check` does not connect to a database, so
+  it cannot see record contents, `$param` values bound at run time, or the
+  result of a row-level permission.
+- **Functions that it cannot see.** A call to a `fn::` function that is not
+  defined in the checked files or in `--workspace` is not checked. Calls to
+  `mod::`, `silo::` and `ml::` functions are never checked.
+- **Builtins from a different SurrealDB release.** The builtin catalogue,
+  [`builtins.json`](builtins.json), comes from one SurrealDB release. A
+  function that a later release adds is reported as `unknown-function`, and a
+  function that a later release removes is not reported.
+
 [`AGENTS.md`](AGENTS.md) is the agent-facing contract: the check loop, the
 diagnostic-code table, and the known grammar gaps an agent must not "fix".
 [`llms.txt`](llms.txt) indexes the machine-consumable resources, including
