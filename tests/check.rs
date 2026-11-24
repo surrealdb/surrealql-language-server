@@ -72,6 +72,32 @@ fn a_parse_error_exits_one() {
 }
 
 #[test]
+fn a_sized_number_type_is_not_an_unknown_type() {
+    // surrealdb/surrealql-language-server#65: SurrealDB 4.0 accepts `i8` and
+    // `f16`, but a name it does not have, such as `int32`, is still reported.
+    let dir = scratch("sized-kind");
+    write(
+        &dir,
+        "schema.surql",
+        "DEFINE TABLE t SCHEMAFULL;\n\
+         DEFINE FIELD c ON t TYPE i8;\n\
+         DEFINE FIELD d ON t TYPE f16;\n\
+         DEFINE FIELD e ON t TYPE int32;\n",
+    );
+    let output = run_check(&dir, &["schema.surql"]);
+    let text = stdout(&output);
+    assert_eq!(exit_code(&output), 1, "got: {text}");
+    assert!(
+        text.contains("schema.surql:4:26 error[unknown-type]"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("1 error, 0 warnings in 1 file"),
+        "got: {text}"
+    );
+}
+
+#[test]
 fn an_unknown_table_is_a_warning_and_fail_on_raises_it() {
     let dir = scratch("unknown-table");
     // Schema inference from usage is a feature, so a bare unknown name

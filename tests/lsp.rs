@@ -546,6 +546,7 @@ fn stays_silent_for_a_table_bucket_or_geometry_argument() {
     for source in [
         "LET $a: record<person> = 2;",
         "LET $b: table<person> = 2;",
+        "LET $b2: tb<person> = 2;",
         "LET $c: file<bucket> = 2;",
         "LET $d: geometry<multipoint> = 2;",
         "LET $e: option<array<record<person>>> = 2;",
