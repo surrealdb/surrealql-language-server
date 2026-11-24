@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`unknown-type` reported type names SurrealDB 4.0 accepts.** `DEFINE
+  FIELD c ON t TYPE i8` and `… TYPE f16` failed `check` with exit 1. The
+  sized number types (`i8` … `u64`, `f16` … `f64`), `bigdecimal`, `date`,
+  `time`, `timestamp`, `interval`, `enum` and the `tb` alias of `table` are
+  now known. A name SurrealDB does not have, such as `int32`, is still
+  reported. ([#65](https://github.com/surrealdb/surrealql-language-server/issues/65))
+
 ## 0.6.4 — 2026-11-17
 
 ### Grammar
