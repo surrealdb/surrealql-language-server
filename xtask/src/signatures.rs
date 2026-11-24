@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::{FnArg, Item, ItemFn, ItemMod, Pat, ReturnType, Type, Visibility};
 
@@ -108,6 +109,8 @@ fn join(prefix: &str, segment: &str) -> String {
 
 /// Recurse through items, extending the module path at each nested `pub mod`.
 fn walk(items: &[Item], module_path: &str, out: &mut BTreeMap<String, Implementation>) {
+    let mut now = Vec::new();
+    let mut templates: BTreeMap<String, TokenStream> = BTreeMap::new();
     for item in items {
         match item {
             Item::Fn(function) if is_public(&function.vis) => {
@@ -127,9 +130,101 @@ fn walk(items: &[Item], module_path: &str, out: &mut BTreeMap<String, Implementa
                 let segment = strip_raw(&ident);
                 walk(nested, &format!("{module_path}::{segment}"), out);
             }
+            Item::Macro(invocation) if invocation.mac.path.is_ident("now") => {
+                now.extend(now_entries(invocation.mac.tokens.clone()));
+            }
+            Item::Macro(definition) if definition.mac.path.is_ident("macro_rules") => {
+                if let Some(name) = &definition.ident
+                    && let Some(signature) = template_signature(definition.mac.tokens.clone())
+                {
+                    templates.insert(name.to_string(), signature);
+                }
+            }
+            // `calendar_accessor!(day, …)` stamps out `pub fn day` from a
+            // template whose signature is fixed (SurrealDB 4,
+            // `runtime/src/time_kinds.rs`).
+            Item::Macro(invocation) => {
+                let template = invocation
+                    .mac
+                    .path
+                    .get_ident()
+                    .and_then(|name| templates.get(&name.to_string()));
+                if let Some(signature) = template
+                    && let Some(TokenTree::Ident(name)) =
+                        invocation.mac.tokens.clone().into_iter().next()
+                    && let Ok(function) =
+                        syn::parse2::<ItemFn>(quote::quote! { pub fn #name #signature {} })
+                    && let Some(implementation) = read_function(&function, module_path)
+                {
+                    out.insert(implementation.path.clone(), implementation);
+                }
+            }
             _ => {}
         }
     }
+    // `now! { max = max_walk((Vec<Number>,)); }` defines a synchronous `max`
+    // that drives the async `max_walk` to its end, so the two take the same
+    // arguments (SurrealDB 4, `runtime/src/math.rs`).
+    for (name, walk) in now {
+        if let Some(found) = out.get(&format!("{module_path}::{walk}")).cloned() {
+            let path = format!("{module_path}::{name}");
+            out.insert(
+                path.clone(),
+                Implementation {
+                    path,
+                    params: found.params,
+                    is_async: false,
+                },
+            );
+        }
+    }
+}
+
+/// The arguments and return type of the `fn $name(…) -> …` a `macro_rules!`
+/// template defines, when neither mentions another metavariable.
+fn template_signature(tokens: TokenStream) -> Option<TokenStream> {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if let TokenTree::Group(group) = token
+            && let Some(found) = template_signature(group.stream())
+        {
+            return Some(found);
+        }
+        if let [
+            TokenTree::Ident(keyword),
+            TokenTree::Punct(dollar),
+            TokenTree::Ident(_),
+            rest @ ..,
+        ] = &tokens[index..]
+            && keyword == "fn"
+            && dollar.as_char() == '$'
+        {
+            // Everything up to the body.
+            let signature: TokenStream = rest
+                .iter()
+                .take_while(|token| !matches!(token, TokenTree::Group(body) if body.delimiter() == Delimiter::Brace))
+                .cloned()
+                .collect();
+            return (!signature.to_string().contains('$')).then_some(signature);
+        }
+    }
+    None
+}
+
+/// The `name = walk` pairs of a `now! { … }` invocation.
+fn now_entries(tokens: TokenStream) -> Vec<(String, String)> {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    tokens
+        .windows(3)
+        .filter_map(|window| match window {
+            [
+                TokenTree::Ident(name),
+                TokenTree::Punct(equals),
+                TokenTree::Ident(walk),
+            ] if equals.as_char() == '=' => Some((name.to_string(), walk.to_string())),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_public(vis: &Visibility) -> bool {

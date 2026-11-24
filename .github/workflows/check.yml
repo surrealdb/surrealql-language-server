@@ -25,7 +25,8 @@ jobs:
               run: bash scripts/setup-grammar.sh
             # The revision `src/grammar_generated.rs` was generated from, in full
             # so a shallow fetch can ask for it by name. Its 9-character
-            # abbreviation `9d9a5b069` is what the catalogue header records.
+            # abbreviation `1126de404` is what the catalogue header records. It is
+            # tag v4.0.1.
             #
             # Without this checkout the catalogue freshness test skips, and it
             # skipped for the whole life of the generator: the return types and
@@ -34,7 +35,7 @@ jobs:
               run: |
                   git init ../surrealdb
                   git -C ../surrealdb remote add origin https://github.com/surrealdb/surrealdb
-                  git -C ../surrealdb fetch --depth 1 origin 9d9a5b0693e499e0d030cac6b618062ec02cd2bc
+                  git -C ../surrealdb fetch --depth 1 origin 1126de4046e33b8e677fb587d700c827c0050b4a
                   git -C ../surrealdb checkout FETCH_HEAD
             - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:

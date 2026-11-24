@@ -950,6 +950,22 @@ fn hover_for_builtin_function_includes_docs_link() {
 }
 
 #[test]
+fn hover_and_completion_know_the_functions_surrealdb_4_added() {
+    let model = MergedSemanticModel::default();
+    for name in ["type::i32", "time::trunc"] {
+        assert!(
+            model.hover_markdown_for_token(name, None).is_some(),
+            "no hover for {name}"
+        );
+        let items = model.completion_items(name, false, None, None, None);
+        assert!(
+            items.iter().any(|item| item.label == name),
+            "no completion for {name}"
+        );
+    }
+}
+
+#[test]
 fn hover_for_special_variable() {
     let model = MergedSemanticModel::default();
     let hover = model
@@ -2498,32 +2514,6 @@ fn a_zero_argument_builtin_still_rejects_arguments() {
 }
 
 #[test]
-fn a_name_that_parses_but_cannot_be_called_is_reported() {
-    // Nine names sit in the parser's table with no implementation behind them,
-    // so the query parses and then fails at run time.
-    let diagnostics = diagnostics_for("RETURN duration::set_day(1d, 3);");
-    let codes = codes_of(&diagnostics);
-    assert!(
-        codes.contains(&"not-callable".to_string()),
-        "got {:?}",
-        messages_of(&diagnostics)
-    );
-    // A warning, not an error: the claim rests on reading the engine's dispatch
-    // tables rather than on the language definition.
-    assert!(
-        diagnostics
-            .iter()
-            .filter(|d| matches!(
-                &d.code,
-                Some(tower_lsp_server::ls_types::NumberOrString::String(code))
-                    if code == "not-callable"
-            ))
-            .all(|d| d.severity == Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)),
-        "not-callable must be a warning"
-    );
-}
-
-#[test]
 fn a_callable_function_is_never_reported_as_not_callable() {
     for source in [
         "RETURN time::day(d'2024-01-01T00:00:00Z');",
@@ -2540,12 +2530,10 @@ fn a_callable_function_is_never_reported_as_not_callable() {
 
 #[test]
 fn a_function_whose_signature_was_not_read_is_never_flagged() {
-    // The nine names the parser accepts and no dispatch arm implements. Their
-    // signatures are unknown, so any count must stay silent.
-    for source in [
-        "RETURN duration::set_day(1d, 3);",
-        "RETURN object::matches({}, {});",
-    ] {
+    // `rand::float` takes zero or two arguments, an arity the catalogue cannot
+    // represent, and `api::timeout` has runtime-supplied leading arguments.
+    // Their signatures are unknown, so any count must stay silent.
+    for source in ["RETURN rand::float(1, 10);", "RETURN api::timeout(30s);"] {
         let codes = codes_of(&diagnostics_for(source));
         assert!(
             !codes.contains(&"argument-count".to_string()),
@@ -2971,7 +2959,7 @@ fn argument_types_are_checked_across_namespaces_the_curated_table_never_had() {
     for (source, function) in [
         ("RETURN math::clamp('a', 1, 10);", "math::clamp"),
         ("RETURN array::at('nope', 0);", "array::at"),
-        ("RETURN time::day(true);", "time::day"),
+        ("RETURN time::from_secs(true);", "time::from_secs"),
         ("RETURN duration::days(true);", "duration::days"),
         ("RETURN object::keys(42);", "object::keys"),
     ] {

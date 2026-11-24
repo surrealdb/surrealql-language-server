@@ -15,7 +15,7 @@
 
 ## Data
 
-- [builtins.json (latest release)](https://github.com/surrealdb/surrealql-language-server/releases/latest/download/builtins.json): 434 builtin functions with signatures, return types, arity, renames and method receivers; `params: null` means the signature is unknown, not zero-arity
+- [builtins.json (latest release)](https://github.com/surrealdb/surrealql-language-server/releases/latest/download/builtins.json): 479 builtin functions with signatures, return types, arity, renames and method receivers; `params: null` means the signature is unknown, not zero-arity
 - [npm package](https://www.npmjs.com/package/@surrealdb/surrealql-language-server): browser WASM build; `builtins.json` resolves as `@surrealdb/surrealql-language-server/builtins.json`
 
 ## Binaries

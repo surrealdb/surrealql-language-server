@@ -53,7 +53,7 @@ pub struct GeneratedParam {
     pub form: ParamForm,
 }
 
-/// One method, and the function `fnc::idiom` dispatches it to.
+/// One method, and the function the engine's method registry dispatches it to.
 ///
 /// Generated from the engine's receiver tables. See
 /// [`crate::grammar_generated::GENERATED_RECEIVERS`].
@@ -63,12 +63,12 @@ pub struct GeneratedMethod {
     pub method: &'static str,
     /// The function this resolves to, ready for [`builtin_signature`].
     ///
-    /// Where several names share one implementation — `array::all` and
-    /// `array::every` do — this is whichever sorts first. They have identical
-    /// parameters by construction, so only the name shown in hover differs.
+    /// The name the engine registers the method against, so an alias such as
+    /// `every` resolves to the function it copies, `array::all`.
     pub function: &'static str,
-    /// The experimental target this method sits behind, when it has one. Every
-    /// `file::` method is behind `Files`.
+    /// The experimental target this method sits behind, when it has one.
+    /// SurrealDB 4 gates no method, so this is always `None`; it stays for the
+    /// published shape.
     pub experimental: Option<&'static str>,
 }
 
@@ -86,7 +86,7 @@ pub struct GeneratedReceiver {
 /// Deliberately separate from [`BuiltinFunction`]: that table carries curated
 /// prose (`summary`, `documentation_url`) which no generator can produce, and
 /// this one carries the argument and return types which no human should
-/// transcribe 434 times. Lookups read both.
+/// transcribe 479 times. Lookups read both.
 #[derive(Debug, Clone, Copy)]
 pub struct GeneratedFunction {
     pub name: &'static str,
@@ -699,7 +699,7 @@ pub fn builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
 /// `math::abs(-1)` was unknown while `(-1).abs()` was a number, because the two
 /// paths consulted different tables.
 ///
-/// The curated table is read first. It is narrower — 79 entries against 434 —
+/// The curated table is read first. It is narrower — 79 entries against 479 —
 /// but a human wrote each one against the documentation, and where it is more
 /// specific than the engine it stays more specific: the engine's macros cannot
 /// spell `array<string>`, so `string::split` declares `Any` there and

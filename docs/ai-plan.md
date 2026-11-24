@@ -106,7 +106,7 @@ Effort: small once (1) exists; the CLI plumbing is shared.
 
 ### 4. Publish the builtin catalogue as data
 
-The catalogue is our most defensible artifact — 434 functions with
+The catalogue is our most defensible artifact — 479 functions with
 signatures, return types and renames, generated from SurrealDB's own source,
 freshness-checked in CI. Today it's locked inside a `.rs` file.
 

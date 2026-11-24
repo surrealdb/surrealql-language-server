@@ -5,9 +5,11 @@
 //! The documentation does not answer this. It never states a rule for
 //! `string + int`, and it never states a rule for numeric promotion in
 //! arithmetic — its operators page shows same-type examples only. So every
-//! table here is read from the engine at revision `9d9a5b069`, the revision
-//! [`crate::grammar_generated::SURREALDB_REVISION`] already pins, and each one
-//! cites the file and lines it came from.
+//! table here was read from the engine at revision `9d9a5b069` (SurrealDB 3.3),
+//! and each one cites the file and lines it came from there. Every arm for a
+//! kind modelled here is unchanged in 4.0.1 (`expr/src/val/mod.rs`, and
+//! `NumberKind::join` for numeric promotion); 4.0 adds arms only for its new
+//! numeric and temporal kinds, which this lattice does not model yet.
 //!
 //! The tables are also irregular enough that no shared rule would capture them:
 //! `+` concatenates two strings but rejects a string and an int; `*` accepts

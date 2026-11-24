@@ -7,9 +7,9 @@
 //! `123.to_float()` is `type::float`, `"abc".is_alphanum()` is
 //! `string::is_alphanum`, `$point.area()` is `geo::area`.
 //!
-//! The real tables are generated from the engine's own `fnc::idiom` into
-//! [`GENERATED_RECEIVERS`] — 12 tables, 820 arms. This module is the lookup over
-//! them.
+//! The real tables are generated from the engine's own `build_method_registry`
+//! into [`GENERATED_RECEIVERS`] — 16 tables, 1215 arms. This module is the lookup
+//! over them.
 //!
 //! # The gate
 //!
@@ -236,9 +236,9 @@ mod tests {
 
     #[test]
     fn the_string_table_shadows_the_shared_block() {
-        // `String` overrides four common arms and drops one. Getting this wrong
-        // means the wrong arity: `string::is_datetime` takes an optional format
-        // argument and `type::is_datetime` does not.
+        // `String` overrides common arms. Getting this wrong means the wrong
+        // arity: `string::is_datetime` takes an optional format argument and
+        // `type::is_datetime` does not.
         let string = scalar("string");
         assert_eq!(
             resolve(&string, "repeat").map(|found| found.function),
@@ -248,9 +248,6 @@ mod tests {
             resolve(&string, "is_datetime").map(|found| found.function),
             Some("string::is_datetime")
         );
-        // Absent from `String`, present everywhere else.
-        assert!(resolve(&string, "is_set").is_none());
-        assert!(resolve(&scalar("int"), "is_set").is_some());
     }
 
     #[test]
@@ -329,15 +326,6 @@ mod tests {
             resolve(&array, "all").map(|found| found.function),
             Some("array::all")
         );
-    }
-
-    #[test]
-    fn a_file_method_is_marked_experimental() {
-        let file = resolve(&scalar("file"), "get").expect("file::get");
-        assert_eq!(file.experimental, Some("Files"));
-        // And nothing else is.
-        let string = resolve(&scalar("string"), "len").expect("string::len");
-        assert_eq!(string.experimental, None);
     }
 
     #[test]

@@ -3676,10 +3676,7 @@ mod tests {
             ),
             ("array::at", "array::at(array: array, i: int)"),
             ("crypto::sha256", "crypto::sha256(arg: string)"),
-            (
-                "time::floor",
-                "time::floor(val: datetime, duration: duration)",
-            ),
+            ("time::floor", "time::floor(val: any, duration: duration)"),
         ] {
             let hover = model
                 .hover_markdown_for_token(token, None)
@@ -3710,18 +3707,6 @@ mod tests {
             .expect("hover");
         assert!(hover.contains("Returns the length of a string"), "{hover}");
         assert!(hover.contains("-> number"), "{hover}");
-    }
-
-    #[test]
-    fn hover_marks_a_name_that_parses_but_cannot_be_called() {
-        let model = MergedSemanticModel::default();
-        let hover = model
-            .hover_markdown_for_token("duration::set_day", None)
-            .expect("hover");
-        assert!(
-            hover.contains("no implementation is reachable"),
-            "the nine parse-but-not-callable names should say so:\n{hover}"
-        );
     }
 
     #[test]
