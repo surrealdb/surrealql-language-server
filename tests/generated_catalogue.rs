@@ -66,8 +66,9 @@ fn the_catalogue_records_which_revision_it_came_from() {
 #[test]
 fn the_catalogue_covers_the_whole_engine_surface() {
     // The engine's own counts, verified against
-    // `syn/parser/builtin.rs` (434 PathKind::Function + 27 PathKind::Constant).
-    assert_eq!(GENERATED_FUNCTIONS.len(), 434);
+    // `expr/src/expr/builtin_paths.rs` (479 PathKind::Function + 27
+    // PathKind::Constant).
+    assert_eq!(GENERATED_FUNCTIONS.len(), 479);
     assert_eq!(GENERATED_CONSTANTS.len(), 27);
     assert_eq!(RENAMED_FUNCTIONS.len(), 62);
 }
@@ -93,6 +94,7 @@ fn only_the_known_exceptions_have_an_unreadable_signature() {
         vec![
             "api::invoke",
             "api::req::body",
+            "api::req::max_body",
             "api::res::body",
             "api::res::header",
             "api::res::headers",
@@ -139,22 +141,13 @@ fn an_unknown_signature_never_looks_like_zero_arity() {
 }
 
 #[test]
-fn the_names_that_parse_but_cannot_be_called_are_the_known_nine() {
-    let mut found: Vec<&str> = PARSES_BUT_NOT_CALLABLE.to_vec();
-    found.sort_unstable();
+fn every_name_that_parses_can_be_called() {
+    // SurrealDB 3.3 had nine: `duration::set_*` and `object::matches` with no
+    // dispatch arm, and `value::chain` as a method only. 4.0 removed the first
+    // eight from the parser and gave `value::chain` an implementation.
     assert_eq!(
-        found,
-        vec![
-            "duration::set_day",
-            "duration::set_hour",
-            "duration::set_minute",
-            "duration::set_month",
-            "duration::set_nanosecond",
-            "duration::set_second",
-            "duration::set_year",
-            "object::matches",
-            "value::chain",
-        ],
+        PARSES_BUT_NOT_CALLABLE,
+        &[] as &[&str],
         "the set of parse-but-not-callable names changed"
     );
 }
@@ -296,7 +289,7 @@ fn the_catalogue_types_the_majority_of_callable_returns() {
 
 #[test]
 fn a_name_that_cannot_be_called_is_never_given_a_return_type() {
-    // The engine refuses to run these nine, so a return type for one of them
+    // The engine refuses to run these, so a return type for one of them
     // would describe a call that always fails.
     for function in GENERATED_FUNCTIONS {
         if function.not_callable {

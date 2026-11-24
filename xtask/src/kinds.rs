@@ -46,6 +46,9 @@ const CONTEXT_TYPES: &[&str] = &[
     "CursorDoc",
     "QueryExecutor",
     "Context",
+    // `ev: Option<&dyn ClosureEvaluator>`, how SurrealDB 4 hands the
+    // closure-taking builtins (`array::map`, `value::chain`) a way to call back.
+    "ClosureEvaluator",
 ];
 
 /// True when this tuple element is engine-injected rather than author-supplied.

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- **The builtin catalogue now comes from SurrealDB v4.0.1** (`1126de404`),
+  not `9d9a5b069` (3.3). It has 479 functions instead of 434, so hover,
+  signature help and completion now know `type::i32`, `time::trunc` and the
+  other functions 4.0 added, such as the `interval::` and `enum::` families
+  (#68). `duration::set_*` and `object::matches`, which 4.0 removed, are gone,
+  so no name reports `not-callable` now. `builtins.json` keeps its shape. Its
+  method tables add the `Date`, `Time`, `Timestamp` and `Interval` receivers,
+  and no file method is marked experimental.
+- `cargo xtask generate-builtins` reads the SurrealDB 4 source layout: the
+  names from `expr/src/expr/builtin_paths.rs`, the methods from
+  `exec/function/method.rs`, and the signatures from `runtime/src` as well as
+  `fnc/`. It no longer reads a 3.x checkout.
+
 ## 0.6.4 — 2026-11-17
 
 ### Grammar

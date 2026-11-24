@@ -335,7 +335,7 @@ never read it as zero-arity.
 
 These targets do not need the grammar checkout: `cargo run --package xtask` never builds the root package, so `build.rs` does not run.
 
-The generator reads four places in the engine: `syn/parser/builtin.rs` for the names, `fnc/mod.rs` for the dispatch and method tables, the `pub fn` signatures under `fnc/` for the argument types, and `exec/function/builtin/` for the return types.
+The generator reads five places in the engine: `expr/src/expr/builtin_paths.rs` for the names, `core/src/fnc/mod.rs` for the dispatch tables, `core/src/exec/function/method.rs` for the method tables, the `pub fn` signatures under `core/src/fnc/` and `runtime/src/` for the argument types, and `core/src/exec/function/builtin/` for the return types.
 
 SurrealDB never reads its own return-type registry, so a wrong declaration there would compile and ship. To check them by running them:
 

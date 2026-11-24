@@ -2751,8 +2751,8 @@ fn check_builtin_call(
         return;
     };
     // The parser accepts the name, but nothing implements it in call form, so
-    // the query parses and then fails at run time. Nine names today, among them
-    // `duration::set_day` and `object::matches`.
+    // the query parses and then fails at run time. SurrealDB 3.3 had nine, among
+    // them `duration::set_day`; 4.0.1 has none.
     if signature.generated.not_callable {
         out.push(warning(
             node_range(ctx, arg_list),

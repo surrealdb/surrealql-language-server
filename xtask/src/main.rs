@@ -172,12 +172,13 @@ fn verify_returns(_surrealdb: &Path) -> Result<String, String> {
 /// Read the engine's tables and join them, with the coverage gates applied.
 fn build_catalogue(surrealdb: &Path) -> Result<emit::Catalogue, String> {
     let core = surrealdb.join("surrealdb/core/src");
-    let builtin_rs = core.join("syn/parser/builtin.rs");
+    let builtin_rs = surrealdb.join("surrealdb/expr/src/expr/builtin_paths.rs");
     let fnc_dir = core.join("fnc");
     let fnc_mod_rs = fnc_dir.join("mod.rs");
     let registry_dir = core.join("exec/function/builtin");
+    let method_rs = core.join("exec/function/method.rs");
 
-    for path in [&builtin_rs, &fnc_mod_rs, &registry_dir] {
+    for path in [&builtin_rs, &fnc_mod_rs, &registry_dir, &method_rs] {
         if !path.exists() {
             return Err(format!(
                 "{} is missing — is {} a SurrealDB checkout?",
@@ -189,12 +190,15 @@ fn build_catalogue(surrealdb: &Path) -> Result<emit::Catalogue, String> {
 
     let paths = engine_tables::parse_paths(&builtin_rs)?;
     let dispatch = engine_tables::parse_dispatch(&fnc_mod_rs)?;
-    let implementations = signatures::collect(&fnc_dir)?;
+    // SurrealDB 4 moved the pure families one crate down, into `runtime`, and
+    // `fnc/` re-exports them under the same module paths.
+    let mut implementations = signatures::collect(&surrealdb.join("surrealdb/runtime/src"))?;
+    implementations.extend(signatures::collect(&fnc_dir)?);
     let declared_returns = returns::collect(&registry_dir)?;
     let namespaces = engine_tables::namespaces(&paths);
     let revision = git_revision(surrealdb).unwrap_or_else(|| "unknown".to_string());
 
-    let receivers = methods::parse(&fnc_mod_rs)?;
+    let receivers = methods::parse(&method_rs)?;
     let catalogue = emit::build(
         &paths,
         &dispatch,

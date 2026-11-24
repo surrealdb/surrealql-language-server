@@ -1,10 +1,11 @@
 -- Copied verbatim from SurrealDB's own language tests:
 --   language-tests/tests/language/functions/method_syntax.surql
--- at revision 9d9a5b069, the revision src/grammar_generated.rs pins.
+-- at revision 1126de404 (v4.0.1), the revision src/grammar_generated.rs pins.
+-- The file is unchanged since 9d9a5b069 (3.3).
 --
 -- Its front matter is the engine's own assertion that none of these calls
 -- errors, so every diagnostic the server produces here is a false positive.
--- 198 calls, covering 93% of the 252 method names in fnc::idiom.
+-- 198 calls, written against the 252 method names SurrealDB 3.3 registered.
 --
 -- Refresh by re-copying the file after a revision bump.
 

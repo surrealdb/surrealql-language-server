@@ -1,10 +1,10 @@
 //! The two engine tables that decide which names exist and where each one is
 //! implemented.
 //!
-//! * `syn/parser/builtin.rs` holds `PATHS`, a `phf_map!` of every name the
-//!   parser accepts. It is the authority on the spelling authors write, and its
-//!   third tuple slot carries the previous spelling for the names that were
-//!   renamed.
+//! * `expr/src/expr/builtin_paths.rs` holds `PATHS`, a `phf_map!` of every
+//!   name the parser accepts. It is the authority on the spelling authors write,
+//!   and the `Some(…)` in its tuple carries the previous spelling for the names
+//!   that were renamed.
 //! * `fnc/mod.rs` holds the `dispatch!` tables, which map that spelling to the
 //!   implementation. A name in `PATHS` with no dispatch arm parses and then
 //!   fails at run time.
@@ -27,7 +27,7 @@ pub struct PathEntry {
     pub previous_name: Option<String>,
 }
 
-/// Parse `PATHS` out of `syn/parser/builtin.rs`.
+/// Parse `PATHS` out of `expr/src/expr/builtin_paths.rs`.
 pub fn parse_paths(builtin_rs: &Path) -> Result<Vec<PathEntry>, String> {
     let source = std::fs::read_to_string(builtin_rs)
         .map_err(|error| format!("cannot read {}: {error}", builtin_rs.display()))?;
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn a_function_entry_is_read() {
         let entries =
-            parse_from_str("UniCase::ascii(\"array::at\") => (PathKind::Function, None),");
+            parse_from_str("UniCase::ascii(\"array::at\") => (PathKind::Function, None, FIRST),");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "array::at");
         assert!(entries[0].is_function);
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn a_constant_entry_is_marked_as_not_a_function() {
         let entries = parse_from_str(
-            "UniCase::ascii(\"math::PI\") => (PathKind::Constant(Constant::MathPi), None),",
+            "UniCase::ascii(\"math::PI\") => (PathKind::Constant(Constant::MathPi), None, FIRST),",
         );
         assert!(!entries[0].is_function);
     }
@@ -202,9 +202,12 @@ mod tests {
     #[test]
     fn a_renamed_entry_keeps_its_previous_spelling() {
         let entries = parse_from_str(
-            "UniCase::ascii(\"type::record\") => (PathKind::Function, Some(UniCase::ascii(\"type::thing\"))),",
+            "UniCase::ascii(\"duration::from_days\") => (PathKind::Function, Some(UniCase::ascii(\"duration::from::days\")), FIRST),",
         );
-        assert_eq!(entries[0].previous_name.as_deref(), Some("type::thing"));
+        assert_eq!(
+            entries[0].previous_name.as_deref(),
+            Some("duration::from::days")
+        );
     }
 
     fn parse_from_str(source: &str) -> Vec<PathEntry> {
