@@ -71,6 +71,31 @@ fn a_parse_error_exits_one() {
     assert!(text.contains("broken.surql:1:"), "got: {text}");
 }
 
+/// Issue #66: SurrealDB rejects both statements at parse time, so a clean exit
+/// would tell a CI gate they run.
+#[test]
+fn statements_the_engine_rejects_at_parse_time_exit_one() {
+    let dir = scratch("engine-parse-errors");
+    for (name, source, code) in [
+        (
+            "where.surql",
+            "SELECT * FROM person WHERE;\n",
+            "error[parse]",
+        ),
+        (
+            "nope.surql",
+            "RETURN math::nope(1);\n",
+            "error[unknown-function]",
+        ),
+    ] {
+        write(&dir, name, source);
+        let output = run_check(&dir, &[name]);
+        assert_eq!(exit_code(&output), 1, "{source}");
+        let text = stdout(&output);
+        assert!(text.contains(code), "{source} got: {text}");
+    }
+}
+
 #[test]
 fn an_unknown_table_is_a_warning_and_fail_on_raises_it() {
     let dir = scratch("unknown-table");

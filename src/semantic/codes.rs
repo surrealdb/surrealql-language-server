@@ -65,6 +65,12 @@ pub const FIELD_TYPE: &str = "field-type";
 /// therefore reported from the syntax pass and is not gated by
 /// `analysis.enable_type_checking` — see [`crate::semantic::type_name`].
 pub const UNKNOWN_TYPE: &str = "unknown-type";
+/// A call to a path in a builtin namespace that SurrealDB does not have, such as
+/// `math::nope(1)`. Like [`UNKNOWN_TYPE`] this is a syntax fault: the engine
+/// rejects the path at parse time with `Invalid function/constant path`, so it
+/// is reported from the syntax pass and is not gated by
+/// `analysis.enable_type_checking`.
+pub const UNKNOWN_FUNCTION: &str = "unknown-function";
 /// A statement whose parse tree is deeper than
 /// [`crate::semantic::analyzer::MAX_TREE_DEPTH`], so it is left out of the
 /// analysis rather than overflowing the stack. A fact about this server, not

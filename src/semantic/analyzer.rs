@@ -1957,6 +1957,39 @@ fn collect_node_diagnostics(
         return;
     }
 
+    // `WHERE` with nothing after it. The grammar makes the condition optional,
+    // so tree-sitter leaves no `ERROR`/`MISSING` node, but the engine refuses it
+    // at parse time: `Unexpected token ';', expected an expression`.
+    if node.kind() == k::WHERE_CLAUSE
+        && k::named_children(node)
+            .iter()
+            .all(|child| k::is_keyword(*child) || child.is_extra())
+    {
+        push_parse_diagnostic(
+            Diagnostic {
+                range: lines.range(source, node.start_byte(), node.end_byte()),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: codes::as_code(codes::PARSE),
+                source: Some("surreal-language-server".to_string()),
+                message: "Expected an expression after `WHERE`.".to_string(),
+                ..Diagnostic::default()
+            },
+            parse_rows,
+            diagnostics,
+        );
+        return;
+    }
+
+    // A builtin path the engine does not have. Like `unknown-type`, the engine
+    // refuses to parse it, so it belongs in the syntax pass. No `return`: the
+    // arguments can hold more calls.
+    if node.kind() == k::FUNCTION_CALL
+        && !parse_failure_on_line(parse_rows, node)
+        && let Some(diagnostic) = unknown_function_diagnostic(source, lines, node)
+    {
+        diagnostics.push(diagnostic);
+    }
+
     // `node.walk()` allocates and frees a tree-sitter cursor, so it is not worth
     // paying for a node that has nothing to iterate. This walk covers every node
     // in the tree, anonymous ones included, and over half of them are leaves.
@@ -2032,6 +2065,63 @@ fn unknown_type_diagnostic(source: &str, lines: &LineIndex, node: Node<'_>) -> O
                 object.insert("table".to_string(), serde_json::Value::String(table));
             }
             payload
+        }),
+        ..Diagnostic::default()
+    })
+}
+
+/// `math::nope(1)` — a call to a path in a builtin namespace that the engine does
+/// not have. SurrealDB looks every builtin path up at parse time and rejects an
+/// unknown one with `Invalid function/constant path, did you maybe mean …`.
+///
+/// Only paths in a namespace the catalogue knows are judged. `fn::`, `mod::`,
+/// `silo::` and `ml::` name user-defined code, and the catalogue cannot say
+/// whether those exist.
+fn unknown_function_diagnostic(
+    source: &str,
+    lines: &LineIndex,
+    call: Node<'_>,
+) -> Option<Diagnostic> {
+    let name_node = k::find_child(call, k::FUNCTION_NAME)?;
+    let name = k::text_of(source, name_node)?;
+    let lower = name.to_ascii_lowercase();
+    if !crate::grammar::GENERATED_NAMESPACES
+        .iter()
+        .any(|namespace| lower.starts_with(namespace))
+        || crate::grammar::is_builtin_function(name)
+        || has_error_ancestor(call)
+    {
+        return None;
+    }
+
+    // The engine's own pick (`find_suggestion`, `expr/src/parser/lit.rs`): the
+    // nearest builtin path by Levenshtein distance under 4, ties broken
+    // alphabetically. Linear over ~460 names, run only on a call already wrong.
+    let suggestion = crate::grammar::GENERATED_FUNCTION_TABLE
+        .iter()
+        .map(|function| function.name)
+        .chain(crate::grammar::GENERATED_CONSTANTS.iter().copied())
+        .map(|path| {
+            (
+                strsim::levenshtein(&lower, &path.to_ascii_lowercase()),
+                path,
+            )
+        })
+        .filter(|(distance, _)| *distance < 4)
+        .min()
+        .map(|(_, path)| path);
+    Some(Diagnostic {
+        range: lines.range(source, name_node.start_byte(), name_node.end_byte()),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: codes::as_code(codes::UNKNOWN_FUNCTION),
+        source: Some("surreal-language-server".to_string()),
+        message: match suggestion {
+            Some(candidate) => format!("Unknown function `{name}`. Did you mean `{candidate}`?"),
+            None => format!("Unknown function `{name}`."),
+        },
+        data: Some(match suggestion {
+            Some(candidate) => serde_json::json!({ "function": name, "suggestion": candidate }),
+            None => serde_json::json!({ "function": name }),
         }),
         ..Diagnostic::default()
     })
