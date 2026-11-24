@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The "Add PERMISSIONS clause to table" code action wrote a clause that
+  does not parse.** It inserted `PERMISSIONS FOR select FULL, create NONE,
+  update NONE, delete NONE`, which SurrealDB and the grammar both reject:
+  every group needs its own `FOR`. It now inserts `PERMISSIONS FOR select
+  FULL, FOR create, update, delete NONE`, which grants the same access.
+
 ## 0.6.4 — 2026-11-17
 
 ### Grammar
